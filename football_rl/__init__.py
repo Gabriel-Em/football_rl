@@ -11,9 +11,15 @@ from football_rl.config import (
     VisionConfig,
 )
 from football_rl.env import FootballParallelEnv, env, parallel_env
+from football_rl.vec_env import (
+    DummyVecFootballEnv,
+    SubprocVecFootballEnv,
+    make_vec_football_env,
+)
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "DummyVecFootballEnv",
     "EnvConfig",
     "FormationConfig",
     "FootballParallelEnv",
@@ -21,7 +27,9 @@ __all__ = [
     "PhysicsConfig",
     "ReplayConfig",
     "RewardConfig",
+    "SubprocVecFootballEnv",
     "VisionConfig",
     "env",
+    "make_vec_football_env",
     "parallel_env",
 ]

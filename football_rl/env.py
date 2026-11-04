@@ -37,6 +37,15 @@ def wrap_to_pi(angle: float | np.ndarray) -> float | np.ndarray:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _fast_clip(val: float, low: float, high: float) -> float:
+    """Fast inline scalar clamp avoiding NumPy dispatch overhead."""
+    if val < low:
+        return low
+    if val > high:
+        return high
+    return val
+
+
 def parallel_env(config: Optional[EnvConfig] = None, render_mode: Optional[str] = None) -> "FootballParallelEnv":
     """Factory function for creating the PettingZoo ParallelEnv."""
     return FootballParallelEnv(config=config, render_mode=render_mode)
@@ -1717,27 +1726,13 @@ class FootballParallelEnv(ParallelEnv):
             if role == ROLE_KEEPER:
                 own_goal = goal_centers[my_side]
                 delta = self.player_pos[idx] - own_goal
-                dist = float(np.linalg.norm(delta))
+                dist = math.hypot(delta[0], delta[1])
                 if dist > box_r:
                     self.player_pos[idx] = own_goal + (delta / dist) * box_r
-
-                self.player_pos[idx, 0] = float(
-                    np.clip(self.player_pos[idx, 0], r_player, phys.field_width - r_player)
-                )
-                self.player_pos[idx, 1] = float(
-                    np.clip(self.player_pos[idx, 1], r_player, phys.field_height - r_player)
-                )
             else:
-                self.player_pos[idx, 0] = float(
-                    np.clip(self.player_pos[idx, 0], r_player, phys.field_width - r_player)
-                )
-                self.player_pos[idx, 1] = float(
-                    np.clip(self.player_pos[idx, 1], r_player, phys.field_height - r_player)
-                )
-
                 for g_center in goal_centers:
                     delta = self.player_pos[idx] - g_center
-                    dist = float(np.linalg.norm(delta))
+                    dist = math.hypot(delta[0], delta[1])
                     if dist <= box_r:
                         if dist < 1e-6:
                             push_dir = np.array(
@@ -1747,12 +1742,9 @@ class FootballParallelEnv(ParallelEnv):
                             push_dir = delta / dist
                         self.player_pos[idx] = g_center + push_dir * (box_r + 1e-3)
 
-                self.player_pos[idx, 0] = float(
-                    np.clip(self.player_pos[idx, 0], r_player, phys.field_width - r_player)
-                )
-                self.player_pos[idx, 1] = float(
-                    np.clip(self.player_pos[idx, 1], r_player, phys.field_height - r_player)
-                )
+        # Vectorized outer boundary clamping for all players in a single operation
+        np.clip(self.player_pos[:, 0], r_player, phys.field_width - r_player, out=self.player_pos[:, 0])
+        np.clip(self.player_pos[:, 1], r_player, phys.field_height - r_player, out=self.player_pos[:, 1])
 
         # Kickoff Exclusion Circle: Smoothly or firmly keep opposing players outside center spot (r = 130.0)
         if self.kickoff_protection_timer > 0.0 and self.ball_holder is not None:
@@ -2080,9 +2072,29 @@ class FootballParallelEnv(ParallelEnv):
     # ==========================================================================
     def _get_observations(self) -> Dict[str, np.ndarray]:
         """Compute the 76-float normalized observation vector for all 12 agents."""
+        c_p_a, c_v_a, c_ang_a = self._to_team_canonical(
+            self.player_pos, self.player_vel, self.player_angle, TEAM_A
+        )
+        c_b_a, c_bv_a, _ = self._to_team_canonical(
+            self.ball_pos, self.ball_vel, 0.0, TEAM_A
+        )
+        c_p_b, c_v_b, c_ang_b = self._to_team_canonical(
+            self.player_pos, self.player_vel, self.player_angle, TEAM_B
+        )
+        c_b_b, c_bv_b, _ = self._to_team_canonical(
+            self.ball_pos, self.ball_vel, 0.0, TEAM_B
+        )
+
         obs_dict: Dict[str, np.ndarray] = {}
         for idx, agent_name in enumerate(self.possible_agents):
-            obs_dict[agent_name] = self._build_single_observation(idx)
+            if idx < 6:
+                obs_dict[agent_name] = self._build_single_observation(
+                    idx, c_p_a, c_v_a, c_ang_a, c_b_a, c_bv_a
+                )
+            else:
+                obs_dict[agent_name] = self._build_single_observation(
+                    idx, c_p_b, c_v_b, c_ang_b, c_b_b, c_bv_b
+                )
         return obs_dict
 
     def _to_team_canonical(
@@ -2103,7 +2115,15 @@ class FootballParallelEnv(ParallelEnv):
         canon_angle = wrap_to_pi(angle + math.pi)
         return canon_pos, canon_vel, canon_angle
 
-    def _build_single_observation(self, idx: int) -> np.ndarray:
+    def _build_single_observation(
+        self,
+        idx: int,
+        c_player_pos: Optional[np.ndarray] = None,
+        c_player_vel: Optional[np.ndarray] = None,
+        c_player_angle: Optional[np.ndarray | float] = None,
+        c_ball_pos: Optional[np.ndarray] = None,
+        c_ball_vel: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Build the 76-float canonical observation for player `idx`."""
         phys = self.cfg.physics
         mech = self.cfg.mechanics
@@ -2112,13 +2132,15 @@ class FootballParallelEnv(ParallelEnv):
         my_team = int(self.player_team[idx])
         my_role = int(self.player_role[idx])
 
-        # Transform all players and ball into `my_team`'s canonical coordinate system
-        c_player_pos, c_player_vel, c_player_angle = self._to_team_canonical(
-            self.player_pos, self.player_vel, self.player_angle, my_team
-        )
-        c_ball_pos, c_ball_vel, _ = self._to_team_canonical(
-            self.ball_pos, self.ball_vel, 0.0, my_team
-        )
+        # Transform all players and ball into `my_team`'s canonical coordinate system if not provided
+        if c_player_pos is None or c_player_vel is None or c_player_angle is None:
+            c_player_pos, c_player_vel, c_player_angle = self._to_team_canonical(
+                self.player_pos, self.player_vel, self.player_angle, my_team
+            )
+        if c_ball_pos is None or c_ball_vel is None:
+            c_ball_pos, c_ball_vel, _ = self._to_team_canonical(
+                self.ball_pos, self.ball_vel, 0.0, my_team
+            )
 
         obs = np.zeros(vis.obs_dim, dtype=np.float32)
 
@@ -2130,8 +2152,8 @@ class FootballParallelEnv(ParallelEnv):
         svx, svy = float(c_player_vel[idx, 0]), float(c_player_vel[idx, 1])
 
         # Normalize self_x, self_y to [-1.0, 1.0]
-        obs[0] = np.clip((sx / phys.field_width) * 2.0 - 1.0, -1.0, 1.0)
-        obs[1] = np.clip((sy / phys.field_height) * 2.0 - 1.0, -1.0, 1.0)
+        obs[0] = _fast_clip((sx / phys.field_width) * 2.0 - 1.0, -1.0, 1.0)
+        obs[1] = _fast_clip((sy / phys.field_height) * 2.0 - 1.0, -1.0, 1.0)
 
         # sin and cos of canonical facing angle
         obs[2] = math.sin(s_angle)
@@ -2139,13 +2161,13 @@ class FootballParallelEnv(ParallelEnv):
 
         # Normalized self velocity
         max_self_v = mech.lunge_speed if my_role == ROLE_KEEPER else self._get_player_max_speed(idx)
-        obs[4] = np.clip(svx / max_self_v, -1.0, 1.0)
-        obs[5] = np.clip(svy / max_self_v, -1.0, 1.0)
+        obs[4] = _fast_clip(svx / max_self_v, -1.0, 1.0)
+        obs[5] = _fast_clip(svy / max_self_v, -1.0, 1.0)
 
         # Score Differential
         my_score = self.stats.get("score", [0, 0])[my_team]
         opp_score = self.stats.get("score", [0, 0])[1 - my_team]
-        obs[6] = float(np.clip((my_score - opp_score) / 3.0, -1.0, 1.0))
+        obs[6] = _fast_clip((my_score - opp_score) / 3.0, -1.0, 1.0)
         has_ball = 1.0 if self.ball_holder == idx else 0.0
         obs[7] = has_ball
 
@@ -2154,14 +2176,17 @@ class FootballParallelEnv(ParallelEnv):
             mech.keeper_max_hold_time if my_role == ROLE_KEEPER else mech.field_max_hold_time
         )
         if has_ball > 0.5:
-            obs[8] = np.clip(self.ball_hold_timer / max_hold, 0.0, 1.0)
+            obs[8] = _fast_clip(self.ball_hold_timer / max_hold, 0.0, 1.0)
         elif self.ball_holder is None:
             obs[8] = 0.0
         elif int(self.player_team[self.ball_holder]) == my_team:
             obs[8] = 0.5
         else:
             holder_idx = self.ball_holder
-            d_holder = float(np.linalg.norm(self.player_pos[idx] - self.player_pos[holder_idx]))
+            d_holder = math.hypot(
+                self.player_pos[idx, 0] - self.player_pos[holder_idx, 0],
+                self.player_pos[idx, 1] - self.player_pos[holder_idx, 1],
+            )
             my_tackle_reach = self._get_role_tackle_params(idx)[0]
             if (
                 self._is_field_role(self.player_role[holder_idx])
@@ -2173,14 +2198,14 @@ class FootballParallelEnv(ParallelEnv):
 
         # Ability cooldown normalized to [0.0, 1.0]
         if my_role == ROLE_KEEPER:
-            obs[9] = np.clip(self.lunge_cooldown[idx] / mech.lunge_cooldown, 0.0, 1.0)
+            obs[9] = _fast_clip(self.lunge_cooldown[idx] / mech.lunge_cooldown, 0.0, 1.0)
         else:
             max_tackle_cd = max(mech.tackle_fail_cooldown, mech.field_violation_tackle_cooldown)
-            obs[9] = np.clip(self.tackle_cooldown[idx] / max_tackle_cd, 0.0, 1.0)
+            obs[9] = _fast_clip(self.tackle_cooldown[idx] / max_tackle_cd, 0.0, 1.0)
 
         # Ghost or Stun timer normalized to [0.0, 1.0]
         active_disable_timer = max(float(self.ghost_timer[idx]), float(self.stun_timer[idx]))
-        obs[10] = np.clip(active_disable_timer / mech.ghost_duration, 0.0, 1.0)
+        obs[10] = _fast_clip(active_disable_timer / mech.ghost_duration, 0.0, 1.0)
 
         # Relative angle and distance to Enemy Goal (always at (1400.0, 420.0) in canonical space)
         enemy_goal_dx = phys.field_width - sx
@@ -2189,12 +2214,12 @@ class FootballParallelEnv(ParallelEnv):
         angle_to_goal = math.atan2(enemy_goal_dy, enemy_goal_dx)
         rel_goal_angle = float(wrap_to_pi(angle_to_goal - s_angle))
 
-        obs[11] = np.clip(rel_goal_angle / math.pi, -1.0, 1.0)
-        obs[12] = np.clip(goal_dist / self._max_field_dist, 0.0, 1.0)
+        obs[11] = _fast_clip(rel_goal_angle / math.pi, -1.0, 1.0)
+        obs[12] = _fast_clip(goal_dist / self._max_field_dist, 0.0, 1.0)
 
         # Role One-Hot Encoding / GK Box Loose Ball Timer (indices 13..15)
         if my_role == ROLE_KEEPER:
-            obs[13] = np.clip(
+            obs[13] = _fast_clip(
                 self.box_loose_ball_timer / mech.keeper_box_loose_max_time, 0.0, 1.0
             )
             obs[14] = 0.0
@@ -2239,26 +2264,26 @@ class FootballParallelEnv(ParallelEnv):
                 # Slot 0 (Ball): 360-degree awareness
                 in_cone = (dist <= vis.max_range) and (abs(rel_ang) <= vis.half_fov_rad)
                 obs[slot_start + 0] = 1.0 if in_cone else 0.5
-                obs[slot_start + 1] = np.clip(dist / self._max_field_dist, 0.0, 1.0)
-                obs[slot_start + 2] = np.clip(rel_ang / math.pi, -1.0, 1.0)
-                obs[slot_start + 3] = np.clip(
+                obs[slot_start + 1] = _fast_clip(dist / self._max_field_dist, 0.0, 1.0)
+                obs[slot_start + 2] = _fast_clip(rel_ang / math.pi, -1.0, 1.0)
+                obs[slot_start + 3] = _fast_clip(
                     (float(evel[0]) - svx) / max_rel_vel, -1.0, 1.0
                 )
-                obs[slot_start + 4] = np.clip(
+                obs[slot_start + 4] = _fast_clip(
                     (float(evel[1]) - svy) / max_rel_vel, -1.0, 1.0
                 )
             else:
                 # Slots 1..11: Vision cone limited to vis.max_range and half_fov_rad
                 if dist <= vis.max_range and abs(rel_ang) <= vis.half_fov_rad:
                     obs[slot_start + 0] = 1.0
-                    obs[slot_start + 1] = np.clip(dist / vis.max_range, 0.0, 1.0)
-                    obs[slot_start + 2] = np.clip(
+                    obs[slot_start + 1] = _fast_clip(dist / vis.max_range, 0.0, 1.0)
+                    obs[slot_start + 2] = _fast_clip(
                         rel_ang / vis.half_fov_rad, -1.0, 1.0
                     )
-                    obs[slot_start + 3] = np.clip(
+                    obs[slot_start + 3] = _fast_clip(
                         (float(evel[0]) - svx) / max_rel_vel, -1.0, 1.0
                     )
-                    obs[slot_start + 4] = np.clip(
+                    obs[slot_start + 4] = _fast_clip(
                         (float(evel[1]) - svy) / max_rel_vel, -1.0, 1.0
                     )
 

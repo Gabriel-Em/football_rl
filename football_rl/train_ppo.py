@@ -25,6 +25,7 @@ from football_rl.config import (
     OBS_DIM,
 )
 from football_rl.env import FootballParallelEnv, parallel_env
+from football_rl.vec_env import make_vec_football_env, SubprocVecFootballEnv, DummyVecFootballEnv
 
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 0.0) -> nn.Linear:
@@ -118,6 +119,7 @@ class ParameterSharingPPOTrainer:
         self.num_envs = num_envs
         self.rollout_steps = rollout_steps
         self.device = torch.device(device)
+        self.inference_device = torch.device("cpu") if self.device.type == "cuda" else self.device
         self.checkpoint_dir = checkpoint_dir
         self.seed = seed
         self.separate_teams = separate_teams
@@ -134,10 +136,9 @@ class ParameterSharingPPOTrainer:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        # Instantiate environments
-        self.envs: List[FootballParallelEnv] = [
-            parallel_env(config=self.cfg) for _ in range(num_envs)
-        ]
+        # Instantiate vectorized environments (SubprocVecFootballEnv for num_envs > 1, DummyVecFootballEnv for 1)
+        self.vec_env = make_vec_football_env(config=self.cfg, num_envs=num_envs)
+        self.envs: List[FootballParallelEnv] = getattr(self.vec_env, "envs", [])
 
         # Role & Team index masks across the 12 agents:
         self.blue_keeper_indices = [0]                    # a_keeper
@@ -148,7 +149,7 @@ class ParameterSharingPPOTrainer:
         self.keeper_indices = [0, 6]
         self.field_indices = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
-        # Blue Team (TEAM_A) Policies
+        # Blue Team (TEAM_A) Policies (on self.device, e.g. CUDA)
         self.blue_field_policy = ActorCritic(
             obs_dim=OBS_DIM,
             action_dim=ACTION_DIM,
@@ -197,10 +198,53 @@ class ParameterSharingPPOTrainer:
         self.field_optimizer = self.blue_field_optimizer
         self.keeper_optimizer = self.blue_keeper_optimizer
 
+        # CPU shadow policies for fast rollout inference (when device == 'cuda')
+        if self.device.type == "cuda":
+            self.cpu_blue_field_policy = ActorCritic(
+                obs_dim=OBS_DIM,
+                action_dim=ACTION_DIM,
+                hidden_dims=self.cfg.ppo.hidden_dims,
+            ).to(self.inference_device)
+            self.cpu_blue_keeper_policy = ActorCritic(
+                obs_dim=OBS_DIM,
+                action_dim=ACTION_DIM,
+                hidden_dims=self.cfg.ppo.hidden_dims,
+            ).to(self.inference_device)
+            if self.separate_teams:
+                self.cpu_red_field_policy = ActorCritic(
+                    obs_dim=OBS_DIM,
+                    action_dim=ACTION_DIM,
+                    hidden_dims=self.cfg.ppo.hidden_dims,
+                ).to(self.inference_device)
+                self.cpu_red_keeper_policy = ActorCritic(
+                    obs_dim=OBS_DIM,
+                    action_dim=ACTION_DIM,
+                    hidden_dims=self.cfg.ppo.hidden_dims,
+                ).to(self.inference_device)
+            else:
+                self.cpu_red_field_policy = self.cpu_blue_field_policy
+                self.cpu_red_keeper_policy = self.cpu_blue_keeper_policy
+            self._sync_cpu_policies()
+        else:
+            self.cpu_blue_field_policy = self.blue_field_policy
+            self.cpu_blue_keeper_policy = self.blue_keeper_policy
+            self.cpu_red_field_policy = self.red_field_policy
+            self.cpu_red_keeper_policy = self.red_keeper_policy
+
         # Initialize environments and store current observations (num_envs, len(ALL_AGENTS), OBS_DIM)
         self.num_agents: int = len(ALL_AGENTS)
         self.current_obs = np.zeros((num_envs, self.num_agents, OBS_DIM), dtype=np.float32)
         self._reset_all_envs(initial=True)
+
+    def _sync_cpu_policies(self) -> None:
+        """Synchronize training weights from CUDA to the CPU rollout inference policies."""
+        if self.device.type != "cuda":
+            return
+        self.cpu_blue_field_policy.load_state_dict(self.blue_field_policy.state_dict())
+        self.cpu_blue_keeper_policy.load_state_dict(self.blue_keeper_policy.state_dict())
+        if self.separate_teams:
+            self.cpu_red_field_policy.load_state_dict(self.red_field_policy.state_dict())
+            self.cpu_red_keeper_policy.load_state_dict(self.red_keeper_policy.state_dict())
 
     def _allocate_match_id(self) -> int:
         mid = self.next_match_id
@@ -210,29 +254,32 @@ class ParameterSharingPPOTrainer:
     def _reset_all_envs(self, initial: bool = False) -> None:
         """Reset all parallel environments with sequential match IDs."""
         target_gen = self.current_generation + 1
-        for env_i, env in enumerate(self.envs):
-            mid = self._allocate_match_id()
-            env_seed = (self.seed + self.current_generation * 100 + env_i) if initial else None
-            obs_dict, _ = env.reset(
-                seed=env_seed,
-                options={"generation": target_gen, "match_id": mid},
-            )
+        seeds = [
+            (self.seed + self.current_generation * 100 + env_i) if initial else None
+            for env_i in range(self.num_envs)
+        ]
+        options_list = [
+            {"generation": target_gen, "match_id": self._allocate_match_id()}
+            for _ in range(self.num_envs)
+        ]
+        obs_list, _ = self.vec_env.reset(seeds=seeds, options_list=options_list)
+        for env_i in range(self.num_envs):
             for agent_i, agent_name in enumerate(ALL_AGENTS):
-                self.current_obs[env_i, agent_i] = obs_dict[agent_name]
+                self.current_obs[env_i, agent_i] = obs_list[env_i][agent_name]
 
     @torch.no_grad()
     def _select_actions(
         self, obs_batch: np.ndarray, deterministic: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Query Blue and Red role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
-        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
-        actions = torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.device)
-        logprobs = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.device)
-        values = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.device)
+        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
+        actions = torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
+        logprobs = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
+        values = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
 
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
-            k_act, k_logp, _, k_val = self.blue_keeper_policy.get_action_and_value(
+            k_act, k_logp, _, k_val = self.cpu_blue_keeper_policy.get_action_and_value(
                 k_obs, deterministic=deterministic
             )
             actions[:, self.keeper_indices, :] = k_act.view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
@@ -240,7 +287,7 @@ class ParameterSharingPPOTrainer:
             values[:, self.keeper_indices] = k_val.view(self.num_envs, len(self.keeper_indices))
 
             f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
-            f_act, f_logp, _, f_val = self.blue_field_policy.get_action_and_value(
+            f_act, f_logp, _, f_val = self.cpu_blue_field_policy.get_action_and_value(
                 f_obs, deterministic=deterministic
             )
             actions[:, self.field_indices, :] = f_act.view(self.num_envs, len(self.field_indices), ACTION_DIM)
@@ -248,10 +295,10 @@ class ParameterSharingPPOTrainer:
             values[:, self.field_indices] = f_val.view(self.num_envs, len(self.field_indices))
         else:
             groups = [
-                (self.blue_keeper_indices, self.blue_keeper_policy),
-                (self.blue_field_indices, self.blue_field_policy),
-                (self.red_keeper_indices, self.red_keeper_policy),
-                (self.red_field_indices, self.red_field_policy),
+                (self.blue_keeper_indices, self.cpu_blue_keeper_policy),
+                (self.blue_field_indices, self.cpu_blue_field_policy),
+                (self.red_keeper_indices, self.cpu_red_keeper_policy),
+                (self.red_field_indices, self.cpu_red_field_policy),
             ]
             for indices, policy in groups:
                 cnt = len(indices)
@@ -272,24 +319,24 @@ class ParameterSharingPPOTrainer:
     @torch.no_grad()
     def _compute_values(self, obs_batch: np.ndarray) -> np.ndarray:
         """Compute critic values for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
-        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
+        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
         values = np.zeros((self.num_envs, self.num_agents), dtype=np.float32)
 
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
             values[:, self.keeper_indices] = (
-                self.blue_keeper_policy.get_value(k_obs).view(self.num_envs, len(self.keeper_indices)).cpu().numpy()
+                self.cpu_blue_keeper_policy.get_value(k_obs).view(self.num_envs, len(self.keeper_indices)).cpu().numpy()
             )
             f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
             values[:, self.field_indices] = (
-                self.blue_field_policy.get_value(f_obs).view(self.num_envs, len(self.field_indices)).cpu().numpy()
+                self.cpu_blue_field_policy.get_value(f_obs).view(self.num_envs, len(self.field_indices)).cpu().numpy()
             )
         else:
             groups = [
-                (self.blue_keeper_indices, self.blue_keeper_policy),
-                (self.blue_field_indices, self.blue_field_policy),
-                (self.red_keeper_indices, self.red_keeper_policy),
-                (self.red_field_indices, self.red_field_policy),
+                (self.blue_keeper_indices, self.cpu_blue_keeper_policy),
+                (self.blue_field_indices, self.cpu_blue_field_policy),
+                (self.red_keeper_indices, self.cpu_red_keeper_policy),
+                (self.red_field_indices, self.cpu_red_field_policy),
             ]
             for indices, policy in groups:
                 cnt = len(indices)
@@ -316,8 +363,7 @@ class ParameterSharingPPOTrainer:
         exported_replays: List[str] = []
         gen_completed_matches: List[Dict[str, Any]] = []
 
-        for env in self.envs:
-            env.current_generation = active_generation
+        self.vec_env.set_generation(active_generation)
 
         for t in range(T):
             buf_obs[t] = self.current_obs
@@ -326,13 +372,22 @@ class ParameterSharingPPOTrainer:
             buf_logp[t] = logprobs
             buf_val[t] = values
 
-            for env_i, env in enumerate(self.envs):
-                env.current_generation = active_generation
-                act_dict = {
+            actions_by_env = [
+                {
                     agent_name: np.clip(actions[env_i, agent_i], -1.0, 1.0)
                     for agent_i, agent_name in enumerate(ALL_AGENTS)
                 }
-                next_obs_dict, rew_dict, term_dict, trunc_dict, info_dict = env.step(act_dict)
+                for env_i in range(N)
+            ]
+            obs_list, rew_list, term_list, trunc_list, info_list, done_list = self.vec_env.step(actions_by_env)
+
+            for env_i in range(N):
+                next_obs_dict = obs_list[env_i]
+                rew_dict = rew_list[env_i]
+                term_dict = term_list[env_i]
+                trunc_dict = trunc_list[env_i]
+                info_dict = info_list[env_i]
+                is_env_done = done_list[env_i]
 
                 for agent_i, agent_name in enumerate(ALL_AGENTS):
                     buf_rew[t, env_i, agent_i] = rew_dict[agent_name]
@@ -340,7 +395,7 @@ class ParameterSharingPPOTrainer:
                     buf_done[t, env_i, agent_i] = 1.0 if is_done else 0.0
 
                 # Check if episode ended
-                if not env.agents:
+                if is_env_done:
                     completed_episodes += 1
                     k_info = info_dict["a_keeper"]
                     ep_interest = float(k_info["interest_score"])
@@ -350,14 +405,14 @@ class ParameterSharingPPOTrainer:
                         exported_replays.append(rpath)
 
                     # Record match summary entry
-                    fstats = k_info.get("final_stats", env.stats)
+                    fstats = k_info.get("final_stats", {})
                     total_poss = max(1, sum(fstats.get("possession_frames", [1, 1])))
                     poss_pct = [
-                        round(100.0 * fstats["possession_frames"][0] / total_poss, 1),
-                        round(100.0 * fstats["possession_frames"][1] / total_poss, 1),
+                        round(100.0 * fstats.get("possession_frames", [1, 1])[0] / total_poss, 1),
+                        round(100.0 * fstats.get("possession_frames", [1, 1])[1] / total_poss, 1),
                     ]
                     match_record = {
-                        "match_id": int(k_info.get("match_id", env.current_match_id)),
+                        "match_id": int(k_info.get("match_id", self.next_match_id)),
                         "generation": int(active_generation),
                         "score": list(fstats.get("score", [0, 0])),
                         "goals": int(fstats.get("goals", 0)),
@@ -381,12 +436,14 @@ class ParameterSharingPPOTrainer:
 
                     # Auto-reset environment for seamless rollout collection
                     next_gen_hint = active_generation + (1 if t == T - 1 else 0)
-                    next_obs_dict, _ = env.reset(
-                        options={
+                    reset_obs_list, _ = self.vec_env.reset(
+                        options_list=[{
                             "generation": next_gen_hint,
                             "match_id": self._allocate_match_id(),
-                        }
+                        }],
+                        env_indices=[env_i],
                     )
+                    next_obs_dict = reset_obs_list[0]
 
                 for agent_i, agent_name in enumerate(ALL_AGENTS):
                     self.current_obs[env_i, agent_i] = next_obs_dict[agent_name]
@@ -572,7 +629,7 @@ class ParameterSharingPPOTrainer:
                 self.blue_keeper_optimizer,
                 *_extract_role_tensors(self.keeper_indices),
             )
-            return {
+            metrics = {
                 "field": field_metrics,
                 "keeper": keeper_metrics,
                 "blue_field": field_metrics,
@@ -580,6 +637,8 @@ class ParameterSharingPPOTrainer:
                 "red_field": field_metrics,
                 "red_keeper": keeper_metrics,
             }
+            self._sync_cpu_policies()
+            return metrics
 
         blue_field_m = self._ppo_update_role(
             self.blue_field_policy,
@@ -601,7 +660,7 @@ class ParameterSharingPPOTrainer:
             self.red_keeper_optimizer,
             *_extract_role_tensors(self.red_keeper_indices),
         )
-        return {
+        metrics = {
             "field": blue_field_m,
             "keeper": blue_keeper_m,
             "blue_field": blue_field_m,
@@ -609,6 +668,8 @@ class ParameterSharingPPOTrainer:
             "red_field": red_field_m,
             "red_keeper": red_keeper_m,
         }
+        self._sync_cpu_policies()
+        return metrics
 
     def save_checkpoints(self) -> Tuple[str, str]:
         """Save Blue and Red policies, optimizers, generation counter, and match summaries to disk."""
@@ -850,6 +911,7 @@ class ParameterSharingPPOTrainer:
 
             # Re-number active environments so the next match starts cleanly at len(match_history) + 1
             self._reset_all_envs(initial=True)
+            self._sync_cpu_policies()
             return True
 
         loaded_any = False
@@ -865,7 +927,16 @@ class ParameterSharingPPOTrainer:
             if self.separate_teams:
                 self.red_keeper_policy.load_state_dict(w)
             loaded_any = True
+        self._sync_cpu_policies()
         return loaded_any
+
+    def close(self) -> None:
+        """Close vector environments and worker processes."""
+        if hasattr(self, "vec_env"):
+            self.vec_env.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def train(self, total_updates: int = 100) -> Dict[str, Any]:
         """Run `total_updates` generations of MARL PPO training."""
@@ -906,6 +977,7 @@ class ParameterSharingPPOTrainer:
             else:
                 for pol in (self.blue_field_policy, self.blue_keeper_policy):
                     torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+            self._sync_cpu_policies()
 
             # Balanced Co-Evolution & Underdog Soft-Sync (over rolling 3-generation window)
             if self.separate_teams:
@@ -938,6 +1010,7 @@ class ParameterSharingPPOTrainer:
                                 f"Soft-synced Red policy (tau=0.35) to restore parity."
                             )
                             self.recent_team_goals.clear()
+                            self._sync_cpu_policies()
                         elif sum_b >= 3 * max(1, sum_a):
                             # Team B is dominating >= 75% -> soft-sync Team A towards Team B
                             with torch.no_grad():
@@ -956,6 +1029,7 @@ class ParameterSharingPPOTrainer:
                                 f"Soft-synced Blue policy (tau=0.35) to restore parity."
                             )
                             self.recent_team_goals.clear()
+                            self._sync_cpu_policies()
 
             gen_record = {
                 "generation": gen,
