@@ -178,6 +178,8 @@ class MechanicsConfig:
     kickoff_protection_time: float = 1.2    # Time (s) after kickoff during which carrier cannot be tackled
     kickoff_exclusion_radius: float = 130.0 # Radial buffer keeping opponents outside center spot at kickoff
     gk_hold_opponent_buffer: float = 230.0  # Min distance opposing field players must keep from goal center while GK holds ball
+    gk_hold_push_speed: float = 285.0       # Smooth radial pushback speed (u/s) when GK holds ball (no instant teleport)
+    tackle_whiff_max_ball_dist: float = 180.0  # Max distance to ball within which an out-of-range tackle triggers a physical whiff stun
 
 
 @dataclass(frozen=True)
@@ -235,10 +237,11 @@ class RewardConfig:
     blocked_kick_pen: float = -0.45         # Immediate penalty in _execute_kick when kicking into near opponent
 
     # Progressive Pass & Anti-Exploit Parameters
-    pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X gained (e.g., +200u dx = +1.2)
+    pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +1.2)
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
+    box_angle_pass_bonus: float = 0.85         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
     pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
-    min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx to qualify as progressive
+    min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx or goal-dist reduction to qualify as progressive
 
     # Tiki-Taka Chain Parameters
     pass_chain_multiplier_coeff: float = 0.30  # Multiplier scale: (1.0 + 0.30 * C_chain)
@@ -285,12 +288,17 @@ class RewardConfig:
     possession_team: float = 0.001
     carrier_goal_advance_ind_scale: float = 0.008  # Individual bonus to carrier for dribbling toward enemy goal
     ball_advance_team_scale: float = 0.004         # Team reward per unit closer to enemy goal center
+    hold_urgency_pen_scale: float = 0.035          # Escalating per-step penalty when field player holds ball > 3.2s
 
     # Context-Dependent Tactical & Role Positioning
-    teammate_min_spacing: float = 135.0
-    carrier_min_spacing: float = 120.0
-    crowding_penalty_scale: float = 0.005
-    carrier_approach_penalty_scale: float = 0.008
+    teammate_min_spacing: float = 165.0            # Increased from 135.0 to spread off-ball players across 1400x840 pitch
+    teammate_box_cutback_spacing: float = 95.0     # Relaxed spacing when two attackers are in different angular sectors (>=40 deg) near box
+    carrier_min_spacing: float = 135.0             # Increased from 120.0
+    crowding_penalty_scale: float = 0.018          # Increased from 0.005 (applied asymmetrically with right-of-way exemptions)
+    teammate_approach_penalty_scale: float = 0.012 # Penalty per unit closed when approaching a nearby off-ball teammate (<155u)
+    carrier_approach_penalty_scale: float = 0.010  # Increased from 0.008
+    box_sector_crowding_pen: float = 0.020         # Penalty for non-carrier clogging the same angular sector (<35 deg) within 240u of enemy goal
+    gk_buffer_obstruction_pen: float = 0.015       # Penalty when actively driving toward enemy GK while enemy GK holds the ball
     support_pocket_approach_scale: float = 0.010
     open_support_bonus_scale: float = 0.010
     role_zone_anchor_scale: float = 0.005

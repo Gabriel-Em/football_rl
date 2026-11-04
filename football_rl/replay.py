@@ -94,6 +94,8 @@ class ReplayViewer:
         self,
         replay_data: Dict[str, Any],
         headless: bool = False,
+        show_vision_cones: bool = False,
+        show_reward_hud: bool = False,
     ) -> None:
         self.data = replay_data
         self.meta = replay_data["metadata"]
@@ -133,8 +135,8 @@ class ReplayViewer:
         self.current_frame_idx: int = 0
         self.paused: bool = False
         self.playback_speed: int = 1
-        self.show_vision_cones: bool = True
-        self.show_reward_hud: bool = True
+        self.show_vision_cones: bool = show_vision_cones
+        self.show_reward_hud: bool = show_reward_hud
         self.running: bool = True
         self.headless: bool = headless
 
@@ -1304,6 +1306,18 @@ def main() -> None:
         default=None,
         help="Run headlessly for N frames and exit (for automated testing).",
     )
+    parser.add_argument(
+        "--show-cones",
+        action="store_true",
+        default=False,
+        help="Enable vision cones overlay on startup (toggled in-viewer with 'V').",
+    )
+    parser.add_argument(
+        "--show-rewards",
+        action="store_true",
+        default=False,
+        help="Enable reward/punishment stats HUD overlay on startup (toggled in-viewer with 'E').",
+    )
     args = parser.parse_args()
 
     if args.list or args.range is not None or args.top is not None:
@@ -1334,7 +1348,12 @@ def main() -> None:
 
     print(f"Loading replay: {filepath}")
     replay_data = load_replay_json(filepath)
-    viewer = ReplayViewer(replay_data, headless=args.headless_frames is not None)
+    viewer = ReplayViewer(
+        replay_data,
+        headless=args.headless_frames is not None,
+        show_vision_cones=args.show_cones,
+        show_reward_hud=args.show_rewards,
+    )
     viewer.run(max_frames=args.headless_frames)
 
 
