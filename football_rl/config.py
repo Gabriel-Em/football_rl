@@ -54,14 +54,14 @@ class PhysicsConfig:
     field_center: Tuple[float, float] = (700.0, 420.0)
 
     # Goals (centered on X = 0.0 and X = 1400.0 walls)
-    goal_y_min: float = 340.0
-    goal_y_max: float = 500.0
-    goal_width: float = 160.0
+    goal_y_min: float = 320.0
+    goal_y_max: float = 520.0
+    goal_width: float = 200.0
     left_goal_center: Tuple[float, float] = (0.0, 420.0)
     right_goal_center: Tuple[float, float] = (1400.0, 420.0)
 
     # Keeper Semi-Circles (The Box)
-    keeper_box_radius: float = 145.0
+    keeper_box_radius: float = 195.0
 
     # Player Kinematics (Base defaults + Role-Specific Profiles)
     player_radius: float = 18.0
@@ -155,8 +155,9 @@ class MechanicsConfig:
 
     # Keeper Lunge & Perimeter Strip
     lunge_speed: float = 430.0
+    keeper_dive_speed: float = 340.0
     lunge_duration: float = 0.25
-    lunge_cooldown: float = 5.0
+    lunge_cooldown: float = 1.8
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
 
@@ -177,7 +178,7 @@ class MechanicsConfig:
     # Kickoff Protection & GK Possession Buffer
     kickoff_protection_time: float = 1.2    # Time (s) after kickoff during which carrier cannot be tackled
     kickoff_exclusion_radius: float = 130.0 # Radial buffer keeping opponents outside center spot at kickoff
-    gk_hold_opponent_buffer: float = 230.0  # Min distance opposing field players must keep from goal center while GK holds ball
+    gk_hold_opponent_buffer: float = 265.0  # Min distance opposing field players must keep from goal center while GK holds ball (keeper_box_radius + 70.0)
     gk_hold_push_speed: float = 285.0       # Smooth radial pushback speed (u/s) when GK holds ball (no instant teleport)
     tackle_whiff_max_ball_dist: float = 180.0  # Max distance to ball within which an out-of-range tackle triggers a physical whiff stun
 
@@ -271,7 +272,9 @@ class RewardConfig:
     # Loose Ball Recovery
     loose_ball_pickup_ind: float = 0.5
     loose_ball_pickup_team: float = 0.15
+    first_touch_reception_bonus: float = 0.35  # Discrete bonus when cleanly receiving a pass in flight within 55u
     keeper_box_recovery_ind: float = 1.2    # Bonus when GK picks up loose ball in own semicircle
+    keeper_sweeper_chase_scale: float = 0.028  # Velocity reward scale for sweeper-keeper actively charging loose ball in box
     keeper_dive_save_attempt_ind: float = 0.60  # Bonus when GK triggers lunge towards shot-on-target
     keeper_reckless_lunge_pen: float = -0.15    # Penalty when GK triggers lunge away from play
 
@@ -311,7 +314,7 @@ class RewardConfig:
     keeper_angle_track_scale: float = 0.010
     keeper_anchor_approach_scale: float = 0.018
     keeper_edge_camp_pen: float = 0.035
-    keeper_edge_camp_radius: float = 65.0
+    keeper_edge_camp_radius: float = 95.0  # Scaled to enlarged 195u semicircle to allow angle-narrowing bisector positioning
     keeper_fetch_box_scale: float = 0.045
     keeper_back_wall_face_pen: float = 0.035
     jitter_reverse_pen: float = -0.008
@@ -348,25 +351,47 @@ class FormationConfig:
         }
     )
 
-    # 2. Keeper 5-Second Foul Teleport (Assuming Left Keeper committed the foul)
+    # 2. Foul Restart Formation (Open 3-2 Attacking Overload & Zonal Block)
+    # Canonical coordinates where the Attacking Team attacks toward +X (1400.0, 420.0)
+    foul_attacking_canonical: Dict[str, Tuple[float, float]] = field(
+        default_factory=lambda: {
+            "keeper": (40.0, 420.0),
+            "def_1": (540.0, 260.0),
+            "def_2": (540.0, 580.0),
+            "mid_1": (965.0, 235.0),
+            "mid_2": (965.0, 605.0),
+            "atk_1": (820.0, 420.0),
+        }
+    )
+    foul_defending_canonical: Dict[str, Tuple[float, float]] = field(
+        default_factory=lambda: {
+            "keeper": (1360.0, 420.0),
+            "def_1": (1115.0, 315.0),
+            "def_2": (1115.0, 525.0),
+            "mid_1": (1030.0, 130.0),
+            "mid_2": (1030.0, 710.0),
+            "atk_1": (640.0, 420.0),
+        }
+    )
+    # Backward-compatible mappings:
     foul_penalized_left: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
-            "keeper": (45.0, 420.0),
-            "def_1": (210.0, 260.0),
-            "def_2": (210.0, 580.0),
-            "mid_1": (260.0, 160.0),
-            "mid_2": (260.0, 680.0),
-            "atk_1": (320.0, 420.0),
+            "keeper": (40.0, 420.0),
+            "def_1": (285.0, 525.0),
+            "def_2": (285.0, 315.0),
+            "mid_1": (370.0, 710.0),
+            "mid_2": (370.0, 130.0),
+            "atk_1": (760.0, 420.0),
         }
     )
     foul_attacking_right: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
-            "keeper": (1355.0, 420.0),
-            "def_1": (920.0, 250.0),
-            "def_2": (920.0, 590.0),
-            "mid_1": (460.0, 110.0),  # Wide top flank
-            "mid_2": (460.0, 730.0),  # Wide bottom flank
-            "atk_1": (590.0, 420.0),  # Starts holding ball in opponent's half (further from goal)
+            "keeper": (1360.0, 420.0),
+            "def_1": (860.0, 580.0),
+            "def_2": (860.0, 260.0),
+            "mid_1": (435.0, 605.0),
+            "mid_2": (435.0, 235.0),
+            "atk_1": (580.0, 420.0),
         }
     )
 

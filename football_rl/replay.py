@@ -102,9 +102,9 @@ class ReplayViewer:
 
         self.field_w = float(self.meta.get("field_width", 1400.0))
         self.field_h = float(self.meta.get("field_height", 840.0))
-        self.goal_y_min = float(self.meta.get("goal_y_min", 340.0))
-        self.goal_y_max = float(self.meta.get("goal_y_max", 500.0))
-        self.box_radius = float(self.meta.get("keeper_box_radius", 145.0))
+        self.goal_y_min = float(self.meta.get("goal_y_min", 320.0))
+        self.goal_y_max = float(self.meta.get("goal_y_max", 520.0))
+        self.box_radius = float(self.meta.get("keeper_box_radius", 195.0))
         self.player_radius = float(self.meta.get("player_radius", 18.0))
         self.ball_radius = float(self.meta.get("ball_radius", 10.0))
         self.fov_deg = float(self.meta.get("vision_fov_deg", 90.0))

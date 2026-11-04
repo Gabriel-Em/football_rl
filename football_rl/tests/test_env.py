@@ -174,9 +174,9 @@ def test_semi_circle_barriers_for_keepers_and_field_players() -> None:
         env.player_pos[env.agent_to_idx["b_def_1"]] - np.array([1400.0, 420.0])
     )
 
-    assert dist_keeper <= 145.0 + 1e-6
-    assert dist_field_a > 145.0
-    assert dist_field_b > 145.0
+    assert dist_keeper <= env.cfg.physics.keeper_box_radius + 1e-6
+    assert dist_field_a > env.cfg.physics.keeper_box_radius
+    assert dist_field_b > env.cfg.physics.keeper_box_radius
 
 
 def test_field_5s_violation_ghost_mode_and_other_player_reset() -> None:
@@ -229,15 +229,15 @@ def test_keeper_5s_foul_teleport_and_zero_advance_spike() -> None:
     _, rewards, _, _, _ = env.step(_zero_actions(env))
 
     assert env.stats["keeper_5s_violations"] == 1
-    # Attacking Team B's b_atk_1 holds ball at (590, 420)
+    # Attacking Team B's b_atk_1 holds ball at world (580, 420) (canonical 820, 420)
     b_atk_1_idx = env.agent_to_idx["b_atk_1"]
     b_mid_1_idx = env.agent_to_idx["b_mid_1"]
     b_mid_2_idx = env.agent_to_idx["b_mid_2"]
     assert env.ball_holder == b_atk_1_idx
-    np.testing.assert_allclose(env.player_pos[b_atk_1_idx], [590.0, 420.0])
-    np.testing.assert_allclose(env.player_pos[b_mid_1_idx], [460.0, 110.0])
-    np.testing.assert_allclose(env.player_pos[b_mid_2_idx], [460.0, 730.0])
-    np.testing.assert_allclose(env.player_pos[keeper_idx], [45.0, 420.0])
+    np.testing.assert_allclose(env.player_pos[b_atk_1_idx], [580.0, 420.0])
+    np.testing.assert_allclose(env.player_pos[b_mid_1_idx], [435.0, 605.0])
+    np.testing.assert_allclose(env.player_pos[b_mid_2_idx], [435.0, 235.0])
+    np.testing.assert_allclose(env.player_pos[keeper_idx], [40.0, 420.0])
 
     assert math.isclose(rewards["a_keeper"], -5.5, abs_tol=0.05)
 
@@ -797,12 +797,12 @@ def test_kickoff_protection_and_gk_hold_opponent_buffer() -> None:
     dist_from_center = float(np.linalg.norm(env.player_pos[opp_idx] - center))
     assert dist_from_center >= env.cfg.mechanics.kickoff_exclusion_radius - 1e-3
 
-    # GK Possession buffer: when GK holds ball, opposing field players are pushed outside 230u
+    # GK Possession buffer: when GK holds ball, opposing field players are pushed outside gk_hold_opponent_buffer
     gk_idx = env.agent_to_idx["a_keeper"]
     env.ball_holder = gk_idx
     left_goal = np.array(env.cfg.physics.left_goal_center, dtype=np.float64)
-    env.player_pos[opp_idx] = left_goal + np.array([180.0, 0.0], dtype=np.float64)  # dist 180 < 230
-    for _ in range(12):
+    env.player_pos[opp_idx] = left_goal + np.array([210.0, 0.0], dtype=np.float64)  # dist 210 < 265
+    for _ in range(20):
         env._clamp_players_to_boundaries()
     dist_from_goal = float(np.linalg.norm(env.player_pos[opp_idx] - left_goal))
     assert dist_from_goal >= env.cfg.mechanics.gk_hold_opponent_buffer - 1e-3
@@ -960,8 +960,9 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     # Pass 1: Not progressive (canon_dx = 0.0 < 30.0) -> prog_bonus = 0.0
     # Pairwise repeat count = 0, decay multiplier = 1.0
     # Passer gets 0.0, receiver gets 0.2
+    rx_bonus = env.cfg.rewards.first_touch_reception_bonus
     assert rew1[p1] == 0.0
-    assert math.isclose(rew1[p2], 0.20, abs_tol=1e-5)
+    assert math.isclose(rew1[p2], 0.20 + rx_bonus, abs_tol=1e-5)
     assert env.team_pass_chain[team] == 0  # Lateral pass does not increment pass chain
 
     # Pass 2: p2 -> p1 (lateral ping-pong back: repeat count = 1, decay = 0.25)
@@ -977,7 +978,7 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     env._check_free_ball_pickup(rew2)
 
     assert rew2[p2] == 0.0
-    assert math.isclose(rew2[p1], 0.20 * 0.25, abs_tol=1e-5)  # 0.05
+    assert math.isclose(rew2[p1], 0.20 * 0.25 + rx_bonus, abs_tol=1e-5)
     assert env.pairwise_repeat_count == 1
 
     # Pass 3: p1 -> p2 (lateral ping-pong: repeat count = 2, decay = 0.0625)
@@ -993,8 +994,8 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     env._check_free_ball_pickup(rew3)
 
     assert rew3[p1] == 0.0
-    assert math.isclose(rew3[p2], 0.20 * (0.25**2), abs_tol=1e-5)  # 0.0125
-    assert rew3[p2] < 0.02
+    assert math.isclose(rew3[p2], 0.20 * (0.25**2) + rx_bonus, abs_tol=1e-5)
+    assert (rew3[p2] - rx_bonus) < 0.02
 
     # Now Pass 4: p2 -> p3 (forward progressive pass to mid_1: X = 600.0)
     p3 = env.agent_to_idx["a_mid_1"]
@@ -1019,7 +1020,7 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     prog_bonus = effective_dx * env.cfg.rewards.pass_progressive_dx_weight
     team_bonus = prog_bonus * 0.5
     expected_p2 = prog_bonus + env.cfg.rewards.def_breakout_pass_bonus + team_bonus
-    expected_p3 = 0.20 + env.cfg.rewards.mid_link_receive_bonus + team_bonus
+    expected_p3 = 0.20 + env.cfg.rewards.mid_link_receive_bonus + team_bonus + rx_bonus
     assert math.isclose(rew4[p2], expected_p2, abs_tol=1e-5)
     assert math.isclose(rew4[p3], expected_p3, abs_tol=1e-5)
     assert env.team_pass_chain[team] == 1  # Progressive pass increments chain!
@@ -1068,6 +1069,7 @@ def test_gk_observation_state_separation() -> None:
 
     # State 1: Loose ball in keeper box; GK does NOT hold ball
     env.ball_holder = None
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)  # Loose inside keeper's own box
     env.box_loose_ball_timer = 1.5  # 1.5s / 3.0s = 0.5 normalized
     env.ball_hold_timer = 0.0
 
@@ -1076,8 +1078,9 @@ def test_gk_observation_state_separation() -> None:
 
     # obs[8] must be 0.0 (free ball) and NOT aliased with box timer
     assert obs_gk[8] == 0.0
-    # obs[13] for GK contains box loose ball timer
-    assert math.isclose(obs_gk[13], 0.5, abs_tol=1e-5)
+    # obs[13] for GK contains stepped ramp: 0.25 + 0.75 * (1.5 / 3.0) = 0.625
+    expected_obs13 = 0.25 + 0.75 * (1.5 / env.cfg.mechanics.keeper_box_loose_max_time)
+    assert math.isclose(obs_gk[13], expected_obs13, abs_tol=1e-5)
     assert obs_gk[14] == 0.0
     assert obs_gk[15] == 0.0
     # Field DEF player retains role bit in obs[13]
@@ -1471,7 +1474,8 @@ def test_smooth_gk_repulsion_wave_and_zero_potential_corruption() -> None:
     b_atk_idx = env.agent_to_idx["b_atk_1"]
 
     env.player_pos[gk_idx] = np.array([45.0, 420.0], dtype=np.float64)
-    env.player_pos[b_atk_idx] = np.array([155.0, 420.0], dtype=np.float64)
+    # Outside new box radius (195.0) but inside GK possession buffer (265.0)
+    env.player_pos[b_atk_idx] = np.array([205.0, 420.0], dtype=np.float64)
     env.player_vel[:] = 0.0
     env.ball_holder = gk_idx
     env.ball_pos = env.player_pos[gk_idx] + np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
@@ -1481,15 +1485,15 @@ def test_smooth_gk_repulsion_wave_and_zero_potential_corruption() -> None:
     _, rewards, _, _, _ = env.step(_zero_actions(env))
 
     # Expect b_atk_1 to have moved smoothly: 4 substeps * (285.0 * 1/60) = 19.0 units
-    # New X should be ~174.0, NOT instantly teleported to >= 230.0!
-    assert abs(env.player_pos[b_atk_idx, 0] - 174.0) < 0.1
-    assert env.player_pos[b_atk_idx, 0] < 230.0
+    # New X should be ~224.0, NOT instantly teleported to >= 265.0!
+    assert abs(env.player_pos[b_atk_idx, 0] - 224.0) < 0.1
+    assert env.player_pos[b_atk_idx, 0] < env.cfg.mechanics.gk_hold_opponent_buffer
     assert abs(env.step_external_push[b_atk_idx, 0] - 19.0) < 0.1
 
     # Verify that external push did not produce an artificial presser penalty for b_atk_1
     assert rewards["b_atk_1"] > -0.05
 
-    # Run remaining steps to reach buffer boundary >= 230.0 (need ~56 units more -> ~3 RL steps)
+    # Run remaining steps to reach buffer boundary >= 265.0 (need ~41 units more -> ~3 RL steps)
     for _ in range(4):
         env.step(_zero_actions(env))
 
@@ -1654,6 +1658,191 @@ def test_off_ball_air_tackle_suppression() -> None:
     assert not env.is_ghost[def_idx]
     assert step_rewards[def_idx] == 0.0
     assert not any(ev["type"] == "AIR TACKLE!" for ev in env._frame_events)
+
+
+def test_enlarged_goal_and_semicircle_geometry_and_scaled_buffers() -> None:
+    """Verify 200u goal, 195u semicircle, and scaled tactical/hold buffers."""
+    cfg = DEFAULT_CONFIG
+    phys = cfg.physics
+    mech = cfg.mechanics
+    rew = cfg.rewards
+
+    assert phys.goal_width == 200.0
+    assert phys.goal_y_min == 320.0
+    assert phys.goal_y_max == 520.0
+    assert phys.keeper_box_radius == 195.0
+
+    assert mech.gk_hold_opponent_buffer == 265.0
+    assert mech.lunge_cooldown == 1.8
+    assert mech.keeper_dive_speed == 340.0
+    assert rew.first_touch_reception_bonus == 0.35
+    assert rew.keeper_sweeper_chase_scale == 0.028
+    assert rew.keeper_edge_camp_radius == 95.0
+
+    # Ensure keeper can move vertically inside the expanded goal mouth without barrier clamp
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    gk_idx = env.agent_to_idx["a_keeper"]
+    env.player_pos[gk_idx] = np.array([40.0, 328.0], dtype=np.float64)
+    env._clamp_players_to_boundaries()
+    assert abs(env.player_pos[gk_idx, 1] - 328.0) < 1e-3
+
+
+def test_stationary_receiver_earns_zero_chase_reward_and_active_receiver_earns_bonus() -> None:
+    """Verify stationary receiver gets zero chase reward while active sprint earns displacement projection and touch bonus."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    passer_idx = env.agent_to_idx["a_def_1"]
+    receiver_idx = env.agent_to_idx["a_mid_1"]
+
+    env.player_pos[passer_idx] = np.array([300.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver_idx] = np.array([550.0, 420.0], dtype=np.float64)
+    env.player_vel[:] = 0.0
+
+    # Pass in flight toward receiver
+    env.ball_holder = None
+    env.ball_kicked_in_flight = True
+    env.ball_kick_origin = env.player_pos[passer_idx].copy()
+    env.last_ball_holder = passer_idx
+    env.last_ball_team = TEAM_A
+    env.ball_pos = np.array([400.0, 420.0], dtype=np.float64)  # Rolling toward receiver
+    env.ball_vel = np.array([120.0, 0.0], dtype=np.float64)
+
+    # 1. Receiver stands completely still (zero throttle): active chase reward is exactly 0.0
+    r_still = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        r_still,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos, axis=1),
+        False,
+    )
+
+    # 2. Receiver actively moves 10 units toward the ball
+    prev_pos = env.player_pos.copy()
+    env.player_pos[receiver_idx] += np.array([-10.0, 0.0])  # Displaced toward incoming ball
+    r_moving = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        r_moving,
+        prev_pos,
+        np.linalg.norm(prev_pos - env.ball_pos, axis=1),
+        False,
+    )
+
+    active_chase_reward = r_moving[receiver_idx] - r_still[receiver_idx]
+    assert math.isclose(active_chase_reward, 10.0 * env.cfg.rewards.loose_ball_chase_scale, abs_tol=1e-5)
+    assert active_chase_reward > 0.09
+
+    # 3. Clean first touch reception awards discrete first_touch_reception_bonus
+    env.ball_pos = env.player_pos[receiver_idx].copy()
+    rew_arr = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew_arr)
+    assert env.ball_holder == receiver_idx
+    # Includes reception base (0.2), progressive bonus, mid-link bonus, and first_touch_reception_bonus (0.35)
+    assert rew_arr[receiver_idx] >= env.cfg.rewards.first_touch_reception_bonus + 0.20
+
+
+def test_loose_ball_never_triggers_field_tackle_stun() -> None:
+    """Verify field players firing tackle on loose balls never stun themselves or popup air tackle."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    p_idx = env.agent_to_idx["a_atk_1"]
+    env.ball_holder = None
+    env.ball_pos = env.player_pos[p_idx] + np.array([20.0, 0.0], dtype=np.float64)  # Ball loose right next to player
+    env._frame_events = []
+
+    rew_arr = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(p_idx, rew_arr)
+
+    assert env.stun_timer[p_idx] == 0.0
+    assert not env.is_ghost[p_idx]
+    assert rew_arr[p_idx] == 0.0
+    assert not any(ev["type"] == "AIR TACKLE!" for ev in env._frame_events)
+
+
+def test_keeper_obs13_instant_step_signal_and_sweeper_fetch_priority() -> None:
+    """Verify GK obs[13] jumps from 0.0 to 0.25 on frame 1 in semicircle and sweeper fetch priority triggers."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    gk_idx = env.agent_to_idx["a_keeper"]
+
+    # Ball at midfield: obs[13] must be 0.0
+    env.ball_holder = None
+    env.ball_pos = np.array([700.0, 420.0], dtype=np.float64)
+    obs = env._build_single_observation(gk_idx)
+    assert obs[13] == 0.0
+
+    # Ball crosses into GK semicircle (radius 195.0), timer = 0.0: instant jump to 0.25!
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)
+    env.box_loose_ball_timer = 0.0
+    obs = env._build_single_observation(gk_idx)
+    assert math.isclose(obs[13], 0.25, abs_tol=1e-4)
+
+    # As timer ramps to 3.0s, obs[13] ramps to 1.0
+    env.box_loose_ball_timer = 1.5
+    obs = env._build_single_observation(gk_idx)
+    assert math.isclose(obs[13], 0.625, abs_tol=1e-4)
+
+    env.box_loose_ball_timer = 3.0
+    obs = env._build_single_observation(gk_idx)
+    assert math.isclose(obs[13], 1.0, abs_tol=1e-4)
+
+
+def test_keeper_holonomic_lateral_and_intercept_dive_saves_fast_shot() -> None:
+    """Verify GK holonomic dive overrides velocity toward intercept point without angular turn delay and saves fast shot."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    env.player_pos[gk_idx] = np.array([45.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_idx] = 0.0  # Facing downfield (+X)
+    env.player_vel[gk_idx] = 0.0
+    env.lunge_cooldown[gk_idx] = 0.0
+
+    # Fast incoming shot toward upper corner (X=0, Y=340)
+    env.ball_holder = None
+    env.ball_pos = np.array([180.0, 360.0], dtype=np.float64)
+    env.ball_vel = np.array([-360.0, -40.0], dtype=np.float64)
+
+    # Keeper triggers special (action[3] = 1.0)
+    actions = _zero_actions(env)
+    actions["a_keeper"] = np.array([0.0, -1.0, 0.0, 1.0], dtype=np.float32)
+
+    _, rewards, _, _, _ = env.step(actions)
+
+    # Keeper must have dove holonomically at keeper_dive_speed (340.0 u/s) with reduced cooldown 1.8s
+    speed = float(np.linalg.norm(env.player_vel[gk_idx]))
+    assert speed >= 300.0  # Underwent holonomic dive impulse
+    assert env.lunge_cooldown[gk_idx] > 1.5  # Cooldown applied (1.8s max)
+    assert env.lunge_cooldown[gk_idx] <= 1.81
+
+
+def test_foul_restart_formation_opens_central_lane_and_forward_halfspace_runners() -> None:
+    """Verify foul restart places attacking ST at canonical 820, M1/M2 at 965 in halfspaces, and opens central lane."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    env._setup_keeper_foul_teleport(penalized_team=TEAM_A)
+    # Attacking team is Team B (canonical coordinates)
+    c_pos, _, _ = env._to_team_canonical(env.player_pos, env.player_vel, env.player_angle, TEAM_B)
+
+    b_atk_idx = env.agent_to_idx["b_atk_1"]
+    b_mid1_idx = env.agent_to_idx["b_mid_1"]
+    b_mid2_idx = env.agent_to_idx["b_mid_2"]
+
+    # Attacking 3-2 overload positions
+    assert math.isclose(c_pos[b_atk_idx, 0], 820.0, abs_tol=1e-3)
+    assert math.isclose(c_pos[b_atk_idx, 1], 420.0, abs_tol=1e-3)
+    assert math.isclose(c_pos[b_mid1_idx, 0], 965.0, abs_tol=1e-3)
+    assert math.isclose(c_pos[b_mid1_idx, 1], 235.0, abs_tol=1e-3)
+    assert math.isclose(c_pos[b_mid2_idx, 0], 965.0, abs_tol=1e-3)
+    assert math.isclose(c_pos[b_mid2_idx, 1], 605.0, abs_tol=1e-3)
+
+    # Defending zonal block: striker behind ball at 640
+    a_atk_idx = env.agent_to_idx["a_atk_1"]
+    assert math.isclose(c_pos[a_atk_idx, 0], 640.0, abs_tol=1e-3)
+
 
 
 
