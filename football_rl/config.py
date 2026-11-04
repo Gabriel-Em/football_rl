@@ -118,7 +118,7 @@ class MechanicsConfig:
     kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
     pickup_kick_grace: float = 0.25   # Minimum hold duration (s) after picking up ball before kick can trigger
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
-    min_pass_distance: float = 75.0   # Minimum kick travel distance to count as a Completed Pass
+    min_pass_distance: float = 38.0   # Minimum kick travel distance to count as a Completed Pass (allows short GK & CB distributions)
 
     # Special Action Trigger (action[3])
     special_trigger_threshold: float = 0.5
@@ -212,6 +212,7 @@ class RewardConfig:
     atk_shot_on_target_ind: float = 2.0        # Increased from 0.7: strong incentive for ATK to shoot on target
     other_shot_on_target_ind: float = 1.2      # Increased from 0.2: strong incentive for MID/DEF to shoot on target
     shot_on_target_team: float = 0.3           # Shared team bonus when firing a valid shot on target
+    shot_near_target_mult: float = 0.35        # Fraction of shot reward awarded for near-target shots hitting wall beside goal
     prime_shot_hesitation_pen: float = -0.025  # Per-RL-step penalty when aimed at goal within 320u and not shooting
 
     # Keeper Save, Off-Target Catch, & Strip
@@ -241,6 +242,9 @@ class RewardConfig:
     pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +1.2)
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
     box_angle_pass_bonus: float = 0.85         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
+    escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
+    attacking_layoff_bonus: float = 0.65       # Bonus when attacker in final third lays ball back to oncoming midfielder
+    give_and_go_bonus: float = 0.70            # Bonus when receiver of return pass has advanced into space since initial pass
     pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
     min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx or goal-dist reduction to qualify as progressive
 

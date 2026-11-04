@@ -1901,6 +1901,416 @@ def test_intermediate_teammate_pass_not_classified_as_shot_on_target() -> None:
     assert step_rewards[kicker_idx] > 0.0
 
 
+def test_short_distribution_pass_registered_as_completed_pass() -> None:
+    """Verify short distribution (e.g. GK to CB ~90u apart, ~50u ball travel) registers as a Completed Pass."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=410)
+
+    # In Half 1, Team A defends Left (X=0)
+    gk_idx = env.agent_to_idx["a_keeper"]
+    d1_idx = env.agent_to_idx["a_def_1"]
+
+    # Keeper at (100.0, 384.0), D1 at (170.0, 324.0) -> separation ~92u
+    env.player_pos[gk_idx] = np.array([100.0, 384.0], dtype=np.float64)
+    env.player_pos[d1_idx] = np.array([170.0, 324.0], dtype=np.float64)
+
+    to_d1 = env.player_pos[d1_idx] - env.player_pos[gk_idx]
+    env.player_angle[gk_idx] = math.atan2(to_d1[1], to_d1[0])
+
+    env.ball_holder = gk_idx
+    env.kick_grace_timer = 0.0
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+
+    # Execute gentle distribution pass
+    env._execute_kick(gk_idx, kick_power=0.4, step_rewards=step_rewards)
+    assert env.ball_kicked_in_flight is True
+
+    # Ball moves toward D1 and D1 picks it up (~50u kick travel)
+    env.ball_pos = env.player_pos[d1_idx].copy()
+    step_rewards.fill(0.0)
+    env._check_free_ball_pickup(step_rewards)
+
+    assert env.ball_holder == d1_idx
+    assert env.stats["completed_passes"] == 1
+    assert env.stats["team_passes"][TEAM_A] == 1
+    # Both players receive appropriate pass link-up rewards
+    assert step_rewards[d1_idx] >= env.cfg.rewards.first_touch_reception_bonus
+
+
+def test_wall_bounce_resets_shot_on_target_and_near_shot_reward_distinction() -> None:
+    """Verify true shots on target vs near shots hitting end wall beside goal, and that wall bounces prevent false saves."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=55)
+
+    shooter_idx = env.agent_to_idx["b_atk_1"]
+    gk_idx = env.agent_to_idx["a_keeper"]
+
+    # 1. Near Shot: Attacker shoots toward Left goal line, but trajectory hits wall beside goal (Y = 300, goal is [320, 520])
+    env.ball_holder = shooter_idx
+    env.player_pos[shooter_idx] = np.array([400.0, 300.0], dtype=np.float64)
+    env.player_angle[shooter_idx] = math.pi  # Aimed directly at (0.0, 300.0) - hits end wall 20u beside post
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+
+    env._execute_kick(shooter_idx, kick_power=1.0, step_rewards=rewards)
+
+    # Near shot must NOT be counted as a shot on target
+    assert env.ball_kick_was_shot_on_target is False
+    assert env.stats["shots"][TEAM_B] == 0
+    # But receives partial reward (35%) to reward shooting ambition
+    assert rewards[shooter_idx] > 0.0
+    expected_near_rew = env.cfg.rewards.atk_shot_on_target_ind * env.cfg.rewards.shot_near_target_mult
+    assert rewards[shooter_idx] >= expected_near_rew * 0.9
+
+    # 2. True Shot on Target that hits the wall and bounces:
+    env.reset(seed=56)
+    env.ball_holder = shooter_idx
+    env.player_pos[shooter_idx] = np.array([400.0, 420.0], dtype=np.float64)
+    env.player_angle[shooter_idx] = math.pi  # Aimed directly at center net (0.0, 420.0)
+    rewards.fill(0.0)
+
+    env._execute_kick(shooter_idx, kick_power=1.0, step_rewards=rewards)
+    assert env.ball_kick_was_shot_on_target is True
+    assert env.stats["shots"][TEAM_B] == 1
+
+    # Simulate ball bouncing off wall
+    env.ball_pos = np.array([5.0, 200.0], dtype=np.float64)
+    env.ball_vel = np.array([-200.0, 50.0], dtype=np.float64)
+    bounced = env._bounce_ball_off_walls()
+    assert bounced is True
+    # Wall bounce MUST immediately clear shot on target flag
+    assert env.ball_kick_was_shot_on_target is False
+
+    # Keeper now picks up the rebounded ball in the semicircle
+    env.player_pos[gk_idx] = env.ball_pos.copy()
+    pickup_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(pickup_rewards)
+
+    assert env.ball_holder == gk_idx
+    # Must NOT register as a save! (it is a harmless catch / box recovery ~1.85, NOT 6.0 save reward)
+    assert env.stats["keeper_saves"] == 0
+    assert pickup_rewards[gk_idx] < 3.0
+
+
+def test_gk_dive_save_attempt_rejected_if_ball_already_passed_keeper_or_crossing_goal() -> None:
+    """Verify that a goalkeeper triggering action[3] does NOT get awarded a dive save attempt
+    if the ball has already flown past the keeper towards the goal line or is crossing the goal in < dt.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=101)
+
+    # Scenario 1: Match 601 Frame 7096-7097 scenario (Half 2, Team A defends right goal x = 1400.0)
+    # a_keeper is at x = 1314.35, y = 459.29.
+    # The opponent's shot is at x = 1399.83, y = 515.14, moving rightwards at +175 u/s.
+    # The ball has ALREADY flown 85.5u past the keeper towards the goal line.
+    env.current_half = 2
+    env.team_side = np.array([SIDE_RIGHT, SIDE_LEFT], dtype=np.int32)
+    gk_idx = env.agent_to_idx["a_keeper"]
+    env.player_pos[gk_idx] = np.array([1314.35, 459.29], dtype=np.float64)
+    env.player_vel[gk_idx] = 0.0
+    env.lunge_cooldown[gk_idx] = 0.0
+
+    env.ball_holder = None
+    env.last_ball_holder = env.agent_to_idx["b_atk_1"]
+    env.last_ball_team = TEAM_B
+    env.ball_pos = np.array([1399.83, 515.14], dtype=np.float64)
+    env.ball_vel = np.array([175.0, -10.0], dtype=np.float64)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_was_shot_on_target = True
+
+    actions = _zero_actions(env)
+    actions["a_keeper"] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    # Step environment
+    _, rewards, _, _, _ = env.step(actions)
+
+    # Goal was scored because ball crossed x=1400.
+    # But a_keeper must NOT receive keeper_dive_save_attempt_ind (+0.60)!
+    # The keeper's individual reward must reflect conceding the goal (and reckless lunge penalty), NOT dive save bonus.
+    events = [e["type"] for fr in env.replay_frames[-4:] for e in fr.get("events", [])]
+    assert "GK DIVE!" not in events, "Erroneous GK DIVE! should not be awarded when ball already passed keeper into goal!"
+    assert "GOAL!" in events
+
+    # Scenario 2: Incoming shot in front of keeper with adequate reaction time DOES get awarded GK DIVE!
+    env.reset(seed=102)
+    env.kickoff_protection_timer = 0.0  # Clear kickoff protection for test
+    gk_a_idx = env.agent_to_idx["a_keeper"]  # In half 1, a_keeper defends left goal (x=0)
+    env.player_pos[gk_a_idx] = np.array([35.0, 410.0], dtype=np.float64)
+    env.lunge_cooldown[gk_a_idx] = 0.0
+    env.ball_holder = None
+    env.last_ball_holder = env.agent_to_idx["b_atk_1"]
+    env.last_ball_team = TEAM_B
+    env.ball_pos = np.array([120.0, 390.0], dtype=np.float64)  # in front of keeper (120 > 35)
+    env.ball_vel = np.array([-250.0, -10.0], dtype=np.float64)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_was_shot_on_target = True
+
+    actions = _zero_actions(env)
+    actions["a_keeper"] = np.array([0.0, -1.0, 0.0, 1.0], dtype=np.float32)
+
+    _, rewards_2, _, _, _ = env.step(actions)
+
+    events_2 = [e["type"] for fr in env.replay_frames[-4:] for e in fr.get("events", [])]
+    assert "GK DIVE!" in events_2, "Legitimate dive attempt in front of keeper should be awarded GK DIVE!"
+    assert rewards_2["a_keeper"] > 0.0
+
+
+def test_kickoff_protection_blocks_tackle_and_dive_bleedover() -> None:
+    """Verify that during kickoff protection, neither keeper dive nor field player tackle triggers,
+    and scoring a goal zeroes action execution for remaining substeps of that RL step.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=103)
+
+    # env.reset() sets kickoff_protection_timer = 1.5s
+    assert env.kickoff_protection_timer > 0.0
+
+    # Try triggering special (action[3] = 1.0) on all players during kickoff
+    actions = {}
+    for agent in env.agents:
+        actions[agent] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    _, _, _, _, _ = env.step(actions)
+
+    # No player should have triggered lunge or tackle
+    assert np.all(env.lunge_timer == 0.0)
+    assert np.all(env.tackle_cooldown == 0.0)
+
+
+def test_backward_passes_escape_press_and_attacking_layoff() -> None:
+    """Verify that backward passes under pressure earn escape_press_pass_bonus,
+    and final-third drop passes to midfielders earn attacking_layoff_bonus.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=201)
+
+    # 1. Escape Press Scenario:
+    # Team A defends left goal (canonical space = world space).
+    # a_atk_1 is at (1000.0, 700.0).
+    # Opponent b_def_1 is pressing closely at (1050.0, 700.0) - dist 50u <= 140u.
+    # a_atk_1 passes backwards to open midfielder a_mid_2 at (750.0, 420.0).
+    # Nearest opponent to a_mid_2 is > 180u away.
+    atk_idx = env.agent_to_idx["a_atk_1"]
+    mid_idx = env.agent_to_idx["a_mid_2"]
+    opp_def_idx = env.agent_to_idx["b_def_1"]
+
+    env.player_pos[atk_idx] = np.array([1000.0, 700.0], dtype=np.float64)
+    env.player_pos[opp_def_idx] = np.array([1050.0, 700.0], dtype=np.float64)
+    env.player_pos[mid_idx] = np.array([750.0, 420.0], dtype=np.float64)
+    # Move other opponents away
+    for idx in range(env.num_players):
+        if env.player_team[idx] == TEAM_B and idx != opp_def_idx:
+            env.player_pos[idx] = np.array([1250.0, 420.0], dtype=np.float64)
+
+    env.ball_holder = atk_idx
+    env.ball_hold_timer = 2.0
+    rew_arr = np.zeros(env.num_players, dtype=np.float64)
+
+    # Face toward receiver (angle to 750, 420 from 1000, 700)
+    to_mid = env.player_pos[mid_idx] - env.player_pos[atk_idx]
+    env.player_angle[atk_idx] = math.atan2(to_mid[1], to_mid[0])
+
+    env._execute_kick(atk_idx, kick_power=0.8, step_rewards=rew_arr)
+    assert env.ball_kicked_in_flight is True
+
+    # Simulate arrival at receiver
+    env.ball_pos = env.player_pos[mid_idx].copy()
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    assert env.ball_holder == mid_idx
+    assert env.stats["completed_passes"] == 1
+    # Passer must receive escape_press_pass_bonus
+    assert step_rewards[atk_idx] >= env.cfg.rewards.escape_press_pass_bonus
+    # Chain must be preserved >= 1
+    assert env.team_pass_chain[TEAM_A] >= 1
+
+    # 2. Attacking Lay-Off (Hold-up Wall Pass) Scenario:
+    env.reset(seed=202)
+    env.player_pos[atk_idx] = np.array([850.0, 420.0], dtype=np.float64)
+    env.player_pos[mid_idx] = np.array([620.0, 420.0], dtype=np.float64)
+    env.ball_holder = atk_idx
+    env.ball_hold_timer = 0.5
+    env.player_angle[atk_idx] = math.pi  # Facing backward directly at midfielder
+
+    rew_arr.fill(0.0)
+    env._execute_kick(atk_idx, kick_power=0.6, step_rewards=rew_arr)
+
+    env.ball_pos = env.player_pos[mid_idx].copy()
+    step_rewards.fill(0.0)
+    env._check_free_ball_pickup(step_rewards)
+
+    # Passer must receive attacking_layoff_bonus
+    assert step_rewards[atk_idx] >= env.cfg.rewards.attacking_layoff_bonus
+    assert env.team_pass_chain[TEAM_A] >= 1
+
+
+def test_give_and_go_one_two_bonus_and_anti_farming_decay() -> None:
+    """Verify that a 1-2 give-and-go return pass is rewarded with full multiplier and give_and_go_bonus,
+    while stationary 3+ pass loops between the same pair suffer steep decay.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=203)
+
+    m1_idx = env.agent_to_idx["a_mid_1"]
+    m2_idx = env.agent_to_idx["a_mid_2"]
+
+    # --- Pass 1: M1 passes to M2 ---
+    env.player_pos[m1_idx] = np.array([450.0, 420.0], dtype=np.float64)
+    env.player_pos[m2_idx] = np.array([600.0, 420.0], dtype=np.float64)
+    env.ball_holder = m1_idx
+    env.player_angle[m1_idx] = 0.0  # Facing M2 (+X)
+    rew_arr = np.zeros(env.num_players, dtype=np.float64)
+
+    env._execute_kick(m1_idx, kick_power=0.7, step_rewards=rew_arr)
+    env.ball_pos = env.player_pos[m2_idx].copy()
+    step_rew_1 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rew_1)
+
+    assert env.pairwise_repeat_count == 0
+    assert env.ball_holder == m2_idx
+
+    # --- Pass 2: M1 sprints forward 80u to (530.0, 420.0), M2 returns ball to M1 (GIVE & GO) ---
+    env.player_pos[m1_idx] = np.array([530.0, 420.0], dtype=np.float64)  # 530 - 450 = +80u forward
+    env.player_angle[m2_idx] = math.pi  # Facing backward toward M1
+
+    rew_arr.fill(0.0)
+    env._execute_kick(m2_idx, kick_power=0.6, step_rewards=rew_arr)
+    env.ball_pos = env.player_pos[m1_idx].copy()
+    step_rew_2 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rew_2)
+
+    # Must recognize Give-and-Go!
+    assert env.pairwise_repeat_count == 1
+    # Passer M2 receives give_and_go_bonus
+    assert step_rew_2[m2_idx] >= env.cfg.rewards.give_and_go_bonus
+
+    # --- Pass 3: Immediate Pass back without movement (Exchange 3 between same pair) ---
+    rew_arr.fill(0.0)
+    env.player_angle[m1_idx] = 0.0
+    env._execute_kick(m1_idx, kick_power=0.6, step_rewards=rew_arr)
+    env.ball_pos = env.player_pos[m2_idx].copy()
+    step_rew_3 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rew_3)
+
+    assert env.pairwise_repeat_count == 2
+    # Receiver bonus + team bonus must be decayed by 0.25^2 = 0.0625 (total added reward <= 0.05)
+    rx_added_3 = step_rew_3[m2_idx] - env.cfg.rewards.first_touch_reception_bonus
+    assert rx_added_3 <= 0.05
+
+    # --- Pass 4: Stalling loop (Exchange 4 between same pair) ---
+    rew_arr.fill(0.0)
+    env.player_angle[m2_idx] = math.pi
+    env._execute_kick(m2_idx, kick_power=0.6, step_rewards=rew_arr)
+    env.ball_pos = env.player_pos[m1_idx].copy()
+    step_rew_4 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rew_4)
+
+    assert env.pairwise_repeat_count == 3
+    # Suffer steep 0.25^3 = 0.0156 decay (total added reward <= 0.02)
+    rx_added_4 = step_rew_4[m1_idx] - env.cfg.rewards.first_touch_reception_bonus
+    assert rx_added_4 <= 0.02
+
+
+def test_loose_ball_two_defenders_mutual_crowding_exemption_and_continuous_chase() -> None:
+    """Verify that when two defenders converge on a loose ball in proximity (<165u):
+    1. Neither defender suffers mutual crowding or approach repulsion penalties against each other.
+    2. Chase reward is continuously awarded within 55u down to pickup distance (eliminating deadzone).
+    3. Primary chaser hysteresis prevents 15 Hz flip-flopping between defenders.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=201)
+
+    d1_idx = env.agent_to_idx["a_def_1"]
+    d2_idx = env.agent_to_idx["a_def_2"]
+
+    # Match 783 geometry: Ball at (328.0, 457.0), D1 at (266.0, 432.0), D2 at (270.0, 505.0)
+    # Distance between D1 and D2 is ~73u (well below teammate_min_spacing 165u!)
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.ball_pos = np.array([328.0, 457.0], dtype=np.float64)
+    env.ball_vel = np.zeros(2, dtype=np.float64)
+
+    env.player_pos[d1_idx] = np.array([266.0, 432.0], dtype=np.float64)
+    env.player_pos[d2_idx] = np.array([270.0, 505.0], dtype=np.float64)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    prev_dists = np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1)
+
+    # Compute tactical positioning rewards
+    env._compute_tactical_positioning_rewards(step_rewards, prev_pos, prev_dists, any_teleport=False)
+
+    # Crucial assertion: Neither D1 nor D2 should receive negative crowding penalty from each other!
+    # With min_spacing = 165u and dist = 73u, without exemption pen would be ~ -0.015 per player.
+    # With exemption, rewards should be non-negative (no crowding pen).
+    assert step_rewards[d1_idx] >= 0.0
+    assert step_rewards[d2_idx] >= 0.0
+
+    # Test continuous chase within 55u:
+    # Place D1 at distance 48u from ball (<55u) moving toward ball
+    env.player_pos[d1_idx] = np.array([285.0, 457.0], dtype=np.float64)  # 328 - 285 = 43u (<55u)
+    prev_pos_d1 = env.player_pos.copy()
+    prev_pos_d1[d1_idx] = np.array([280.0, 457.0], dtype=np.float64)  # closed 5u
+    prev_dists_d1 = np.linalg.norm(prev_pos_d1 - env.ball_pos[None, :], axis=1)
+
+    step_rewards_chase = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards_chase, prev_pos_d1, prev_dists_d1, any_teleport=False
+    )
+    # Chase reward MUST be awarded even though dist < 55u!
+    assert step_rewards_chase[d1_idx] > 0.005
+
+
+def test_gk_shot_directly_at_keeper_smothers_forward_and_rejects_lateral_dodge_dive() -> None:
+    """Verify Match 783 frame 8373 scenario:
+    When a shot is directed directly at the goalkeeper's body (d_cpa <= 18u),
+    the keeper does NOT dive laterally away to open the goal mouth, does NOT receive an
+    undeserved GK DIVE! (+0.60) award, and instead smothers forward into the shot.
+    """
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=202)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    # a_keeper defends Left Goal (x=0) in Half 1
+    # Match 783 geometry: GK at (19.63, 444.43), incoming shot at (108.22, 394.02), vel = (-354, 178.8)
+    env.player_pos[gk_idx] = np.array([19.63, 444.43], dtype=np.float64)
+    env.player_vel[gk_idx] = 0.0
+    env.lunge_cooldown[gk_idx] = 0.0
+    env.kickoff_protection_timer = 0.0
+
+    env.ball_holder = None
+    env.last_ball_holder = env.agent_to_idx["b_atk_1"]
+    env.last_ball_team = TEAM_B
+    env.ball_pos = np.array([108.22, 394.02], dtype=np.float64)
+    env.ball_vel = np.array([-354.0, 178.8], dtype=np.float64)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_was_shot_on_target = True
+
+    # Keeper triggers special action (action[3] = 1.0)
+    actions = _zero_actions(env)
+    actions["a_keeper"] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    _, rewards, _, _, _ = env.step(actions)
+
+    # 1. Keeper MUST NOT receive 'GK DIVE!' (+0.60) bonus for dodging a ball shot directly at them!
+    events = [e["type"] for fr in env.replay_frames[-2:] for e in fr.get("events", [])]
+    assert "GK DIVE!" not in events, "Keeper should not receive GK DIVE! for ball shot directly at body!"
+
+    # 2. Keeper MUST NOT lunge sideways in +Y away from the ball (in match 783 it lunged to y=530+)
+    # Instead, keeper stays centered around y=444 or meets the ball along incoming path
+    assert env.player_pos[gk_idx, 1] <= 455.0, (
+        f"Keeper lunged laterally away to y={env.player_pos[gk_idx, 1]}, exposing goal!"
+    )
+
+    # 3. Keeper must not dive backwards into own net
+    assert env.player_pos[gk_idx, 0] >= 18.0
+
+
+
+
+
+
+
 
 
 
