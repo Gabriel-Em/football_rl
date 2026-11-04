@@ -1126,41 +1126,70 @@ class FootballParallelEnv(ParallelEnv):
         # Check if this kick is a Shot on Target against the enemy goal
         enemy_side = 1 - int(self.team_side[kicker_team])
         is_sot = self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, enemy_side)
+        cx = 0.0
+        if is_sot:
+            c_kicker_pos, _, _ = self._to_team_canonical(
+                self.player_pos[kicker_idx:kicker_idx + 1],
+                self.player_vel[kicker_idx:kicker_idx + 1],
+                self.player_angle[kicker_idx],
+                kicker_team,
+            )
+            cx = float(c_kicker_pos[0, 0])
+            # A shot on target must originate from attacking territory (cx >= 680.0)
+            if cx < 680.0:
+                is_sot = False
+            else:
+                # Disqualify if this kick is aimed at an intermediate teammate in the pass reception corridor
+                ball_spd = float(np.linalg.norm(self.ball_vel))
+                if ball_spd > 1e-6:
+                    u_kick = self.ball_vel / ball_spd
+                    goal_x = 0.0 if enemy_side == SIDE_LEFT else phys.field_width
+                    dist_to_goal = abs(goal_x - float(self.ball_pos[0]))
+                    tau_lead = rew.pass_lead_tau
+                    for tm_idx in range(self.num_players):
+                        if tm_idx != kicker_idx and self.player_team[tm_idx] == kicker_team:
+                            raw_lead = self.player_pos[tm_idx] + tau_lead * self.player_vel[tm_idx]
+                            for test_pt in (self.player_pos[tm_idx], raw_lead):
+                                to_tm = test_pt - self.ball_pos
+                                proj_along = float(np.dot(to_tm, u_kick))
+                                if 30.0 <= proj_along <= min(500.0, dist_to_goal - 70.0):
+                                    perp_vec = to_tm - proj_along * u_kick
+                                    dist_perp = float(np.linalg.norm(perp_vec))
+                                    d_tm = float(np.linalg.norm(to_tm))
+                                    cos_angle = proj_along / max(1e-6, d_tm)
+                                    if dist_perp <= 45.0 or cos_angle >= 0.95:  # within ~18 deg pass corridor
+                                        is_sot = False
+                                        break
+                            if not is_sot:
+                                break
+
         self.ball_kick_was_shot_on_target = is_sot
 
         if is_sot:
             self.stats["shots"][kicker_team] += 1
             if step_rewards is not None and self.shot_on_target_cd[kicker_idx] <= 0.0:
-                c_kicker_pos, _, _ = self._to_team_canonical(
-                    self.player_pos[kicker_idx:kicker_idx + 1],
-                    self.player_vel[kicker_idx:kicker_idx + 1],
-                    self.player_angle[kicker_idx],
-                    kicker_team,
+                prime_zone_mult = 1.0 if cx >= 980.0 else 0.55
+                power_factor = 0.6 + 0.4 * power_norm
+                base_sot = (
+                    rew.atk_shot_on_target_ind
+                    if kicker_role == ROLE_ATK
+                    else rew.other_shot_on_target_ind
                 )
-                cx = float(c_kicker_pos[0, 0])
-                if cx >= 680.0:
-                    prime_zone_mult = 1.0 if cx >= 980.0 else 0.55
-                    power_factor = 0.6 + 0.4 * power_norm
-                    base_sot = (
-                        rew.atk_shot_on_target_ind
-                        if kicker_role == ROLE_ATK
-                        else rew.other_shot_on_target_ind
-                    )
-                    chain_len = self.team_pass_chain[kicker_team]
-                    chain_mult = 1.0 + (rew.pass_chain_multiplier_coeff * chain_len)
+                chain_len = self.team_pass_chain[kicker_team]
+                chain_mult = 1.0 + (rew.pass_chain_multiplier_coeff * chain_len)
 
-                    sot_rew = base_sot * prime_zone_mult * power_factor * chain_mult
-                    team_sot_rew = rew.shot_on_target_team * prime_zone_mult * chain_mult
-                    step_rewards[kicker_idx] += sot_rew
-                    self._add_team_reward(step_rewards, kicker_team, team_sot_rew)
-                    self.shot_on_target_cd[kicker_idx] = 1.5
-                    self._emit_event(
-                        "SHOT ON TARGET!",
-                        self.player_pos[kicker_idx],
-                        team=kicker_team,
-                        agent=self.idx_to_agent[kicker_idx],
-                        reward=sot_rew + team_sot_rew,
-                    )
+                sot_rew = base_sot * prime_zone_mult * power_factor * chain_mult
+                team_sot_rew = rew.shot_on_target_team * prime_zone_mult * chain_mult
+                step_rewards[kicker_idx] += sot_rew
+                self._add_team_reward(step_rewards, kicker_team, team_sot_rew)
+                self.shot_on_target_cd[kicker_idx] = 1.5
+                self._emit_event(
+                    "SHOT ON TARGET!",
+                    self.player_pos[kicker_idx],
+                    team=kicker_team,
+                    agent=self.idx_to_agent[kicker_idx],
+                    reward=sot_rew + team_sot_rew,
+                )
 
         # Keeper distribution / clearance forward bonus
         if step_rewards is not None and kicker_role == ROLE_KEEPER:

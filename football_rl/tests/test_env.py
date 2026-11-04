@@ -1844,5 +1844,63 @@ def test_foul_restart_formation_opens_central_lane_and_forward_halfspace_runners
     assert math.isclose(c_pos[a_atk_idx, 0], 640.0, abs_tol=1e-3)
 
 
+def test_intermediate_teammate_pass_not_classified_as_shot_on_target() -> None:
+    """Verify that a forward pass toward a teammate whose position is collinear with the goal is NOT classified as a shot on target."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=127)
+
+    # In Half 1, Team B (TEAM_B = 1) defends Right (X=1400) and attacks Left (X=0)
+    kicker_idx = env.agent_to_idx["b_mid_2"]
+    teammate_idx = env.agent_to_idx["b_def_2"]
+
+    # Recreate Match 127: Kicker at (615.0, 271.0) aimed at Left goal center (0.0, 420.0)
+    # An intermediate teammate is at (535.0, 290.4) directly along that line of sight
+    env.player_pos[kicker_idx] = np.array([615.0, 271.0], dtype=np.float64)
+    aim_angle = math.atan2(420.0 - 271.0, 0.0 - 615.0)
+    env.player_angle[kicker_idx] = aim_angle
+
+    # Teammate 82u ahead along the exact line of sight to the goal
+    env.player_pos[teammate_idx] = np.array([535.0, 290.4], dtype=np.float64)
+
+    # Move other players far away to eliminate side effects
+    for idx in range(env.num_players):
+        if idx not in (kicker_idx, teammate_idx):
+            env.player_pos[idx] = np.array([1200.0, 700.0], dtype=np.float64)
+
+    env.ball_holder = kicker_idx
+    env.kick_grace_timer = 0.0
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+
+    env._execute_kick(kicker_idx, kick_power=1.0, step_rewards=step_rewards)
+
+    # 1. Although physically intersecting the goal frame, having a teammate in the pass corridor disqualifies it as a shot
+    assert env.ball_kick_was_shot_on_target is False
+    assert env.stats["shots"][TEAM_B] == 0
+    # Kicker does not receive shot-on-target rewards
+    assert step_rewards[kicker_idx] < env.cfg.rewards.other_shot_on_target_ind * 0.5
+
+    # 2. Now move teammate away out of the pass corridor
+    env.reset(seed=128)
+    env.player_pos[kicker_idx] = np.array([615.0, 271.0], dtype=np.float64)
+    env.player_angle[kicker_idx] = aim_angle
+    env.player_pos[teammate_idx] = np.array([535.0, 700.0], dtype=np.float64)  # away from kick cone
+
+    for idx in range(env.num_players):
+        if idx not in (kicker_idx, teammate_idx):
+            env.player_pos[idx] = np.array([1200.0, 700.0], dtype=np.float64)
+
+    env.ball_holder = kicker_idx
+    env.kick_grace_timer = 0.0
+    step_rewards.fill(0.0)
+
+    env._execute_kick(kicker_idx, kick_power=1.0, step_rewards=step_rewards)
+
+    # Without an intermediate teammate in the corridor, this kick counts as a valid shot on target
+    assert env.ball_kick_was_shot_on_target is True
+    assert env.stats["shots"][TEAM_B] == 1
+    assert step_rewards[kicker_idx] > 0.0
+
+
+
 
 
