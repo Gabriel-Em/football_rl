@@ -112,6 +112,7 @@ class ParameterSharingPPOTrainer:
         checkpoint_dir: str = "checkpoints",
         seed: int = 42,
         separate_teams: bool = True,
+        save_best_only: bool = False,
     ) -> None:
         self.cfg = config
         self.num_envs = num_envs
@@ -120,6 +121,7 @@ class ParameterSharingPPOTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.seed = seed
         self.separate_teams = separate_teams
+        self.save_best_only = save_best_only or self.cfg.replay.save_best_only
 
         # Cumulative training & match tracking across resumed sessions
         self.current_generation: int = 0
@@ -312,6 +314,7 @@ class ParameterSharingPPOTrainer:
         completed_episodes = 0
         max_interest = 0.0
         exported_replays: List[str] = []
+        gen_completed_matches: List[Dict[str, Any]] = []
 
         for env in self.envs:
             env.current_generation = active_generation
@@ -353,27 +356,28 @@ class ParameterSharingPPOTrainer:
                         round(100.0 * fstats["possession_frames"][0] / total_poss, 1),
                         round(100.0 * fstats["possession_frames"][1] / total_poss, 1),
                     ]
-                    self.match_history.append(
-                        {
-                            "match_id": int(k_info.get("match_id", env.current_match_id)),
-                            "generation": int(active_generation),
-                            "score": list(fstats.get("score", [0, 0])),
-                            "goals": int(fstats.get("goals", 0)),
-                            "interest_score": round(ep_interest, 2),
-                            "possession_pct": poss_pct,
-                            "shots": list(fstats.get("shots", [0, 0])),
-                            "team_passes": list(fstats.get("team_passes", [0, 0])),
-                            "completed_passes": int(fstats.get("completed_passes", 0)),
-                            "team_tackles": list(fstats.get("team_tackles", [0, 0])),
-                            "successful_tackles": int(fstats.get("successful_tackles", 0)),
-                            "team_saves": list(fstats.get("team_saves", [0, 0])),
-                            "keeper_saves": int(fstats.get("keeper_saves", 0)),
-                            "field_3s_violations": int(fstats.get("field_3s_violations", 0)),
-                            "keeper_5s_violations": int(fstats.get("keeper_5s_violations", 0)),
-                            "replay_path": rpath or "",
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    )
+                    match_record = {
+                        "match_id": int(k_info.get("match_id", env.current_match_id)),
+                        "generation": int(active_generation),
+                        "score": list(fstats.get("score", [0, 0])),
+                        "goals": int(fstats.get("goals", 0)),
+                        "interest_score": round(ep_interest, 2),
+                        "possession_pct": poss_pct,
+                        "shots": list(fstats.get("shots", [0, 0])),
+                        "team_passes": list(fstats.get("team_passes", [0, 0])),
+                        "completed_passes": int(fstats.get("completed_passes", 0)),
+                        "team_tackles": list(fstats.get("team_tackles", [0, 0])),
+                        "successful_tackles": int(fstats.get("successful_tackles", 0)),
+                        "team_saves": list(fstats.get("team_saves", [0, 0])),
+                        "keeper_saves": int(fstats.get("keeper_saves", 0)),
+                        "field_5s_violations": int(fstats.get("field_5s_violations", fstats.get("field_3s_violations", 0))),
+                        "field_3s_violations": int(fstats.get("field_3s_violations", fstats.get("field_5s_violations", 0))),
+                        "keeper_5s_violations": int(fstats.get("keeper_5s_violations", 0)),
+                        "replay_path": rpath or "",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    self.match_history.append(match_record)
+                    gen_completed_matches.append(match_record)
 
                     # Auto-reset environment for seamless rollout collection
                     next_gen_hint = active_generation + (1 if t == T - 1 else 0)
@@ -386,6 +390,25 @@ class ParameterSharingPPOTrainer:
 
                 for agent_i, agent_name in enumerate(ALL_AGENTS):
                     self.current_obs[env_i, agent_i] = next_obs_dict[agent_name]
+
+        # If save_best_only is enabled, retain only the single best match replay per generation
+        if self.save_best_only and gen_completed_matches:
+            matches_with_replays = [m for m in gen_completed_matches if m.get("replay_path")]
+            if matches_with_replays:
+                best_match = max(
+                    matches_with_replays,
+                    key=lambda m: (float(m.get("interest_score", 0.0)), int(m.get("goals", 0))),
+                )
+                for m in matches_with_replays:
+                    if m is not best_match:
+                        rpath_to_remove = m.get("replay_path")
+                        if rpath_to_remove and os.path.exists(rpath_to_remove):
+                            try:
+                                os.remove(rpath_to_remove)
+                            except OSError:
+                                pass
+                        m["replay_path"] = ""
+                exported_replays = [best_match["replay_path"]] if best_match.get("replay_path") else []
 
         # Compute Generalized Advantage Estimation (GAE) per agent trajectory
         next_values = self._compute_values(self.current_obs)
@@ -733,7 +756,7 @@ class ParameterSharingPPOTrainer:
             passes = f"{m['team_passes'][0]}/{m['team_passes'][1]}"
             tackles = f"{m['team_tackles'][0]}/{m['team_tackles'][1]}"
             saves = f"{m['team_saves'][0]}/{m['team_saves'][1]}"
-            cmd = f"`.venv/bin/python replay.py {mid}`"
+            cmd = f"`.venv/bin/python replay.py {mid}`" if m.get("replay_path") else "_(no replay)_"
             lines.append(
                 f"| #{rank} | **Match {mid}** | Gen {gen} | {sc} | {inter} | {poss} | {shots} | {passes} | {tackles} | {saves} | {cmd} |"
             )
@@ -746,7 +769,7 @@ class ParameterSharingPPOTrainer:
                 "",
                 "## All Matches (Chronological: Match 1 to " + str(len(self.match_history)) + ")",
                 "",
-                "| Match # | Gen | Score (Blue - Red) | Interest | Poss% (B/R) | Shots (B/R) | Passes (B/R) | Tackles (B/R) | Saves (B/R) | Fouls (3s/5s) | Replay File |",
+                "| Match # | Gen | Score (Blue - Red) | Interest | Poss% (B/R) | Shots (B/R) | Passes (B/R) | Tackles (B/R) | Saves (B/R) | Fouls (Field 5s/GK 5s) | Replay File |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
@@ -760,7 +783,9 @@ class ParameterSharingPPOTrainer:
             passes = f"{m['team_passes'][0]}/{m['team_passes'][1]}"
             tackles = f"{m['team_tackles'][0]}/{m['team_tackles'][1]}"
             saves = f"{m['team_saves'][0]}/{m['team_saves'][1]}"
-            fouls = f"{m['field_3s_violations']}/{m['keeper_5s_violations']}"
+            f_viol = m.get("field_5s_violations", m.get("field_3s_violations", 0))
+            k_viol = m.get("keeper_5s_violations", 0)
+            fouls = f"{f_viol}/{k_viol}"
             rfile = os.path.basename(m["replay_path"]) if m["replay_path"] else "_(not saved)_"
             lines.append(
                 f"| **Match {mid}** | Gen {gen} | {sc} | {inter} | {poss} | {shots} | {passes} | {tackles} | {saves} | {fouls} | `{rfile}` |"
@@ -1163,6 +1188,14 @@ def main() -> None:
         help="Minimum episode interest_score to save a 60 FPS JSON replay (default: 0.0 = save all matches).",
     )
     parser.add_argument(
+        "--save-best-only",
+        "--best-match-per-gen",
+        "--save-best-match-only",
+        dest="save_best_only",
+        action="store_true",
+        help="Only save the single best match replay (highest interest score) per generation when running with num_envs > 1.",
+    )
+    parser.add_argument(
         "--shared-teams",
         action="store_true",
         help="Share a single field_policy and keeper_policy across both Blue and Red (default: False, Blue and Red train separate brains).",
@@ -1255,7 +1288,11 @@ def main() -> None:
 
     cfg = replace(
         DEFAULT_CONFIG,
-        replay=replace(DEFAULT_CONFIG.replay, interest_threshold=args.interest_threshold),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            interest_threshold=args.interest_threshold,
+            save_best_only=args.save_best_only,
+        ),
     )
     trainer = ParameterSharingPPOTrainer(
         config=cfg,
@@ -1265,6 +1302,7 @@ def main() -> None:
         checkpoint_dir=ckpt_dir,
         seed=args.seed,
         separate_teams=not args.shared_teams,
+        save_best_only=args.save_best_only,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")

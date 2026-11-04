@@ -66,6 +66,7 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "TACKLE FAILED!": (255, 130, 130),
     "AIR TACKLE!": (255, 70, 70),
     "GK BACK-KICK!": (255, 80, 120),
+    "5s VIOLATION!": (245, 110, 255),
     "3s VIOLATION!": (245, 110, 255),
     "5s KEEPER FOUL!": (255, 75, 150),
     "HALFTIME!": (200, 220, 255),
@@ -1205,7 +1206,7 @@ def list_matches_table(
         pa = f"{m['team_passes'][0]}/{m['team_passes'][1]}"
         ta = f"{m['team_tackles'][0]}/{m['team_tackles'][1]}"
         sa = f"{m['team_saves'][0]}/{m['team_saves'][1]}"
-        cmd = f".venv/bin/python replay.py {mid}"
+        cmd = f".venv/bin/python replay.py {mid}" if m.get("replay_path") else "(not saved)"
         print(
             f"#{mid:<8d} {gen:<7d} {sc:<13} {m['interest_score']:<10.1f} "
             f"{poss:<13} {sh:<9} {pa:<9} {ta:<9} {sa:<7} {cmd}"

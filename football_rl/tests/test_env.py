@@ -27,7 +27,7 @@ from football_rl.config import (
     TEAM_A,
     TEAM_B,
 )
-from football_rl.env import FootballParallelEnv, parallel_env
+from football_rl.env import FootballParallelEnv, parallel_env, wrap_to_pi
 from football_rl.replay import (
     ReplayViewer,
     find_replay_by_match_id,
@@ -179,8 +179,8 @@ def test_semi_circle_barriers_for_keepers_and_field_players() -> None:
     assert dist_field_b > 145.0
 
 
-def test_field_3s_violation_ghost_mode_and_other_player_reset() -> None:
-    """Verify 3-second field hold violation drops ball, enables Ghost Mode, and resets on other touch."""
+def test_field_5s_violation_ghost_mode_and_other_player_reset() -> None:
+    """Verify 5-second field hold violation drops ball, enables Ghost Mode, and resets on other touch."""
     env = parallel_env(
         config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
     )
@@ -202,6 +202,7 @@ def test_field_3s_violation_ghost_mode_and_other_player_reset() -> None:
     assert env.ghost_timer[carrier_idx] > 2.9
     assert env.pickup_cooldown[carrier_idx] > 2.9
     assert env.tackle_cooldown[carrier_idx] > 2.9
+    assert env.stats["field_5s_violations"] == 1
     assert env.stats["field_3s_violations"] == 1
     assert total_carrier_reward < -1.5
 
@@ -765,7 +766,8 @@ def test_asymmetric_deadzone_velocity_inertia_and_anti_jitter() -> None:
 
 def test_kickoff_protection_and_gk_hold_opponent_buffer() -> None:
     """Verify kickoff tackle protection, exclusion circle, and GK possession buffer."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
     env.reset(seed=42)
 
     # Immediately after kickoff, protection timer is active
@@ -890,3 +892,564 @@ def test_competitive_interest_score_discounts_blowouts() -> None:
 
     assert score_competitive > score_blowout
     assert score_competitive > 100.0
+
+
+def test_observation_dimension_parity_and_vision_normalization() -> None:
+    """Verify 76-dim obs parity and entity relative angle normalization under 210-deg vision cone."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    obs_dict, _ = env.reset(seed=42)
+
+    # 1. Dimension parity
+    assert env.cfg.vision.fov_deg == 210.0
+    assert math.isclose(env.cfg.vision.half_fov_rad, math.radians(105.0))
+    for agent in env.possible_agents:
+        assert env.observation_space(agent).shape == (76,)
+        assert obs_dict[agent].shape == (76,)
+
+    # 2. Vision angle normalization strictly bounded in [-1.0, 1.0] across all entity slots
+    for _ in range(50):
+        actions = {
+            agent: np.array([0.5, 0.5, -1.0, -1.0], dtype=np.float32) for agent in env.agents
+        }
+        obs_dict, _, _, _, _ = env.step(actions)
+        for agent, obs in obs_dict.items():
+            # Check slot 0 (ball, index 16..20)
+            assert -1.0 <= obs[18] <= 1.0
+            # Check slots 1..11 (entities, indices 21..75)
+            for slot_i in range(1, 12):
+                slot_start = 16 + slot_i * 5
+                rel_angle_norm = obs[slot_start + 2]
+                assert -1.0 <= rel_angle_norm <= 1.0
+
+
+def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
+    """Verify that lateral/backward pass farming yields zero progressive reward and decays pairwise."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    p1 = env.agent_to_idx["a_def_1"]
+    p2 = env.agent_to_idx["a_def_2"]
+    team = TEAM_A
+
+    # Position two defenders laterally at same X: 350.0, Y: 320.0 and 520.0 (distance = 200u)
+    env.player_pos[p1] = np.array([350.0, 320.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([350.0, 520.0], dtype=np.float64)
+
+    # Move opponent field players away
+    for idx in range(env.num_players):
+        if env.player_team[idx] != team:
+            env.player_pos[idx] = np.array([1200.0, 420.0], dtype=np.float64)
+
+    # Pass 1: p1 -> p2 (lateral pass: dx = 0.0)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[p1].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = p1
+    env.last_ball_team = team
+    env.ball_pos = env.player_pos[p2].copy()
+
+    rew1 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew1)
+
+    # Pass 1: Not progressive (canon_dx = 0.0 < 30.0) -> prog_bonus = 0.0
+    # Pairwise repeat count = 0, decay multiplier = 1.0
+    # Passer gets 0.0, receiver gets 0.2
+    assert rew1[p1] == 0.0
+    assert math.isclose(rew1[p2], 0.20, abs_tol=1e-5)
+    assert env.team_pass_chain[team] == 0  # Lateral pass does not increment pass chain
+
+    # Pass 2: p2 -> p1 (lateral ping-pong back: repeat count = 1, decay = 0.25)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[p2].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = p2
+    env.last_ball_team = team
+    env.ball_pos = env.player_pos[p1].copy()
+
+    rew2 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew2)
+
+    assert rew2[p2] == 0.0
+    assert math.isclose(rew2[p1], 0.20 * 0.25, abs_tol=1e-5)  # 0.05
+    assert env.pairwise_repeat_count == 1
+
+    # Pass 3: p1 -> p2 (lateral ping-pong: repeat count = 2, decay = 0.0625)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[p1].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = p1
+    env.last_ball_team = team
+    env.ball_pos = env.player_pos[p2].copy()
+
+    rew3 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew3)
+
+    assert rew3[p1] == 0.0
+    assert math.isclose(rew3[p2], 0.20 * (0.25**2), abs_tol=1e-5)  # 0.0125
+    assert rew3[p2] < 0.02
+
+    # Now Pass 4: p2 -> p3 (forward progressive pass to mid_1: X = 600.0)
+    p3 = env.agent_to_idx["a_mid_1"]
+    env.player_pos[p3] = np.array([600.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[p2].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = p2
+    env.last_ball_team = team
+    env.ball_pos = env.player_pos[p3].copy()
+
+    rew4 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew4)
+
+    # Pairwise history resets on new pair!
+    assert env.pairwise_repeat_count == 0
+    # canon_dx = 600 - 350 = 250u. Progressive bonus = 250 * 0.006 = 1.5
+    prog_bonus = 250.0 * env.cfg.rewards.pass_progressive_dx_weight
+    team_bonus = prog_bonus * 0.5
+    expected_p2 = prog_bonus + env.cfg.rewards.def_breakout_pass_bonus + team_bonus
+    expected_p3 = 0.20 + env.cfg.rewards.mid_link_receive_bonus + team_bonus
+    assert math.isclose(rew4[p2], expected_p2, abs_tol=1e-5)
+    assert math.isclose(rew4[p3], expected_p3, abs_tol=1e-5)
+    assert env.team_pass_chain[team] == 1  # Progressive pass increments chain!
+
+    # Pass 5: Line-breaking through pass from p3 (mid_1 at 600) to p4 (atk_1 at 950)
+    # Position 2 opponent defenders at X=750 and X=850 (between 600 and 950)
+    p4 = env.agent_to_idx["a_atk_1"]
+    opp_def1 = env.agent_to_idx["b_def_1"]
+    opp_def2 = env.agent_to_idx["b_def_2"]
+    env.player_pos[opp_def1] = np.array([750.0, 250.0], dtype=np.float64)
+    env.player_pos[opp_def2] = np.array([850.0, 600.0], dtype=np.float64)
+    env.player_pos[p4] = np.array([950.0, 420.0], dtype=np.float64)
+
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[p3].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = p3
+    env.last_ball_team = team
+    env.ball_pos = env.player_pos[p4].copy()
+
+    rew5 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew5)
+
+    # 350u forward territory + 2 bypassed defenders:
+    # prog_bonus = (350 * 0.006) + (2 * 0.40) = 2.10 + 0.80 = 2.90
+    expected_prog = (350.0 * env.cfg.rewards.pass_progressive_dx_weight) + (2 * env.cfg.rewards.pass_line_break_bonus)
+    expected_team = expected_prog * 0.5
+    expected_p3_passer = (
+        expected_prog
+        + env.cfg.rewards.mid_to_atk_pass_bonus
+        + env.cfg.rewards.pass_to_atk_bonus
+        + expected_team
+    )
+    assert math.isclose(rew5[p3], expected_p3_passer, abs_tol=1e-5)
+    assert env.team_pass_chain[team] == 2  # Increments to 2!
+
+
+def test_gk_observation_state_separation() -> None:
+    """Verify decoupling of GK ball hold timer (obs[8]) and GK box loose ball countdown (obs[13])."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    gk_idx = env.agent_to_idx["a_keeper"]
+    def_idx = env.agent_to_idx["a_def_1"]
+
+    # State 1: Loose ball in keeper box; GK does NOT hold ball
+    env.ball_holder = None
+    env.box_loose_ball_timer = 1.5  # 1.5s / 3.0s = 0.5 normalized
+    env.ball_hold_timer = 0.0
+
+    obs_gk = env._build_single_observation(gk_idx)
+    obs_def = env._build_single_observation(def_idx)
+
+    # obs[8] must be 0.0 (free ball) and NOT aliased with box timer
+    assert obs_gk[8] == 0.0
+    # obs[13] for GK contains box loose ball timer
+    assert math.isclose(obs_gk[13], 0.5, abs_tol=1e-5)
+    assert obs_gk[14] == 0.0
+    assert obs_gk[15] == 0.0
+    # Field DEF player retains role bit in obs[13]
+    assert obs_def[13] == 1.0
+
+    # State 2: GK holds ball; box loose timer is 0.0
+    env.ball_holder = gk_idx
+    env.ball_hold_timer = 2.5  # 2.5s / 5.0s = 0.5 normalized
+    env.box_loose_ball_timer = 0.0
+
+    obs_gk2 = env._build_single_observation(gk_idx)
+    assert math.isclose(obs_gk2[8], 0.5, abs_tol=1e-5)
+    assert obs_gk2[13] == 0.0
+
+
+def test_tiki_taka_chain_multiplier_and_own_goal_exclusion() -> None:
+    """Verify that pass chains scale terminal offensive goals and exclude own goals."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    rew_cfg = env.cfg.rewards
+
+    atk_idx = env.agent_to_idx["a_atk_1"]
+    def_b_idx = env.agent_to_idx["b_def_1"]
+
+    # 1. 4-pass sequence for Team A -> Chain = 4 -> Multiplier = 1.0 + 0.30 * 4 = 2.2
+    env.team_pass_chain[TEAM_A] = 4
+    env.last_ball_holder = atk_idx
+
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_goal_scored(TEAM_A, step_rew)
+
+    expected_team_goal = rew_cfg.goal_team_shared * 2.2  # 10.0 * 2.2 = 22.0
+    expected_atk_goal = rew_cfg.atk_goal_scorer_ind * 2.2  # 7.5 * 2.2 = 16.5
+    # atk_1 receives individual + team shared
+    assert math.isclose(step_rew[atk_idx], expected_atk_goal + expected_team_goal, abs_tol=1e-5)
+    # teammate receives team shared
+    assert math.isclose(step_rew[env.agent_to_idx["a_def_1"]], expected_team_goal, abs_tol=1e-5)
+    # Chains reset post-goal
+    assert env.team_pass_chain == [0, 0]
+
+    # 2. Own Goal: Chain multiplier must NOT apply to own goal
+    env.team_pass_chain[TEAM_A] = 5
+    env.last_ball_holder = atk_idx  # Team A player puts ball into own net -> Team B scores
+
+    step_rew_og = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_goal_scored(TEAM_B, step_rew_og)
+
+    # Team B gets standard goal_team_shared without multiplier
+    assert math.isclose(step_rew_og[def_b_idx], rew_cfg.goal_team_shared, abs_tol=1e-5)
+    # Own goal scorer receives own_goal_ind + goal_concede_team_shared (-8.0 + -10.0 = -18.0)
+    assert math.isclose(
+        step_rew_og[atk_idx], rew_cfg.own_goal_ind + rew_cfg.goal_concede_team_shared, abs_tol=1e-5
+    )
+
+
+def test_kinematic_lead_pass_targeting() -> None:
+    """Verify that pass aiming rewards raycasts directed at kinematic lead projection (p + tau * v)."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    kicker_idx = env.agent_to_idx["a_mid_1"]
+    runner_idx = env.agent_to_idx["a_atk_1"]
+
+    env.player_pos[kicker_idx] = np.array([400.0, 420.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[kicker_idx].copy()
+    env.ball_holder = kicker_idx
+
+    # Runner at [600.0, 300.0] sprinting up at 160 u/s along Y
+    env.player_pos[runner_idx] = np.array([600.0, 300.0], dtype=np.float64)
+    env.player_vel[runner_idx] = np.array([0.0, 160.0], dtype=np.float64)
+    tau = env.cfg.rewards.pass_lead_tau  # 0.70s
+    # Lead target: [600.0, 300.0 + 0.7 * 160.0] = [600.0, 412.0]
+    lead_target = env.player_pos[runner_idx] + tau * env.player_vel[runner_idx]
+    to_lead = lead_target - env.ball_pos
+    lead_angle = math.atan2(to_lead[1], to_lead[0])
+
+    # Move opponent defenders far out of way
+    for idx in range(env.num_players):
+        if env.player_team[idx] != TEAM_A:
+            env.player_pos[idx] = np.array([1200.0, 700.0], dtype=np.float64)
+
+    # Face directly toward the kinematic lead point
+    env.player_angle[kicker_idx] = lead_angle
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(kicker_idx, kick_power=0.6, step_rewards=step_rew)
+
+    # Kicker receives pass_target_aim_ind
+    assert step_rew[kicker_idx] >= env.cfg.rewards.pass_target_aim_ind - 1e-4
+
+
+def test_kickoff_carrier_faces_own_keeper_and_sees_teammates() -> None:
+    """Verify that the center kickoff player faces their own goalkeeper at start and after a goal."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+
+    # 1. Team A kickoff (Team A defends Left, keeper at X=45)
+    env.reset(seed=42, options={"kickoff_team": TEAM_A})
+    a_atk_idx = env.agent_to_idx["a_atk_1"]
+    a_gk_idx = env.agent_to_idx["a_keeper"]
+
+    assert env.ball_holder == a_atk_idx
+    # Carrier angle must face negative X (towards Left keeper at X=45)
+    cos_angle_a = math.cos(env.player_angle[a_atk_idx])
+    sin_angle_a = math.sin(env.player_angle[a_atk_idx])
+    assert math.isclose(cos_angle_a, -1.0, abs_tol=1e-5)
+    assert math.isclose(sin_angle_a, 0.0, abs_tol=1e-5)
+
+    # In canonical coordinates, carrier faces angle pi (towards own keeper)
+    obs_carrier = env._build_single_observation(a_atk_idx)
+    # Ball is held
+    assert obs_carrier[7] == 1.0
+    # Relative angle to own keeper must be ~0.0 (directly ahead in FOV)
+    gk_pos = env.player_pos[a_gk_idx]
+    car_pos = env.player_pos[a_atk_idx]
+    angle_to_gk = math.atan2(gk_pos[1] - car_pos[1], gk_pos[0] - car_pos[0])
+    rel_angle_to_gk = wrap_to_pi(angle_to_gk - env.player_angle[a_atk_idx])
+    assert math.isclose(rel_angle_to_gk, 0.0, abs_tol=1e-5)
+
+    # Verify all 5 teammates are within carrier's FOV (+/- 105 degrees = +/- 1.83 rad)
+    half_fov = env.cfg.vision.half_fov_rad
+    for tm_role in ("keeper", "def_1", "def_2", "mid_1", "mid_2"):
+        tm_idx = env.agent_to_idx[f"a_{tm_role}"]
+        tm_pos = env.player_pos[tm_idx]
+        ang = math.atan2(tm_pos[1] - car_pos[1], tm_pos[0] - car_pos[0])
+        rel_ang = abs(wrap_to_pi(ang - env.player_angle[a_atk_idx]))
+        assert rel_ang <= half_fov, f"Teammate {tm_role} (rel_ang={rel_ang:.2f}) outside FOV ({half_fov:.2f})"
+
+    # 2. Team B kickoff (Team B defends Right, keeper at X=1355)
+    env.reset(seed=42, options={"kickoff_team": TEAM_B})
+    b_atk_idx = env.agent_to_idx["b_atk_1"]
+    b_gk_idx = env.agent_to_idx["b_keeper"]
+
+    assert env.ball_holder == b_atk_idx
+    # Carrier angle must face positive X (towards Right keeper at X=1355)
+    cos_angle_b = math.cos(env.player_angle[b_atk_idx])
+    sin_angle_b = math.sin(env.player_angle[b_atk_idx])
+    assert math.isclose(cos_angle_b, 1.0, abs_tol=1e-5)
+    assert math.isclose(sin_angle_b, 0.0, abs_tol=1e-5)
+
+    # 3. Post-Goal reset: Team A scores -> Conceding team (Team B) kicks off facing b_keeper
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_goal_scored(TEAM_A, step_rew)
+    assert env.ball_holder == b_atk_idx
+    assert math.isclose(math.cos(env.player_angle[b_atk_idx]), 1.0, abs_tol=1e-5)
+
+
+def test_kinematic_lunge_config_parameters() -> None:
+    """Verify MechanicsConfig parameters for kinematic lunges and dynamic tackle probabilities."""
+    mech = DEFAULT_CONFIG.mechanics
+    assert mech.field_lunge_speed == 320.0
+    assert mech.field_lunge_duration == 0.25
+    assert mech.tackle_miss_stun_time == 0.8
+    assert mech.tackle_victim_stun_time == 1.0
+
+    # Expanded Max Tackle Radii
+    assert mech.tackle_radius_def == 85.0
+    assert mech.tackle_radius_mid == 75.0
+    assert mech.tackle_radius_atk == 65.0
+
+    # Base Probabilities
+    assert mech.tackle_prob_def == 0.90
+    assert mech.tackle_prob_mid == 0.82
+    assert mech.tackle_prob_atk == 0.74
+
+
+def test_kinematic_field_lunge_trajectory_and_speed_override() -> None:
+    """Verify that triggering a tackle within aiming range overrides velocity to 320 u/s directed at carrier."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    # Clear kickoff protection
+    env.kickoff_protection_timer = 0.0
+
+    tackler_idx = env.agent_to_idx["a_def_1"]  # Role: DEF, R_max = 85.0, Aiming = 127.5
+    carrier_idx = env.agent_to_idx["b_atk_1"]
+
+    # Place carrier at (600, 400), tackler at (550, 400) -> distance = 50.0 (< 85.0)
+    env.player_pos[carrier_idx] = np.array([600.0, 400.0], dtype=np.float64)
+    env.ball_holder = carrier_idx
+    env.player_pos[tackler_idx] = np.array([550.0, 400.0], dtype=np.float64)
+    env.player_vel[tackler_idx] = np.array([0.0, 0.0], dtype=np.float64)
+
+    # Initial zero step
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(tackler_idx, step_rew)
+
+    # Tackler must have lunged at 320.0 u/s along +X (direction to carrier)
+    assert env.lunge_timer[tackler_idx] == 0.25
+    assert math.isclose(env.player_vel[tackler_idx, 0], 320.0, abs_tol=1e-3)
+    assert math.isclose(env.player_vel[tackler_idx, 1], 0.0, abs_tol=1e-3)
+    assert math.isclose(env.player_angle[tackler_idx], 0.0, abs_tol=1e-3)
+
+
+def test_tackle_whiff_air_penalty_and_instant_freeze() -> None:
+    """Verify that tackling with no carrier nearby triggers instant stun, ghost state, and air penalty."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+
+    tackler_idx = env.agent_to_idx["a_mid_1"]  # Role: MID, R_max = 75.0, Aiming = 112.5
+    carrier_idx = env.agent_to_idx["b_atk_1"]
+
+    # Carrier is very far away at (1200, 400), tackler at (400, 400) -> dist = 800 > 112.5
+    env.player_pos[tackler_idx] = np.array([400.0, 400.0], dtype=np.float64)
+    env.player_vel[tackler_idx] = np.array([100.0, 50.0], dtype=np.float64)
+    env.player_pos[carrier_idx] = np.array([1200.0, 400.0], dtype=np.float64)
+    env.ball_holder = carrier_idx
+
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(tackler_idx, step_rew)
+
+    # Whiff: instant stun for 0.8s, zero velocity, ghost flag, and reckless penalty
+    assert env.stun_timer[tackler_idx] == env.cfg.mechanics.tackle_miss_stun_time
+    assert np.allclose(env.player_vel[tackler_idx], [0.0, 0.0])
+    assert env.is_ghost[tackler_idx] is True or env.is_ghost[tackler_idx] == 1
+    assert step_rew[tackler_idx] == env.cfg.rewards.reckless_tackle_ind
+
+
+def test_dynamic_tackle_quadratic_decay_and_out_of_reach_failure() -> None:
+    """Verify dynamic tackle success formula P = P_max * (1 - (d/R)^2) and automatic cutoff for d > R."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+
+    tackler_idx = env.agent_to_idx["a_def_1"]  # Role: DEF, R_max = 85.0, P_max = 0.90, Aiming = 127.5
+    carrier_idx = env.agent_to_idx["b_atk_1"]
+
+    # Case 1: In aiming range (100u <= 127.5u) but outside reach (100u > 85.0u) -> Automatic failure
+    env.player_pos[tackler_idx] = np.array([500.0, 400.0], dtype=np.float64)
+    env.player_pos[carrier_idx] = np.array([600.0, 400.0], dtype=np.float64)
+    env.ball_holder = carrier_idx
+
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(tackler_idx, step_rew)
+
+    # Must fail: tackler is stunned for 0.8s, carrier retains ball, failed_tackle_ind penalty
+    assert env.ball_holder == carrier_idx
+    assert env.stun_timer[tackler_idx] == env.cfg.mechanics.tackle_miss_stun_time
+    assert env.is_ghost[tackler_idx] is True or env.is_ghost[tackler_idx] == 1
+    assert step_rew[tackler_idx] == env.cfg.rewards.failed_tackle_ind
+
+    # Case 2: Point blank range (d = 0.0) with mock RNG forced to 0.0 (guaranteed success)
+    env.stun_timer[tackler_idx] = 0.0
+    env.tackle_cooldown[tackler_idx] = 0.0
+    env.player_pos[tackler_idx] = np.array([600.0, 400.0], dtype=np.float64)
+    from unittest.mock import MagicMock
+    mock_rng = MagicMock()
+    mock_rng.random.return_value = 0.0
+    original_rng = env.np_random
+    env.np_random = mock_rng
+
+    step_rew.fill(0.0)
+    env._attempt_tackle(tackler_idx, step_rew)
+
+    # Success: tackler gets ball, victim stunned for 1.0s and velocity 0.0
+    assert env.ball_holder == tackler_idx
+    assert env.stun_timer[carrier_idx] == env.cfg.mechanics.tackle_victim_stun_time
+    assert np.allclose(env.player_vel[carrier_idx], [0.0, 0.0])
+    assert env.is_ghost[carrier_idx] is True or env.is_ghost[carrier_idx] == 1
+    assert step_rew[tackler_idx] > 0.0
+    assert step_rew[carrier_idx] == env.cfg.rewards.successful_tackle_carrier_ind
+
+    env.np_random = original_rng
+
+
+def test_stun_state_physics_and_ghost_mode_collision_pass_through() -> None:
+    """Verify that stunned players ignore NN actions, have zero velocity, and allow collision pass-through."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    p1 = env.agent_to_idx["a_mid_1"]
+    p2 = env.agent_to_idx["b_mid_1"]
+
+    # Place p1 and p2 overlapping (dist = 10.0 < 36.0 min_dist)
+    env.player_pos[p1] = np.array([500.0, 400.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([510.0, 400.0], dtype=np.float64)
+
+    # Normal state: resolve collisions pushes them apart
+    env.ghost_timer[:] = 0.0
+    env.stun_timer[:] = 0.0
+    env.is_ghost[:] = False
+    env._resolve_player_collisions()
+    dist_after_normal = float(np.linalg.norm(env.player_pos[p2] - env.player_pos[p1]))
+    assert dist_after_normal >= 35.9
+
+    # Stun state: p1 is stunned -> flagged as ghost -> collisions do NOT push them
+    env.player_pos[p1] = np.array([500.0, 400.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([510.0, 400.0], dtype=np.float64)
+    env.stun_timer[p1] = 1.0
+    env.is_ghost[p1] = True
+
+    env._resolve_player_collisions()
+    dist_after_stun = float(np.linalg.norm(env.player_pos[p2] - env.player_pos[p1]))
+    # Since p1 is a ghost, distance is unchanged
+    assert math.isclose(dist_after_stun, 10.0, abs_tol=1e-3)
+
+
+def test_save_best_only_with_multiple_parallel_envs(tmp_path: Path) -> None:
+    """Verify that --save-best-only retains solely the highest-interest replay per generation when num_envs > 1."""
+    rep_dir = str(tmp_path / "replays")
+    ckpt_dir = str(tmp_path / "checkpoints")
+
+    # Fast test config: 10 RL steps per episode
+    fast_physics = replace(
+        DEFAULT_CONFIG.physics,
+        max_rl_steps=10,
+    )
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=fast_physics,
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            save_dir=rep_dir,
+            enable_recording=True,
+            interest_threshold=0.0,
+            save_best_only=True,
+        ),
+    )
+
+    # 1. Run 1 generation with 3 parallel environments and save_best_only=True
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg,
+        num_envs=3,
+        rollout_steps=10,
+        device="cpu",
+        checkpoint_dir=ckpt_dir,
+        seed=123,
+        save_best_only=True,
+    )
+    rollout = trainer.collect_rollouts(active_generation=1)
+
+    assert rollout["completed_episodes"] == 3
+    assert len(trainer.match_history) == 3
+
+    # All 3 matches are tracked in match_history
+    scores = [m["interest_score"] for m in trainer.match_history]
+    max_score = max(scores)
+
+    # Only 1 replay is kept in exported_replays
+    assert len(rollout["exported_replays"]) == 1
+    best_replay_file = rollout["exported_replays"][0]
+    assert os.path.exists(best_replay_file)
+
+    # Check that in match_history, exactly the best match retained its replay_path
+    saved_matches = [m for m in trainer.match_history if m["replay_path"]]
+    assert len(saved_matches) == 1
+    assert saved_matches[0]["interest_score"] == max_score
+    assert saved_matches[0]["replay_path"] == best_replay_file
+
+    # Verify that only 1 .json replay file exists in the directory
+    import glob
+    json_files = glob.glob(os.path.join(rep_dir, "match_*.json"))
+    assert len(json_files) == 1
+    assert os.path.abspath(json_files[0]) == os.path.abspath(best_replay_file)
+
+    # 2. Run another generation with save_best_only=False to verify contrast
+    rep_dir_all = str(tmp_path / "replays_all")
+    cfg_all = replace(
+        cfg,
+        replay=replace(cfg.replay, save_dir=rep_dir_all, save_best_only=False),
+    )
+    trainer_all = ParameterSharingPPOTrainer(
+        config=cfg_all,
+        num_envs=3,
+        rollout_steps=10,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt_all"),
+        seed=456,
+        save_best_only=False,
+    )
+    rollout_all = trainer_all.collect_rollouts(active_generation=1)
+    assert rollout_all["completed_episodes"] == 3
+    assert len(rollout_all["exported_replays"]) == 3
+    assert len(glob.glob(os.path.join(rep_dir_all, "match_*.json"))) == 3
+
+
+

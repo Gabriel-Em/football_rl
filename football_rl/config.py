@@ -123,19 +123,35 @@ class MechanicsConfig:
     # Special Action Trigger (action[3])
     special_trigger_threshold: float = 0.5
 
-    # Role-Specific Tackle Parameters
-    tackle_range: float = 44.0         # base / Midfielder
-    def_tackle_range: float = 48.0
-    mid_tackle_range: float = 44.0
-    atk_tackle_range: float = 40.0
-    tackle_near_range: float = 75.0   # Max distance to opponent carrier for tackle to not be reckless
-    tackle_success_prob: float = 0.78  # base / Midfielder
-    def_tackle_success_prob: float = 0.86
-    mid_tackle_success_prob: float = 0.78
-    atk_tackle_success_prob: float = 0.70
-    tackle_stun_duration: float = 0.20
+    # Kinematic Field Lunges & Role-Specific Tackle Parameters
+    field_lunge_speed: float = 320.0       # Units per second impulse during a field tackle
+    field_lunge_duration: float = 0.25     # Seconds the lunge impulse lasts
+    tackle_miss_stun_time: float = 0.8     # Seconds tackler is frozen/stunned if they miss or fail
+    tackle_victim_stun_time: float = 1.0   # Seconds victim is frozen after losing the ball
+
+    # Expanded Max Tackle Radii (Base Reach + Lunge)
+    tackle_radius_def: float = 85.0
+    tackle_radius_mid: float = 75.0
+    tackle_radius_atk: float = 65.0
+
+    # Base Probabilities (at point-blank range)
+    tackle_prob_def: float = 0.90
+    tackle_prob_mid: float = 0.82
+    tackle_prob_atk: float = 0.74
+
+    # Backward-compatible aliases and derived limits
+    tackle_range: float = 75.0         # base / Midfielder
+    def_tackle_range: float = 85.0
+    mid_tackle_range: float = 75.0
+    atk_tackle_range: float = 65.0
+    tackle_near_range: float = 127.5   # Max aiming range (1.5 * tackle_radius_def = 127.5)
+    tackle_success_prob: float = 0.82  # base / Midfielder
+    def_tackle_success_prob: float = 0.90
+    mid_tackle_success_prob: float = 0.82
+    atk_tackle_success_prob: float = 0.74
+    tackle_stun_duration: float = 1.0  # Synced to tackle_victim_stun_time
     tackled_opponent_cooldown: float = 1.0
-    tackle_fail_cooldown: float = 2.0
+    tackle_fail_cooldown: float = 0.8  # Synced to tackle_miss_stun_time
 
     # Keeper Lunge & Perimeter Strip
     lunge_speed: float = 430.0
@@ -168,9 +184,9 @@ class MechanicsConfig:
 class VisionConfig:
     """Observation space & vision cone parameters."""
 
-    fov_deg: float = 90.0
-    fov_rad: float = math.pi / 2.0
-    half_fov_rad: float = math.pi / 4.0  # +/- 45 deg
+    fov_deg: float = 210.0
+    fov_rad: float = math.radians(210.0)
+    half_fov_rad: float = math.radians(105.0)  # +/- 105 deg (210 deg total FOV)
     max_range: float = 650.0
 
     self_feature_dim: int = 16  # indices 0..12 + indices 13..15 one-hot [is_def, is_mid, is_atk]
@@ -205,18 +221,31 @@ class RewardConfig:
     keeper_clear_forward_ind: float = 0.4   # Bonus when keeper kicks ball forward out of own box
     keeper_kick_backward_pen: float = -1.5  # Penalty when keeper kicks ball toward own goal wall
 
-    # Pass & Role Link-Up Bonuses
-    completed_pass_passer_ind: float = 1.0
-    completed_pass_receiver_ind: float = 0.8
-    completed_pass_team: float = 0.25
+    # Pass & Role Link-Up Bonuses (Anti-Farming & Progressive)
+    completed_pass_passer_ind: float = 0.0      # Zeroed out (was 1.0)
+    completed_pass_receiver_ind: float = 0.2    # Modest receive touch bonus (was 0.8)
+    completed_pass_team: float = 0.0            # Zeroed out (was 0.25)
     def_breakout_pass_bonus: float = 0.5
     mid_link_receive_bonus: float = 0.5
     mid_to_atk_pass_bonus: float = 0.8
     pass_to_atk_bonus: float = 0.6
     pass_target_aim_ind: float = 0.45       # Immediate bonus in _execute_kick when aiming toward open teammate
-    recycle_pass_bonus: float = 0.35        # Bonus when completing a lateral/backward pass (canon_dx <= 40.0)
+    recycle_pass_bonus: float = 0.0         # Completely removed (was 0.35)
     open_clearance_ind: float = 0.25        # Immediate bonus in _execute_kick when kicking to open pitch corridor
     blocked_kick_pen: float = -0.45         # Immediate penalty in _execute_kick when kicking into near opponent
+
+    # Progressive Pass & Anti-Exploit Parameters
+    pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X gained (e.g., +200u dx = +1.2)
+    pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
+    pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
+    min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx to qualify as progressive
+
+    # Tiki-Taka Chain Parameters
+    pass_chain_multiplier_coeff: float = 0.30  # Multiplier scale: (1.0 + 0.30 * C_chain)
+    pass_chain_max_count: int = 10             # Cap at 10 passes (max multiplier 4.0x)
+
+    # Kinematic Lead-Pass Targeting
+    pass_lead_tau: float = 0.70                # Lookahead horizon in seconds: p_lead = p + tau * v
 
     # Defensive Half Ball-Winning Multiplier for DEF
     def_own_half_tackle_bonus: float = 0.75
@@ -243,9 +272,11 @@ class RewardConfig:
     keeper_dive_save_attempt_ind: float = 0.60  # Bonus when GK triggers lunge towards shot-on-target
     keeper_reckless_lunge_pen: float = -0.15    # Penalty when GK triggers lunge away from play
 
-    # Hold Violations
-    field_3s_violation_ind: float = -2.0
-    field_3s_violation_team: float = -0.5
+    # Hold Violations (5s Field Hold & 5s Keeper Box Hold)
+    field_5s_violation_ind: float = -2.0
+    field_5s_violation_team: float = -0.5
+    field_3s_violation_ind: float = -2.0   # Backwards-compatible alias
+    field_3s_violation_team: float = -0.5  # Backwards-compatible alias
     keeper_5s_violation_ind: float = -4.0
     keeper_5s_violation_team: float = -1.5
 
@@ -339,6 +370,7 @@ class ReplayConfig:
     save_dir: str = "replays"
     enable_recording: bool = True
     interest_threshold: float = 15.0
+    save_best_only: bool = False
 
     # Interest Score Formula Weights
     goal_weight: float = 5.0
