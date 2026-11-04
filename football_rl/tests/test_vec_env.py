@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import numpy as np
 import pytest
@@ -163,3 +164,44 @@ def test_subproc_trainer_rollout_integration(tmp_path: Path) -> None:
         assert metrics["total_matches"] >= 0
     finally:
         trainer.close()
+
+
+def test_trainer_monotonic_match_id_and_every_gen_checkpoint(tmp_path: Path) -> None:
+    """Verify trainer allocates monotonic match IDs across resumes and persists checkpoints every generation."""
+    ckpt_dir = tmp_path / "ckpt"
+    rep_dir = tmp_path / "replays"
+    os.makedirs(rep_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Pre-create a dummy replay file: match_0380_gen0048_...
+    dummy_replay = rep_dir / "match_0380_gen0048_score1_0_20261105_000000.json"
+    dummy_replay.write_text('{"metadata": {"match_id": 380, "generation": 48}}', encoding="utf-8")
+
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(DEFAULT_CONFIG.replay, save_dir=str(rep_dir), enable_recording=False),
+    )
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg,
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(ckpt_dir),
+        seed=42,
+    )
+    try:
+        # Match ID must start strictly higher than 380
+        assert trainer.next_match_id >= 381
+        m1 = trainer._allocate_match_id()
+        assert m1 >= 381
+        assert trainer.next_match_id == m1 + 1
+
+        # Run 1 generation and verify checkpoint was saved immediately
+        trainer.train(total_updates=1)
+        state_file = ckpt_dir / "training_state.pt"
+        assert state_file.exists()
+        state = torch.load(state_file, map_location="cpu", weights_only=False)
+        assert state["current_generation"] == 1
+    finally:
+        trainer.close()
+

@@ -128,10 +128,10 @@ class ParameterSharingPPOTrainer:
         # Cumulative training & match tracking across resumed sessions
         self.current_generation: int = 0
         self.total_env_steps: int = 0
-        self.next_match_id: int = 1
         self.match_history: List[Dict[str, Any]] = []
         self.generation_history: List[Dict[str, Any]] = []
         self.recent_team_goals: List[Tuple[int, int]] = []
+        self.next_match_id: int = self._get_max_saved_match_id() + 1
 
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -246,9 +246,28 @@ class ParameterSharingPPOTrainer:
             self.cpu_red_field_policy.load_state_dict(self.red_field_policy.state_dict())
             self.cpu_red_keeper_policy.load_state_dict(self.red_keeper_policy.state_dict())
 
+    def _get_max_saved_match_id(self) -> int:
+        """Scan match_history and replay directory to determine the highest existing match ID."""
+        max_id = len(self.match_history)
+        for m in self.match_history:
+            mid = m.get("match_id", 0)
+            if isinstance(mid, int) and mid > max_id:
+                max_id = mid
+
+        rep_dir = getattr(self.cfg.replay, "save_dir", getattr(self.cfg.replay, "replay_dir", "replays"))
+        if os.path.exists(rep_dir):
+            for fname in os.listdir(rep_dir):
+                if fname.startswith("match_") and fname.endswith(".json"):
+                    parts = fname.split("_")
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        fid = int(parts[1])
+                        if fid > max_id:
+                            max_id = fid
+        return max_id
+
     def _allocate_match_id(self) -> int:
-        mid = self.next_match_id
-        self.next_match_id += 1
+        mid = max(self.next_match_id, self._get_max_saved_match_id() + 1)
+        self.next_match_id = mid + 1
         return mid
 
     def _reset_all_envs(self, initial: bool = False) -> None:
@@ -694,7 +713,7 @@ class ParameterSharingPPOTrainer:
             {
                 "current_generation": self.current_generation,
                 "total_env_steps": self.total_env_steps,
-                "next_match_id": len(self.match_history) + 1,
+                "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
                 "field_policy": self.blue_field_policy.state_dict(),
                 "keeper_policy": self.blue_keeper_policy.state_dict(),
@@ -880,7 +899,7 @@ class ParameterSharingPPOTrainer:
             self.match_history = list(state.get("match_history", []))
             self.generation_history = list(state.get("generation_history", []))
             self.recent_team_goals = [tuple(x) for x in state.get("recent_team_goals", [])]
-            self.next_match_id = len(self.match_history) + 1
+            self.next_match_id = self._get_max_saved_match_id() + 1
 
             blue_f_weights = state.get("blue_field_policy", state.get("field_policy"))
             blue_k_weights = state.get("blue_keeper_policy", state.get("keeper_policy"))
@@ -945,135 +964,146 @@ class ParameterSharingPPOTrainer:
         start_gen = self.current_generation + 1
         end_gen = self.current_generation + total_updates
 
-        for gen in range(start_gen, end_gen + 1):
-            self.current_generation = gen
-            rollout = self.collect_rollouts(active_generation=gen)
-            metrics = self.update_policies(rollout)
-            elapsed = max(1e-6, time.time() - start_time)
+        try:
+            for gen in range(start_gen, end_gen + 1):
+                self.current_generation = gen
+                rollout = self.collect_rollouts(active_generation=gen)
+                metrics = self.update_policies(rollout)
+                elapsed = max(1e-6, time.time() - start_time)
 
-            step_delta = self.rollout_steps * self.num_envs
-            self.total_env_steps += step_delta
-            session_steps = (gen - start_gen + 1) * step_delta
-            sps = int(session_steps / elapsed)
+                step_delta = self.rollout_steps * self.num_envs
+                self.total_env_steps += step_delta
+                session_steps = (gen - start_gen + 1) * step_delta
+                sps = int(session_steps / elapsed)
 
-            mean_field_rew = float(rollout["rewards"][:, :, self.field_indices].mean())
-            mean_keeper_rew = float(rollout["rewards"][:, :, self.keeper_indices].mean())
-            blue_rew = float(
-                rollout["rewards"][:, :, self.blue_keeper_indices + self.blue_field_indices].mean()
-            )
-            red_rew = float(
-                rollout["rewards"][:, :, self.red_keeper_indices + self.red_field_indices].mean()
-            )
+                mean_field_rew = float(rollout["rewards"][:, :, self.field_indices].mean())
+                mean_keeper_rew = float(rollout["rewards"][:, :, self.keeper_indices].mean())
+                blue_rew = float(
+                    rollout["rewards"][:, :, self.blue_keeper_indices + self.blue_field_indices].mean()
+                )
+                red_rew = float(
+                    rollout["rewards"][:, :, self.red_keeper_indices + self.red_field_indices].mean()
+                )
 
-            # Exploration LogStd Clamp (prevent action noise explosion / collapse)
-            if self.separate_teams:
-                for pol in (
-                    self.blue_field_policy,
-                    self.blue_keeper_policy,
-                    self.red_field_policy,
-                    self.red_keeper_policy,
-                ):
-                    torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
-            else:
-                for pol in (self.blue_field_policy, self.blue_keeper_policy):
-                    torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
-            self._sync_cpu_policies()
+                # Exploration LogStd Clamp (prevent action noise explosion / collapse)
+                if self.separate_teams:
+                    for pol in (
+                        self.blue_field_policy,
+                        self.blue_keeper_policy,
+                        self.red_field_policy,
+                        self.red_keeper_policy,
+                    ):
+                        torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                else:
+                    for pol in (self.blue_field_policy, self.blue_keeper_policy):
+                        torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                self._sync_cpu_policies()
 
-            # Balanced Co-Evolution & Underdog Soft-Sync (over rolling 3-generation window)
-            if self.separate_teams:
-                gen_matches = [m for m in self.match_history if m.get("generation") == gen]
-                gen_goals_a = sum(m["score"][0] for m in gen_matches)
-                gen_goals_b = sum(m["score"][1] for m in gen_matches)
-                self.recent_team_goals.append((gen_goals_a, gen_goals_b))
-                if len(self.recent_team_goals) > 3:
-                    self.recent_team_goals.pop(0)
+                # Balanced Co-Evolution & Underdog Soft-Sync (over rolling 3-generation window)
+                if self.separate_teams:
+                    gen_matches = [m for m in self.match_history if m.get("generation") == gen]
+                    gen_goals_a = sum(m["score"][0] for m in gen_matches)
+                    gen_goals_b = sum(m["score"][1] for m in gen_matches)
+                    self.recent_team_goals.append((gen_goals_a, gen_goals_b))
+                    if len(self.recent_team_goals) > 3:
+                        self.recent_team_goals.pop(0)
 
-                if len(self.recent_team_goals) >= 3:
-                    sum_a = sum(x[0] for x in self.recent_team_goals)
-                    sum_b = sum(x[1] for x in self.recent_team_goals)
-                    if sum_a + sum_b >= 8:
-                        if sum_a >= 3 * max(1, sum_b):
-                            # Team A is dominating >= 75% -> soft-sync Team B towards Team A
-                            with torch.no_grad():
-                                for p_dst, p_src in zip(
-                                    self.red_field_policy.parameters(),
-                                    self.blue_field_policy.parameters(),
-                                ):
-                                    p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                for p_dst, p_src in zip(
-                                    self.red_keeper_policy.parameters(),
-                                    self.blue_keeper_policy.parameters(),
-                                ):
-                                    p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                            print(
-                                f"  [Co-Evolution Sync] Team A dominated ({sum_a}-{sum_b} over 3 gens). "
-                                f"Soft-synced Red policy (tau=0.35) to restore parity."
-                            )
-                            self.recent_team_goals.clear()
-                            self._sync_cpu_policies()
-                        elif sum_b >= 3 * max(1, sum_a):
-                            # Team B is dominating >= 75% -> soft-sync Team A towards Team B
-                            with torch.no_grad():
-                                for p_dst, p_src in zip(
-                                    self.blue_field_policy.parameters(),
-                                    self.red_field_policy.parameters(),
-                                ):
-                                    p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                for p_dst, p_src in zip(
-                                    self.blue_keeper_policy.parameters(),
-                                    self.red_keeper_policy.parameters(),
-                                ):
-                                    p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                            print(
-                                f"  [Co-Evolution Sync] Team B dominated ({sum_b}-{sum_a} over 3 gens). "
-                                f"Soft-synced Blue policy (tau=0.35) to restore parity."
-                            )
-                            self.recent_team_goals.clear()
-                            self._sync_cpu_policies()
+                    if len(self.recent_team_goals) >= 3:
+                        sum_a = sum(x[0] for x in self.recent_team_goals)
+                        sum_b = sum(x[1] for x in self.recent_team_goals)
+                        if sum_a + sum_b >= 8:
+                            if sum_a >= 3 * max(1, sum_b):
+                                # Team A is dominating >= 75% -> soft-sync Team B towards Team A
+                                with torch.no_grad():
+                                    for p_dst, p_src in zip(
+                                        self.red_field_policy.parameters(),
+                                        self.blue_field_policy.parameters(),
+                                    ):
+                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
+                                    for p_dst, p_src in zip(
+                                        self.red_keeper_policy.parameters(),
+                                        self.blue_keeper_policy.parameters(),
+                                    ):
+                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
+                                print(
+                                    f"  [Co-Evolution Sync] Team A dominated ({sum_a}-{sum_b} over 3 gens). "
+                                    f"Soft-synced Red policy (tau=0.35) to restore parity."
+                                )
+                                self.recent_team_goals.clear()
+                                self._sync_cpu_policies()
+                            elif sum_b >= 3 * max(1, sum_a):
+                                # Team B is dominating >= 75% -> soft-sync Team A towards Team B
+                                with torch.no_grad():
+                                    for p_dst, p_src in zip(
+                                        self.blue_field_policy.parameters(),
+                                        self.red_field_policy.parameters(),
+                                    ):
+                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
+                                    for p_dst, p_src in zip(
+                                        self.blue_keeper_policy.parameters(),
+                                        self.red_keeper_policy.parameters(),
+                                    ):
+                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
+                                print(
+                                    f"  [Co-Evolution Sync] Team B dominated ({sum_b}-{sum_a} over 3 gens). "
+                                    f"Soft-synced Blue policy (tau=0.35) to restore parity."
+                                )
+                                self.recent_team_goals.clear()
+                                self._sync_cpu_policies()
 
-            gen_record = {
-                "generation": gen,
-                "total_env_steps": self.total_env_steps,
-                "sps": sps,
-                "blue_mean_reward": round(blue_rew, 5),
-                "red_mean_reward": round(red_rew, 5),
-                "mean_field_reward": round(mean_field_rew, 5),
-                "mean_keeper_reward": round(mean_keeper_rew, 5),
-                "max_interest": round(float(rollout["max_interest"]), 2),
-                "completed_matches_in_gen": int(rollout["completed_episodes"]),
-                "total_matches_so_far": len(self.match_history),
-            }
-            self.generation_history.append(gen_record)
+                gen_record = {
+                    "generation": gen,
+                    "total_env_steps": self.total_env_steps,
+                    "sps": sps,
+                    "blue_mean_reward": round(blue_rew, 5),
+                    "red_mean_reward": round(red_rew, 5),
+                    "mean_field_reward": round(mean_field_rew, 5),
+                    "mean_keeper_reward": round(mean_keeper_rew, 5),
+                    "max_interest": round(float(rollout["max_interest"]), 2),
+                    "completed_matches_in_gen": int(rollout["completed_episodes"]),
+                    "total_matches_so_far": len(self.match_history),
+                }
+                self.generation_history.append(gen_record)
 
-            print(
-                f"[Gen {gen:04d}/{end_gen:04d}] "
-                f"Matches: {len(self.match_history):4d} | "
-                f"Steps: {self.total_env_steps:8d} ({sps:5d} SPS) | "
-                f"Blue Rew: {blue_rew:+.4f} | Red Rew: {red_rew:+.4f} | "
-                f"Interest: {rollout['max_interest']:.1f}"
-            )
-            for rpath in rollout["exported_replays"]:
-                print(f"  -> Saved replay: {rpath}")
+                print(
+                    f"[Gen {gen:04d}/{end_gen:04d}] "
+                    f"Matches: {len(self.match_history):4d} | "
+                    f"Steps: {self.total_env_steps:8d} ({sps:5d} SPS) | "
+                    f"Blue Rew: {blue_rew:+.4f} | Red Rew: {red_rew:+.4f} | "
+                    f"Interest: {rollout['max_interest']:.1f}"
+                )
+                for rpath in rollout["exported_replays"]:
+                    print(f"  -> Saved replay: {rpath}")
 
-            last_metrics = {
-                "update": gen,
-                "generation": gen,
-                "total_env_steps": self.total_env_steps,
-                "sps": sps,
-                "field": metrics["field"],
-                "keeper": metrics["keeper"],
-                "blue_field": metrics["blue_field"],
-                "red_field": metrics["red_field"],
-                "mean_field_reward": mean_field_rew,
-                "mean_keeper_reward": mean_keeper_rew,
-                "blue_mean_reward": blue_rew,
-                "red_mean_reward": red_rew,
-                "total_matches": len(self.match_history),
-            }
+                last_metrics = {
+                    "update": gen,
+                    "generation": gen,
+                    "total_env_steps": self.total_env_steps,
+                    "sps": sps,
+                    "field": metrics["field"],
+                    "keeper": metrics["keeper"],
+                    "blue_field": metrics["blue_field"],
+                    "red_field": metrics["red_field"],
+                    "mean_field_reward": mean_field_rew,
+                    "mean_keeper_reward": mean_keeper_rew,
+                    "blue_mean_reward": blue_rew,
+                    "red_mean_reward": red_rew,
+                    "total_matches": len(self.match_history),
+                }
 
-            # Persist checkpoints and update `replays/matches_summary.md` periodically and on completion
-            if gen % 10 == 0 or gen == end_gen:
+                # Persist checkpoints and update `replays/matches_summary.md` on every generation
                 self.save_checkpoints()
+
+        except KeyboardInterrupt:
+            print(
+                f"\n[Training Interrupted] Caught KeyboardInterrupt / SIGINT. "
+                f"Safely persisting active checkpoint at Generation {self.current_generation}..."
+            )
+            self.save_checkpoints()
+            print(
+                f"[Checkpoint Saved] State safely preserved at Generation {self.current_generation} "
+                f"(Completed Matches: {len(self.match_history)}). Exiting gracefully."
+            )
 
         return last_metrics
 

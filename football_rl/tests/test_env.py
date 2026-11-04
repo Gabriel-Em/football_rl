@@ -2306,6 +2306,76 @@ def test_gk_shot_directly_at_keeper_smothers_forward_and_rejects_lateral_dodge_d
     assert env.player_pos[gk_idx, 0] >= 18.0
 
 
+def test_defenders_start_compact_at_kickoff_and_zone_inwards() -> None:
+    """Verify defenders start compact (150u apart) shielding goal mouth and are exempt from crowding."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42, options={"kickoff_team": TEAM_A})
+
+    d1_a = env.agent_to_idx["a_def_1"]
+    d2_a = env.agent_to_idx["a_def_2"]
+    m1_a = env.agent_to_idx["a_mid_1"]
+    m2_a = env.agent_to_idx["a_mid_2"]
+    d1_b = env.agent_to_idx["b_def_1"]
+    d2_b = env.agent_to_idx["b_def_2"]
+    m1_b = env.agent_to_idx["b_mid_1"]
+    m2_b = env.agent_to_idx["b_mid_2"]
+
+    # 1. At match start / kickoff, both teams' defenders must start compact (150u apart)
+    # Team A defends Left (goal mouth Y in [320, 520], center 420)
+    pos_d1_a = env.player_pos[d1_a]
+    pos_d2_a = env.player_pos[d2_a]
+    sep_a = abs(pos_d2_a[1] - pos_d1_a[1])
+    assert math.isclose(sep_a, 150.0, abs_tol=1e-3), f"Team A defenders separation was {sep_a}, expected 150.0"
+    assert min(pos_d1_a[1], pos_d2_a[1]) >= 320.0, "Defenders should be inside or at goal mouth top post"
+    assert max(pos_d1_a[1], pos_d2_a[1]) <= 520.0, "Defenders should be inside or at goal mouth bottom post"
+
+    # Team A starts with the ball: midfielders start positioned deeper towards their own goal post (X = 520.0)
+    pos_m1_a = env.player_pos[m1_a]
+    pos_m2_a = env.player_pos[m2_a]
+    assert math.isclose(pos_m1_a[0], 520.0, abs_tol=1e-3)
+    assert math.isclose(pos_m2_a[0], 520.0, abs_tol=1e-3)
+
+    # Team B defends Right
+    pos_d1_b = env.player_pos[d1_b]
+    pos_d2_b = env.player_pos[d2_b]
+    sep_b = abs(pos_d2_b[1] - pos_d1_b[1])
+    assert math.isclose(sep_b, 150.0, abs_tol=1e-3), f"Team B defenders separation was {sep_b}, expected 150.0"
+
+    # Team B receiving midfielders remain at X = 960.0
+    pos_m1_b = env.player_pos[m1_b]
+    pos_m2_b = env.player_pos[m2_b]
+    assert math.isclose(pos_m1_b[0], 960.0, abs_tol=1e-3)
+    assert math.isclose(pos_m2_b[0], 960.0, abs_tol=1e-3)
+
+    # 2. Verify post-goal reset maintains compact defender and deeper midfielder formation
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_goal_scored(TEAM_A, step_rew)
+    pos_d1_b_reset = env.player_pos[d1_b]
+    pos_d2_b_reset = env.player_pos[d2_b]
+    assert math.isclose(abs(pos_d2_b_reset[1] - pos_d1_b_reset[1]), 150.0, abs_tol=1e-3)
+
+    # After Team A scores, Team B restarts with the ball from Right side:
+    # Team B midfielders now start rotated towards their own post (1400.0 - 520.0 = 880.0)
+    pos_m1_b_reset = env.player_pos[m1_b]
+    pos_m2_b_reset = env.player_pos[m2_b]
+    assert math.isclose(pos_m1_b_reset[0], 880.0, abs_tol=1e-3)
+    assert math.isclose(pos_m2_b_reset[0], 880.0, abs_tol=1e-3)
+
+    # 3. Verify defender pair in defensive half at 150u separation incurs ZERO crowding penalty
+    env.kickoff_protection_timer = 0.0
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    prev_dists = np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1)
+    env._compute_tactical_positioning_rewards(step_rewards, prev_pos, prev_dists, any_teleport=False)
+
+    # Defender rewards should have no crowding deduction (-pen)
+    # teammate_defender_spacing is 120u, so 150u is well above threshold!
+    assert step_rewards[d1_a] >= -1e-6
+    assert step_rewards[d2_a] >= -1e-6
+
+
+
 
 
 

@@ -2916,7 +2916,12 @@ class FootballParallelEnv(ParallelEnv):
                     ang_diff = abs(float(wrap_to_pi(ang_i - ang_j)))
 
                     both_near_enemy_box = (di_goal <= 280.0) and (dj_goal <= 280.0)
-                    if both_near_enemy_box and ang_diff >= math.radians(40.0):
+                    is_defender_pair = (p_i in def_indices and p_j in def_indices)
+                    in_defensive_half = (float(c_player_pos[p_i, 0]) <= 700.0 and float(c_player_pos[p_j, 0]) <= 700.0)
+                    if is_defender_pair and in_defensive_half:
+                        # Center back pair shielding own goal mouth: relax spacing to allow compact central zoning
+                        min_space = rew.teammate_defender_spacing
+                    elif both_near_enemy_box and ang_diff >= math.radians(40.0):
                         # Wide angular separation around keeper semicircle (e.g. ST below, MID above):
                         # Relax spacing threshold so cutback options are never punished!
                         min_space = rew.teammate_box_cutback_spacing
@@ -2992,13 +2997,13 @@ class FootballParallelEnv(ParallelEnv):
                     role_key = dynamic_role_key[idx]
 
                     if is_gk_carrier:
-                        # Case 1: GK Holds the Ball -> "Show for the Keeper" wide outlet pockets
+                        # Case 1: GK Holds the Ball -> Show for Keeper with both central channel and wide outlet options
                         if role_key in ("def_1", "mid_1"):
                             x_cand_list = (200.0, 330.0) if role_key == "def_1" else (420.0, 560.0)
-                            y_cand_list = (95.0, 195.0, 295.0)
+                            y_cand_list = (180.0, 265.0, 345.0) if role_key == "def_1" else (95.0, 195.0, 295.0)
                         elif role_key in ("def_2", "mid_2"):
                             x_cand_list = (200.0, 330.0) if role_key == "def_2" else (420.0, 560.0)
-                            y_cand_list = (545.0, 645.0, 745.0)
+                            y_cand_list = (495.0, 575.0, 660.0) if role_key == "def_2" else (545.0, 645.0, 745.0)
                         else:
                             x_cand_list = (720.0, 920.0)
                             y_cand_list = (260.0, 420.0, 580.0)
@@ -3029,10 +3034,12 @@ class FootballParallelEnv(ParallelEnv):
                                 ideal_x = float(np.clip(cx_car + 90.0, 240.0, 580.0))
                             else:
                                 ideal_x = float(np.clip(cx_car - 240.0, 520.0, 780.0))
-                            ideal_y = 250.0 if role_key == "def_1" else 590.0
+                            # Keep center backs compact (150u separation) centered around goal axis with subtle flank shifting
+                            y_shift = float(np.clip(0.15 * (float(carrier_c[1]) - 420.0), -35.0, 35.0))
+                            ideal_y = (420.0 + y_shift - 75.0) if role_key == "def_1" else (420.0 + y_shift + 75.0)
                             target_pocket = np.array([ideal_x, ideal_y], dtype=np.float64)
                         elif role_key in ("mid_1", "mid_2"):
-                            dx_list = (120.0, 220.0, -90.0)
+                            dx_list = (120.0, 220.0, -90.0, -180.0)
                             y_cand_list = (150.0, 290.0) if role_key == "mid_1" else (550.0, 690.0)
                             best_cand = None
                             best_score = -1e9
@@ -3124,9 +3131,13 @@ class FootballParallelEnv(ParallelEnv):
 
             # 3. State B: Ball is Loose
             elif self.ball_holder is None:
+                # Keep non-chasing center backs compact (150u separation) guarding the central channel
+                y_shift_loose = float(np.clip(0.15 * (float(c_ball_pos[1]) - 420.0), -35.0, 35.0))
+                def1_loose_y = 420.0 + y_shift_loose - 75.0
+                def2_loose_y = 420.0 + y_shift_loose + 75.0
                 role_anchors = {
-                    "def_1": np.array([np.clip(c_ball_pos[0] * 0.55, 220.0, 580.0), 250.0], dtype=np.float64),
-                    "def_2": np.array([np.clip(c_ball_pos[0] * 0.55, 220.0, 580.0), 590.0], dtype=np.float64),
+                    "def_1": np.array([np.clip(c_ball_pos[0] * 0.55, 220.0, 580.0), def1_loose_y], dtype=np.float64),
+                    "def_2": np.array([np.clip(c_ball_pos[0] * 0.55, 220.0, 580.0), def2_loose_y], dtype=np.float64),
                     "mid_1": np.array([np.clip(c_ball_pos[0] * 0.85, 380.0, 980.0), 200.0], dtype=np.float64),
                     "mid_2": np.array([np.clip(c_ball_pos[0] * 0.85, 380.0, 980.0), 640.0], dtype=np.float64),
                     "atk_1": np.array([np.clip(c_ball_pos[0] + 220.0, 720.0, 1180.0), 420.0], dtype=np.float64),
@@ -3217,9 +3228,13 @@ class FootballParallelEnv(ParallelEnv):
 
             # 4. State C: Opponent Has the Ball
             else:
+                # Keep non-pressing center backs compact (150u separation) directly shielding the goal mouth
+                y_shift_opp = float(np.clip(0.18 * (float(c_ball_pos[1]) - 420.0), -40.0, 40.0))
+                def1_opp_y = 420.0 + y_shift_opp - 75.0
+                def2_opp_y = 420.0 + y_shift_opp + 75.0
                 cover_anchors = {
-                    "def_1": np.array([np.clip(c_ball_pos[0] * 0.55, 200.0, 560.0), 270.0], dtype=np.float64),
-                    "def_2": np.array([np.clip(c_ball_pos[0] * 0.55, 200.0, 560.0), 570.0], dtype=np.float64),
+                    "def_1": np.array([np.clip(c_ball_pos[0] * 0.55, 200.0, 560.0), def1_opp_y], dtype=np.float64),
+                    "def_2": np.array([np.clip(c_ball_pos[0] * 0.55, 200.0, 560.0), def2_opp_y], dtype=np.float64),
                     "mid_1": np.array([np.clip(c_ball_pos[0] * 0.78, 360.0, 820.0), 210.0], dtype=np.float64),
                     "mid_2": np.array([np.clip(c_ball_pos[0] * 0.78, 360.0, 820.0), 630.0], dtype=np.float64),
                     "atk_1": np.array([np.clip(c_ball_pos[0] + 180.0, 680.0, 1080.0), 420.0], dtype=np.float64),

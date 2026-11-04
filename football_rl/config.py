@@ -300,6 +300,7 @@ class RewardConfig:
     # Context-Dependent Tactical & Role Positioning
     teammate_min_spacing: float = 165.0            # Increased from 135.0 to spread off-ball players across 1400x840 pitch
     teammate_box_cutback_spacing: float = 95.0     # Relaxed spacing when two attackers are in different angular sectors (>=40 deg) near box
+    teammate_defender_spacing: float = 120.0       # Relaxed spacing between center backs in own defensive half to allow central goal mouth zoning
     carrier_min_spacing: float = 135.0             # Increased from 120.0
     crowding_penalty_scale: float = 0.018          # Increased from 0.005 (applied asymmetrically with right-of-way exemptions)
     teammate_approach_penalty_scale: float = 0.012 # Penalty per unit closed when approaching a nearby off-ball teammate (<155u)
@@ -337,18 +338,18 @@ class FormationConfig:
     kickoff_starting_left: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
             "keeper": (45.0, 420.0),
-            "def_1": (320.0, 250.0),
-            "def_2": (320.0, 590.0),
-            "mid_1": (650.0, 260.0),
-            "mid_2": (650.0, 580.0),
+            "def_1": (320.0, 345.0),
+            "def_2": (320.0, 495.0),
+            "mid_1": (520.0, 260.0),
+            "mid_2": (520.0, 580.0),
             "atk_1": (700.0, 420.0),  # Ball Carrier at center spot
         }
     )
     kickoff_receiving_right: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
             "keeper": (1355.0, 420.0),
-            "def_1": (1120.0, 240.0),
-            "def_2": (1120.0, 600.0),
+            "def_1": (1120.0, 495.0),
+            "def_2": (1120.0, 345.0),
             "mid_1": (960.0, 220.0),
             "mid_2": (960.0, 620.0),
             "atk_1": (910.0, 420.0),  # Outside center circle (210u from center spot)
