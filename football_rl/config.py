@@ -176,7 +176,8 @@ class MechanicsConfig:
     post_save_box_grace_time: float = 2.0   # Grace period (s) after GK save before box loose timer accumulates
 
     # Dynamic Semicircle Shrinking Parameters (Anti-Stall on Unclaimed Loose Box Balls)
-    box_shrink_grace_time: float = 1.0      # seconds of unclaimed loose ball in box before semicircle starts shrinking
+    box_shrink_grace_time: float = 2.0      # seconds an unclaimed loose ball must be completely stopped inside the box before semicircle starts shrinking
+    box_ball_stopped_threshold: float = 15.0 # max ball speed (u/s) for ball to be considered completely stopped
     box_shrink_rate: float = 55.0           # units/sec radial shrink speed allowing outfielders closer and closer
     box_expand_rate: float = 220.0          # units/sec smooth radial re-expansion speed once ball is claimed or exits box
     box_min_radius: float = 0.0             # minimum radius the semicircle can shrink to (0.0 = completely open)
@@ -244,7 +245,7 @@ class RewardConfig:
     completed_pass_passer_ind: float = 0.0      # Zeroed out (was 1.0)
     completed_pass_receiver_ind: float = 0.2    # Modest receive touch bonus (was 0.8)
     completed_pass_team: float = 0.0            # Zeroed out (was 0.25)
-    def_breakout_pass_bonus: float = 0.5
+    def_breakout_pass_bonus: float = 1.10
     mid_link_receive_bonus: float = 0.5
     mid_to_atk_pass_bonus: float = 0.8
     pass_to_atk_bonus: float = 0.6
@@ -258,11 +259,12 @@ class RewardConfig:
     # Progressive Pass & Anti-Exploit Parameters
     pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +1.2)
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
-    box_angle_pass_bonus: float = 0.85         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
+    box_angle_pass_bonus: float = 1.15         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
     escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
-    attacking_layoff_bonus: float = 0.65       # Bonus when attacker in final third lays ball back to oncoming midfielder
+    attacking_layoff_bonus: float = 1.15       # Bonus when attacker in final third lays ball back to oncoming midfielder or cutback
     give_and_go_bonus: float = 0.70            # Bonus when receiver of return pass has advanced into space since initial pass
     wall_pass_bonus: float = 0.65              # Bonus for completing an intentional bank pass off the side wall
+    scanned_pass_mult: float = 1.20            # Multiplier on progressive pass bonus when receiver is in passer's vision cone
     pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
     min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx or goal-dist reduction to qualify as progressive
 
@@ -345,6 +347,8 @@ class RewardConfig:
     keeper_fetch_box_scale: float = 0.045
     keeper_back_wall_face_pen: float = 0.035
     jitter_reverse_pen: float = -0.008
+    pocket_deadzone_radius: float = 35.0           # Deadzone radius (u) around tactical pockets/anchors with 0 approach gradient
+    line_order_pen_scale: float = 0.010            # Soft penalty scale when outfield player breaches role line-ordering margin
 
 
 @dataclass(frozen=True)

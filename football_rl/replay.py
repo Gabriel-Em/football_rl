@@ -198,6 +198,10 @@ class ReplayViewer:
                 f"6v6 MARL Football Replay — {match_tag}Interest Score: {self.meta.get('interest_score', 0.0)}"
             )
             self.screen = pygame.display.set_mode((self.win_w, self.win_h))
+            try:
+                pygame.mouse.set_visible(False)
+            except Exception:
+                pass
 
         self.clock = pygame.time.Clock()
         self.pitch_surface = pygame.Surface(
@@ -461,10 +465,51 @@ class ReplayViewer:
         self._draw_top_hud(frame)
         self._draw_scrubber_bar(frame)
 
+        # 8. Software cursor (ensures clear visibility in WSLg / X11 environments)
+        if not self.headless:
+            self._draw_cursor()
+
         if not self.headless:
             pygame.display.flip()
 
         return self.screen
+
+    def _draw_cursor(self) -> None:
+        """Draw a high-contrast software arrow cursor to ensure mouse visibility in WSLg/X11."""
+        if not pygame.mouse.get_focused():
+            return
+        mx, my = pygame.mouse.get_pos()
+        if not (0 <= mx < self.win_w and 0 <= my < self.win_h):
+            return
+
+        # Check if hovering over scrubber bar or an interactive player
+        is_hovering_player = (
+            self._is_pos_on_field(mx, my) and self._find_player_at_screen_pos(mx, my) is not None
+        )
+        bar_x = self.margin_x
+        bar_w = self.disp_field_w
+        bar_y = self.hud_height + self.disp_field_h + 12
+        is_hovering_scrubber = bar_x <= mx <= bar_x + bar_w and bar_y - 10 <= my <= bar_y + 26
+
+        if is_hovering_player or is_hovering_scrubber:
+            accent_col = (80, 220, 255) if is_hovering_player else (255, 200, 60)
+            pygame.draw.circle(self.screen, (15, 23, 42), (mx, my), 6)
+            pygame.draw.circle(self.screen, accent_col, (mx, my), 5, width=2)
+            pygame.draw.circle(self.screen, (255, 255, 255), (mx, my), 2)
+        else:
+            pts = [
+                (mx, my),
+                (mx, my + 16),
+                (mx + 4, my + 12),
+                (mx + 8, my + 20),
+                (mx + 11, my + 18),
+                (mx + 7, my + 11),
+                (mx + 13, my + 11),
+            ]
+            shadow_pts = [(x + 1, y + 1) for x, y in pts]
+            pygame.draw.polygon(self.screen, (15, 23, 42), shadow_pts)
+            pygame.draw.polygon(self.screen, (245, 245, 250), pts)
+            pygame.draw.polygon(self.screen, (15, 23, 42), pts, width=1)
 
     def _draw_pitch(self, frame: Dict[str, Any]) -> None:
         """Draw turf stripes, boundary lines, center circle, and keeper semi-circles."""

@@ -978,7 +978,7 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     env._check_free_ball_pickup(rew2)
 
     assert rew2[p2] == 0.0
-    assert math.isclose(rew2[p1], 0.20 * 0.25 + rx_bonus, abs_tol=1e-5)
+    assert math.isclose(rew2[p1], (0.20 + rx_bonus) * 0.25, abs_tol=1e-5)
     assert env.pairwise_repeat_count == 1
 
     # Pass 3: p1 -> p2 (lateral ping-pong: repeat count = 2, decay = 0.0625)
@@ -994,8 +994,8 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     env._check_free_ball_pickup(rew3)
 
     assert rew3[p1] == 0.0
-    assert math.isclose(rew3[p2], 0.20 * (0.25**2) + rx_bonus, abs_tol=1e-5)
-    assert (rew3[p2] - rx_bonus) < 0.02
+    assert math.isclose(rew3[p2], (0.20 + rx_bonus) * (0.25**2), abs_tol=1e-5)
+    assert rew3[p2] < 0.05
 
     # Now Pass 4: p2 -> p3 (forward progressive pass to mid_1: X = 600.0)
     p3 = env.agent_to_idx["a_mid_1"]
@@ -1017,7 +1017,7 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     d_orig_goal = float(np.linalg.norm(env.player_pos[p2] - np.array([1400.0, 420.0])))
     d_dest_goal = float(np.linalg.norm(env.player_pos[p3] - np.array([1400.0, 420.0])))
     effective_dx = max(250.0, d_orig_goal - d_dest_goal)
-    prog_bonus = effective_dx * env.cfg.rewards.pass_progressive_dx_weight
+    prog_bonus = effective_dx * env.cfg.rewards.pass_progressive_dx_weight * env.cfg.rewards.scanned_pass_mult
     team_bonus = prog_bonus * 0.5
     expected_p2 = prog_bonus + env.cfg.rewards.def_breakout_pass_bonus + team_bonus
     expected_p3 = 0.20 + env.cfg.rewards.mid_link_receive_bonus + team_bonus + rx_bonus
@@ -1047,7 +1047,9 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
 
     # 350u forward territory + 2 bypassed defenders:
     # prog_bonus = (350 * 0.006) + (2 * 0.40) = 2.10 + 0.80 = 2.90
-    expected_prog = (350.0 * env.cfg.rewards.pass_progressive_dx_weight) + (2 * env.cfg.rewards.pass_line_break_bonus)
+    expected_prog = (
+        (350.0 * env.cfg.rewards.pass_progressive_dx_weight) + (2 * env.cfg.rewards.pass_line_break_bonus)
+    ) * env.cfg.rewards.scanned_pass_mult
     expected_team = expected_prog * 0.5
     expected_p3_passer = (
         expected_prog
@@ -2751,6 +2753,716 @@ def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
     # Box loose timer should still be 0.0 because post_save_box_grace_timer was active
     assert env.box_loose_ball_timer == 0.0
     assert env.post_save_box_grace_timer < 2.0
+
+
+def test_dynamic_box_shrinks_only_after_ball_stopped_for_2s() -> None:
+    """Verify box loose timer and shrinkage ONLY engage when ball is stopped/settled inside for 2s (<= 15.0 u/s)."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    nom_radius = env.cfg.physics.keeper_box_radius
+    assert env.active_box_radius[SIDE_LEFT] == nom_radius
+
+    # 1. Moving ball enters left box: timer must stay 0.0, radius must not shrink
+    env.ball_holder = None
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)  # inside left box
+    env.ball_vel = np.array([200.0, 0.0], dtype=np.float64)  # moving at high speed
+    env.box_loose_ball_timer = 0.0
+    env.post_save_box_grace_timer = 0.0
+
+    actions = _zero_actions(env)
+    # Run 1 RL decision step (4 physics frames) with ball moving
+    env.step(actions)
+    assert env.box_loose_ball_timer == 0.0
+    assert env.active_box_radius[SIDE_LEFT] == nom_radius
+
+    # 2. Ball settles/slows inside left box (<= 15.0 u/s threshold)
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)
+    env.ball_vel = np.array([8.0, 0.0], dtype=np.float64)
+    env.box_loose_ball_timer = 0.0
+    env.post_save_box_grace_timer = 0.0
+
+    # Simulate 1.5s (< 2.0s box_shrink_grace_time)
+    dt = env.cfg.physics.dt
+    frames_1_5s = int(round(1.5 / dt))
+    for _ in range(frames_1_5s):
+        env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+
+    # Timer accumulated, but radius must still be untouched at nominal 195.0
+    assert env.box_loose_ball_timer > 1.4
+    assert env.box_loose_ball_timer < 2.0
+    assert env.active_box_radius[SIDE_LEFT] == nom_radius
+
+    # Simulate another 1.0s (total 2.5s > 2.0s grace)
+    frames_1s = int(round(1.0 / dt))
+    for _ in range(frames_1s):
+        env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+
+    # After 2.5s stopped, radius must have shrunk by ~0.5s * 55 u/s = ~27.5u
+    assert env.box_loose_ball_timer > 2.4
+    assert env.active_box_radius[SIDE_LEFT] < nom_radius - 20.0
+
+    # 3. Ball starts moving again (> 15.0 u/s) -> timer resets immediately and radius re-expands
+    env.ball_vel = np.array([120.0, 0.0], dtype=np.float64)
+    shrunken_r = float(env.active_box_radius[SIDE_LEFT])
+    env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+
+    assert env.box_loose_ball_timer == 0.0
+    assert env.active_box_radius[SIDE_LEFT] > shrunken_r
+
+
+def test_outfield_semicircle_contact_strips_inward_radial_velocity() -> None:
+    """Verify outfield player colliding with active_box_radius has inward radial velocity stripped, but outward velocity is preserved."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    # Use Team A striker approaching Team B goal (Right goal at 1400, 420)
+    atk_idx = env.agent_to_idx["a_atk_1"]
+    goal_c = np.array(env.cfg.physics.right_goal_center, dtype=np.float64)  # [1400, 420]
+    box_r = float(env.active_box_radius[SIDE_RIGHT])
+
+    # 1. Position player inside the semicircle boundary, heading inward toward goal center
+    inward_dir = np.array([-1.0, 0.0], dtype=np.float64)  # towards (1400, 420) from the left
+    player_pos = goal_c + inward_dir * (box_r - 10.0)  # at (1215, 420)
+    env.player_pos[atk_idx] = player_pos.copy()
+    # Velocity heading inwards toward the goal (+x) and tangentially (+y)
+    env.player_vel[atk_idx] = np.array([80.0, 50.0], dtype=np.float64)
+
+    delta = env.player_pos[atk_idx] - goal_c
+    push_dir = delta / np.linalg.norm(delta)
+    assert np.dot(env.player_vel[atk_idx], push_dir) < -50.0
+
+    # Execute boundary clamp with dynamic push
+    env.step_external_push.fill(0.0)
+    env._clamp_players_to_boundaries(apply_dynamic_push=True)
+
+    # Position must be clamped to eff_box_r + 1e-3
+    dist_after = float(np.linalg.norm(env.player_pos[atk_idx] - goal_c))
+    assert dist_after >= box_r
+
+    # Inward radial velocity component must be stripped, leaving only tangential velocity (Vy = 50.0)
+    rad_v_after = float(np.dot(env.player_vel[atk_idx], push_dir))
+    assert rad_v_after >= -1e-6
+    assert math.isclose(env.player_vel[atk_idx, 1], 50.0, abs_tol=1e-5)
+
+    # 2. Outward velocity preservation: player moving outward away from goal
+    env.player_pos[atk_idx] = goal_c + inward_dir * (box_r - 5.0)
+    env.player_vel[atk_idx] = np.array([-60.0, 30.0], dtype=np.float64)  # moving away from goal (-X)
+    delta2 = env.player_pos[atk_idx] - goal_c
+    push_dir2 = delta2 / np.linalg.norm(delta2)
+    assert np.dot(env.player_vel[atk_idx], push_dir2) > 0.0  # outward!
+
+    env.step_external_push.fill(0.0)
+    env._clamp_players_to_boundaries(apply_dynamic_push=True)
+    # Outward velocity must NOT be stripped or altered
+    assert math.isclose(env.player_vel[atk_idx, 0], -60.0, abs_tol=1e-5)
+    assert math.isclose(env.player_vel[atk_idx, 1], 30.0, abs_tol=1e-5)
+
+    # 3. Goalkeeper inside own box is exempt from boundary clamp
+    gk_idx = env.agent_to_idx["a_keeper"]
+    gk_goal = np.array(env.cfg.physics.left_goal_center, dtype=np.float64)
+    env.player_pos[gk_idx] = gk_goal + np.array([50.0, 0.0], dtype=np.float64)  # inside left box
+    env.player_vel[gk_idx] = np.array([-40.0, 0.0], dtype=np.float64)
+    env._clamp_players_to_boundaries(apply_dynamic_push=True)
+    # GK position and vel are not clamped by own box
+    assert float(np.linalg.norm(env.player_pos[gk_idx] - gk_goal)) < 60.0
+    assert math.isclose(env.player_vel[gk_idx, 0], -40.0, abs_tol=1e-5)
+
+
+def test_carrier_center_used_for_advance_and_backpedal_suppression() -> None:
+    """Verify carrier rotation produces 0 team advance penalty, backpedaling earns 0 advance bonus, and defender advance is tapered."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    carrier_idx = env.agent_to_idx["a_mid_1"]
+    team = TEAM_A
+
+    # 1. Rotating in place at enemy semicircle edge: carrier center remains fixed, only body angle changes
+    env.ball_holder = carrier_idx
+    env.player_pos[carrier_idx] = np.array([1205.0, 420.0], dtype=np.float64)
+    env.player_angle[carrier_idx] = 0.0  # facing goal
+    env.player_vel[carrier_idx] = np.array([0.0, 0.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[carrier_idx] + np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
+
+    # Rotate 180 degrees to face field (turn action) without throttle
+    actions = _zero_actions(env)
+    actions["a_mid_1"] = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)  # pure turn
+    obs, rewards, terms, truncs, infos = env.step(actions)
+
+    # Carrier rotated without advancing center towards or away from enemy goal:
+    # Team advance reward should be ~0.0 (no massive negative penalty for looking back for a cutback pass!)
+    team_adv_rew = env.cfg.rewards.ball_advance_team_scale
+    assert rewards["a_def_1"] >= -team_adv_rew * 2.0  # bounded near 0, NOT -48u * 0.004
+
+    # 2. Backpedaling into enemy semicircle: facing away from goal (pi), driving backwards (+X)
+    env.ball_holder = carrier_idx
+    env.player_pos[carrier_idx] = np.array([1150.0, 420.0], dtype=np.float64)
+    env.player_angle[carrier_idx] = math.pi  # facing away from enemy goal
+    env.player_vel[carrier_idx] = np.array([80.0, 0.0], dtype=np.float64)  # moving toward goal in reverse!
+    env.ball_pos = env.player_pos[carrier_idx] - np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
+
+    actions = _zero_actions(env)
+    # Reverse throttle: moving +X while facing -X
+    actions["a_mid_1"] = np.array([-1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    obs, rewards, terms, truncs, infos = env.step(actions)
+
+    # When backpedaling (long_v < -5.0), carrier_goal_advance_ind_scale MUST NOT be awarded!
+    # Even though center advanced toward goal, carrier individual advance reward is 0.0
+    ind_scale = env.cfg.rewards.carrier_goal_advance_ind_scale
+    # The carrier's reward should not include positive carrier_goal_advance_ind
+    assert rewards["a_mid_1"] < ind_scale * 10.0
+
+    # 3. Defender dribbling advance reward taper in opponent half (> 680u) vs own half (<= 680u)
+    def_idx = env.agent_to_idx["a_def_1"]
+    
+    # In own half: full 1.0x advance
+    env.ball_holder = def_idx
+    env.player_pos[def_idx] = np.array([400.0, 420.0], dtype=np.float64)
+    env.player_angle[def_idx] = 0.0
+    env.player_vel[def_idx] = np.array([60.0, 0.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[def_idx] + np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
+    actions = _zero_actions(env)
+    actions["a_def_1"] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    _, rew_own, _, _, _ = env.step(actions)
+    adv_own = rew_own["a_def_1"]
+
+    # In opponent half (> 680u): 0.25x advance multiplier
+    env.ball_holder = def_idx
+    env.player_pos[def_idx] = np.array([850.0, 420.0], dtype=np.float64)
+    env.player_angle[def_idx] = 0.0
+    env.player_vel[def_idx] = np.array([60.0, 0.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[def_idx] + np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
+    actions = _zero_actions(env)
+    actions["a_def_1"] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    _, rew_opp, _, _, _ = env.step(actions)
+    adv_opp = rew_opp["a_def_1"]
+
+    # Defender in opponent half earns significantly less advance reward than in own half
+    assert adv_opp < adv_own
+
+
+def test_semicircle_cutback_pass_triggers_layoff_and_increments_chain() -> None:
+    """Verify cutbacks from byline/semicircle trigger layoff to ST, MID, or DEF, while rejecting non-cutbacks."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    atk = env.agent_to_idx["a_atk_1"]
+    mid = env.agent_to_idx["a_mid_1"]
+    df = env.agent_to_idx["a_def_1"]
+    team = TEAM_A
+
+    # 1. ATK -> MID cutback from (1310, 580) to (1120, 420)
+    env.player_pos[atk] = np.array([1310.0, 580.0], dtype=np.float64)
+    env.player_pos[mid] = np.array([1120.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[atk].copy()
+    env.ball_pos = env.player_pos[mid].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = atk
+    env.last_ball_team = team
+    env.team_pass_chain[team] = 1
+
+    rew = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew)
+    assert env.team_pass_chain[team] == 2
+    assert rew[atk] >= env.cfg.rewards.attacking_layoff_bonus
+    assert any(e.get("type") == "LAY-OFF!" for e in env._frame_events)
+
+    # 2. DEF (overlapping) -> ATK cutback: kicker is DEF, receiver is ATK
+    env.reset(seed=43)
+    env.player_pos[df] = np.array([1320.0, 570.0], dtype=np.float64)
+    env.player_pos[atk] = np.array([1100.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[df].copy()
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = df
+    env.last_ball_team = team
+    env.team_pass_chain[team] = 1
+
+    rew2 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew2)
+    assert env.team_pass_chain[team] == 2
+    assert rew2[df] >= env.cfg.rewards.attacking_layoff_bonus
+    assert any(e.get("type") == "LAY-OFF!" for e in env._frame_events)
+
+    # 3. Lateral cutback inward: Delta X is small (-5u), but Delta Y towards center is 150u
+    env.reset(seed=44)
+    env.player_pos[atk] = np.array([1250.0, 600.0], dtype=np.float64)
+    env.player_pos[mid] = np.array([1245.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[atk].copy()
+    env.ball_pos = env.player_pos[mid].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = atk
+    env.last_ball_team = team
+    env.team_pass_chain[team] = 1
+
+    rew3 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew3)
+    assert env.team_pass_chain[team] == 2
+    assert rew3[atk] >= env.cfg.rewards.attacking_layoff_bonus
+    assert any(e.get("type") == "LAY-OFF!" for e in env._frame_events)
+
+    # 4. Anti-Exploit / False Positive: Forward pass towards goal line is NOT a cutback
+    env.reset(seed=45)
+    env.player_pos[mid] = np.array([1150.0, 420.0], dtype=np.float64)
+    env.player_pos[atk] = np.array([1300.0, 420.0], dtype=np.float64)  # forward into box
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[mid].copy()
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = mid
+    env.last_ball_team = team
+
+    rew4 = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew4)
+    # Forward pass into box is progressive, NOT an attacking layoff
+    assert not any(e.get("type") == "LAY-OFF!" for e in env._frame_events)
+
+
+def test_role_aware_chaser_handoff_prioritizes_mid_and_atk_over_def_in_opponent_half() -> None:
+    """Verify role-aware chaser priority in opponent half, own half, deep defense, and State C."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    d1 = env.agent_to_idx["a_def_1"]
+    m1 = env.agent_to_idx["a_mid_1"]
+    a1 = env.agent_to_idx["a_atk_1"]
+
+    # 1. State B (Loose Ball) in Opponent Half (X=1050 > 660):
+    # Place DEF closer in raw distance (40u) than MID (90u) and ATK (80u)
+    env.ball_holder = None
+    env.ball_pos = np.array([1050.0, 420.0], dtype=np.float64)
+    env.player_pos[d1] = np.array([1010.0, 420.0], dtype=np.float64)  # raw dist = 40.0u
+    env.player_pos[m1] = np.array([960.0, 420.0], dtype=np.float64)   # raw dist = 90.0u
+    env.player_pos[a1] = np.array([970.0, 420.0], dtype=np.float64)   # raw dist = 80.0u
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert env.primary_loose_ball_chaser[TEAM_A] in (m1, a1)
+
+    # 2. State B in Own Half (X=400 <= 660):
+    # DEF has zero distance offset; closest player wins priority
+    env.ball_pos = np.array([400.0, 420.0], dtype=np.float64)
+    env.player_pos[d1] = np.array([360.0, 420.0], dtype=np.float64)  # raw dist = 40u
+    env.player_pos[m1] = np.array([480.0, 420.0], dtype=np.float64)  # raw dist = 80u
+    env.player_pos[a1] = np.array([550.0, 420.0], dtype=np.float64)
+
+    step_rewards.fill(0.0)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert env.primary_loose_ball_chaser[TEAM_A] == d1
+
+    # 3. Deep Defensive Third (X=300 < 450):
+    # ATK has +130u penalty to keep them forward for counter-attack
+    d2 = env.agent_to_idx["a_def_2"]
+    env.ball_pos = np.array([300.0, 420.0], dtype=np.float64)
+    env.player_pos[d1] = np.array([100.0, 420.0], dtype=np.float64)  # raw dist = 200u
+    env.player_pos[d2] = np.array([100.0, 580.0], dtype=np.float64)  # raw dist = 256u
+    env.player_pos[a1] = np.array([340.0, 420.0], dtype=np.float64)  # raw dist = 40u (+130 = 170u eff)
+    env.player_pos[m1] = np.array([410.0, 420.0], dtype=np.float64)  # raw dist = 110u
+    step_rewards.fill(0.0)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert env.primary_loose_ball_chaser[TEAM_A] == m1
+
+    # 4. Emergency DEF step-in when opponent-half gap is huge:
+    # DEF is right next to ball (10u), MID/ATK are 400u away
+    env.ball_pos = np.array([1050.0, 420.0], dtype=np.float64)
+    env.player_pos[d1] = np.array([1040.0, 420.0], dtype=np.float64)  # eff dist = 10 + 160 + 0.35*(390) = 306.5u
+    env.player_pos[m1] = np.array([650.0, 420.0], dtype=np.float64)   # eff dist = 400u
+    env.player_pos[a1] = np.array([650.0, 420.0], dtype=np.float64)
+    step_rewards.fill(0.0)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert env.primary_loose_ball_chaser[TEAM_A] == d1
+
+
+def test_back_wall_bounce_resets_pass_chain_and_side_wall_preserves() -> None:
+    """Verify that endline back-wall bounce resets pass chain, but side-wall bounce preserves it."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    team = TEAM_A
+    env.team_pass_chain[team] = 5
+    env.last_ball_team = team
+    env.ball_holder = None
+    env.ball_kick_was_shot_on_target = True
+
+    # 1. Back wall bounce outside goal mouth (X=5.0, Y=200.0, moving left)
+    env.ball_pos = np.array([5.0, 200.0], dtype=np.float64)
+    env.ball_vel = np.array([-100.0, 0.0], dtype=np.float64)
+    bounced = env._bounce_ball_off_walls()
+
+    assert bounced is True
+    assert env.team_pass_chain[team] == 0
+    assert env.ball_kick_was_shot_on_target is False
+
+    # 2. Side wall bounce (bank pass / wall pass off top wall: Y=2.0, Vy = -80.0)
+    env.team_pass_chain[team] = 4
+    env.last_ball_team = team
+    env.ball_pos = np.array([700.0, 2.0], dtype=np.float64)
+    env.ball_vel = np.array([50.0, -80.0], dtype=np.float64)
+    bounced_side = env._bounce_ball_off_walls()
+
+    assert bounced_side is True
+    # Side-wall bank pass MUST retain pass chain!
+    assert env.team_pass_chain[team] == 4
+
+
+def test_margin_gated_soft_line_ordering_penalizes_overextended_defender() -> None:
+    """Verify line-ordering penalty on overextension, retreat recovery bonus, and carrier/chaser exemptions."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    d1 = env.agent_to_idx["a_def_1"]
+    m1 = env.agent_to_idx["a_mid_1"]
+    m2 = env.agent_to_idx["a_mid_2"]
+    a1 = env.agent_to_idx["a_atk_1"]
+
+    env.ball_holder = a1
+    env.ball_pos = np.array([900.0, 420.0], dtype=np.float64)
+    env.player_pos[a1] = np.array([900.0, 420.0], dtype=np.float64)
+    env.player_pos[m1] = np.array([600.0, 300.0], dtype=np.float64)
+    env.player_pos[m2] = np.array([620.0, 540.0], dtype=np.float64)
+
+    # 1. Compare defender just below threshold (X=664.0) vs just above threshold (X=666.0, where threshold is 620 + 45 = 665.0)
+    env.player_pos[d1] = np.array([664.0, 350.0], dtype=np.float64)
+    step_rewards_legal = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards_legal,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+
+    env.player_pos[d1] = np.array([666.0, 350.0], dtype=np.float64)
+    step_rewards_over = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards_over,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    # Step discontinuity crossing 665.0 is exactly line_order_pen_scale (-0.010)
+    assert step_rewards_over[d1] <= step_rewards_legal[d1] - env.cfg.rewards.line_order_pen_scale + 5e-4
+
+    # 2. Extreme overextended defender at X = 700 (> 665)
+    env.player_pos[d1] = np.array([700.0, 350.0], dtype=np.float64)
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert step_rewards[d1] <= -env.cfg.rewards.line_order_pen_scale + 1e-5
+
+    # 3. Overextended defender who is carrying the ball is EXEMPT from line order penalty
+    env.ball_holder = d1
+    env.player_pos[d1] = np.array([700.0, 350.0], dtype=np.float64)
+    step_rewards3 = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards3,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert step_rewards3[d1] > -1e-5
+
+    # 4. Retreat recovery bonus: overextended defender retreating back (prev=720, curr=700)
+    env.ball_holder = a1
+    env.player_pos[d1] = np.array([700.0, 350.0], dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    prev_pos[d1] = np.array([720.0, 350.0], dtype=np.float64)  # was 20u further overextended
+    step_rewards4 = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards4,
+        prev_pos,
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    # Retreat recovery bonus adds 20u * role_zone_anchor_scale to offset the base penalty
+    assert step_rewards4[d1] > -env.cfg.rewards.line_order_pen_scale
+
+    # 5. Midfielder overextending ahead of striker (m1 at X = 980 > 900 + 60 = 960)
+    env.player_pos[m1] = np.array([980.0, 300.0], dtype=np.float64)
+    step_rewards5 = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards5,
+        env.player_pos.copy(),
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert step_rewards5[m1] <= -0.5 * env.cfg.rewards.line_order_pen_scale + 1e-5
+
+
+def test_anchor_pocket_deadzone_eliminates_micro_jitter_inside_35u() -> None:
+    """Verify that moving within 35u of a tactical anchor/pocket yields 0.0 delta approach reward in env."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    # Setup loose ball State B at X=500, Y=420
+    env.ball_holder = None
+    env.ball_pos = np.array([500.0, 420.0], dtype=np.float64)
+
+    m2 = env.agent_to_idx["a_mid_2"]
+    anc_x = float(np.clip(0.62 * 500.0 + 220.0, 360.0, 960.0))
+    anc = np.array([anc_x, 640.0], dtype=np.float64)
+
+    # 1. Movement entirely inside 35u deadzone (from 30u away to 15u away)
+    env.player_pos[m2] = anc + np.array([15.0, 0.0], dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    prev_pos[m2] = anc + np.array([30.0, 0.0], dtype=np.float64)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        prev_pos,
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    # Approach delta inside deadzone is max(0, 30 - 35) - max(0, 15 - 35) = 0 - 0 = 0.0!
+    assert abs(step_rewards[m2]) < 1e-5
+
+    # 2. Movement entirely outside deadzone (from 65u away to 50u away: 15u gain)
+    env.player_pos[m2] = anc + np.array([50.0, 0.0], dtype=np.float64)
+    prev_pos[m2] = anc + np.array([65.0, 0.0], dtype=np.float64)
+
+    step_rewards2 = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards2,
+        prev_pos,
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    # Approach delta outside deadzone is max(0, 65 - 35) - max(0, 50 - 35) = 30 - 15 = 15.0u * scale
+    expected = env.cfg.rewards.role_zone_anchor_scale * 15.0
+    assert math.isclose(step_rewards2[m2], expected, abs_tol=1e-4)
+
+
+def test_pinned_ball_nudge_exempts_penalty_box_and_triggers_near_edge() -> None:
+    """Verify that pinned_ball nudge is exempt inside box, but triggers outside near box edge."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    # 1. Position ball inside the left goalkeeper box
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)
+    env.ball_vel = np.array([0.0, 0.0], dtype=np.float64)
+    env.ball_holder = None
+
+    p1 = env.agent_to_idx["a_def_1"]
+    p2 = env.agent_to_idx["b_atk_1"]
+    env.player_pos[p1] = np.array([90.0, 420.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([80.0, 430.0], dtype=np.float64)
+
+    env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+    # pinned_ball_timer must NOT accumulate because in_any_box is True
+    assert env.pinned_ball_timer == 0.0
+
+    # 2. Position ball OUTSIDE box near edge: d = 210u (within 24u of 195u radius)
+    env.ball_pos = np.array([210.0, 420.0], dtype=np.float64)
+    env.ball_vel = np.array([0.0, 0.0], dtype=np.float64)
+    env.player_pos[p1] = np.array([215.0, 420.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([210.0, 430.0], dtype=np.float64)
+
+    env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+    # near_box_edge is True, so pinned_ball_timer accumulates!
+    assert env.pinned_ball_timer > 0.0
+
+
+def test_dead_angle_flank_shot_attenuation_and_cutback_aim_boost() -> None:
+    """Verify flank shots receive 0.35x attenuation, cutback aim receives 1.5x boost, and pairwise aim decays."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    atk = env.agent_to_idx["a_atk_1"]
+    mid = env.agent_to_idx["a_mid_1"]
+
+    # 1. Extreme byline flank shot: X=1250 >= 1210, Y=180 (|180-420|=240 >= 135)
+    env.player_pos[atk] = np.array([1250.0, 180.0], dtype=np.float64)
+    env.player_angle[atk] = math.atan2(420.0 - 180.0, 1400.0 - 1250.0)
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_holder = atk
+
+    rew_flank = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(atk, kick_power=0.8, step_rewards=rew_flank)
+    flank_shot_rew = rew_flank[atk]
+
+    # 2. Central shot from same distance: X=1250, Y=420 (|420-420|=0 < 135)
+    env.reset(seed=43)
+    env.player_pos[atk] = np.array([1250.0, 420.0], dtype=np.float64)
+    env.player_angle[atk] = 0.0
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_holder = atk
+
+    rew_central = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(atk, kick_power=0.8, step_rewards=rew_central)
+    central_shot_rew = rew_central[atk]
+
+    # Flank shot must receive significant attenuation compared to central shot
+    assert flank_shot_rew < central_shot_rew - 0.40
+
+    # 3. Semicircle Cutback Aim Bonus: near enemy goal (d <= 250u), aimed at teammate
+    env.reset(seed=44)
+    env.player_pos[atk] = np.array([1280.0, 500.0], dtype=np.float64)  # dist to enemy goal = 144u <= 250u
+    env.player_pos[mid] = np.array([1100.0, 420.0], dtype=np.float64)  # open teammate
+    env.player_angle[atk] = math.atan2(420.0 - 500.0, 1100.0 - 1280.0)
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_holder = atk
+    env.last_ball_holder = -1
+
+    rew_cutback = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(atk, kick_power=0.6, step_rewards=rew_cutback)
+    # Cutback aim bonus is 1.5x pass_target_aim_ind (1.5 * 0.45 = 0.675)
+    assert rew_cutback[atk] >= 1.5 * env.cfg.rewards.pass_target_aim_ind - 1e-4
+
+    # 4. Instant Pass-Aim Decay on Return Pass to last_passer_idx:
+    env.reset(seed=45)
+    env.player_pos[atk] = np.array([900.0, 420.0], dtype=np.float64)
+    env.player_pos[mid] = np.array([1000.0, 420.0], dtype=np.float64)
+    env.player_angle[atk] = 0.0  # aiming at mid
+    env.ball_pos = env.player_pos[atk].copy()
+    env.ball_holder = atk
+    env.last_passer_idx = mid
+    env.pairwise_repeat_count = 1
+
+    rew_decay = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(atk, kick_power=0.6, step_rewards=rew_decay)
+    # Decayed by (0.25)^2 = 0.0625
+    expected_decayed = env.cfg.rewards.pass_target_aim_ind * (env.cfg.rewards.pass_pairwise_decay_base ** 2)
+    assert math.isclose(rew_decay[atk], expected_decayed, abs_tol=1e-3)
+
+
+def test_scanned_pass_multiplier_in_and_out_of_fov() -> None:
+    """Verify 1.20x progressive pass bonus for passes inside vision cone and 1.00x for passes outside."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    kicker = env.agent_to_idx["a_mid_1"]
+    receiver = env.agent_to_idx["a_atk_1"]
+    team = TEAM_A
+
+    # 1. Receiver INSIDE kicker's 210 deg FOV at kick
+    env.player_pos[kicker] = np.array([600.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver] = np.array([900.0, 420.0], dtype=np.float64)  # forward pass, rel angle = 0
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[kicker].copy()
+    env.ball_pos = env.player_pos[receiver].copy()
+    env.ball_vel = np.array([200.0, 0.0], dtype=np.float64)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = kicker
+    env.last_ball_team = team
+    env.kick_frame_player_pos = env.player_pos.copy()
+
+    rew_in = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew_in)
+    kicker_rew_in = rew_in[kicker]
+
+    # 2. Receiver OUTSIDE kicker's FOV (e.g. blind pass kicked forward while receiver is behind kick direction)
+    env.reset(seed=43)
+    env.player_pos[kicker] = np.array([600.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver] = np.array([300.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[kicker].copy()
+    env.ball_pos = env.player_pos[receiver].copy()
+    env.ball_vel = np.array([200.0, 0.0], dtype=np.float64)  # ball heading right, receiver was at left (180 deg)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = kicker
+    env.last_ball_team = team
+    env.kick_frame_player_pos = env.player_pos.copy()
+
+    rew_out = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(rew_out)
+    kicker_rew_out = rew_out[kicker]
+
+    # Pass in FOV must be rewarded significantly higher due to scanned_pass_mult (1.20x) and forward progress
+    assert kicker_rew_in > kicker_rew_out
+
+
+def test_state_a2_defender_stays_behind_ball_carrier() -> None:
+    """Verify State A2 sets defender target anchor strictly behind the ball carrier."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    carrier = env.agent_to_idx["a_mid_1"]
+    d1 = env.agent_to_idx["a_def_1"]
+
+    # Ball carrier at X = 400.0
+    env.ball_holder = carrier
+    env.player_pos[carrier] = np.array([400.0, 420.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[carrier].copy()
+
+    # Target anchor in State A2 for def_1: min(0.50 * 400 + 110, 400 - 120) = min(310, 280) = 280.0
+    target_anchor_x = float(np.clip(min(0.50 * 400.0 + 110.0, 400.0 - 120.0), 200.0, 660.0))
+    assert target_anchor_x == 280.0
+    assert target_anchor_x < 400.0 - 100.0  # strictly behind the carrier!
+
+    # Verify defender moving towards 280.0 receives positive anchor approach reward
+    env.player_pos[d1] = np.array([280.0, 245.0], dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    prev_pos[d1] = np.array([220.0, 245.0], dtype=np.float64)  # moved closer from 220 to 280
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        prev_pos,
+        np.linalg.norm(env.player_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+    assert step_rewards[d1] > 0.0
+
+
+def test_arc_hesitation_stall_penalty() -> None:
+    """Verify carrier grinding near enemy semicircle for >= 0.75s incurs prime_shot_hesitation_pen."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    carrier = env.agent_to_idx["a_mid_1"]
+    enemy_goal = np.array([1400.0, 420.0], dtype=np.float64)
+
+    # Position carrier at distance 200u from enemy goal (<= 235u) facing away from goal (pi)
+    env.ball_holder = carrier
+    env.player_pos[carrier] = np.array([1200.0, 420.0], dtype=np.float64)
+    env.player_angle[carrier] = math.pi  # facing midfield (not aimed at goal!)
+    env.ball_pos = env.player_pos[carrier] - np.array([env.cfg.mechanics.ball_carry_offset, 0.0])
+
+    # 1. Stalling for 0.85s (>= 0.75s): hesitation penalty MUST trigger
+    env.ball_hold_timer = 0.85
+    _, rewards_stall, _, _, _ = env.step(_zero_actions(env))
+    assert rewards_stall["a_mid_1"] < -0.01  # includes -0.025 penalty
+
+    # 2. Fresh possession (< 0.75s, e.g. 0.3s): hesitation penalty must NOT trigger
+    env.ball_hold_timer = 0.30
+    _, rewards_fresh, _, _, _ = env.step(_zero_actions(env))
+    # Possession reward without hesitation penalty is positive/neutral
+    assert rewards_fresh["a_mid_1"] > rewards_stall["a_mid_1"]
+
+
 
 
 

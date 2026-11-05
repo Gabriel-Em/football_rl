@@ -338,3 +338,37 @@ def test_real_saved_replay_render() -> None:
         surf_save = viz.render_frame()
         assert isinstance(surf_save, pygame.Surface)
 
+
+def test_software_cursor_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that _draw_cursor renders cleanly in standard, player hover, and scrubber hover states."""
+    data = _create_mock_replay_data()
+    viz = ReplayViewer(data, headless=True)
+
+    # 1. In headless, _draw_cursor is safely callable and returns without crashing
+    viz._draw_cursor()
+
+    # 2. Simulate mouse within window and call drawing directly
+    viz.headless = False
+    viz.screen = pygame.Surface((viz.win_w, viz.win_h))
+    monkeypatch.setattr(pygame.mouse, "get_focused", lambda: True)
+
+    # Standard arrow cursor test (in margin)
+    monkeypatch.setattr(pygame.mouse, "get_pos", lambda: (10, 10))
+    viz._draw_cursor()
+    assert isinstance(viz.screen, pygame.Surface)
+
+    # Hovering over scrubber bar
+    bar_x = viz.margin_x
+    bar_y = viz.hud_height + viz.disp_field_h + 12
+    monkeypatch.setattr(pygame.mouse, "get_pos", lambda: (bar_x + 50, bar_y + 5))
+    viz._draw_cursor()
+    assert isinstance(viz.screen, pygame.Surface)
+
+    # Hovering over player on field
+    viz.player_screen_positions = [(viz.margin_x + 100, viz.hud_height + 100)]
+    monkeypatch.setattr(pygame.mouse, "get_pos", lambda: (viz.margin_x + 100, viz.hud_height + 100))
+    viz._draw_cursor()
+    assert isinstance(viz.screen, pygame.Surface)
+
+
+
