@@ -67,6 +67,7 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "WALL PASS!": (95, 230, 255),
     "LAY-OFF!": (120, 240, 200),
     "ESCAPE PRESS!": (140, 230, 255),
+    "BALL WON!": (100, 240, 180),
     "TACKLE!": (255, 175, 65),
     "TACKLE FAILED!": (255, 130, 130),
     "AIR TACKLE!": (255, 70, 70),

@@ -201,6 +201,7 @@ class FootballParallelEnv(ParallelEnv):
         self.is_wall_pass_in_flight: bool = False
         self.pinned_ball_timer: float = 0.0
         self.kickoff_protection_timer: float = 0.0
+        self.pickup_tackle_grace_timer: float = 0.0
         self.prev_longitudinal_vel: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.prev_ball_x: float = 700.0
         self.step_external_push: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
@@ -381,6 +382,7 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_kick_flight_timer = 0.0
         self.pinned_ball_timer = 0.0
         self.kickoff_protection_timer = 0.0
+        self.pickup_tackle_grace_timer = 0.0
         self.prev_longitudinal_vel[:] = 0.0
         self.step_external_push.fill(0.0)
         self.prev_ball_at_step_start = self.ball_pos.copy()
@@ -663,6 +665,7 @@ class FootballParallelEnv(ParallelEnv):
         self.shot_on_target_cd = np.maximum(0.0, self.shot_on_target_cd - dt)
         self.popup_cooldown = np.maximum(0.0, self.popup_cooldown - dt)
         self.kickoff_protection_timer = max(0.0, self.kickoff_protection_timer - dt)
+        self.pickup_tackle_grace_timer = max(0.0, self.pickup_tackle_grace_timer - dt)
 
         # Clear tracking flags when cooldown naturally expires
         expired_mask = self.pickup_cooldown <= 0.0
@@ -1111,6 +1114,7 @@ class FootballParallelEnv(ParallelEnv):
     ) -> None:
         """Launch the ball from kicker with role-specific speed & jitter, check shot-on-target, and apply cooldown."""
         self.kickoff_protection_timer = 0.0
+        self.pickup_tackle_grace_timer = 0.0
         phys = self.cfg.physics
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
@@ -1289,7 +1293,7 @@ class FootballParallelEnv(ParallelEnv):
                     reward=near_sot_rew + near_team_sot_rew,
                 )
 
-        # Keeper distribution / clearance forward bonus
+        # Keeper distribution / clearance forward bonus (gated by pass corridor clearance)
         if step_rewards is not None and kicker_role == ROLE_KEEPER:
             cos_fwd = (
                 float(facing_vec[0])
@@ -1297,20 +1301,36 @@ class FootballParallelEnv(ParallelEnv):
                 else float(-facing_vec[0])
             )
             if cos_fwd > 0.25:
-                aim_bonus = 1.0
-                for j in range(self.num_players):
-                    if j != kicker_idx and self.player_team[j] == kicker_team:
-                        to_tm = self.player_pos[j] - self.player_pos[kicker_idx]
-                        d_tm = float(np.linalg.norm(to_tm))
-                        if d_tm > 40.0 and float(np.dot(facing_vec, to_tm / d_tm)) >= 0.85:
-                            aim_bonus = 1.5
+                opp_team = 1 - kicker_team
+                opp_indices = [idx for idx in range(self.num_players) if self.player_team[idx] == opp_team]
+                corridor_blocked = False
+                for opp_idx in opp_indices:
+                    to_opp = self.player_pos[opp_idx] - self.ball_pos
+                    proj = float(np.dot(to_opp, kick_vec))
+                    if 0.0 < proj <= mech.keeper_clear_corridor_length:
+                        perp_dist = math.hypot(
+                            to_opp[0] - proj * kick_vec[0],
+                            to_opp[1] - proj * kick_vec[1],
+                        )
+                        if perp_dist <= mech.keeper_clear_corridor_half_width:
+                            corridor_blocked = True
                             break
-                step_rewards[kicker_idx] += (
-                    rew.keeper_clear_forward_ind
-                    * cos_fwd
-                    * (0.5 + 0.5 * power_norm)
-                    * aim_bonus
-                )
+
+                if not corridor_blocked:
+                    aim_bonus = 1.0
+                    for j in range(self.num_players):
+                        if j != kicker_idx and self.player_team[j] == kicker_team:
+                            to_tm = self.player_pos[j] - self.player_pos[kicker_idx]
+                            d_tm = float(np.linalg.norm(to_tm))
+                            if d_tm > 40.0 and float(np.dot(facing_vec, to_tm / d_tm)) >= 0.85:
+                                aim_bonus = 1.5
+                                break
+                    step_rewards[kicker_idx] += (
+                        rew.keeper_clear_forward_ind
+                        * cos_fwd
+                        * (0.5 + 0.5 * power_norm)
+                        * aim_bonus
+                    )
 
         # Immediate Kick-Direction Evaluation (for all players when step_rewards is not None)
         if step_rewards is not None:
@@ -1400,7 +1420,7 @@ class FootballParallelEnv(ParallelEnv):
 
     def _attempt_tackle(self, tackler_idx: int, step_rewards: np.ndarray) -> None:
         """Execute kinematic lunge and dynamic distance-based tackle check when action[3] > 0.5."""
-        if self.kickoff_protection_timer > 0.0:
+        if self.kickoff_protection_timer > 0.0 or self.pickup_tackle_grace_timer > 0.0:
             return
 
         mech = self.cfg.mechanics
@@ -1650,6 +1670,7 @@ class FootballParallelEnv(ParallelEnv):
 
         self._on_new_player_touched_ball(new_holder)
 
+        is_teammate_pass = False
         max_flight = (
             mech.max_wall_pass_flight_time
             if self.is_wall_pass_in_flight
@@ -1662,10 +1683,12 @@ class FootballParallelEnv(ParallelEnv):
         ):
             kicker_idx = self.last_ball_holder
             kicker_team = int(self.last_ball_team) if self.last_ball_team is not None else new_team
+            kicker_role = int(self.player_role[kicker_idx])
             kick_travel_dist = float(np.linalg.norm(self.ball_pos - self.ball_kick_origin))
             is_wall_pass = bool(self.is_wall_pass_in_flight and self.ball_wall_bounces == 1)
 
             if new_team == kicker_team and new_holder != kicker_idx:
+                is_teammate_pass = True
                 step_rewards[new_holder] += rew.first_touch_reception_bonus
                 min_dist = mech.min_wall_pass_distance if is_wall_pass else mech.min_pass_distance
                 if kick_travel_dist >= min_dist:
@@ -1893,7 +1916,27 @@ class FootballParallelEnv(ParallelEnv):
                 )
 
                 if not is_real_save:
-                    step_rewards[kicker_idx] += rew.intercepted_kicker_ind
+                    if kicker_role == ROLE_KEEPER:
+                        c_rx_pos, _, _ = self._to_team_canonical(
+                            self.player_pos[new_holder : new_holder + 1],
+                            np.zeros((1, 2)),
+                            0.0,
+                            kicker_team,
+                        )
+                        c_rx_x = float(c_rx_pos[0, 0])
+                        if c_rx_x <= 200.0:
+                            gk_turnover_pen = rew.keeper_deep_turnover_pen
+                        elif c_rx_x >= 700.0:
+                            gk_turnover_pen = rew.intercepted_kicker_ind
+                        else:
+                            ratio = (c_rx_x - 200.0) / 500.0
+                            gk_turnover_pen = (
+                                rew.keeper_deep_turnover_pen
+                                + (rew.intercepted_kicker_ind - rew.keeper_deep_turnover_pen) * ratio
+                            )
+                        step_rewards[kicker_idx] += gk_turnover_pen
+                    else:
+                        step_rewards[kicker_idx] += rew.intercepted_kicker_ind
                     self._add_team_reward(step_rewards, kicker_team, rew.intercepted_team)
                     self.stats["interceptions"] += 1
 
@@ -1937,11 +1980,31 @@ class FootballParallelEnv(ParallelEnv):
             if new_role == ROLE_KEEPER:
                 step_rewards[new_holder] += rew.keeper_box_recovery_ind
 
+            # Contested loose-ball recovery bonus: if an opponent is within contested_ball_distance
+            opp_team = 1 - new_team
+            opp_indices = [i for i in range(self.num_players) if self.player_team[i] == opp_team]
+            if opp_indices:
+                opp_dists = np.linalg.norm(
+                    self.player_pos[opp_indices] - self.ball_pos[None, :],
+                    axis=1,
+                )
+                if float(np.min(opp_dists)) <= mech.contested_ball_distance:
+                    step_rewards[new_holder] += rew.contested_ball_recovery_bonus
+                    self._emit_event(
+                        "BALL WON!",
+                        self.player_pos[new_holder],
+                        team=new_team,
+                        agent=self.idx_to_agent[new_holder],
+                        reward=rew.loose_ball_pickup_ind + rew.contested_ball_recovery_bonus,
+                    )
+
         # Assign possession to new_holder
         self.ball_holder = new_holder
         self.ball_hold_timer = 0.0
         self.box_loose_ball_timer = 0.0
         self.kick_grace_timer = mech.pickup_kick_grace
+        if not is_teammate_pass:
+            self.pickup_tackle_grace_timer = mech.pickup_tackle_grace
         self.last_ball_holder = new_holder
         self.last_ball_team = new_team
         self.ball_kicked_in_flight = False
@@ -2350,6 +2413,7 @@ class FootballParallelEnv(ParallelEnv):
         self.is_wall_pass_in_flight = False
         self.pinned_ball_timer = 0.0
         self.kickoff_protection_timer = 0.0
+        self.pickup_tackle_grace_timer = 0.0
         self.prev_longitudinal_vel[:] = 0.0
         self.step_external_push.fill(0.0)
         self.prev_ball_at_step_start = self.ball_pos.copy()

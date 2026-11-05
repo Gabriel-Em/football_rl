@@ -116,7 +116,9 @@ class MechanicsConfig:
     pickup_distance: float = 28.0     # player_radius (18.0) + ball_radius (10.0)
     ball_carry_offset: float = 24.0   # player_pos + facing_vec * 24.0
     kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
-    pickup_kick_grace: float = 0.25   # Minimum hold duration (s) after picking up ball before kick can trigger
+    pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
+    pickup_tackle_grace: float = 0.35 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
+    contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
     min_pass_distance: float = 38.0   # Minimum kick travel distance to count as a Completed Pass (allows short GK & CB distributions)
 
@@ -160,6 +162,8 @@ class MechanicsConfig:
     lunge_cooldown: float = 1.8
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
+    keeper_clear_corridor_length: float = 220.0   # Forward corridor distance (u) to check for blocking opponents
+    keeper_clear_corridor_half_width: float = 38.0 # Corridor half-width (u) around GK kick trajectory
 
     # Hold Rules & Violation Penalties
     field_max_hold_time: float = 5.0
@@ -264,6 +268,7 @@ class RewardConfig:
 
     # Shot / Pass Intercepted by Opponent
     intercepted_kicker_ind: float = -0.8
+    keeper_deep_turnover_pen: float = -2.0      # Dangerous GK turnover inside own defensive third (interpolates to -0.8 at midfield)
     intercepted_team: float = -0.2
 
     # Tackle Outcomes
@@ -278,6 +283,7 @@ class RewardConfig:
 
     # Loose Ball Recovery
     loose_ball_pickup_ind: float = 0.5
+    contested_ball_recovery_bonus: float = 0.40  # Bonus when securing a loose ball contested by nearby opponents (<=65u)
     loose_ball_pickup_team: float = 0.15
     first_touch_reception_bonus: float = 0.35  # Discrete bonus when cleanly receiving a pass in flight within 55u
     keeper_box_recovery_ind: float = 1.2    # Bonus when GK picks up loose ball in own semicircle

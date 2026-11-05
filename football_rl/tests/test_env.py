@@ -2543,6 +2543,182 @@ def test_loose_ball_proximity_pull() -> None:
     assert step_rewards[3] > 0.005, f"Expected proximity reward > 0.005, got {step_rewards[3]}"
 
 
+def test_contested_ball_recovery_and_pickup_tackle_grace() -> None:
+    """Verify that recovering a contested loose ball awards the contested bonus and grants tackle immunity."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+
+    p_red = env.agent_to_idx["a_mid_1"]
+    p_blue = env.agent_to_idx["b_mid_1"]
+
+    # Place loose ball at (700, 400)
+    # Red is within pickup range (dist = 15 <= 28)
+    # Blue is within contested range (dist to ball = 45 <= 65)
+    env.ball_pos = np.array([700.0, 400.0], dtype=np.float64)
+    env.ball_vel = np.array([0.0, 0.0], dtype=np.float64)
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.pickup_cooldown[:] = 0.0
+    env.stun_timer[:] = 0.0
+
+    env.player_pos[p_red] = np.array([715.0, 400.0], dtype=np.float64)
+    env.player_pos[p_blue] = np.array([745.0, 400.0], dtype=np.float64)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    # 1. Red should win the ball, get pickup reward + team pickup reward + contested recovery bonus (+0.5 + 0.15 + 0.4 = +1.05)
+    assert env.ball_holder == p_red
+    expected_red_rew = (
+        env.cfg.rewards.loose_ball_pickup_ind
+        + env.cfg.rewards.loose_ball_pickup_team
+        + env.cfg.rewards.contested_ball_recovery_bonus
+    )
+    assert math.isclose(step_rewards[p_red], expected_red_rew, rel_tol=1e-5)
+
+    # 2. Pickup tackle grace timer must be set to pickup_tackle_grace (0.35s)
+    assert math.isclose(env.pickup_tackle_grace_timer, env.cfg.mechanics.pickup_tackle_grace, rel_tol=1e-5)
+
+    # 3. Blue attempts immediate tackle during grace period
+    step_rewards.fill(0.0)
+    env._attempt_tackle(p_blue, step_rewards)
+
+    # Tackle must be blocked by grace period: Red retains ball, Red not stunned, Blue not whiff stunned
+    assert env.ball_holder == p_red
+    assert env.stun_timer[p_red] == 0.0
+    assert env.stun_timer[p_blue] == 0.0
+    assert step_rewards[p_blue] == 0.0
+
+    # 4. Once grace expires, Blue can tackle normally
+    env.pickup_tackle_grace_timer = 0.0
+    from unittest.mock import MagicMock
+    mock_rng = MagicMock()
+    mock_rng.random.return_value = 0.0  # Force 100% tackle success
+    orig_rng = env.np_random
+    env.np_random = mock_rng
+
+    step_rewards.fill(0.0)
+    env._attempt_tackle(p_blue, step_rewards)
+
+    assert env.ball_holder == p_blue
+    assert env.stun_timer[p_red] > 0.0
+    assert step_rewards[p_blue] > 0.0
+
+    env.np_random = orig_rng
+
+
+def test_keeper_pass_corridor_blocks_clearance_bonus() -> None:
+    """Verify that keeper_clear_forward_ind is withheld if an opponent stands within the 38u pass corridor."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]  # Side Left, defends X=0, attacks X=1400
+    opp_atk_idx = env.agent_to_idx["b_atk_1"]
+
+    env.player_pos[gk_idx] = np.array([50.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_idx] = 0.0  # Facing directly forward +X
+    env.ball_pos = np.array([74.0, 420.0], dtype=np.float64)
+    env.ball_holder = gk_idx
+
+    # Case 1: Opponent is standing at (180, 420) directly in the corridor (proj = 106u, perp_dist = 0u <= 38u)
+    env.player_pos[opp_atk_idx] = np.array([180.0, 420.0], dtype=np.float64)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(gk_idx, kick_power=0.8, step_rewards=step_rewards)
+
+    # Clearance bonus should be BLOCKED because corridor has opponent
+    assert step_rewards[gk_idx] <= 0.0
+
+    # Case 2: Move opponent outside the corridor to (180, 475) (proj = 106u, perp_dist = 55u > 38u)
+    env.ball_holder = gk_idx
+    env.player_pos[gk_idx] = np.array([50.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_idx] = 0.0
+    env.ball_pos = np.array([74.0, 420.0], dtype=np.float64)
+    env.player_pos[opp_atk_idx] = np.array([180.0, 475.0], dtype=np.float64)
+
+    step_rewards.fill(0.0)
+    env._execute_kick(gk_idx, kick_power=0.8, step_rewards=step_rewards)
+
+    # Clearance bonus should now be awarded (> 0)
+    assert step_rewards[gk_idx] > 0.0
+
+
+def test_keeper_turnover_penalty_gradient() -> None:
+    """Verify that keeper turnovers follow a smooth penalty gradient from -2.0 (own box) to -0.8 (midfield)."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]  # Side Left, kicker_team = 0
+    opp_idx = env.agent_to_idx["b_atk_1"]
+
+    env.last_ball_holder = gk_idx
+    env.last_ball_team = 0
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.ball_kick_origin = np.array([50.0, 420.0], dtype=np.float64)
+    env.ball_kick_was_shot_on_target = False
+
+    # Scenario A: Deep defensive turnover (canonical X = 150 <= 200) -> -2.0
+    env.player_pos[opp_idx] = np.array([150.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([150.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.pickup_cooldown[:] = 0.0
+    env.stun_timer[:] = 0.0
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    # GK should receive full deep turnover penalty (-2.0) + team penalty (-0.2) = -2.2
+    assert math.isclose(
+        step_rewards[gk_idx],
+        env.cfg.rewards.keeper_deep_turnover_pen + env.cfg.rewards.intercepted_team,
+        rel_tol=1e-5,
+    )
+
+    # Scenario B: Midfield turnover (canonical X = 450, halfway between 200 and 700)
+    # Expected penalty: -2.0 + 1.2 * (250/500) = -1.4; with team penalty: -1.6
+    env.last_ball_holder = gk_idx
+    env.last_ball_team = 0
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.ball_kick_was_shot_on_target = False
+    env.player_pos[opp_idx] = np.array([450.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([450.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.pickup_cooldown[:] = 0.0
+    env.stun_timer[:] = 0.0
+
+    step_rewards.fill(0.0)
+    env._check_free_ball_pickup(step_rewards)
+
+    expected_mid_pen = -2.0 + 1.2 * 0.5 + env.cfg.rewards.intercepted_team  # -1.6
+    assert math.isclose(step_rewards[gk_idx], expected_mid_pen, rel_tol=1e-5)
+
+    # Scenario C: Upfield turnover (canonical X = 800 >= 700) -> standard -0.8; with team: -1.0
+    env.last_ball_holder = gk_idx
+    env.last_ball_team = 0
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.ball_kick_was_shot_on_target = False
+    env.player_pos[opp_idx] = np.array([800.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([800.0, 420.0], dtype=np.float64)
+    env.ball_holder = None
+    env.pickup_cooldown[:] = 0.0
+    env.stun_timer[:] = 0.0
+
+    step_rewards.fill(0.0)
+    env._check_free_ball_pickup(step_rewards)
+
+    expected_upfield = env.cfg.rewards.intercepted_kicker_ind + env.cfg.rewards.intercepted_team
+    assert math.isclose(step_rewards[gk_idx], expected_upfield, rel_tol=1e-5)
+
+
+
+
 
 
 
