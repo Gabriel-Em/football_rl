@@ -2375,6 +2375,177 @@ def test_defenders_start_compact_at_kickoff_and_zone_inwards() -> None:
     assert step_rewards[d2_a] >= -1e-6
 
 
+def test_wall_pass_mechanics_and_anti_exploit() -> None:
+    """Verify side-wall bank passes count as completed passes with anti-exploit protections."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42, options={"kickoff_team": TEAM_A})
+
+    p1 = env.agent_to_idx["a_mid_1"]
+    p2 = env.agent_to_idx["a_atk_1"]
+
+    # 1. Valid Side-Wall Bank Pass:
+    # Passer at (500, 100) kicks towards top wall (Y=0)
+    # Receiver at (700, 120) receives the ball after 1 wall bounce
+    env.ball_holder = None
+    env.last_ball_holder = p1
+    env.last_ball_team = TEAM_A
+    env.player_pos[p1] = np.array([500.0, 100.0])
+    env.player_pos[p2] = np.array([700.0, 120.0])
+    env.ball_pos = np.array([500.0, 100.0])
+    env.ball_kick_origin = np.array([500.0, 100.0])
+    env.ball_vel = np.array([200.0, -300.0])  # heading towards top wall Y=0
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.2
+    env.ball_wall_bounces = 0
+    env.is_wall_pass_in_flight = False
+    env.pickup_cooldown[p1] = 1.0
+
+    zero_acts = np.zeros((env.num_players, 4), dtype=np.float32)
+
+    # Simulate physics until ball bounces off top wall
+    for _ in range(30):
+        env._physics_substep(zero_acts, None)
+        if env.ball_wall_bounces > 0:
+            break
+
+    assert env.ball_wall_bounces == 1
+    assert env.is_wall_pass_in_flight is True
+    assert env.ball_kicked_in_flight is True
+
+    # Now ball reaches receiver p2 (distance > 85u from kick origin)
+    env.ball_pos = env.player_pos[p2].copy()
+    step_rew = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rew)
+
+    # Must register as completed pass and WALL PASS!
+    assert env.stats["completed_passes"] == 1
+    assert env.stats["team_passes"][TEAM_A] == 1
+    assert step_rew[p1] >= cfg.rewards.wall_pass_bonus - 1e-5
+    assert any(ev.get("type") == "WALL PASS!" for ev in env._frame_events)
+
+    # 2. Anti-Self-Pass exploit test:
+    # Same player collecting ball off the wall cannot register a pass
+    env._frame_events.clear()
+    env.ball_holder = None
+    env.last_ball_holder = p1
+    env.last_ball_team = TEAM_A
+    env.player_pos[p1] = np.array([500.0, 50.0])
+    env.ball_pos = np.array([500.0, 50.0])
+    env.ball_kick_origin = np.array([500.0, 50.0])
+    env.ball_vel = np.array([0.0, -200.0])
+    env.ball_kicked_in_flight = True
+    env.ball_wall_bounces = 0
+    env.is_wall_pass_in_flight = False
+    env.pickup_cooldown[p1] = 0.5
+
+    for _ in range(20):
+        env._physics_substep(zero_acts, None)
+        if env.ball_wall_bounces > 0:
+            break
+
+    assert env.ball_wall_bounces == 1
+    assert env.is_wall_pass_in_flight is True
+
+    # Same player collects:
+    env.pickup_cooldown[p1] = 0.0
+    prev_completed = env.stats["completed_passes"]
+    step_rew.fill(0.0)
+    env.ball_pos = env.player_pos[p1].copy()
+    env._check_free_ball_pickup(step_rew)
+    assert env.stats["completed_passes"] == prev_completed
+    assert not any(ev.get("type") == "WALL PASS!" for ev in env._frame_events)
+
+    # 3. Back-Wall / Endline test:
+    # Ball hits back wall (X <= 0 or X >= 1400)
+    env.ball_holder = None
+    env.last_ball_holder = p1
+    env.last_ball_team = TEAM_A
+    env.player_pos[p1] = np.array([1300.0, 200.0])
+    env.ball_pos = np.array([1380.0, 200.0])  # Non-goal Y
+    env.ball_vel = np.array([300.0, 0.0])     # Hits X=1400 back wall
+    env.ball_kicked_in_flight = True
+    env.ball_wall_bounces = 0
+    env.is_wall_pass_in_flight = False
+
+    for _ in range(15):
+        env._physics_substep(zero_acts, None)
+        if env.ball_wall_bounces > 0:
+            break
+
+    # Back wall bounce must clear in-flight status
+    assert env.ball_kicked_in_flight is False
+    assert env.is_wall_pass_in_flight is False
+
+
+def test_vision_cone_peripheral_fade() -> None:
+    """Verify smooth peripheral visibility falloff across the outer 15 degrees of the vision cone."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    # Position player 0 at (100, 100) facing canonical angle 0 rad (due right)
+    env.player_pos[0] = np.array([100.0, 100.0], dtype=np.float64)
+    env.player_angle[0] = 0.0
+
+    # 1. Player 1 at 0 degrees (dead center, rel_ang = 0) -> vis_presence == 1.0
+    env.player_pos[1] = np.array([200.0, 100.0], dtype=np.float64)
+    obs = env._build_single_observation(0)
+    slot1_presence = obs[21]
+    assert math.isclose(slot1_presence, 1.0, abs_tol=1e-5)
+
+    # 2. Player 1 at 85 degrees (inside un-faded region <= 90 deg) -> vis_presence == 1.0
+    ang85 = math.radians(85.0)
+    env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang85), 100.0 + 100.0 * math.sin(ang85)], dtype=np.float64)
+    obs = env._build_single_observation(0)
+    assert math.isclose(obs[21], 1.0, abs_tol=1e-5)
+
+    # 3. Player 1 at 97.5 degrees (exact midpoint of fade range 90..105 deg) -> vis_presence == 0.5
+    ang975 = math.radians(97.5)
+    env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang975), 100.0 + 100.0 * math.sin(ang975)], dtype=np.float64)
+    obs = env._build_single_observation(0)
+    assert math.isclose(obs[21], 0.5, abs_tol=1e-4)
+
+    # 4. Player 1 at 106 degrees (outside 105 deg FOV) -> vis_presence == 0.0
+    ang106 = math.radians(106.0)
+    env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang106), 100.0 + 100.0 * math.sin(ang106)], dtype=np.float64)
+    obs = env._build_single_observation(0)
+    assert math.isclose(obs[21], 0.0, abs_tol=1e-5)
+
+
+def test_loose_ball_proximity_pull() -> None:
+    """Verify proximity gravitational pull for stationary ball chasers within 95u."""
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    env.ball_holder = None
+    env.ball_pos = np.array([700.0, 420.0], dtype=np.float64)
+    # Move all other players far away
+    for i in range(12):
+        env.player_pos[i] = np.array([100.0, 100.0], dtype=np.float64)
+
+    # Place player 3 (a_mid_1) at distance 50u from ball
+    env.player_pos[3] = np.array([700.0, 470.0], dtype=np.float64)
+    prev_pos = env.player_pos.copy()
+    env.prev_ball_at_step_start = env.ball_pos.copy()
+
+    step_rewards = np.zeros(12, dtype=np.float64)
+    env._compute_tactical_positioning_rewards(
+        step_rewards,
+        prev_pos,
+        np.linalg.norm(prev_pos - env.ball_pos[None, :], axis=1),
+        any_teleport=False,
+    )
+
+    # Player 3 is primary chaser (rank 0 -> w=1.0) and stationary (active_chase_closed=0.0)
+    # Proximity reward should be active: 0.008 * (1.0 - (50 - 28) / (95 - 28)) = 0.008 * 45/67 ≈ 0.00537
+    assert step_rewards[3] > 0.005, f"Expected proximity reward > 0.005, got {step_rewards[3]}"
+
+
+
+
+
 
 
 

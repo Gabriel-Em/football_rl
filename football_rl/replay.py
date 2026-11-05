@@ -8,7 +8,7 @@ import glob
 import json
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pygame
 
@@ -28,13 +28,13 @@ COLOR_LINE = (235, 240, 245)
 COLOR_GOAL_NET = (190, 200, 210)
 
 # Team A (Red) & Team B (Blue)
-COLOR_TEAM_A = (235, 65, 65)
-COLOR_TEAM_A_DARK = (145, 30, 30)
-COLOR_TEAM_A_CONE = (235, 65, 65, 38)
+COLOR_TEAM_A = (255, 60, 75)
+COLOR_TEAM_A_DARK = (165, 25, 35)
+COLOR_TEAM_A_CONE = (255, 65, 85, 70)
 
-COLOR_TEAM_B = (55, 145, 245)
-COLOR_TEAM_B_DARK = (25, 75, 155)
-COLOR_TEAM_B_CONE = (55, 145, 245, 38)
+COLOR_TEAM_B = (55, 155, 255)
+COLOR_TEAM_B_DARK = (25, 75, 165)
+COLOR_TEAM_B_CONE = (55, 155, 255, 60)
 
 # Role Accents
 COLOR_KEEPER_GOLD = (255, 215, 70)
@@ -64,6 +64,7 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "NEAR SHOT!": (255, 165, 80),
     "PASS!": (125, 245, 130),
     "ONE-TWO!": (100, 255, 180),
+    "WALL PASS!": (95, 230, 255),
     "LAY-OFF!": (120, 240, 200),
     "ESCAPE PRESS!": (140, 230, 255),
     "TACKLE!": (255, 175, 65),
@@ -138,8 +139,10 @@ class ReplayViewer:
         # Playback state
         self.current_frame_idx: int = 0
         self.paused: bool = False
-        self.playback_speed: int = 1
+        self.playback_speed: float = 1.0
+        self.subframe_accumulator: float = 0.0
         self.show_vision_cones: bool = show_vision_cones
+        self.selected_cone_players: Set[int] = set()
         self.show_reward_hud: bool = show_reward_hud
         self.running: bool = True
         self.headless: bool = headless
@@ -148,15 +151,31 @@ class ReplayViewer:
         self.popups: List[FloatingPopup] = []
         self._last_processed_frame: int = -1
 
-        # Pre-index goal and own-goal frames for timeline markers (g_frame, g_team, is_own_goal)
+        # Pre-index timeline markers:
+        # 1. Goal frames: (idx, team, is_own_goal)
+        # 2. Save frames: (idx, team, is_lunge_save)
+        # 3. High-reward (+5.0 or up) other event frames: (idx, team, label, reward)
+        # 4. Foul / violation frames: (idx, team, label)
         self.goal_frames: List[Tuple[int, int, bool]] = []
+        self.save_frames: List[Tuple[int, int, bool]] = []
+        self.high_reward_frames: List[Tuple[int, int, str, float]] = []
+        self.foul_frames: List[Tuple[int, int, str]] = []
+
         for idx, fr in enumerate(self.frames):
             for ev in fr.get("events", []):
-                ev_t = ev.get("type")
+                ev_t = str(ev.get("type", ""))
+                team = int(ev.get("team", -1))
+                rew = ev.get("reward")
+                rew_val = float(rew) if rew is not None else 0.0
+
                 if ev_t in ("GOAL!", "OWN GOAL!"):
-                    self.goal_frames.append(
-                        (idx, int(ev.get("team", -1)), ev_t == "OWN GOAL!")
-                    )
+                    self.goal_frames.append((idx, team, ev_t == "OWN GOAL!"))
+                elif ev_t in ("KEEPER SAVE!", "LUNGE SAVE!") or "SAVE" in ev_t.upper():
+                    self.save_frames.append((idx, team, ev_t == "LUNGE SAVE!"))
+                elif "FOUL" in ev_t.upper() or "VIOLATION" in ev_t.upper():
+                    self.foul_frames.append((idx, team, ev_t))
+                elif rew_val >= 5.0:
+                    self.high_reward_frames.append((idx, team, ev_t, rew_val))
 
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -216,16 +235,66 @@ class ReplayViewer:
                     self.paused = not self.paused
                 elif event.key == pygame.K_v:
                     self.show_vision_cones = not self.show_vision_cones
+                elif event.key == pygame.K_c:
+                    # Toggle between All cones, Selected cone, or OFF
+                    if self.selected_cone_players:
+                        self.selected_cone_players.clear()
+                        self.show_vision_cones = False
+                    else:
+                        self.selected_cone_players.add(0)
+                        self.show_vision_cones = True
+                elif event.key == pygame.K_TAB:
+                    # Cycle through individual players for cone isolation (0..11 -> OFF -> 0)
+                    mods = pygame.key.get_mods()
+                    is_shift = bool(mods & pygame.KMOD_SHIFT)
+                    num_p = len(self.frames[0]["players"]) if self.frames else 12
+                    if not self.selected_cone_players or not self.show_vision_cones:
+                        next_idx = (num_p - 1) if is_shift else 0
+                        self.selected_cone_players = {next_idx}
+                        self.show_vision_cones = True
+                    elif len(self.selected_cone_players) == 1:
+                        curr_p = next(iter(self.selected_cone_players))
+                        if is_shift:
+                            if curr_p == 0:
+                                self.selected_cone_players.clear()
+                                self.show_vision_cones = False
+                            else:
+                                self.selected_cone_players = {curr_p - 1}
+                                self.show_vision_cones = True
+                        else:
+                            if curr_p == num_p - 1:
+                                self.selected_cone_players.clear()
+                                self.show_vision_cones = False
+                            else:
+                                self.selected_cone_players = {curr_p + 1}
+                                self.show_vision_cones = True
+                    else:
+                        self.selected_cone_players.clear()
+                        self.show_vision_cones = False
                 elif event.key == pygame.K_e:
                     self.show_reward_hud = not self.show_reward_hud
                 elif event.key == pygame.K_r:
                     self.seek_to_frame(0)
+                elif event.key in (pygame.K_0, pygame.K_s):
+                    # Toggle slow-mo (0.25x) vs normal speed (1.0x)
+                    if math.isclose(self.playback_speed, 0.25, abs_tol=1e-3):
+                        self.playback_speed = 1.0
+                    else:
+                        self.playback_speed = 0.25
                 elif event.key == pygame.K_1:
-                    self.playback_speed = 1
+                    self.playback_speed = 1.0
                 elif event.key == pygame.K_2:
-                    self.playback_speed = 2
+                    self.playback_speed = 2.0
                 elif event.key == pygame.K_4:
-                    self.playback_speed = 4
+                    self.playback_speed = 4.0
+                elif event.key in (pygame.K_LEFTBRACKET, pygame.K_COMMA):
+                    speeds = [0.25, 0.5, 1.0, 2.0, 4.0]
+                    curr_idx = min(range(len(speeds)), key=lambda i: abs(speeds[i] - self.playback_speed))
+                    self.playback_speed = speeds[max(0, curr_idx - 1)]
+                elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_PERIOD):
+                    speeds = [0.25, 0.5, 1.0, 2.0, 4.0]
+                    curr_idx = min(range(len(speeds)), key=lambda i: abs(speeds[i] - self.playback_speed))
+                    self.playback_speed = speeds[min(len(speeds) - 1, curr_idx + 1)]
                 elif event.key == pygame.K_RIGHT:
                     mods = pygame.key.get_mods()
                     delta = 1 if (mods & pygame.KMOD_SHIFT or self.paused) else self.physics_hz * 5
@@ -234,18 +303,76 @@ class ReplayViewer:
                     mods = pygame.key.get_mods()
                     delta = 1 if (mods & pygame.KMOD_SHIFT or self.paused) else self.physics_hz * 5
                     self.seek_to_frame(self.current_frame_idx - delta)
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            elif event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
                 bar_x = self.margin_x
                 bar_w = self.disp_field_w
                 bar_y = self.hud_height + self.disp_field_h + 12
-                if bar_x <= mx <= bar_x + bar_w and bar_y - 10 <= my <= bar_y + 22:
+                # 1. Left Click on Scrubber Bar -> Seek
+                if event.button == 1 and bar_x <= mx <= bar_x + bar_w and bar_y - 10 <= my <= bar_y + 26:
                     ratio = (mx - bar_x) / float(bar_w)
                     self.seek_to_frame(int(ratio * (self.num_frames - 1)))
+                # 2. Left Click on Pitch -> Toggle clicked player's vision cone
+                elif event.button == 1 and self._is_pos_on_field(mx, my):
+                    p_idx = self._find_player_at_screen_pos(mx, my)
+                    if p_idx is not None:
+                        if p_idx in self.selected_cone_players:
+                            self.selected_cone_players.remove(p_idx)
+                            # When deselecting the active player, turn cones OFF (do not revert to ALL)
+                            if not self.selected_cone_players:
+                                self.show_vision_cones = False
+                        else:
+                            self.selected_cone_players.add(p_idx)
+                            self.show_vision_cones = True
+                # 3. Right Click anywhere on Pitch -> Clear player cone selection and turn cones OFF
+                elif event.button == 3:
+                    if self.selected_cone_players:
+                        self.selected_cone_players.clear()
+                        self.show_vision_cones = False
+                    else:
+                        self.show_vision_cones = not self.show_vision_cones
+
+    def _is_pos_on_field(self, mx: int, my: int) -> bool:
+        """Check if mouse coordinate is within the pitch turf rendering area."""
+        return (
+            self.margin_x <= mx <= self.margin_x + self.disp_field_w
+            and self.hud_height <= my <= self.hud_height + self.disp_field_h
+        )
+
+    def _find_player_at_screen_pos(self, mx: int, my: int) -> Optional[int]:
+        """Find index of player closest to screen coordinate within click radius (default 28px)."""
+        if not self.frames:
+            return None
+        frame = self.frames[self.current_frame_idx]
+        players = frame.get("players", [])
+        best_idx = None
+        best_dist = 28.0
+        for idx, pdata in enumerate(players):
+            wx, wy = float(pdata[0]), float(pdata[1])
+            sx, sy = self.world_to_screen(wx, wy)
+            d = math.hypot(mx - sx, my - sy)
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+        return best_idx
+
+    def _get_player_label(self, idx: int) -> str:
+        """Format player role name, e.g. 'Red GK', 'Red D1', 'Blue ST'."""
+        team_size = max(1, len(self.frames[0]["players"]) // 2) if self.frames else 6
+        is_team_a = idx < team_size
+        team_str = "Red" if is_team_a else "Blue"
+        local_idx = idx if is_team_a else (idx - team_size)
+        if team_size == 6:
+            roles = ["GK", "D1", "D2", "M1", "M2", "ST"]
+            role_str = roles[local_idx] if local_idx < len(roles) else f"P{local_idx}"
+        else:
+            role_str = "GK" if local_idx == 0 else f"P{local_idx}"
+        return f"{team_str} {role_str}"
 
     def seek_to_frame(self, target_idx: int) -> None:
         """Jump to a specific frame index and clear stale popups."""
         self.current_frame_idx = max(0, min(self.num_frames - 1, target_idx))
+        self.subframe_accumulator = 0.0
         self.popups.clear()
         self._last_processed_frame = -1
         self._ingest_frame_events(self.current_frame_idx)
@@ -284,7 +411,11 @@ class ReplayViewer:
         if self.paused:
             return
 
-        for _ in range(self.playback_speed):
+        self.subframe_accumulator += self.playback_speed
+        frames_to_advance = int(self.subframe_accumulator)
+        self.subframe_accumulator -= frames_to_advance
+
+        for _ in range(frames_to_advance):
             if self.current_frame_idx < self.num_frames - 1:
                 self.current_frame_idx += 1
                 self._ingest_frame_events(self.current_frame_idx)
@@ -349,8 +480,10 @@ class ReplayViewer:
         # Tint Keeper Semi-Circles based on which team defends Left vs Right
         team_side = frame.get("team_side", [0, 1])
         left_team_is_a = team_side[0] == 0
-        left_box_color = (235, 65, 65, 45) if left_team_is_a else (55, 145, 245, 45)
-        right_box_color = (55, 145, 245, 45) if left_team_is_a else (235, 65, 65, 45)
+        red_box_color = (255, 65, 85, 75)
+        blue_box_color = (55, 160, 255, 55)
+        left_box_color = red_box_color if left_team_is_a else blue_box_color
+        right_box_color = blue_box_color if left_team_is_a else red_box_color
 
         box_r = int(round(self.box_radius * self.scale))
         box_overlay = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -358,9 +491,13 @@ class ReplayViewer:
         pygame.draw.circle(box_overlay, right_box_color, (w, h // 2), box_r)
         self.pitch_surface.blit(box_overlay, (0, 0))
 
-        # Keeper Semi-Circle solid boundary arcs
+        # Keeper Semi-Circle solid boundary arcs with team-tinted accent inner ring
         pygame.draw.circle(self.pitch_surface, COLOR_LINE, (0, h // 2), box_r, width=2)
         pygame.draw.circle(self.pitch_surface, COLOR_LINE, (w, h // 2), box_r, width=2)
+        left_arc_col = (255, 80, 100) if left_team_is_a else (70, 175, 255)
+        right_arc_col = (70, 175, 255) if left_team_is_a else (255, 80, 100)
+        pygame.draw.circle(self.pitch_surface, left_arc_col, (0, h // 2), max(1, box_r - 2), width=2)
+        pygame.draw.circle(self.pitch_surface, right_arc_col, (w, h // 2), max(1, box_r - 2), width=2)
 
         # Center line & center circle
         pygame.draw.line(self.pitch_surface, COLOR_LINE, (w // 2, 0), (w // 2, h), width=2)
@@ -403,27 +540,47 @@ class ReplayViewer:
         pygame.draw.circle(self.screen, COLOR_LINE, (right_x, gy2), 5)
 
     def _draw_vision_cones(self, frame: Dict[str, Any]) -> None:
-        """Render semi-transparent vision cones."""
+        """Render semi-transparent vision cones, filtering by selected players if active."""
         self.cone_surface.fill((0, 0, 0, 0))
         half_fov = math.radians(self.fov_deg * 0.5)
-        num_arc_pts = 14
+        num_arc_pts = 16
         num_players = len(frame["players"])
         team_size = max(1, num_players // 2)
 
         for idx, pdata in enumerate(frame["players"]):
+            if self.selected_cone_players and idx not in self.selected_cone_players:
+                continue
             px, py, angle, flags = float(pdata[0]), float(pdata[1]), float(pdata[2]), int(pdata[3])
             if flags & FLAG_IS_STUNNED:
                 continue
 
-            cone_color = COLOR_TEAM_A_CONE if idx < team_size else COLOR_TEAM_B_CONE
+            is_team_a = idx < team_size
+            is_selected = bool(self.selected_cone_players and idx in self.selected_cone_players)
+
+            if is_team_a:
+                # Vibrant coral-crimson for Red team cones
+                cone_color = (255, 75, 95, 120) if is_selected else (255, 65, 85, 70)
+                edge_color = (255, 130, 150, 180)
+            else:
+                # Crisp electric blue for Blue team cones
+                cone_color = (55, 180, 255, 110) if is_selected else (55, 160, 255, 60)
+                edge_color = (130, 215, 255, 170)
+
             points = [(int(round(px * self.scale)), int(round(py * self.scale)))]
+            arc_points = []
             for step in range(num_arc_pts + 1):
                 a = (angle - half_fov) + (2.0 * half_fov * step / num_arc_pts)
                 cx = (px + math.cos(a) * self.vision_range) * self.scale
                 cy = (py + math.sin(a) * self.vision_range) * self.scale
-                points.append((int(round(cx)), int(round(cy))))
+                pt = (int(round(cx)), int(round(cy)))
+                points.append(pt)
+                arc_points.append(pt)
 
             pygame.draw.polygon(self.cone_surface, cone_color, points)
+            if len(arc_points) > 1:
+                pygame.draw.lines(self.cone_surface, edge_color, False, [points[0], arc_points[0]], width=1)
+                pygame.draw.lines(self.cone_surface, edge_color, False, arc_points, width=2)
+                pygame.draw.lines(self.cone_surface, edge_color, False, [arc_points[-1], points[0]], width=1)
 
         self.screen.blit(self.cone_surface, (self.margin_x, self.hud_height))
 
@@ -498,6 +655,10 @@ class ReplayViewer:
             # 3. Possession Halo
             if flags & FLAG_HAS_BALL:
                 pygame.draw.circle(self.screen, COLOR_KEEPER_GOLD, (sx, sy), r + 5, width=2)
+
+            # 3b. Cone Selection Halo (Cyan ring when this player's vision cone is explicitly isolated)
+            if self.show_vision_cones and idx in self.selected_cone_players:
+                pygame.draw.circle(self.screen, (80, 245, 200), (sx, sy), r + 7, width=2)
 
             # 4. Player Body & Role Insignia
             if flags & FLAG_IS_GHOST:
@@ -1059,18 +1220,33 @@ class ReplayViewer:
 
         # Controls & Status Strip
         role_legend = "Roles: GK | D1-D2 (Def) | M1-M2 (Mid) | ST (Atk)"
+        if self.playback_speed < 1.0:
+            speed_str = f"{self.playback_speed:g}x (SLOWMO)"
+        else:
+            speed_str = f"{int(self.playback_speed)}x"
+
+        if not self.show_vision_cones:
+            cone_str = "OFF"
+        elif not self.selected_cone_players:
+            cone_str = "ALL"
+        elif len(self.selected_cone_players) == 1:
+            sel_idx = next(iter(self.selected_cone_players))
+            cone_str = self._get_player_label(sel_idx)
+        else:
+            cone_str = f"{len(self.selected_cone_players)} Selected"
+
         status_str = (
             f"[SPACE] {'PAUSED' if self.paused else 'PLAYING'}   "
-            f"[1/2/4] Speed: {self.playback_speed}x   "
-            f"[V] Cones: {'ON' if self.show_vision_cones else 'OFF'}   "
+            f"[0/1/2/4/S] Speed: {speed_str}   "
+            f"[V/TAB/Click] Cones: {cone_str}   "
             f"[E] Rewards: {'ON' if self.show_reward_hud else 'OFF'}   "
-            f"[LEFT/RIGHT] Scrub   [R] Restart   {role_legend}"
+            f"[LEFT/RIGHT] Scrub   [R] Restart"
         )
         ctrl_surf = self.font_small.render(status_str, True, COLOR_TEXT_MUTED)
         self.screen.blit(ctrl_surf, (cx - ctrl_surf.get_width() // 2, 70))
 
     def _draw_scrubber_bar(self, frame: Dict[str, Any]) -> None:
-        """Draw bottom timeline scrubber bar with halftime tick and goal markers."""
+        """Draw bottom timeline scrubber bar with halftime tick, goal markers, and save markers."""
         bar_x = self.margin_x
         bar_w = self.disp_field_w
         bar_y = self.hud_height + self.disp_field_h + 16
@@ -1098,7 +1274,45 @@ class ReplayViewer:
             self.screen, COLOR_LINE, (ht_x, bar_y - 4), (ht_x, bar_y + bar_h + 4), width=2
         )
 
-        # Goal markers along timeline
+        # 1. High-reward (+5 or up) other event markers along timeline (triangle shaped: ▲)
+        for h_frame, h_team, h_label, h_rew in self.high_reward_frames:
+            hx = bar_x + int((h_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            hy = bar_y + bar_h // 2
+            h_col = COLOR_TEAM_A if h_team == 0 else (COLOR_TEAM_B if h_team == 1 else (75, 255, 120))
+            tri_pts = [
+                (hx, hy - 6),
+                (hx + 5, hy + 5),
+                (hx - 5, hy + 5),
+            ]
+            pygame.draw.polygon(self.screen, h_col, tri_pts)
+            ring_col = (255, 215, 60)  # Bright gold outline for +5 highlights
+            pygame.draw.polygon(self.screen, ring_col, tri_pts, width=1)
+
+        # 2. Foul / violation markers along timeline (card shaped: ▮)
+        for f_frame, f_team, f_type in self.foul_frames:
+            fx = bar_x + int((f_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            fy = bar_y + bar_h // 2
+            f_col = COLOR_TEAM_A if f_team == 0 else (COLOR_TEAM_B if f_team == 1 else (255, 80, 80))
+            card_rect = pygame.Rect(fx - 3, fy - 6, 7, 12)
+            pygame.draw.rect(self.screen, f_col, card_rect, border_radius=1)
+            pygame.draw.rect(self.screen, (255, 170, 40), card_rect, width=1, border_radius=1)
+
+        # 3. Save markers along timeline (diamond shaped: ◆)
+        for s_frame, s_team, is_lunge in self.save_frames:
+            sx = bar_x + int((s_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            sy = bar_y + bar_h // 2
+            s_col = COLOR_TEAM_A if s_team == 0 else COLOR_TEAM_B
+            diamond_pts = [
+                (sx, sy - 6),
+                (sx + 5, sy),
+                (sx, sy + 6),
+                (sx - 5, sy),
+            ]
+            pygame.draw.polygon(self.screen, s_col, diamond_pts)
+            ring_col = (80, 245, 200) if is_lunge else COLOR_KEEPER_GOLD
+            pygame.draw.polygon(self.screen, ring_col, diamond_pts, width=1)
+
+        # 4. Goal markers along timeline (circular: ●)
         for g_frame, g_team, is_og in self.goal_frames:
             gx = bar_x + int((g_frame / float(max(1, self.num_frames - 1))) * bar_w)
             g_col = COLOR_TEAM_A if g_team == 0 else COLOR_TEAM_B
@@ -1111,12 +1325,54 @@ class ReplayViewer:
         knob_x = bar_x + fill_w
         pygame.draw.circle(self.screen, COLOR_TEXT_MAIN, (knob_x, bar_y + bar_h // 2), 8)
 
+        # Frame counter label (left)
         frame_lbl = self.font_small.render(
             f"Frame {self.current_frame_idx} / {self.num_frames - 1}",
             True,
             COLOR_TEXT_MUTED,
         )
         self.screen.blit(frame_lbl, (bar_x, bar_y + 14))
+
+        # Bottom Bar Legend (right)
+        legend_x = bar_x + bar_w - 335
+        legend_y = bar_y + 14
+
+        # Circle icon for Goal
+        pygame.draw.circle(self.screen, COLOR_LINE, (legend_x + 4, legend_y + 6), 4)
+        pygame.draw.circle(self.screen, COLOR_KEEPER_GOLD, (legend_x + 4, legend_y + 6), 4, width=1)
+        goal_leg_surf = self.font_small.render("Goal", True, COLOR_TEXT_MUTED)
+        self.screen.blit(goal_leg_surf, (legend_x + 11, legend_y))
+
+        # Diamond icon for Save
+        d_leg_x = legend_x + 65
+        d_pts = [
+            (d_leg_x + 4, legend_y + 2),
+            (d_leg_x + 8, legend_y + 6),
+            (d_leg_x + 4, legend_y + 10),
+            (d_leg_x, legend_y + 6),
+        ]
+        pygame.draw.polygon(self.screen, (80, 245, 200), d_pts)
+        save_leg_surf = self.font_small.render("Save", True, COLOR_TEXT_MUTED)
+        self.screen.blit(save_leg_surf, (d_leg_x + 11, legend_y))
+
+        # Triangle icon for +5 Event
+        t_leg_x = legend_x + 130
+        t_pts = [
+            (t_leg_x + 4, legend_y + 2),
+            (t_leg_x + 8, legend_y + 10),
+            (t_leg_x, legend_y + 10),
+        ]
+        pygame.draw.polygon(self.screen, (255, 215, 60), t_pts)
+        plus5_leg_surf = self.font_small.render("+5 Event", True, COLOR_TEXT_MUTED)
+        self.screen.blit(plus5_leg_surf, (t_leg_x + 11, legend_y))
+
+        # Card icon for Foul
+        f_leg_x = legend_x + 220
+        card_leg_rect = pygame.Rect(f_leg_x + 2, legend_y + 1, 6, 10)
+        pygame.draw.rect(self.screen, (255, 80, 80), card_leg_rect, border_radius=1)
+        pygame.draw.rect(self.screen, (255, 170, 40), card_leg_rect, width=1, border_radius=1)
+        foul_leg_surf = self.font_small.render("Foul", True, COLOR_TEXT_MUTED)
+        self.screen.blit(foul_leg_surf, (f_leg_x + 12, legend_y))
 
     def run(self, max_frames: Optional[int] = None) -> None:
         """Run the main 60 FPS visualizer loop."""
@@ -1132,9 +1388,9 @@ class ReplayViewer:
         pygame.quit()
 
 
-# ==============================================================================
-# CLI Helpers & Demo Replay Generator
-# ==============================================================================
+# Backwards-compatible alias
+ReplayVisualizer = ReplayViewer
+
 def load_replay_json(filepath: str) -> Dict[str, Any]:
     """Load a JSON match trajectory from disk."""
     with open(filepath, "r", encoding="utf-8") as f:

@@ -197,6 +197,8 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_kick_origin: np.ndarray = np.zeros(2, dtype=np.float64)
         self.ball_kicked_in_flight: bool = False
         self.ball_kick_flight_timer: float = 0.0
+        self.ball_wall_bounces: int = 0
+        self.is_wall_pass_in_flight: bool = False
         self.pinned_ball_timer: float = 0.0
         self.kickoff_protection_timer: float = 0.0
         self.prev_longitudinal_vel: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
@@ -1044,15 +1046,19 @@ class FootballParallelEnv(ParallelEnv):
                 return True
 
             # Bounce off walls (restitution = 0.85)
-            if self._bounce_ball_off_walls():
-                self.ball_kick_was_shot_on_target = False
-                self.ball_kicked_in_flight = False
+            self._bounce_ball_off_walls()
 
-            # 3-Second Pass Flight Timeout
+            # Pass Flight Timeout
             if self.ball_kicked_in_flight:
                 self.ball_kick_flight_timer += dt
-                if self.ball_kick_flight_timer > mech.max_pass_flight_time:
+                max_flight = (
+                    mech.max_wall_pass_flight_time
+                    if self.is_wall_pass_in_flight
+                    else mech.max_pass_flight_time
+                )
+                if self.ball_kick_flight_timer > max_flight:
                     self.ball_kicked_in_flight = False
+                    self.is_wall_pass_in_flight = False
                     self.ball_kick_was_shot_on_target = False
 
             # Pinned Wall/Semicircle Ball Unsticking
@@ -1169,6 +1175,8 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_kick_origin = self.ball_pos.copy()
         self.ball_kicked_in_flight = True
         self.ball_kick_flight_timer = 0.0
+        self.ball_wall_bounces = 0
+        self.is_wall_pass_in_flight = False
 
         # 1.0s pickup cooldown on kicker
         self.pickup_cooldown[kicker_idx] = max(
@@ -1642,18 +1650,25 @@ class FootballParallelEnv(ParallelEnv):
 
         self._on_new_player_touched_ball(new_holder)
 
+        max_flight = (
+            mech.max_wall_pass_flight_time
+            if self.is_wall_pass_in_flight
+            else mech.max_pass_flight_time
+        )
         if (
             self.ball_kicked_in_flight
-            and self.ball_kick_flight_timer <= mech.max_pass_flight_time
+            and self.ball_kick_flight_timer <= max_flight
             and self.last_ball_holder is not None
         ):
             kicker_idx = self.last_ball_holder
             kicker_team = int(self.last_ball_team) if self.last_ball_team is not None else new_team
             kick_travel_dist = float(np.linalg.norm(self.ball_pos - self.ball_kick_origin))
+            is_wall_pass = bool(self.is_wall_pass_in_flight and self.ball_wall_bounces == 1)
 
             if new_team == kicker_team and new_holder != kicker_idx:
                 step_rewards[new_holder] += rew.first_touch_reception_bonus
-                if kick_travel_dist >= mech.min_pass_distance:
+                min_dist = mech.min_wall_pass_distance if is_wall_pass else mech.min_pass_distance
+                if kick_travel_dist >= min_dist:
                     # Completed pass
                     kicker_role = int(self.player_role[kicker_idx])
                     receiver_role = int(self.player_role[new_holder])
@@ -1795,10 +1810,18 @@ class FootballParallelEnv(ParallelEnv):
                     if is_attacking_layoff:
                         prog_bonus += rew.attacking_layoff_bonus
 
+                    is_valid_wall_pass = False
+                    if is_wall_pass:
+                        # Wall pass: award wall_pass_bonus if it advances downfield (effective_dx >= 30u),
+                        # switches angles, lays off, or escapes opponent pressure
+                        if is_progressive or is_escape_press or is_box_angle_switch or is_attacking_layoff or effective_dx >= 30.0:
+                            is_valid_wall_pass = True
+                            prog_bonus += rew.wall_pass_bonus
+
                     prog_bonus *= pair_decay_multiplier
 
                     # Update Tiki-Taka chain:
-                    if is_progressive or is_box_angle_switch or is_give_and_go:
+                    if is_progressive or is_box_angle_switch or is_give_and_go or is_valid_wall_pass:
                         self.team_pass_chain[new_team] = min(
                             self.team_pass_chain[new_team] + 1, rew.pass_chain_max_count
                         )
@@ -1833,7 +1856,9 @@ class FootballParallelEnv(ParallelEnv):
                     self.stats["completed_passes"] += 1
                     self.stats["team_passes"][new_team] += 1
 
-                    if is_give_and_go:
+                    if is_valid_wall_pass:
+                        lbl = "WALL PASS!"
+                    elif is_give_and_go:
                         lbl = "ONE-TWO!"
                     elif is_attacking_layoff:
                         lbl = "LAY-OFF!"
@@ -1920,6 +1945,8 @@ class FootballParallelEnv(ParallelEnv):
         self.last_ball_holder = new_holder
         self.last_ball_team = new_team
         self.ball_kicked_in_flight = False
+        self.ball_wall_bounces = 0
+        self.is_wall_pass_in_flight = False
 
         if new_role == ROLE_KEEPER:
             k_ang = float(self.player_angle[new_holder])
@@ -2165,41 +2192,59 @@ class FootballParallelEnv(ParallelEnv):
         r_ball = phys.ball_radius
         rest = phys.ball_wall_restitution
         bounced = False
+        bounce_side_wall = False
+        bounce_back_wall = False
 
         bx, by = float(self.ball_pos[0]), float(self.ball_pos[1])
         in_goal_y = phys.goal_y_min <= by <= phys.goal_y_max
 
-        # Left and Right walls
+        # Left and Right walls (Back walls / Endlines)
         if not in_goal_y:
             if bx < r_ball:
                 self.ball_pos[0] = r_ball + (r_ball - bx) * rest
                 self.ball_vel[0] = abs(self.ball_vel[0]) * rest
                 self.ball_vel[1] *= rest
                 bounced = True
+                bounce_back_wall = True
             elif bx > phys.field_width - r_ball:
                 over = bx - (phys.field_width - r_ball)
                 self.ball_pos[0] = (phys.field_width - r_ball) - over * rest
                 self.ball_vel[0] = -abs(self.ball_vel[0]) * rest
                 self.ball_vel[1] *= rest
                 bounced = True
+                bounce_back_wall = True
 
-        # Top and Bottom walls
+        # Top and Bottom walls (Longitudinal Side boards Y = 0 and Y = 840)
         by = float(self.ball_pos[1])
         if by < r_ball:
             self.ball_pos[1] = r_ball + (r_ball - by) * rest
             self.ball_vel[1] = abs(self.ball_vel[1]) * rest
             self.ball_vel[0] *= rest
             bounced = True
+            bounce_side_wall = True
         elif by > phys.field_height - r_ball:
             over = by - (phys.field_height - r_ball)
             self.ball_pos[1] = (phys.field_height - r_ball) - over * rest
             self.ball_vel[1] = -abs(self.ball_vel[1]) * rest
             self.ball_vel[0] *= rest
             bounced = True
+            bounce_side_wall = True
 
         if bounced:
             self.ball_kick_was_shot_on_target = False
-            self.ball_kicked_in_flight = False
+            self.ball_wall_bounces += 1
+            if (
+                bounce_side_wall
+                and not bounce_back_wall
+                and self.ball_wall_bounces == 1
+                and self.ball_kicked_in_flight
+            ):
+                # Valid intentional single side-wall bank pass: keep in-flight active with max_wall_pass_flight_time
+                self.is_wall_pass_in_flight = True
+            else:
+                # Back wall bounce, corner rattle, or multi-wall bounce: cancel in-flight pass status
+                self.ball_kicked_in_flight = False
+                self.is_wall_pass_in_flight = False
 
         return bounced
 
@@ -2301,6 +2346,8 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_kicked_in_flight = False
         self.ball_kick_was_shot_on_target = False
         self.ball_kick_flight_timer = 0.0
+        self.ball_wall_bounces = 0
+        self.is_wall_pass_in_flight = False
         self.pinned_ball_timer = 0.0
         self.kickoff_protection_timer = 0.0
         self.prev_longitudinal_vel[:] = 0.0
@@ -2670,8 +2717,14 @@ class FootballParallelEnv(ParallelEnv):
                 )
             else:
                 # Slots 1..11: Vision cone limited to vis.max_range and half_fov_rad
+                # Smooth peripheral falloff over outer 15 degrees (fade_rad) to prevent discontinuous blinking at the FOV boundary
+                fade_rad = math.radians(15.0)
                 if dist <= vis.max_range and abs(rel_ang) <= vis.half_fov_rad:
-                    obs[slot_start + 0] = 1.0
+                    if abs(rel_ang) <= vis.half_fov_rad - fade_rad:
+                        vis_presence = 1.0
+                    else:
+                        vis_presence = (vis.half_fov_rad - abs(rel_ang)) / fade_rad
+                    obs[slot_start + 0] = _fast_clip(vis_presence, 0.0, 1.0)
                     obs[slot_start + 1] = _fast_clip(dist / vis.max_range, 0.0, 1.0)
                     obs[slot_start + 2] = _fast_clip(
                         rel_ang / vis.half_fov_rad, -1.0, 1.0
@@ -3200,8 +3253,13 @@ class FootballParallelEnv(ParallelEnv):
                                 u_to_ball = to_ball_vec / dist_to_ball_prev
                                 active_chase_closed = float(np.dot(player_disp, u_to_ball))
                                 # Reward active chase continuously all the way until pickup!
-                                if float(curr_player_ball_dists[idx]) > mech.pickup_distance:
+                                d_to_ball_curr = float(curr_player_ball_dists[idx])
+                                if d_to_ball_curr > mech.pickup_distance:
                                     step_rewards[idx] += w * rew.loose_ball_chase_scale * max(0.0, active_chase_closed)
+                                    # Continuous proximity gravitational pull within 95u to eliminate hesitation / deadlock near loose ball
+                                    if d_to_ball_curr <= 95.0:
+                                        prox_factor = max(0.0, 1.0 - (d_to_ball_curr - mech.pickup_distance) / (95.0 - mech.pickup_distance))
+                                        step_rewards[idx] += w * rew.loose_ball_proximity_scale * prox_factor
                             to_ball = self.ball_pos - self.player_pos[idx]
                             d_ball = float(np.linalg.norm(to_ball))
                             if d_ball > 1e-6:

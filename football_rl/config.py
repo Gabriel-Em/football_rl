@@ -170,7 +170,9 @@ class MechanicsConfig:
     keeper_box_loose_max_time: float = 3.0  # Max time a loose ball can sit in keeper semicircle before foul teleport
 
     # Pass Flight Timeout & Pinned Ball Unsticking
-    max_pass_flight_time: float = 3.0       # Max time (s) after a kick for a pickup to count as a pass/interception
+    max_pass_flight_time: float = 3.0       # Max time (s) after a kick for a direct pickup to count as a pass/interception
+    max_wall_pass_flight_time: float = 2.2  # Max time (s) after a kick for a side-wall bank pass to be received
+    min_wall_pass_distance: float = 85.0    # Min displacement (u) between kick origin and receiver for wall pass
     pinned_ball_max_time: float = 2.0       # Time (s) a slow loose ball near a wall/box can stay jammed before nudge
     pinned_ball_speed_thresh: float = 18.0  # Max ball speed (u/s) considered pinned/stuck
     pinned_ball_nudge_speed: float = 95.0   # Inward impulse speed (u/s) applied to unstick a pinned ball
@@ -245,6 +247,7 @@ class RewardConfig:
     escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
     attacking_layoff_bonus: float = 0.65       # Bonus when attacker in final third lays ball back to oncoming midfielder
     give_and_go_bonus: float = 0.70            # Bonus when receiver of return pass has advanced into space since initial pass
+    wall_pass_bonus: float = 0.65              # Bonus for completing an intentional bank pass off the side wall
     pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
     min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx or goal-dist reduction to qualify as progressive
 
@@ -311,6 +314,7 @@ class RewardConfig:
     open_support_bonus_scale: float = 0.010
     role_zone_anchor_scale: float = 0.005
     loose_ball_chase_scale: float = 0.010
+    loose_ball_proximity_scale: float = 0.008
     non_chaser_ball_repulsion_radius: float = 185.0
     non_chaser_ball_repulsion_scale: float = 0.012
     presser_approach_scale: float = 0.010
