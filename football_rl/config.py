@@ -81,7 +81,7 @@ class PhysicsConfig:
     def_max_kick_speed: float = 510.0
     mid_max_kick_speed: float = 560.0
     atk_max_kick_speed: float = 640.0
-    keeper_max_kick_speed: float = 560.0
+    keeper_max_kick_speed: float = 640.0
     def_shot_jitter_rad: float = math.radians(7.5)   # applied only when power_norm > 0.65
     mid_shot_jitter_rad: float = math.radians(3.8)   # applied only when power_norm > 0.65
     atk_shot_jitter_rad: float = 0.0                 # pinpoint laser accuracy at all power levels
@@ -117,7 +117,8 @@ class MechanicsConfig:
     ball_carry_offset: float = 24.0   # player_pos + facing_vec * 24.0
     kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
     pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
-    pickup_tackle_grace: float = 0.35 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
+    pickup_tackle_grace: float = 0.45 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
+    kick_steer_max_deflection_deg: float = 50.0  # Option B side-foot pass/clearance angle modulation (+/- 50 deg)
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
     min_pass_distance: float = 38.0   # Minimum kick travel distance to count as a Completed Pass (allows short GK & CB distributions)
@@ -162,8 +163,8 @@ class MechanicsConfig:
     lunge_cooldown: float = 1.8
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
-    keeper_clear_corridor_length: float = 220.0   # Forward corridor distance (u) to check for blocking opponents
-    keeper_clear_corridor_half_width: float = 38.0 # Corridor half-width (u) around GK kick trajectory
+    keeper_clear_corridor_length: float = 380.0   # Forward corridor distance (u) to check for blocking opponents (reaches past gk_hold_opponent_buffer=265.0)
+    keeper_clear_corridor_half_width: float = 45.0 # Corridor half-width (u) around GK kick trajectory
 
     # Hold Rules & Violation Penalties
     field_max_hold_time: float = 5.0
@@ -171,7 +172,14 @@ class MechanicsConfig:
     field_violation_pickup_cooldown: float = 3.0
     field_violation_tackle_cooldown: float = 3.0
     keeper_max_hold_time: float = 5.0
-    keeper_box_loose_max_time: float = 3.0  # Max time a loose ball can sit in keeper semicircle before foul teleport
+    keeper_box_loose_max_time: float = 5.0  # Max time a loose ball can sit in keeper semicircle before foul teleport
+    post_save_box_grace_time: float = 2.0   # Grace period (s) after GK save before box loose timer accumulates
+
+    # Dynamic Semicircle Shrinking Parameters (Anti-Stall on Unclaimed Loose Box Balls)
+    box_shrink_grace_time: float = 1.0      # seconds of unclaimed loose ball in box before semicircle starts shrinking
+    box_shrink_rate: float = 55.0           # units/sec radial shrink speed allowing outfielders closer and closer
+    box_expand_rate: float = 220.0          # units/sec smooth radial re-expansion speed once ball is claimed or exits box
+    box_min_radius: float = 0.0             # minimum radius the semicircle can shrink to (0.0 = completely open)
 
     # Pass Flight Timeout & Pinned Ball Unsticking
     max_pass_flight_time: float = 3.0       # Max time (s) after a kick for a direct pickup to count as a pass/interception
@@ -215,6 +223,7 @@ class RewardConfig:
     goal_team_shared: float = 10.0
     goal_concede_team_shared: float = -10.0
     own_goal_ind: float = -8.0  # Additional individual penalty on top of -10.0 team penalty (-18.0 total)
+    dangerous_own_goal_kick_pen: float = -3.0  # Option A: Immediate penalty on Frame 0 of kick aimed into own net
     atk_shot_on_target_ind: float = 2.0        # Increased from 0.7: strong incentive for ATK to shoot on target
     other_shot_on_target_ind: float = 1.2      # Increased from 0.2: strong incentive for MID/DEF to shoot on target
     shot_on_target_team: float = 0.3           # Shared team bonus when firing a valid shot on target
@@ -242,7 +251,9 @@ class RewardConfig:
     pass_target_aim_ind: float = 0.45       # Immediate bonus in _execute_kick when aiming toward open teammate
     recycle_pass_bonus: float = 0.0         # Completely removed (was 0.35)
     open_clearance_ind: float = 0.25        # Immediate bonus in _execute_kick when kicking to open pitch corridor
-    blocked_kick_pen: float = -0.45         # Immediate penalty in _execute_kick when kicking into near opponent
+    blocked_kick_pen: float = -0.85         # Immediate penalty in _execute_kick when kicking into near opponent
+    keeper_wall_clear_bonus: float = 1.25   # Bonus for high-power GK side-wall ricochet clearances past pressed center
+    lead_pass_bonus: float = 1.50           # Bonus for completing pass to teammate running in forward stride (>=90u/s)
 
     # Progressive Pass & Anti-Exploit Parameters
     pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +1.2)
@@ -318,6 +329,7 @@ class RewardConfig:
     gk_buffer_obstruction_pen: float = 0.015       # Penalty when actively driving toward enemy GK while enemy GK holds the ball
     support_pocket_approach_scale: float = 0.010
     open_support_bonus_scale: float = 0.010
+    unmask_lateral_scale: float = 0.015            # Reward for shadowed off-ball teammates moving laterally to unmask passing lanes
     role_zone_anchor_scale: float = 0.005
     loose_ball_chase_scale: float = 0.010
     loose_ball_proximity_scale: float = 0.008

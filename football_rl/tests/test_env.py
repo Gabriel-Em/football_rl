@@ -282,7 +282,7 @@ def test_role_specific_kick_speeds() -> None:
     assert atk_max_spd == 640.0
     assert mid_max_spd == 560.0
     assert def_max_spd == 510.0
-    assert gk_max_spd == 560.0
+    assert gk_max_spd == 640.0
     assert atk_max_spd > mid_max_spd > def_max_spd
 
 
@@ -1184,22 +1184,22 @@ def test_kickoff_carrier_faces_own_keeper_and_sees_teammates() -> None:
     a_gk_idx = env.agent_to_idx["a_keeper"]
 
     assert env.ball_holder == a_atk_idx
-    # Carrier angle must face negative X (towards Left keeper at X=45)
+    # Carrier angle aims at mid_2 (520, 580) at canon_angle 2.4189 rad
     cos_angle_a = math.cos(env.player_angle[a_atk_idx])
     sin_angle_a = math.sin(env.player_angle[a_atk_idx])
-    assert math.isclose(cos_angle_a, -1.0, abs_tol=1e-5)
-    assert math.isclose(sin_angle_a, 0.0, abs_tol=1e-5)
+    assert math.isclose(cos_angle_a, math.cos(2.4189), abs_tol=1e-4)
+    assert math.isclose(sin_angle_a, math.sin(2.4189), abs_tol=1e-4)
 
-    # In canonical coordinates, carrier faces angle pi (towards own keeper)
+    # In canonical coordinates, carrier faces angle 2.4189 rad (towards mid_2)
     obs_carrier = env._build_single_observation(a_atk_idx)
     # Ball is held
     assert obs_carrier[7] == 1.0
-    # Relative angle to own keeper must be ~0.0 (directly ahead in FOV)
-    gk_pos = env.player_pos[a_gk_idx]
+    # Relative angle to mid_2 must be ~0.0 (directly ahead in FOV)
+    mid2_pos = env.player_pos[env.agent_to_idx["a_mid_2"]]
     car_pos = env.player_pos[a_atk_idx]
-    angle_to_gk = math.atan2(gk_pos[1] - car_pos[1], gk_pos[0] - car_pos[0])
-    rel_angle_to_gk = wrap_to_pi(angle_to_gk - env.player_angle[a_atk_idx])
-    assert math.isclose(rel_angle_to_gk, 0.0, abs_tol=1e-5)
+    angle_to_mid2 = math.atan2(mid2_pos[1] - car_pos[1], mid2_pos[0] - car_pos[0])
+    rel_angle_to_mid2 = wrap_to_pi(angle_to_mid2 - env.player_angle[a_atk_idx])
+    assert math.isclose(rel_angle_to_mid2, 0.0, abs_tol=1e-2)
 
     # Verify all 5 teammates are within carrier's FOV (+/- 105 degrees = +/- 1.83 rad)
     half_fov = env.cfg.vision.half_fov_rad
@@ -1216,17 +1216,18 @@ def test_kickoff_carrier_faces_own_keeper_and_sees_teammates() -> None:
     b_gk_idx = env.agent_to_idx["b_keeper"]
 
     assert env.ball_holder == b_atk_idx
-    # Carrier angle must face positive X (towards Right keeper at X=1355)
+    # Carrier angle aims at b_mid_2
     cos_angle_b = math.cos(env.player_angle[b_atk_idx])
     sin_angle_b = math.sin(env.player_angle[b_atk_idx])
-    assert math.isclose(cos_angle_b, 1.0, abs_tol=1e-5)
-    assert math.isclose(sin_angle_b, 0.0, abs_tol=1e-5)
+    expected_b_ang = wrap_to_pi(2.4189 + math.pi)
+    assert math.isclose(cos_angle_b, math.cos(expected_b_ang), abs_tol=1e-4)
+    assert math.isclose(sin_angle_b, math.sin(expected_b_ang), abs_tol=1e-4)
 
-    # 3. Post-Goal reset: Team A scores -> Conceding team (Team B) kicks off facing b_keeper
+    # 3. Post-Goal reset: Team A scores -> Conceding team (Team B) kicks off facing b_mid_2
     step_rew = np.zeros(env.num_players, dtype=np.float64)
     env._handle_goal_scored(TEAM_A, step_rew)
     assert env.ball_holder == b_atk_idx
-    assert math.isclose(math.cos(env.player_angle[b_atk_idx]), 1.0, abs_tol=1e-5)
+    assert math.isclose(math.cos(env.player_angle[b_atk_idx]), math.cos(expected_b_ang), abs_tol=1e-4)
 
 
 def test_kinematic_lunge_config_parameters() -> None:
@@ -1779,12 +1780,13 @@ def test_keeper_obs13_instant_step_signal_and_sweeper_fetch_priority() -> None:
     obs = env._build_single_observation(gk_idx)
     assert math.isclose(obs[13], 0.25, abs_tol=1e-4)
 
-    # As timer ramps to 3.0s, obs[13] ramps to 1.0
-    env.box_loose_ball_timer = 1.5
+    # As timer ramps to max_time (5.0s), obs[13] ramps to 1.0
+    half_time = 0.5 * env.cfg.mechanics.keeper_box_loose_max_time
+    env.box_loose_ball_timer = half_time
     obs = env._build_single_observation(gk_idx)
     assert math.isclose(obs[13], 0.625, abs_tol=1e-4)
 
-    env.box_loose_ball_timer = 3.0
+    env.box_loose_ball_timer = env.cfg.mechanics.keeper_box_loose_max_time
     obs = env._build_single_observation(gk_idx)
     assert math.isclose(obs[13], 1.0, abs_tol=1e-4)
 
@@ -2715,6 +2717,40 @@ def test_keeper_turnover_penalty_gradient() -> None:
 
     expected_upfield = env.cfg.rewards.intercepted_kicker_ind + env.cfg.rewards.intercepted_team
     assert math.isclose(step_rewards[gk_idx], expected_upfield, rel_tol=1e-5)
+
+
+def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
+    """Verify 5.0s box loose timer, differentiated event naming, and post-save grace timer."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+
+    # 1. Verify GK hold violation emits '5s KEEPER HOLD FOUL!'
+    env.ball_holder = gk_idx
+    env.ball_hold_timer = 5.01
+    env._frame_events.clear()
+    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
+    assert any(e["type"] == "5s KEEPER HOLD FOUL!" for e in env._frame_events)
+
+    # 2. Verify loose ball in box emits '5s UNCLAIMED BOX BALL!'
+    env._frame_events.clear()
+    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=False)
+    assert any(e["type"] == "5s UNCLAIMED BOX BALL!" for e in env._frame_events)
+
+    # 3. Verify post-save grace pauses box_loose_ball_timer accumulation
+    env.ball_holder = None
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)  # Inside left keeper box
+    env.box_loose_ball_timer = 0.0
+    env.post_save_box_grace_timer = 2.0
+
+    # Advance 1 physics step
+    actions = _zero_actions(env)
+    env.step(actions)
+    # Box loose timer should still be 0.0 because post_save_box_grace_timer was active
+    assert env.box_loose_ball_timer == 0.0
+    assert env.post_save_box_grace_timer < 2.0
 
 
 

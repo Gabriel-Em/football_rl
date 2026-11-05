@@ -63,6 +63,7 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "SHOT ON TARGET!": (255, 200, 90),
     "NEAR SHOT!": (255, 165, 80),
     "PASS!": (125, 245, 130),
+    "THROUGH BALL!": (110, 255, 140),
     "ONE-TWO!": (100, 255, 180),
     "WALL PASS!": (95, 230, 255),
     "LAY-OFF!": (120, 240, 200),
@@ -75,6 +76,8 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "5s VIOLATION!": (245, 110, 255),
     "3s VIOLATION!": (245, 110, 255),
     "5s KEEPER FOUL!": (255, 75, 150),
+    "5s KEEPER HOLD FOUL!": (255, 75, 150),
+    "5s UNCLAIMED BOX BALL!": (255, 110, 180),
     "HALFTIME!": (200, 220, 255),
     "FULLTIME!": (255, 215, 0),
     "GK DIVE!": (100, 230, 255),
@@ -173,7 +176,7 @@ class ReplayViewer:
                     self.goal_frames.append((idx, team, ev_t == "OWN GOAL!"))
                 elif ev_t in ("KEEPER SAVE!", "LUNGE SAVE!") or "SAVE" in ev_t.upper():
                     self.save_frames.append((idx, team, ev_t == "LUNGE SAVE!"))
-                elif "FOUL" in ev_t.upper() or "VIOLATION" in ev_t.upper():
+                elif "FOUL" in ev_t.upper() or "VIOLATION" in ev_t.upper() or "UNCLAIMED BOX BALL" in ev_t.upper():
                     self.foul_frames.append((idx, team, ev_t))
                 elif rew_val >= 5.0:
                     self.high_reward_frames.append((idx, team, ev_t, rew_val))
@@ -486,19 +489,33 @@ class ReplayViewer:
         left_box_color = red_box_color if left_team_is_a else blue_box_color
         right_box_color = blue_box_color if left_team_is_a else red_box_color
 
-        box_r = int(round(self.box_radius * self.scale))
+        nom_box_r = int(round(self.box_radius * self.scale))
+        active_radii = frame.get("box_radii", [self.box_radius, self.box_radius])
+        left_box_r = max(1, int(round(float(active_radii[0]) * self.scale)))
+        right_box_r = max(1, int(round(float(active_radii[1]) * self.scale)))
+
         box_overlay = pygame.Surface((w, h), pygame.SRCALPHA)
-        pygame.draw.circle(box_overlay, left_box_color, (0, h // 2), box_r)
-        pygame.draw.circle(box_overlay, right_box_color, (w, h // 2), box_r)
+        if left_box_r > 2:
+            pygame.draw.circle(box_overlay, left_box_color, (0, h // 2), left_box_r)
+        if right_box_r > 2:
+            pygame.draw.circle(box_overlay, right_box_color, (w, h // 2), right_box_r)
         self.pitch_surface.blit(box_overlay, (0, 0))
 
+        # If shrunken, draw a faint dashed/thin guide line at nominal 195u line
+        if left_box_r < nom_box_r - 2:
+            pygame.draw.circle(self.pitch_surface, (160, 175, 190, 80), (0, h // 2), nom_box_r, width=1)
+        if right_box_r < nom_box_r - 2:
+            pygame.draw.circle(self.pitch_surface, (160, 175, 190, 80), (w, h // 2), nom_box_r, width=1)
+
         # Keeper Semi-Circle solid boundary arcs with team-tinted accent inner ring
-        pygame.draw.circle(self.pitch_surface, COLOR_LINE, (0, h // 2), box_r, width=2)
-        pygame.draw.circle(self.pitch_surface, COLOR_LINE, (w, h // 2), box_r, width=2)
         left_arc_col = (255, 80, 100) if left_team_is_a else (70, 175, 255)
         right_arc_col = (70, 175, 255) if left_team_is_a else (255, 80, 100)
-        pygame.draw.circle(self.pitch_surface, left_arc_col, (0, h // 2), max(1, box_r - 2), width=2)
-        pygame.draw.circle(self.pitch_surface, right_arc_col, (w, h // 2), max(1, box_r - 2), width=2)
+        if left_box_r > 2:
+            pygame.draw.circle(self.pitch_surface, COLOR_LINE, (0, h // 2), left_box_r, width=2)
+            pygame.draw.circle(self.pitch_surface, left_arc_col, (0, h // 2), max(1, left_box_r - 2), width=2)
+        if right_box_r > 2:
+            pygame.draw.circle(self.pitch_surface, COLOR_LINE, (w, h // 2), right_box_r, width=2)
+            pygame.draw.circle(self.pitch_surface, right_arc_col, (w, h // 2), max(1, right_box_r - 2), width=2)
 
         # Center line & center circle
         pygame.draw.line(self.pitch_surface, COLOR_LINE, (w // 2, 0), (w // 2, h), width=2)
@@ -841,7 +858,7 @@ class ReplayViewer:
             trans_events = [
                 ev
                 for ev in events
-                if ev.get("type") in ("GOAL!", "OWN GOAL!", "5s KEEPER FOUL!", "HALFTIME!", "FULLTIME!")
+                if ev.get("type") in ("GOAL!", "OWN GOAL!", "5s KEEPER FOUL!", "5s KEEPER HOLD FOUL!", "5s UNCLAIMED BOX BALL!", "HALFTIME!", "FULLTIME!")
             ]
 
             # Trigger Full-Time cinematic at match conclusion on final frame if not already present
@@ -1057,10 +1074,14 @@ class ReplayViewer:
                 team_side = frame.get("team_side", [0, 1])
                 own_side = team_side[team] if team in (0, 1) else 0
                 goal_net_x = 0.0 if own_side == 0 else self.field_w
-            elif ev_type == "5s KEEPER FOUL!":
-                title_str = "5s KEEPER VIOLATION  —  TURNOVER FREE KICK!"
-                sub_str = "Ball awarded to attacking team in opponent's half"
-                accent_color = EVENT_COLORS.get("5s KEEPER FOUL!", (255, 75, 150))
+            elif ev_type in ("5s KEEPER FOUL!", "5s KEEPER HOLD FOUL!"):
+                title_str = "5s KEEPER HOLD VIOLATION  —  TURNOVER FREE KICK!"
+                sub_str = "Goalkeeper held ball > 5.0s  |  Awarded to attacking team"
+                accent_color = EVENT_COLORS.get("5s KEEPER HOLD FOUL!", (255, 75, 150))
+            elif ev_type == "5s UNCLAIMED BOX BALL!":
+                title_str = "5s UNCLAIMED BOX BALL  —  ATTACKING OVERLOAD FREE KICK!"
+                sub_str = "Loose ball unclaimed in keeper arc > 5.0s  |  Turnover restart"
+                accent_color = EVENT_COLORS.get("5s UNCLAIMED BOX BALL!", (255, 110, 180))
             elif ev_type == "HALFTIME!":
                 title_str = "HALF-TIME  —  SWITCHING SIDES"
                 sub_str = f"Second Half Kickoff   |   Score: {score[0]} - {score[1]}"
