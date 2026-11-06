@@ -221,6 +221,7 @@ class VisionConfig:
     entity_feature_dim: int = 5
     obs_dim: int = 76          # 16 + (12 * 5) = 76 floats
     action_dim: int = 4
+    critic_vel_norm: float = 340.0  # Velocity normalization denominator for centralized critic state
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,7 @@ class RewardConfig:
     other_shot_on_target_ind: float = 1.2      # Increased from 0.2: strong incentive for MID/DEF to shoot on target
     shot_on_target_team: float = 0.3           # Shared team bonus when firing a valid shot on target
     shot_near_target_mult: float = 0.35        # Fraction of shot reward awarded for near-target shots hitting wall beside goal
+    shot_m_chain_max_dist: float = 420.0       # Maximum distance from goal center for chain multiplier scaling on shots
     prime_shot_hesitation_pen: float = -0.025  # Per-RL-step penalty when aimed at goal within 320u and not shooting
 
     # Keeper Save, Off-Target Catch, & Strip
@@ -284,8 +286,8 @@ class RewardConfig:
     # Progressive Pass & Anti-Exploit Parameters
     pass_progressive_dx_weight: float = 0.012   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +2.4)
     progressive_pass_scale: float = 0.012       # Alias matching pass_progressive_dx_weight
-    recycled_progression_discount: float = 0.25 # Multiplier on progressive dx re-treading territory in same spell
-    triangle_repeat_decay_base: float = 0.35    # Multiplier decay base for repeated triangle passes without fresh ground
+    recycled_progression_discount: float = 0.15 # Multiplier on progressive dx re-treading territory in same spell
+    triangle_repeat_decay_base: float = 0.30    # Multiplier decay base for repeated triangle passes without fresh ground
     final_third_prog_threat_mult: float = 1.35  # Boost for progressive passes delivered into d_dest_goal <= 380.0
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
     box_angle_pass_bonus: float = 1.15         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
@@ -349,6 +351,7 @@ class RewardConfig:
     unpressed_carry_advance_mult: float = 2.0      # Multiplier on carrier advance when forward corridor is unpressed
     unpressed_carry_clear_dist: float = 140.0      # Euclidean clear distance ahead required to qualify as unpressed
     ball_advance_team_scale: float = 0.004         # Team reward per unit closer to enemy goal center
+    team_advance_pbrs_weight: float = 6.50         # Team ball-advance potential-based reward shaping scale
     hold_urgency_pen_scale: float = 0.035          # Escalating per-step penalty when field player holds ball > 3.2s
 
     # Context-Dependent Tactical & Role Positioning
