@@ -461,6 +461,13 @@ class ReplayConfig:
     successful_tackle_weight: float = 1.5
     keeper_save_weight: float = 3.0
 
+    # Broadcast & Visualizer Overlays
+    show_telemetry: bool = True
+    show_pass_lanes: bool = False
+    show_wall_tracers: bool = True
+    show_radar: bool = False
+    auto_focus_carrier: bool = False
+
 
 @dataclass(frozen=True)
 class PPOHyperparams:

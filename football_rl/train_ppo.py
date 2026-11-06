@@ -293,7 +293,7 @@ class ParameterSharingPPOTrainer:
             for fname in os.listdir(rep_dir):
                 if fname.startswith("match_") and fname.endswith(".json"):
                     parts = fname.split("_")
-                    if len(parts) >= 2 and parts[1].isdigit():
+                    if len(parts) >= 3 and parts[1].isdigit() and parts[2].startswith("gen"):
                         fid = int(parts[1])
                         if fid > max_id:
                             max_id = fid

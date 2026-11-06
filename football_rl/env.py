@@ -4114,6 +4114,8 @@ class FootballParallelEnv(ParallelEnv):
                     round(float(self.player_pos[idx, 1]), 2),
                     round(float(self.player_angle[idx]), 4),
                     flags,
+                    round(float(self.player_vel[idx, 0]), 2),
+                    round(float(self.player_vel[idx, 1]), 2),
                 ]
             )
 
@@ -4126,6 +4128,8 @@ class FootballParallelEnv(ParallelEnv):
             round(float(self.ball_pos[0]), 2),
             round(float(self.ball_pos[1]), 2),
             ball_team_color,
+            round(float(self.ball_vel[0]), 2),
+            round(float(self.ball_vel[1]), 2),
         ]
 
         total_poss = max(1, sum(self.stats["possession_frames"]))
@@ -4217,7 +4221,7 @@ class FootballParallelEnv(ParallelEnv):
                 f"_score{score_str}_{timestamp}.json"
             )
         else:
-            filename = f"match_{timestamp}_score{score_str}.json"
+            filename = f"unindexed_{timestamp}_score{score_str}.json"
         filepath = os.path.join(self.cfg.replay.save_dir, filename)
 
         highlights = []

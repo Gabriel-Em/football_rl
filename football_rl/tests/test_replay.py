@@ -371,4 +371,190 @@ def test_software_cursor_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(viz.screen, pygame.Surface)
 
 
+def test_telemetry_panel_rendering_and_toggles() -> None:
+    """Verify right-side telemetry panel rendering, dimensions, and toggle mechanisms."""
+    data = _create_mock_replay_data()
+    # 1. With telemetry enabled by default, window width accommodates the side panel
+    viz = ReplayViewer(data, headless=True, show_telemetry=True)
+    expected_w = viz.disp_field_w + 2 * viz.margin_x + viz.side_panel_w
+    assert viz.win_w == expected_w
+    surf = viz.render_frame()
+    assert surf.get_width() == expected_w
+
+    # 2. Toggle telemetry off with 'T' key event
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_t, mod=0))
+    viz.handle_events()
+    assert viz.show_telemetry is False
+    assert viz.win_w == viz.disp_field_w + 2 * viz.margin_x
+    surf_off = viz.render_frame()
+    assert surf_off.get_width() == viz.win_w
+
+    # 3. Toggle back on
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_t, mod=0))
+    viz.handle_events()
+    assert viz.show_telemetry is True
+    assert viz.win_w == expected_w
+
+    # 4. Click inside telemetry row to inspect/focus player
+    rect_0 = viz.telemetry_row_rects[0]
+    click_event = pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=rect_0.center)
+    pygame.event.post(click_event)
+    viz.handle_events()
+    assert viz.inspect_player_idx == 0
+    assert 0 in viz.selected_cone_players
+
+    # 5. Repeat click on the same row deselects the player
+    pygame.event.post(click_event)
+    viz.handle_events()
+    assert viz.inspect_player_idx is None
+    assert len(viz.selected_cone_players) == 0
+
+
+def test_pass_lanes_unpressed_lead_targets() -> None:
+    """Verify passing lane calculations, lead positions, and unpressed factors."""
+    data = _create_mock_replay_data()
+    # Default ReplayViewer must start with pass lanes OFF
+    viz_default = ReplayViewer(data, headless=True)
+    assert viz_default.show_pass_lanes is False
+
+    # Give ball to player 5 (Red ST)
+    data["frames"][0]["players"][5][3] |= 1  # FLAG_HAS_BALL
+    viz = ReplayViewer(data, headless=True, show_pass_lanes=True)
+
+    # Render frame with active passing lanes
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+    # Test toggling pass lanes via 'P'
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p, mod=0))
+    viz.handle_events()
+    assert viz.show_pass_lanes is False
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p, mod=0))
+    viz.handle_events()
+    assert viz.show_pass_lanes is True
+
+    # Test toggling via clicking "P:PASS" chip in telemetry panel
+    viz.render_frame()
+    assert "P:PASS" in viz.telemetry_chip_rects
+    p_rect = viz.telemetry_chip_rects["P:PASS"]
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(p_rect.centerx, p_rect.centery), button=1)
+    )
+    viz.handle_events()
+    assert viz.show_pass_lanes is False
+
+
+def test_wall_bank_tracers_and_radar_inspector() -> None:
+    """Verify wall rebound tracer sparks and 32-ray peripheral radar inspector."""
+    data = _create_mock_replay_data()
+    # Position ball at top wall cushion
+    data["frames"][0]["ball"] = [500.0, 10.0, 0, 150.0, -100.0]
+    viz = ReplayViewer(data, headless=True, show_wall_tracers=True, show_radar=True)
+
+    # Select player 3 for radar inspection
+    viz.inspect_player_idx = 3
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+    # Verify toggles for wall tracers ('W') and radar ('I')
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_w, mod=0))
+    viz.handle_events()
+    assert viz.show_wall_tracers is False
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_i, mod=0))
+    viz.handle_events()
+    assert viz.show_radar is False
+
+    # Verify toggle for underfoot pocket marking halos ('H')
+    assert viz.show_pocket_halos is True
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_h, mod=0))
+    viz.handle_events()
+    assert viz.show_pocket_halos is False
+
+
+def test_auto_carrier_focus_and_pitch_single_select() -> None:
+    """Verify follow-ball-carrier toggle and pitch body single-select behavior."""
+    data = _create_mock_replay_data()
+    # Player 5 (Red ST) has ball in frame 0
+    data["frames"][0]["players"][5][3] |= 1  # FLAG_HAS_BALL
+    viz = ReplayViewer(data, headless=True, auto_focus_carrier=False)
+    viz.render_frame()
+
+    # 1. Pitch body clicks in manual mode: single-select & deselect on repeat click
+    p1 = data["frames"][0]["players"][1]
+    p1_sx, p1_sy = viz.world_to_screen(float(p1[0]), float(p1[1]))
+    p2 = data["frames"][0]["players"][2]
+    p2_sx, p2_sy = viz.world_to_screen(float(p2[0]), float(p2[1]))
+
+    # Click D1 body -> focus D1
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(p1_sx, p1_sy), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx == 1
+    assert viz.selected_cone_players == {1}
+
+    # Click D2 body -> focus D2, deselect D1
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(p2_sx, p2_sy), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx == 2
+    assert viz.selected_cone_players == {2}
+
+    # Click D2 body again -> deselect D2 (nobody focused)
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(p2_sx, p2_sy), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx is None
+    assert len(viz.selected_cone_players) == 0
+
+    # 2. Toggle follow-ball-carrier via 'F' key
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_f, mod=0))
+    viz.handle_events()
+    assert viz.auto_focus_carrier is True
+
+    # Render frame -> carrier (player 5) automatically focused
+    viz.render_frame()
+    assert viz.inspect_player_idx == 5
+    assert viz.selected_cone_players == {5}
+
+    # With follow-ball ON, clicking pitch body or telemetry row MUST NOT change focus
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(p1_sx, p1_sy), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx == 5
+
+    t1_rect = viz.telemetry_row_rects[1]
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(t1_rect.centerx, t1_rect.centery), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx == 5
+
+    # 3. Toggle follow-ball-carrier OFF via 'F:BALL' chip click -> deselects player
+    assert "F:BALL" in viz.telemetry_chip_rects
+    f_rect = viz.telemetry_chip_rects["F:BALL"]
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(f_rect.centerx, f_rect.centery), button=1))
+    viz.handle_events()
+    assert viz.auto_focus_carrier is False
+    assert viz.inspect_player_idx is None
+    assert len(viz.selected_cone_players) == 0
+    assert viz.show_vision_cones is False
+
+    # 4. Toggle follow-ball ON via 'F' key, then toggle OFF via 'F' key -> deselects player
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_f, mod=0))
+    viz.handle_events()
+    assert viz.auto_focus_carrier is True
+    viz.render_frame()
+    assert viz.inspect_player_idx == 5
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_f, mod=0))
+    viz.handle_events()
+    assert viz.auto_focus_carrier is False
+    assert viz.inspect_player_idx is None
+    assert len(viz.selected_cone_players) == 0
+    assert viz.show_vision_cones is False
+
+    # Now manual clicks work again: click row 1 focuses player 1
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(t1_rect.centerx, t1_rect.centery), button=1))
+    viz.handle_events()
+    assert viz.inspect_player_idx == 1
+
+
+
+
 
