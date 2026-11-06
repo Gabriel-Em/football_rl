@@ -347,26 +347,10 @@ class ReplayViewer:
                     self.show_pocket_halos = not self.show_pocket_halos
                 elif event.key == pygame.K_r:
                     self.seek_to_frame(0)
-                elif event.key in (pygame.K_0, pygame.K_s):
-                    # Toggle slow-mo (0.25x) vs normal speed (1.0x)
-                    if math.isclose(self.playback_speed, 0.25, abs_tol=1e-3):
-                        self.playback_speed = 1.0
-                    else:
-                        self.playback_speed = 0.25
-                elif event.key == pygame.K_1:
-                    self.playback_speed = 1.0
-                elif event.key == pygame.K_2:
-                    self.playback_speed = 2.0
-                elif event.key == pygame.K_4:
-                    self.playback_speed = 4.0
-                elif event.key in (pygame.K_LEFTBRACKET, pygame.K_COMMA):
-                    speeds = [0.25, 0.5, 1.0, 2.0, 4.0]
-                    curr_idx = min(range(len(speeds)), key=lambda i: abs(speeds[i] - self.playback_speed))
-                    self.playback_speed = speeds[max(0, curr_idx - 1)]
-                elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_PERIOD):
-                    speeds = [0.25, 0.5, 1.0, 2.0, 4.0]
-                    curr_idx = min(range(len(speeds)), key=lambda i: abs(speeds[i] - self.playback_speed))
-                    self.playback_speed = speeds[min(len(speeds) - 1, curr_idx + 1)]
+                elif event.key == pygame.K_a:
+                    self.change_playback_speed(-1)
+                elif event.key == pygame.K_d:
+                    self.change_playback_speed(1)
                 elif event.key == pygame.K_RIGHT:
                     mods = pygame.key.get_mods()
                     delta = 1 if (mods & pygame.KMOD_SHIFT or self.paused) else self.physics_hz * 5
@@ -380,9 +364,8 @@ class ReplayViewer:
                 bar_x = self.margin_x
                 bar_w = self.disp_field_w
                 bar_y = self.hud_height + self.disp_field_h + 12
-                # 0. Left Click on Telemetry Quick-Toggle Chips
-                clicked_chip = self._find_chip_at_pos(mx, my) if (self.show_telemetry and event.button == 1) else None
-                if clicked_chip is not None:
+                # 1. Left Click on Telemetry Quick-Toggle Chips
+                if (clicked_chip := (self._find_chip_at_pos(mx, my) if (self.show_telemetry and event.button == 1) else None)) is not None:
                     if clicked_chip == "F:BALL":
                         self.auto_focus_carrier = not self.auto_focus_carrier
                         if self.auto_focus_carrier:
@@ -536,6 +519,22 @@ class ReplayViewer:
             else:
                 self.paused = True
                 break
+
+    SPEED_LEVELS: List[float] = [0.25, 0.5, 0.75, 1.0, 2.0, 4.0]
+
+    def change_playback_speed(self, delta: int) -> float:
+        """Step playback speed: delta < 0 slows down (e.g. 'A'), delta > 0 speeds up (e.g. 'D')."""
+        curr_idx = min(
+            range(len(self.SPEED_LEVELS)),
+            key=lambda i: abs(self.SPEED_LEVELS[i] - self.playback_speed),
+        )
+        new_idx = max(0, min(len(self.SPEED_LEVELS) - 1, curr_idx + delta))
+        self.playback_speed = self.SPEED_LEVELS[new_idx]
+        return self.playback_speed
+
+    def toggle_playback_speed(self, reverse: bool = False) -> float:
+        """Step playback speed: reverse=True slows down (-1), reverse=False speeds up (+1)."""
+        return self.change_playback_speed(-1 if reverse else 1)
 
     # ==========================================================================
     # Rendering Pipeline
@@ -1440,8 +1439,10 @@ class ReplayViewer:
         role_legend = "Roles: GK | D1-D2 (Def) | M1-M2 (Mid) | ST (Atk)"
         if self.playback_speed < 1.0:
             speed_str = f"{self.playback_speed:g}x (SLOWMO)"
-        else:
+        elif math.isclose(self.playback_speed, int(self.playback_speed), abs_tol=1e-3):
             speed_str = f"{int(self.playback_speed)}x"
+        else:
+            speed_str = f"{self.playback_speed:g}x"
 
         if not self.show_vision_cones:
             cone_str = "OFF"
@@ -1453,10 +1454,10 @@ class ReplayViewer:
         else:
             cone_str = f"{len(self.selected_cone_players)} Sel"
 
-        status_str = (
-            f"[SPACE] {'PAUSED' if self.paused else 'PLAYING'}   "
-            f"[Speed: {speed_str}]   "
-            f"[F] FollowBall:{'ON' if self.auto_focus_carrier else 'OFF'}   "
+        left_part = f"[SPACE] {'PAUSED' if self.paused else 'PLAYING'}   "
+        speed_part = f"[A/D] Speed: {speed_str}"
+        right_part = (
+            f"   [F] FollowBall:{'ON' if self.auto_focus_carrier else 'OFF'}   "
             f"[V] Cones:{cone_str}   "
             f"[P] Pass:{'ON' if self.show_pass_lanes else 'OFF'}   "
             f"[W] Walls:{'ON' if self.show_wall_tracers else 'OFF'}   "
@@ -1464,8 +1465,11 @@ class ReplayViewer:
             f"[T] Telemetry:{'ON' if self.show_telemetry else 'OFF'}   "
             f"[E] Rew:{'ON' if self.show_reward_hud else 'OFF'}"
         )
+        status_str = left_part + speed_part + right_part
         ctrl_surf = self.font_small.render(status_str, True, COLOR_TEXT_MUTED)
-        self.screen.blit(ctrl_surf, (cx - ctrl_surf.get_width() // 2, 70))
+        ctrl_x = cx - ctrl_surf.get_width() // 2
+        ctrl_y = 70
+        self.screen.blit(ctrl_surf, (ctrl_x, ctrl_y))
 
     def _draw_scrubber_bar(self, frame: Dict[str, Any]) -> None:
         """Draw bottom timeline scrubber bar with halftime tick, goal markers, and save markers."""

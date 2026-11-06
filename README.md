@@ -198,7 +198,7 @@ During training, <a href="./replays/matches_summary.md">replays/matches_summary.
 | `Space` | Pause / Resume playback. |
 | `Left / Right` | Scrub `-5.0s / +5.0s` (or single frame when paused or holding `Shift`). |
 | `Mouse Click / Drag` | Scrub directly to any point on the bottom timeline (ticks indicate goals, fouls, and HT). |
-| `1 / 2 / 4` | Set playback speed multiplier (`1x`, `2x`, `4x`). |
+| `A / D` | Decrease / increase playback speed (`0.25x` $\leftrightarrow$ `0.5x` $\leftrightarrow$ `0.75x` $\leftrightarrow$ `1x` $\leftrightarrow$ `2x` $\leftrightarrow$ `4x`). |
 | `V` | Toggle player vision cone overlays ($210^\circ$ FOV with peripheral ramp). |
 | `R` | Restart replay from kickoff ($t = 0.0\text{s}$). |
 | `Q / Esc` | Exit viewer. |

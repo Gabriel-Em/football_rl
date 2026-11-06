@@ -123,6 +123,7 @@ class MechanicsConfig:
     kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
     pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
     pickup_tackle_grace: float = 0.45 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
+    pass_reception_tackle_grace: float = 0.25 # Shielding duration (s) after receiving a teammate pass outside goalmouth
     kick_steer_max_deflection_deg: float = 75.0  # Side-foot pass/clearance angle modulation (+/- 75 deg)
     keeper_smother_cpa_radius: float = 30.0      # CPA threshold radius (u) for keeper dive speed clamping and smother saves
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
@@ -167,6 +168,7 @@ class MechanicsConfig:
     keeper_dive_speed: float = 340.0
     lunge_duration: float = 0.25
     lunge_cooldown: float = 1.8
+    keeper_lunge_cooldown: float = 3.5
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
     keeper_clear_corridor_length: float = 380.0   # Forward corridor distance (u) to check for blocking opponents (reaches past gk_hold_opponent_buffer=265.0)
@@ -255,17 +257,25 @@ class RewardConfig:
     keeper_wall_bypass_deep_bonus: float = 1.40    # Bonus when GK banks a ball off side wall into open space in opponent half (x_canon >= 700)
     keeper_hold_urgency_start: float = 2.0         # Seconds before GK hold urgency penalty begins
     keeper_hold_urgency_scale: float = 0.045       # Max per-step urgency penalty for GK holding ball up to 5.0s
+    keeper_dive_slow_ball_chase_mult: float = 0.30 # Scales down sweeper chase rewards while lunging at slow ball (<80u/s)
+    keeper_cooldown_walk_chase_mult: float = 1.25  # Boosts sweeper chase rewards when walking on cooldown to close gap
+    keeper_cooldown_stall_pen: float = 0.045       # Per-RL-step penalty when GK is on lunge cooldown and waiting instead of walking
+    keeper_box_shrink_pen_scale: float = 0.065     # Per-RL-step penalty scale when active box radius shrinks below nominal
+    keeper_shrunk_box_loss_pen: float = -1.50      # Discrete penalty when opponent claims loose ball inside shrunken box
 
     # Pass & Role Link-Up Bonuses (Anti-Farming & Progressive)
-    completed_pass_passer_ind: float = 0.0      # Zeroed out (was 1.0)
-    completed_pass_receiver_ind: float = 0.2    # Modest receive touch bonus (was 0.8)
-    completed_pass_team: float = 0.0            # Zeroed out (was 0.25)
-    def_breakout_pass_bonus: float = 1.10
+    completed_pass_passer_ind: float = 0.0      # Individual reward to passer on pass completion
+    completed_pass_receiver_ind: float = 0.2    # Receive touch bonus
+    completed_pass_team: float = 0.0            # Team reward on pass completion
+    def_breakout_pass_bonus: float = 0.75       # Defender forward breakout pass bonus
     mid_link_receive_bonus: float = 0.5
-    mid_to_atk_pass_bonus: float = 0.8
+    mid_to_atk_pass_bonus: float = 0.60         # Midfielder to attacker pass bonus
     pass_to_atk_bonus: float = 0.6
+    midfield_layoff_bonus: float = 0.30         # Midfield backward drops under press
+    goal_assist_ind: float = 4.0                # Individual reward to passer when receiver scores goal
+    goal_assist_window_sec: float = 4.0         # Maximum elapsed time (s) from completed pass to goal for assist
     pass_target_aim_ind: float = 0.45       # Immediate bonus in _execute_kick when aiming toward open teammate
-    recycle_pass_bonus: float = 0.0         # Completely removed (was 0.35)
+    recycle_pass_bonus: float = 0.0         # Reward for recycling possession
     open_clearance_ind: float = 0.25        # Immediate bonus in _execute_kick when kicking to open pitch corridor
     blocked_kick_pen: float = -0.85         # Immediate penalty in _execute_kick when kicking into near opponent
     keeper_wall_clear_bonus: float = 1.25   # Bonus for high-power GK side-wall ricochet clearances past pressed center
@@ -274,6 +284,9 @@ class RewardConfig:
     # Progressive Pass & Anti-Exploit Parameters
     pass_progressive_dx_weight: float = 0.012   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +2.4)
     progressive_pass_scale: float = 0.012       # Alias matching pass_progressive_dx_weight
+    recycled_progression_discount: float = 0.25 # Multiplier on progressive dx re-treading territory in same spell
+    triangle_repeat_decay_base: float = 0.35    # Multiplier decay base for repeated triangle passes without fresh ground
+    final_third_prog_threat_mult: float = 1.35  # Boost for progressive passes delivered into d_dest_goal <= 380.0
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
     box_angle_pass_bonus: float = 1.15         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
     escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
@@ -331,8 +344,10 @@ class RewardConfig:
     # Dense Per-Step Shaping (at 15 Hz RL step rate)
     possession_carrier_ind: float = 0.006
     possession_team: float = 0.001
-    carrier_goal_advance_ind_scale: float = 0.005  # Reduced from 0.008/u so solo hero-runs do not dominate passing
+    carrier_goal_advance_ind_scale: float = 0.005  # Carrier advance reward per unit gained
     carrier_dribble_decay_start: float = 1.5       # Seconds of continuous carry before solo advance reward decays
+    unpressed_carry_advance_mult: float = 2.0      # Multiplier on carrier advance when forward corridor is unpressed
+    unpressed_carry_clear_dist: float = 140.0      # Euclidean clear distance ahead required to qualify as unpressed
     ball_advance_team_scale: float = 0.004         # Team reward per unit closer to enemy goal center
     hold_urgency_pen_scale: float = 0.035          # Escalating per-step penalty when field player holds ball > 3.2s
 

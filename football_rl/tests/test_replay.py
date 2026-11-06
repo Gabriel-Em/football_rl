@@ -284,13 +284,13 @@ def test_vision_cone_player_isolation_and_tab_cycling() -> None:
     viz.handle_events()
     assert viz.selected_cone_players == {2}
 
-    # Post '0' key -> toggles slowmo (0.25x)
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_0, mod=0))
+    # Post 'a' key -> slows speed down to 0.75x
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
     viz.handle_events()
-    assert math.isclose(viz.playback_speed, 0.25, abs_tol=1e-3)
+    assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
 
-    # Post 's' key -> toggles back to normal (1.0x)
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_s, mod=0))
+    # Post 'd' key -> speeds back up to 1.0x
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
 
@@ -553,6 +553,128 @@ def test_auto_carrier_focus_and_pitch_single_select() -> None:
     pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(t1_rect.centerx, t1_rect.centery), button=1))
     viz.handle_events()
     assert viz.inspect_player_idx == 1
+
+
+def test_speed_toggle_0_5_and_0_75_options() -> None:
+    """Verify A slows down and D speeds up through playback speeds starting at normal (1.0x)."""
+    data = _create_mock_replay_data()
+    viz = ReplayVisualizer(data, headless=True)
+    # Starts with normal (1.0x)
+    assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+    # 1. 'A' slows down: 1.0 -> 0.75 -> 0.5 -> 0.25 (clamped)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.50, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.25, abs_tol=1e-3)
+
+    # Further 'A' stays clamped at min 0.25
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.25, abs_tol=1e-3)
+
+    # 2. 'D' speeds up: 0.25 -> 0.50 -> 0.75 -> 1.0 -> 2.0 -> 4.0 (clamped)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.50, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 2.0, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 4.0, abs_tol=1e-3)
+
+    # Further 'D' stays clamped at max 4.0
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 4.0, abs_tol=1e-3)
+
+    # 'A' slows down from 4.0 -> 2.0 -> 1.0
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 2.0, abs_tol=1e-3)
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    viz.handle_events()
+    assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+    # 3. Ensure other keys (s, 0, 1, 2, 4, 5, 7, brackets, comma, dot) do NOT trigger speed changes
+    for ignored_key in (
+        pygame.K_s,
+        pygame.K_0,
+        pygame.K_1,
+        pygame.K_2,
+        pygame.K_4,
+        pygame.K_5,
+        pygame.K_7,
+        pygame.K_LEFTBRACKET,
+        pygame.K_RIGHTBRACKET,
+        pygame.K_COMMA,
+        pygame.K_PERIOD,
+    ):
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=ignored_key, mod=0))
+        viz.handle_events()
+        assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+    # 4. Ensure mouse clicks do NOT trigger speed changes
+    viz.render_frame()
+    for button in (1, 2, 3):
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(100, 70), button=button))
+        viz.handle_events()
+        assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+
+def test_subframe_accumulator_0_5_and_0_75() -> None:
+    """Verify subframe accumulator accuracy for 0.5x and 0.75x slow-mo speeds."""
+    data = _create_mock_replay_data()
+    viz = ReplayVisualizer(data, headless=True)
+
+    # 1. Test 0.50x playback speed: advances 1 frame every 2 ticks
+    viz.playback_speed = 0.50
+    viz.seek_to_frame(0)
+    assert viz.current_frame_idx == 0
+
+    viz.step_playback()  # tick 1: acc = 0.5 -> 0 frames advanced
+    assert viz.current_frame_idx == 0
+    viz.step_playback()  # tick 2: acc = 1.0 -> 1 frame advanced
+    assert viz.current_frame_idx == 1
+    viz.step_playback()  # tick 3: acc = 0.5 -> 0 frames advanced
+    assert viz.current_frame_idx == 1
+    viz.step_playback()  # tick 4: acc = 1.0 -> 1 frame advanced
+    assert viz.current_frame_idx == 2
+
+    # 2. Test 0.75x playback speed: advances 3 frames every 4 ticks
+    viz.playback_speed = 0.75
+    viz.subframe_accumulator = 0.0
+    viz.seek_to_frame(0)
+    assert viz.current_frame_idx == 0
+
+    viz.step_playback()  # tick 1: acc = 0.75 -> 0 frames advanced
+    assert viz.current_frame_idx == 0
+    viz.step_playback()  # tick 2: acc = 1.50 -> 1 frame advanced (acc rem 0.50)
+    assert viz.current_frame_idx == 1
+    viz.step_playback()  # tick 3: acc = 1.25 -> 1 frame advanced (acc rem 0.25)
+    assert viz.current_frame_idx == 2
+    viz.step_playback()  # tick 4: acc = 1.00 -> 1 frame advanced (acc rem 0.00)
+    assert viz.current_frame_idx == 3
+
 
 
 
