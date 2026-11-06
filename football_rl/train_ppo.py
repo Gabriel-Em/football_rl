@@ -20,6 +20,8 @@ import torch.optim as optim
 from football_rl.config import (
     ACTION_DIM,
     ALL_AGENTS,
+    CENTRAL_STATE_DIM,
+    CRITIC_STATE_DIM,
     DEFAULT_CONFIG,
     EnvConfig,
     OBS_DIM,
@@ -36,19 +38,28 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 
 
 
 class ActorCritic(nn.Module):
-    """Continuous-action Gaussian Actor-Critic network for shared role policies."""
+    """Continuous-action Gaussian Actor-Critic network for shared role policies.
+
+    Supports CTDE (Centralized Training with Decentralized Execution):
+    - Actor policy network observes decentralized observations (obs_dim = 76).
+    - Critic value network observes augmented centralized state (critic_obs_dim = 130 = 76 + 54).
+    """
 
     def __init__(
         self,
         obs_dim: int = OBS_DIM,
         action_dim: int = ACTION_DIM,
         hidden_dims: Tuple[int, int] = (256, 256),
+        central_state_dim: int = CENTRAL_STATE_DIM,
     ) -> None:
         super().__init__()
         h1, h2 = hidden_dims
+        self.obs_dim = obs_dim
+        self.central_state_dim = central_state_dim
+        critic_in_dim = obs_dim + central_state_dim
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, h1)),
+            layer_init(nn.Linear(critic_in_dim, h1)),
             nn.Tanh(),
             layer_init(nn.Linear(h1, h2)),
             nn.Tanh(),
@@ -73,16 +84,35 @@ class ActorCritic(nn.Module):
         )
         self.actor_logstd = nn.Parameter(torch.full((1, action_dim), -0.5))
 
-    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.critic(obs).squeeze(-1)
+    def _prepare_critic_input(
+        self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if central_state is not None:
+            return torch.cat([obs, central_state], dim=-1)
+        if obs.shape[-1] == self.obs_dim + self.central_state_dim:
+            return obs
+        zeros = torch.zeros(
+            (*obs.shape[:-1], self.central_state_dim),
+            dtype=obs.dtype,
+            device=obs.device,
+        )
+        return torch.cat([obs, zeros], dim=-1)
+
+    def get_value(
+        self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        critic_in = self._prepare_critic_input(obs, central_state)
+        return self.critic(critic_in).squeeze(-1)
 
     def get_action_and_value(
         self,
         obs: torch.Tensor,
         action: Optional[torch.Tensor] = None,
         deterministic: bool = False,
+        central_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean = self.actor_mean(obs)
+        actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
+        action_mean = self.actor_mean(actor_obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
@@ -92,7 +122,8 @@ class ActorCritic(nn.Module):
 
         log_prob = probs.log_prob(action).sum(-1)
         entropy = probs.entropy().sum(-1)
-        value = self.critic(obs).squeeze(-1)
+        critic_in = self._prepare_critic_input(actor_obs, central_state)
+        value = self.critic(critic_in).squeeze(-1)
         return action, log_prob, entropy, value
 
 
@@ -231,9 +262,12 @@ class ParameterSharingPPOTrainer:
             self.cpu_red_field_policy = self.red_field_policy
             self.cpu_red_keeper_policy = self.red_keeper_policy
 
-        # Initialize environments and store current observations (num_envs, len(ALL_AGENTS), OBS_DIM)
+        # Initialize environments and store current observations and centralized states
         self.num_agents: int = len(ALL_AGENTS)
         self.current_obs = np.zeros((num_envs, self.num_agents, OBS_DIM), dtype=np.float32)
+        self.current_central_state = np.zeros(
+            (num_envs, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32
+        )
         self._reset_all_envs(initial=True)
 
     def _sync_cpu_policies(self) -> None:
@@ -281,33 +315,53 @@ class ParameterSharingPPOTrainer:
             {"generation": target_gen, "match_id": self._allocate_match_id()}
             for _ in range(self.num_envs)
         ]
-        obs_list, _ = self.vec_env.reset(seeds=seeds, options_list=options_list)
+        obs_list, info_list = self.vec_env.reset(seeds=seeds, options_list=options_list)
         for env_i in range(self.num_envs):
             for agent_i, agent_name in enumerate(ALL_AGENTS):
                 self.current_obs[env_i, agent_i] = obs_list[env_i][agent_name]
+                if "central_state" in info_list[env_i].get(agent_name, {}):
+                    self.current_central_state[env_i, agent_i] = info_list[env_i][agent_name]["central_state"]
 
     @torch.no_grad()
     def _select_actions(
-        self, obs_batch: np.ndarray, deterministic: bool = False
+        self,
+        obs_batch: np.ndarray,
+        central_batch: Optional[np.ndarray] = None,
+        deterministic: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Query Blue and Red role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
+        cen_t = (
+            torch.as_tensor(central_batch, dtype=torch.float32, device=self.inference_device)
+            if central_batch is not None
+            else None
+        )
         actions = torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
         logprobs = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
         values = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
 
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
+            k_cen = (
+                cen_t[:, self.keeper_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                if cen_t is not None
+                else None
+            )
             k_act, k_logp, _, k_val = self.cpu_blue_keeper_policy.get_action_and_value(
-                k_obs, deterministic=deterministic
+                k_obs, deterministic=deterministic, central_state=k_cen
             )
             actions[:, self.keeper_indices, :] = k_act.view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
             logprobs[:, self.keeper_indices] = k_logp.view(self.num_envs, len(self.keeper_indices))
             values[:, self.keeper_indices] = k_val.view(self.num_envs, len(self.keeper_indices))
 
             f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
+            f_cen = (
+                cen_t[:, self.field_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                if cen_t is not None
+                else None
+            )
             f_act, f_logp, _, f_val = self.cpu_blue_field_policy.get_action_and_value(
-                f_obs, deterministic=deterministic
+                f_obs, deterministic=deterministic, central_state=f_cen
             )
             actions[:, self.field_indices, :] = f_act.view(self.num_envs, len(self.field_indices), ACTION_DIM)
             logprobs[:, self.field_indices] = f_logp.view(self.num_envs, len(self.field_indices))
@@ -322,8 +376,13 @@ class ParameterSharingPPOTrainer:
             for indices, policy in groups:
                 cnt = len(indices)
                 g_obs = obs_t[:, indices, :].reshape(-1, OBS_DIM)
+                g_cen = (
+                    cen_t[:, indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                    if cen_t is not None
+                    else None
+                )
                 g_act, g_logp, _, g_val = policy.get_action_and_value(
-                    g_obs, deterministic=deterministic
+                    g_obs, deterministic=deterministic, central_state=g_cen
                 )
                 actions[:, indices, :] = g_act.view(self.num_envs, cnt, ACTION_DIM)
                 logprobs[:, indices] = g_logp.view(self.num_envs, cnt)
@@ -336,19 +395,42 @@ class ParameterSharingPPOTrainer:
         )
 
     @torch.no_grad()
-    def _compute_values(self, obs_batch: np.ndarray) -> np.ndarray:
-        """Compute critic values for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
+    def _compute_values(
+        self, obs_batch: np.ndarray, central_batch: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Compute critic values for observations and centralized states."""
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
+        cen_t = (
+            torch.as_tensor(central_batch, dtype=torch.float32, device=self.inference_device)
+            if central_batch is not None
+            else None
+        )
         values = np.zeros((self.num_envs, self.num_agents), dtype=np.float32)
 
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
+            k_cen = (
+                cen_t[:, self.keeper_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                if cen_t is not None
+                else None
+            )
             values[:, self.keeper_indices] = (
-                self.cpu_blue_keeper_policy.get_value(k_obs).view(self.num_envs, len(self.keeper_indices)).cpu().numpy()
+                self.cpu_blue_keeper_policy.get_value(k_obs, central_state=k_cen)
+                .view(self.num_envs, len(self.keeper_indices))
+                .cpu()
+                .numpy()
             )
             f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
+            f_cen = (
+                cen_t[:, self.field_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                if cen_t is not None
+                else None
+            )
             values[:, self.field_indices] = (
-                self.cpu_blue_field_policy.get_value(f_obs).view(self.num_envs, len(self.field_indices)).cpu().numpy()
+                self.cpu_blue_field_policy.get_value(f_obs, central_state=f_cen)
+                .view(self.num_envs, len(self.field_indices))
+                .cpu()
+                .numpy()
             )
         else:
             groups = [
@@ -360,8 +442,16 @@ class ParameterSharingPPOTrainer:
             for indices, policy in groups:
                 cnt = len(indices)
                 g_obs = obs_t[:, indices, :].reshape(-1, OBS_DIM)
+                g_cen = (
+                    cen_t[:, indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                    if cen_t is not None
+                    else None
+                )
                 values[:, indices] = (
-                    policy.get_value(g_obs).view(self.num_envs, cnt).cpu().numpy()
+                    policy.get_value(g_obs, central_state=g_cen)
+                    .view(self.num_envs, cnt)
+                    .cpu()
+                    .numpy()
                 )
         return values
 
@@ -371,6 +461,7 @@ class ParameterSharingPPOTrainer:
         N = self.num_envs
 
         buf_obs = np.zeros((T, N, self.num_agents, OBS_DIM), dtype=np.float32)
+        buf_central = np.zeros((T, N, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32)
         buf_act = np.zeros((T, N, self.num_agents, ACTION_DIM), dtype=np.float32)
         buf_logp = np.zeros((T, N, self.num_agents), dtype=np.float32)
         buf_rew = np.zeros((T, N, self.num_agents), dtype=np.float32)
@@ -386,7 +477,10 @@ class ParameterSharingPPOTrainer:
 
         for t in range(T):
             buf_obs[t] = self.current_obs
-            actions, logprobs, values = self._select_actions(self.current_obs)
+            buf_central[t] = self.current_central_state
+            actions, logprobs, values = self._select_actions(
+                self.current_obs, self.current_central_state
+            )
             buf_act[t] = actions
             buf_logp[t] = logprobs
             buf_val[t] = values
@@ -455,7 +549,7 @@ class ParameterSharingPPOTrainer:
 
                     # Auto-reset environment for seamless rollout collection
                     next_gen_hint = active_generation + (1 if t == T - 1 else 0)
-                    reset_obs_list, _ = self.vec_env.reset(
+                    reset_obs_list, reset_info_list = self.vec_env.reset(
                         options_list=[{
                             "generation": next_gen_hint,
                             "match_id": self._allocate_match_id(),
@@ -463,9 +557,12 @@ class ParameterSharingPPOTrainer:
                         env_indices=[env_i],
                     )
                     next_obs_dict = reset_obs_list[0]
+                    info_dict = reset_info_list[0]
 
                 for agent_i, agent_name in enumerate(ALL_AGENTS):
                     self.current_obs[env_i, agent_i] = next_obs_dict[agent_name]
+                    if "central_state" in info_dict.get(agent_name, {}):
+                        self.current_central_state[env_i, agent_i] = info_dict[agent_name]["central_state"]
 
         # If save_best_only is enabled, retain only the single best match replay per generation
         if self.save_best_only and gen_completed_matches:
@@ -487,7 +584,7 @@ class ParameterSharingPPOTrainer:
                 exported_replays = [best_match["replay_path"]] if best_match.get("replay_path") else []
 
         # Compute Generalized Advantage Estimation (GAE) per agent trajectory
-        next_values = self._compute_values(self.current_obs)
+        next_values = self._compute_values(self.current_obs, self.current_central_state)
         advantages = np.zeros_like(buf_rew)
         lastgaelam = np.zeros((N, self.num_agents), dtype=np.float32)
 
@@ -505,6 +602,7 @@ class ParameterSharingPPOTrainer:
 
         return {
             "obs": buf_obs,
+            "central_state": buf_central,
             "actions": buf_act,
             "logprobs": buf_logp,
             "advantages": advantages,
@@ -526,6 +624,7 @@ class ParameterSharingPPOTrainer:
         b_advantages: torch.Tensor,
         b_returns: torch.Tensor,
         b_values: torch.Tensor,
+        b_central: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """Run multi-epoch minibatch PPO update on pooled role transitions."""
         batch_size = b_obs.shape[0]
@@ -544,8 +643,9 @@ class ParameterSharingPPOTrainer:
                 end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
+                cen_mb = b_central[mb_inds] if b_central is not None else None
                 _, newlogprob, entropy, newvalue = policy.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
+                    b_obs[mb_inds], b_actions[mb_inds], central_state=cen_mb
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -596,6 +696,7 @@ class ParameterSharingPPOTrainer:
     def update_policies(self, rollout: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
         """Update Blue and Red role networks independently (or pooled if `separate_teams=False`)."""
         obs = rollout["obs"]
+        central_state = rollout.get("central_state")
         actions = rollout["actions"]
         logprobs = rollout["logprobs"]
         advantages = rollout["advantages"]
@@ -609,6 +710,15 @@ class ParameterSharingPPOTrainer:
                 obs[:, :, role_indices, :].reshape(-1, OBS_DIM),
                 dtype=torch.float32,
                 device=self.device,
+            )
+            r_cen = (
+                torch.as_tensor(
+                    central_state[:, :, role_indices, :].reshape(-1, CENTRAL_STATE_DIM),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if central_state is not None
+                else None
             )
             r_act = torch.as_tensor(
                 actions[:, :, role_indices, :].reshape(-1, ACTION_DIM),
@@ -635,18 +745,22 @@ class ParameterSharingPPOTrainer:
                 dtype=torch.float32,
                 device=self.device,
             )
-            return r_obs, r_act, r_logp, r_adv, r_ret, r_val
+            return r_obs, r_act, r_logp, r_adv, r_ret, r_val, r_cen
 
         if not self.separate_teams:
+            f_tensors = _extract_role_tensors(self.field_indices)
             field_metrics = self._ppo_update_role(
                 self.blue_field_policy,
                 self.blue_field_optimizer,
-                *_extract_role_tensors(self.field_indices),
+                f_tensors[0], f_tensors[1], f_tensors[2], f_tensors[3], f_tensors[4], f_tensors[5],
+                b_central=f_tensors[6],
             )
+            k_tensors = _extract_role_tensors(self.keeper_indices)
             keeper_metrics = self._ppo_update_role(
                 self.blue_keeper_policy,
                 self.blue_keeper_optimizer,
-                *_extract_role_tensors(self.keeper_indices),
+                k_tensors[0], k_tensors[1], k_tensors[2], k_tensors[3], k_tensors[4], k_tensors[5],
+                b_central=k_tensors[6],
             )
             metrics = {
                 "field": field_metrics,
@@ -659,25 +773,33 @@ class ParameterSharingPPOTrainer:
             self._sync_cpu_policies()
             return metrics
 
+        bf_tensors = _extract_role_tensors(self.blue_field_indices)
         blue_field_m = self._ppo_update_role(
             self.blue_field_policy,
             self.blue_field_optimizer,
-            *_extract_role_tensors(self.blue_field_indices),
+            bf_tensors[0], bf_tensors[1], bf_tensors[2], bf_tensors[3], bf_tensors[4], bf_tensors[5],
+            b_central=bf_tensors[6],
         )
+        bk_tensors = _extract_role_tensors(self.blue_keeper_indices)
         blue_keeper_m = self._ppo_update_role(
             self.blue_keeper_policy,
             self.blue_keeper_optimizer,
-            *_extract_role_tensors(self.blue_keeper_indices),
+            bk_tensors[0], bk_tensors[1], bk_tensors[2], bk_tensors[3], bk_tensors[4], bk_tensors[5],
+            b_central=bk_tensors[6],
         )
+        rf_tensors = _extract_role_tensors(self.red_field_indices)
         red_field_m = self._ppo_update_role(
             self.red_field_policy,
             self.red_field_optimizer,
-            *_extract_role_tensors(self.red_field_indices),
+            rf_tensors[0], rf_tensors[1], rf_tensors[2], rf_tensors[3], rf_tensors[4], rf_tensors[5],
+            b_central=rf_tensors[6],
         )
+        rk_tensors = _extract_role_tensors(self.red_keeper_indices)
         red_keeper_m = self._ppo_update_role(
             self.red_keeper_policy,
             self.red_keeper_optimizer,
-            *_extract_role_tensors(self.red_keeper_indices),
+            rk_tensors[0], rk_tensors[1], rk_tensors[2], rk_tensors[3], rk_tensors[4], rk_tensors[5],
+            b_central=rk_tensors[6],
         )
         metrics = {
             "field": blue_field_m,
@@ -886,6 +1008,22 @@ class ParameterSharingPPOTrainer:
 
         return summary_path
 
+    def _load_adapted_weights(self, policy: ActorCritic, weights: Dict[str, torch.Tensor]) -> None:
+        """Load state dict into ActorCritic, adapting 76-dim critic weights to 130-dim if needed."""
+        target_dict = policy.state_dict()
+        adapted = {}
+        for k, v in weights.items():
+            if k == "critic.0.weight" and v.shape != target_dict[k].shape:
+                # If old critic was trained on obs_dim (76), pad extra central_state_dim (54) columns with 0
+                new_w = target_dict[k].clone()
+                old_in_dim = v.shape[1]
+                new_w[:, :old_in_dim] = v
+                new_w[:, old_in_dim:] = 0.0
+                adapted[k] = new_w
+            else:
+                adapted[k] = v
+        policy.load_state_dict(adapted, strict=False)
+
     def load_checkpoints(self) -> bool:
         """Load Blue and Red policies, optimizers, and cumulative generation/match state."""
         state_path = os.path.join(self.checkpoint_dir, "training_state.pt")
@@ -906,27 +1044,49 @@ class ParameterSharingPPOTrainer:
             red_f_weights = state.get("red_field_policy", blue_f_weights)
             red_k_weights = state.get("red_keeper_policy", blue_k_weights)
 
-            self.blue_field_policy.load_state_dict(blue_f_weights)
-            self.blue_keeper_policy.load_state_dict(blue_k_weights)
+            if blue_f_weights is not None:
+                self._load_adapted_weights(self.blue_field_policy, blue_f_weights)
+            if blue_k_weights is not None:
+                self._load_adapted_weights(self.blue_keeper_policy, blue_k_weights)
             if self.separate_teams:
-                self.red_field_policy.load_state_dict(red_f_weights)
-                self.red_keeper_policy.load_state_dict(red_k_weights)
+                if red_f_weights is not None:
+                    self._load_adapted_weights(self.red_field_policy, red_f_weights)
+                if red_k_weights is not None:
+                    self._load_adapted_weights(self.red_keeper_policy, red_k_weights)
 
             if "blue_field_optimizer" in state:
-                self.blue_field_optimizer.load_state_dict(state["blue_field_optimizer"])
+                try:
+                    self.blue_field_optimizer.load_state_dict(state["blue_field_optimizer"])
+                except Exception:
+                    pass
             elif "field_optimizer" in state:
-                self.blue_field_optimizer.load_state_dict(state["field_optimizer"])
+                try:
+                    self.blue_field_optimizer.load_state_dict(state["field_optimizer"])
+                except Exception:
+                    pass
 
             if "blue_keeper_optimizer" in state:
-                self.blue_keeper_optimizer.load_state_dict(state["blue_keeper_optimizer"])
+                try:
+                    self.blue_keeper_optimizer.load_state_dict(state["blue_keeper_optimizer"])
+                except Exception:
+                    pass
             elif "keeper_optimizer" in state:
-                self.blue_keeper_optimizer.load_state_dict(state["keeper_optimizer"])
+                try:
+                    self.blue_keeper_optimizer.load_state_dict(state["keeper_optimizer"])
+                except Exception:
+                    pass
 
             if self.separate_teams:
                 if "red_field_optimizer" in state:
-                    self.red_field_optimizer.load_state_dict(state["red_field_optimizer"])
+                    try:
+                        self.red_field_optimizer.load_state_dict(state["red_field_optimizer"])
+                    except Exception:
+                        pass
                 if "red_keeper_optimizer" in state:
-                    self.red_keeper_optimizer.load_state_dict(state["red_keeper_optimizer"])
+                    try:
+                        self.red_keeper_optimizer.load_state_dict(state["red_keeper_optimizer"])
+                    except Exception:
+                        pass
 
             # Re-number active environments so the next match starts cleanly at len(match_history) + 1
             self._reset_all_envs(initial=True)
@@ -936,15 +1096,15 @@ class ParameterSharingPPOTrainer:
         loaded_any = False
         if os.path.exists(field_path):
             w = torch.load(field_path, map_location=self.device, weights_only=True)
-            self.blue_field_policy.load_state_dict(w)
+            self._load_adapted_weights(self.blue_field_policy, w)
             if self.separate_teams:
-                self.red_field_policy.load_state_dict(w)
+                self._load_adapted_weights(self.red_field_policy, w)
             loaded_any = True
         if os.path.exists(keeper_path):
             w = torch.load(keeper_path, map_location=self.device, weights_only=True)
-            self.blue_keeper_policy.load_state_dict(w)
+            self._load_adapted_weights(self.blue_keeper_policy, w)
             if self.separate_teams:
-                self.red_keeper_policy.load_state_dict(w)
+                self._load_adapted_weights(self.red_keeper_policy, w)
             loaded_any = True
         self._sync_cpu_policies()
         return loaded_any

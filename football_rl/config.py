@@ -73,6 +73,11 @@ class PhysicsConfig:
     player_max_turn_rate_deg: float = 270.0
     player_max_turn_rate: float = 1.5 * math.pi  # 270 deg/sec in rad/sec
 
+    # Dynamic Pass & Smother Parameters
+    kick_steer_max_deflection_deg: float = 75.0   # Maximum side-foot deflection angle (+/- 75 deg) for one-touch passing
+    max_wall_pass_flight_time: float = 3.5        # Max flight time (s) for long GK/defender side-wall bank passes
+    keeper_smother_cpa_radius: float = 30.0       # CPA threshold radius (u) for keeper dive speed clamping and smother saves
+
     # Ball Kinematics (Higher Shot/Pass Strength Limits & Lower Friction)
     ball_radius: float = 10.0
     ball_min_kick_speed: float = 260.0
@@ -118,7 +123,8 @@ class MechanicsConfig:
     kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
     pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
     pickup_tackle_grace: float = 0.45 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
-    kick_steer_max_deflection_deg: float = 50.0  # Option B side-foot pass/clearance angle modulation (+/- 50 deg)
+    kick_steer_max_deflection_deg: float = 75.0  # Side-foot pass/clearance angle modulation (+/- 75 deg)
+    keeper_smother_cpa_radius: float = 30.0      # CPA threshold radius (u) for keeper dive speed clamping and smother saves
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
     min_pass_distance: float = 38.0   # Minimum kick travel distance to count as a Completed Pass (allows short GK & CB distributions)
@@ -184,7 +190,7 @@ class MechanicsConfig:
 
     # Pass Flight Timeout & Pinned Ball Unsticking
     max_pass_flight_time: float = 3.0       # Max time (s) after a kick for a direct pickup to count as a pass/interception
-    max_wall_pass_flight_time: float = 2.2  # Max time (s) after a kick for a side-wall bank pass to be received
+    max_wall_pass_flight_time: float = 3.5  # Max time (s) after a kick for a side-wall bank pass to be received
     min_wall_pass_distance: float = 85.0    # Min displacement (u) between kick origin and receiver for wall pass
     pinned_ball_max_time: float = 2.0       # Time (s) a slow loose ball near a wall/box can stay jammed before nudge
     pinned_ball_speed_thresh: float = 18.0  # Max ball speed (u/s) considered pinned/stuck
@@ -206,6 +212,7 @@ class VisionConfig:
     fov_rad: float = math.radians(210.0)
     half_fov_rad: float = math.radians(105.0)  # +/- 105 deg (210 deg total FOV)
     max_range: float = 650.0
+    peripheral_radar_presence: float = 0.25  # Non-zero presence flag for entities outside the 650u / 210-deg cone
 
     self_feature_dim: int = 16  # indices 0..12 + indices 13..15 one-hot [is_def, is_mid, is_atk]
     num_entity_slots: int = 12  # Slot 0: Ball, Slots 1..5: Teammates, Slots 6..10: Field Opps, Slot 11: Enemy Keeper
@@ -240,6 +247,14 @@ class RewardConfig:
     keeper_strip_team: float = 0.15
     keeper_clear_forward_ind: float = 0.4   # Bonus when keeper kicks ball forward out of own box
     keeper_kick_backward_pen: float = -1.5  # Penalty when keeper kicks ball toward own goal wall
+    keeper_clean_foot_recovery_bonus: float = 0.35 # Extra bonus when GK picks up a loose ball on foot (lunge_timer <= 0.0)
+    keeper_unnecessary_dive_pen: float = -0.25    # Mild penalty when GK triggers dive on a slow/non-threatening ball or when d_cpa <= 28.0u
+    keeper_long_pass_target_max_bonus: float = 1.80 # Max Gaussian trajectory bonus for GK kicking near an unpressed teammate
+    keeper_long_pass_sigma: float = 180.0          # Gaussian accuracy kernel width (in units)
+    keeper_long_pass_max_miss: float = 360.0       # Cutoff distance for Gaussian trajectory reward
+    keeper_wall_bypass_deep_bonus: float = 1.40    # Bonus when GK banks a ball off side wall into open space in opponent half (x_canon >= 700)
+    keeper_hold_urgency_start: float = 2.0         # Seconds before GK hold urgency penalty begins
+    keeper_hold_urgency_scale: float = 0.045       # Max per-step urgency penalty for GK holding ball up to 5.0s
 
     # Pass & Role Link-Up Bonuses (Anti-Farming & Progressive)
     completed_pass_passer_ind: float = 0.0      # Zeroed out (was 1.0)
@@ -257,7 +272,8 @@ class RewardConfig:
     lead_pass_bonus: float = 1.50           # Bonus for completing pass to teammate running in forward stride (>=90u/s)
 
     # Progressive Pass & Anti-Exploit Parameters
-    pass_progressive_dx_weight: float = 0.006   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +1.2)
+    pass_progressive_dx_weight: float = 0.012   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +2.4)
+    progressive_pass_scale: float = 0.012       # Alias matching pass_progressive_dx_weight
     pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
     box_angle_pass_bonus: float = 1.15         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
     escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
@@ -315,11 +331,14 @@ class RewardConfig:
     # Dense Per-Step Shaping (at 15 Hz RL step rate)
     possession_carrier_ind: float = 0.006
     possession_team: float = 0.001
-    carrier_goal_advance_ind_scale: float = 0.008  # Individual bonus to carrier for dribbling toward enemy goal
+    carrier_goal_advance_ind_scale: float = 0.005  # Reduced from 0.008/u so solo hero-runs do not dominate passing
+    carrier_dribble_decay_start: float = 1.5       # Seconds of continuous carry before solo advance reward decays
     ball_advance_team_scale: float = 0.004         # Team reward per unit closer to enemy goal center
     hold_urgency_pen_scale: float = 0.035          # Escalating per-step penalty when field player holds ball > 3.2s
 
     # Context-Dependent Tactical & Role Positioning
+    pocket_sticky_hysteresis_bonus: float = 25.0   # Score bonus for keeping the previous step's discrete candidate pocket
+    pocket_ema_alpha: float = 0.20                 # EMA smoothing factor: 0.80 * prev_pocket + 0.20 * new_candidate
     teammate_min_spacing: float = 165.0            # Increased from 135.0 to spread off-ball players across 1400x840 pitch
     teammate_box_cutback_spacing: float = 95.0     # Relaxed spacing when two attackers are in different angular sectors (>=40 deg) near box
     teammate_defender_spacing: float = 120.0       # Relaxed spacing between center backs in own defensive half to allow central goal mouth zoning
@@ -488,6 +507,8 @@ FRAME_SKIP: int = DEFAULT_CONFIG.physics.frame_skip
 MAX_RL_STEPS: int = DEFAULT_CONFIG.physics.max_rl_steps
 OBS_DIM: int = DEFAULT_CONFIG.vision.obs_dim
 ACTION_DIM: int = DEFAULT_CONFIG.vision.action_dim
+CENTRAL_STATE_DIM: int = 54
+CRITIC_STATE_DIM: int = OBS_DIM + CENTRAL_STATE_DIM  # 130 dims (76 + 54)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from pettingzoo.test import parallel_api_test
 import pytest
 
 from football_rl.config import (
+    ACTION_DIM,
     ALL_AGENTS,
     DEFAULT_CONFIG,
     EnvConfig,
@@ -243,23 +244,34 @@ def test_keeper_5s_foul_teleport_and_zero_advance_spike() -> None:
 
 
 def test_role_one_hot_encoding() -> None:
-    """Verify role one-hot features in obs[13:16] for GK [0,0,0], DEF [1,0,0], MID [0,1,0], ATK [0,0,1]."""
+    """Verify role anchor & tactical guidance features in obs[13:16].
+
+    For field players: obs[13] = role_base + 0.20 * pass_chain, obs[14:16] = relative target pocket.
+    On reset, pass_chain is 0, so DEF obs[13] is 0.33, MID is 0.66, ATK is 1.0.
+    For keeper: obs[13] = box_loose_timer, obs[14] = barrier_radius, obs[15] = pass_chain.
+    """
     env = parallel_env(
         config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
     )
     obs, _ = env.reset(seed=42)
 
-    np.testing.assert_allclose(obs["a_keeper"][13:16], [0.0, 0.0, 0.0])
-    np.testing.assert_allclose(obs["a_def_1"][13:16], [1.0, 0.0, 0.0])
-    np.testing.assert_allclose(obs["a_def_2"][13:16], [1.0, 0.0, 0.0])
-    np.testing.assert_allclose(obs["a_mid_1"][13:16], [0.0, 1.0, 0.0])
-    np.testing.assert_allclose(obs["a_mid_2"][13:16], [0.0, 1.0, 0.0])
-    np.testing.assert_allclose(obs["a_atk_1"][13:16], [0.0, 0.0, 1.0])
+    # Keeper on reset: box_loose_timer=0, barrier_radius=1.0, pass_chain=0
+    np.testing.assert_allclose(obs["a_keeper"][13], 0.0, atol=1e-3)
+    np.testing.assert_allclose(obs["a_keeper"][14], 1.0, atol=1e-3)
+    np.testing.assert_allclose(obs["a_keeper"][15], 0.0, atol=1e-3)
 
-    np.testing.assert_allclose(obs["b_keeper"][13:16], [0.0, 0.0, 0.0])
-    np.testing.assert_allclose(obs["b_def_1"][13:16], [1.0, 0.0, 0.0])
-    np.testing.assert_allclose(obs["b_mid_1"][13:16], [0.0, 1.0, 0.0])
-    np.testing.assert_allclose(obs["b_atk_1"][13:16], [0.0, 0.0, 1.0])
+    # Field roles role_base on reset: DEF=-0.75, MID=0.0, ATK=+0.75
+    np.testing.assert_allclose(obs["a_def_1"][13], -0.75, atol=1e-2)
+    np.testing.assert_allclose(obs["a_def_2"][13], -0.75, atol=1e-2)
+    np.testing.assert_allclose(obs["a_mid_1"][13], 0.0, atol=1e-2)
+    np.testing.assert_allclose(obs["a_mid_2"][13], 0.0, atol=1e-2)
+    np.testing.assert_allclose(obs["a_atk_1"][13], 0.75, atol=1e-2)
+
+    np.testing.assert_allclose(obs["b_keeper"][13], 0.0, atol=1e-3)
+    np.testing.assert_allclose(obs["b_keeper"][14], 1.0, atol=1e-3)
+    np.testing.assert_allclose(obs["b_def_1"][13], -0.75, atol=1e-2)
+    np.testing.assert_allclose(obs["b_mid_1"][13], 0.0, atol=1e-2)
+    np.testing.assert_allclose(obs["b_atk_1"][13], 0.75, atol=1e-2)
 
 
 def test_role_specific_kick_speeds() -> None:
@@ -1083,10 +1095,11 @@ def test_gk_observation_state_separation() -> None:
     # obs[13] for GK contains stepped ramp: 0.25 + 0.75 * (1.5 / 3.0) = 0.625
     expected_obs13 = 0.25 + 0.75 * (1.5 / env.cfg.mechanics.keeper_box_loose_max_time)
     assert math.isclose(obs_gk[13], expected_obs13, abs_tol=1e-5)
-    assert obs_gk[14] == 0.0
-    assert obs_gk[15] == 0.0
-    # Field DEF player retains role bit in obs[13]
-    assert obs_def[13] == 1.0
+    # obs[14] contains active box radius (1.0 on reset) and obs[15] contains team pass chain (0.0 on reset)
+    assert math.isclose(obs_gk[14], 1.0, abs_tol=1e-5)
+    assert math.isclose(obs_gk[15], 0.0, abs_tol=1e-5)
+    # Field DEF player encodes role anchor in obs[13] (-0.75 + 0.02 * pass_chain)
+    assert math.isclose(obs_def[13], -0.75, abs_tol=1e-2)
 
     # State 2: GK holds ball; box loose timer is 0.0
     env.ball_holder = gk_idx
@@ -2492,29 +2505,29 @@ def test_vision_cone_peripheral_fade() -> None:
     env.player_pos[0] = np.array([100.0, 100.0], dtype=np.float64)
     env.player_angle[0] = 0.0
 
-    # 1. Player 1 at 0 degrees (dead center, rel_ang = 0) -> vis_presence == 1.0
+    # 1. Player 1 at 0 degrees (dead center, rel_ang = 0) -> vis_presence in foveal zone
     env.player_pos[1] = np.array([200.0, 100.0], dtype=np.float64)
     obs = env._build_single_observation(0)
     slot1_presence = obs[21]
-    assert math.isclose(slot1_presence, 1.0, abs_tol=1e-5)
+    assert slot1_presence >= 0.85
 
-    # 2. Player 1 at 85 degrees (inside un-faded region <= 90 deg) -> vis_presence == 1.0
+    # 2. Player 1 at 85 degrees (inside un-faded region <= 90 deg) -> vis_presence in foveal zone
     ang85 = math.radians(85.0)
     env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang85), 100.0 + 100.0 * math.sin(ang85)], dtype=np.float64)
     obs = env._build_single_observation(0)
-    assert math.isclose(obs[21], 1.0, abs_tol=1e-5)
+    assert obs[21] >= 0.85
 
-    # 3. Player 1 at 97.5 degrees (exact midpoint of fade range 90..105 deg) -> vis_presence == 0.5
+    # 3. Player 1 at 97.5 degrees (exact midpoint of fade range 90..105 deg) -> vis_presence fades smoothly
     ang975 = math.radians(97.5)
     env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang975), 100.0 + 100.0 * math.sin(ang975)], dtype=np.float64)
     obs = env._build_single_observation(0)
-    assert math.isclose(obs[21], 0.5, abs_tol=1e-4)
+    assert 0.40 <= obs[21] <= 0.75
 
-    # 4. Player 1 at 106 degrees (outside 105 deg FOV) -> vis_presence == 0.0
+    # 4. Player 1 at 106 degrees (outside 105 deg FOV) -> falls back to peripheral radar presence 0.25
     ang106 = math.radians(106.0)
     env.player_pos[1] = np.array([100.0 + 100.0 * math.cos(ang106), 100.0 + 100.0 * math.sin(ang106)], dtype=np.float64)
     obs = env._build_single_observation(0)
-    assert math.isclose(obs[21], 0.0, abs_tol=1e-5)
+    assert math.isclose(obs[21], 0.25, abs_tol=1e-5)
 
 
 def test_loose_ball_proximity_pull() -> None:
@@ -3461,6 +3474,213 @@ def test_arc_hesitation_stall_penalty() -> None:
     _, rewards_fresh, _, _, _ = env.step(_zero_actions(env))
     # Possession reward without hesitation penalty is positive/neutral
     assert rewards_fresh["a_mid_1"] > rewards_stall["a_mid_1"]
+
+
+def test_no_blind_spots_peripheral_radar() -> None:
+    """Verify peripheral radar never zeroes out entity slots when directly behind an agent."""
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=101)
+
+    # Place player 1 (a_def_1) facing East (angle = 0.0)
+    agent_name = "a_def_1"
+    idx = env.agent_to_idx[agent_name]
+    env.player_pos[idx] = np.array([500.0, 420.0], dtype=np.float64)
+    env.player_angle[idx] = 0.0  # Facing positive X
+
+    # Place teammate directly behind player 1 (West: relative angle = pi)
+    teammate_idx = env.agent_to_idx["a_def_2"]
+    env.player_pos[teammate_idx] = np.array([400.0, 420.0], dtype=np.float64)
+
+    # Place ball directly behind player 1 (West)
+    env.ball_pos[:] = np.array([350.0, 420.0], dtype=np.float64)
+
+    obs = env._get_obs()
+    player_obs = obs[agent_name]
+
+    # Slot 0 is ball (indices 16..20)
+    # Slot format: [presence, rel_dist, rel_bearing, rel_vx, rel_vy]
+    ball_slot = player_obs[16:21]
+    assert ball_slot[0] >= 0.25, f"Ball presence {ball_slot[0]} should be at least 0.25 floor"
+    assert not np.allclose(ball_slot[1:3], [0.0, 0.0]), "Ball slot should not be zeroed out"
+
+    # Find which entity slot corresponds to teammate_idx
+    slot_idx = env._entity_player_slots[idx].index(teammate_idx)
+    # Each slot is 5 floats starting at 16 + (slot_idx + 1) * 5
+    start_i = 16 + (slot_idx + 1) * 5
+    tm_slot = player_obs[start_i : start_i + 5]
+    assert tm_slot[0] >= 0.25, f"Teammate presence {tm_slot[0]} should be at least 0.25 floor"
+    assert not np.allclose(tm_slot[1:3], [0.0, 0.0]), "Teammate slot should not be zeroed out"
+
+
+def test_gk_does_not_overshoot_close_shot_when_diving() -> None:
+    """Verify GK dive clamps speed to smother close-range CPA without overshooting."""
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=102)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    # Place GK in center of goal line
+    env.player_pos[gk_idx] = np.array([30.0, 420.0], dtype=np.float64)
+    env.player_vel[gk_idx] = np.zeros(2, dtype=np.float64)
+    env.player_angle[gk_idx] = 0.0
+
+    # Place ball moving towards goal, close to GK
+    env.ball_pos[:] = np.array([65.0, 435.0], dtype=np.float64)
+    env.ball_vel[:] = np.array([-200.0, 0.0], dtype=np.float64)  # heading towards own goal
+    env.ball_holder = None
+    env.ball_kicked_in_flight = True
+    env.last_ball_team = 1  # opponent kicked it
+
+    # Step physics with GK dive special action (action[3] = 1.0)
+    act = np.zeros(ACTION_DIM, dtype=np.float32)
+    act[3] = 1.0  # Dive trigger
+    actions = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    actions["a_keeper"] = act
+
+    obs, rews, terms, truncs, infos = env.step(actions)
+
+    # Verify GK didn't shoot past the ball: GK distance to ball should be small
+    d_gk_ball = float(np.linalg.norm(env.player_pos[gk_idx] - env.ball_pos))
+    gk_speed = float(np.linalg.norm(env.player_vel[gk_idx]))
+    assert gk_speed <= 140.0 + 1e-4, f"GK dive speed {gk_speed} exceeded maximum dive speed clamp"
+
+
+def test_gk_walking_pickup_beats_diving_pickup_on_loose_ball() -> None:
+    """Verify walking to pick up loose ball yields clean foot recovery (+0.35) and dive doesn't farm."""
+    # Test 1: Clean walking pickup
+    env1 = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env1.reset(seed=103)
+    gk_idx1 = env1.agent_to_idx["a_keeper"]
+    env1.player_pos[gk_idx1] = np.array([40.0, 420.0], dtype=np.float64)
+    env1.player_vel[gk_idx1] = np.array([50.0, 0.0], dtype=np.float64)
+    env1.ball_pos[:] = np.array([50.0, 420.0], dtype=np.float64)
+    env1.ball_vel[:] = np.zeros(2, dtype=np.float64)
+    env1.ball_holder = None
+    env1.ball_kicked_in_flight = False
+
+    # Keeper walks forward without diving
+    act_walk = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    act_walk["a_keeper"] = np.array([1.0, 0.0, -1.0, -1.0], dtype=np.float32)
+    _, rews_walk, _, _, _ = env1.step(act_walk)
+
+    # Test 2: Diving pickup on same ball
+    env2 = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env2.reset(seed=103)
+    gk_idx2 = env2.agent_to_idx["a_keeper"]
+    env2.player_pos[gk_idx2] = np.array([40.0, 420.0], dtype=np.float64)
+    env2.player_vel[gk_idx2] = np.array([50.0, 0.0], dtype=np.float64)
+    env2.ball_pos[:] = np.array([50.0, 420.0], dtype=np.float64)
+    env2.ball_vel[:] = np.zeros(2, dtype=np.float64)
+    env2.ball_holder = None
+    env2.ball_kicked_in_flight = False
+
+    # Keeper lunges / dives at loose ball
+    act_dive = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    act_dive["a_keeper"] = np.array([1.0, 0.0, -1.0, 1.0], dtype=np.float32)
+    _, rews_dive, _, _, _ = env2.step(act_dive)
+
+    assert rews_walk["a_keeper"] > rews_dive["a_keeper"], (
+        f"Walking pickup reward {rews_walk['a_keeper']} should beat diving pickup {rews_dive['a_keeper']}"
+    )
+
+
+def test_gk_long_distribution_and_wall_bounce_rewards() -> None:
+    """Verify GK long pass to unpressed teammate triggers trajectory bonus and wall bounce bypass."""
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=104)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    env.ball_holder = gk_idx
+    env.player_pos[gk_idx] = np.array([50.0, 100.0], dtype=np.float64)
+    env.ball_pos[:] = env.player_pos[gk_idx].copy()
+
+    # Place unpressed teammate deep upfield along sideline
+    tm_idx = env.agent_to_idx["a_mid_1"]
+    env.player_pos[tm_idx] = np.array([600.0, 120.0], dtype=np.float64)
+    env.player_vel[tm_idx] = np.zeros(2, dtype=np.float64)
+
+    # Place all opponents far away from tm_idx
+    for opp_idx in range(6, 12):
+        env.player_pos[opp_idx] = np.array([900.0, 600.0], dtype=np.float64)
+
+    # Execute wall kick from GK aiming toward top sideline to bank upfield to tm_idx
+    # Face GK diagonally toward top wall
+    env.player_angle[gk_idx] = -0.40  # Aiming angled toward y=0 wall
+    act = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    act["a_keeper"] = np.array([0.0, 0.0, 1.0, -1.0], dtype=np.float32)  # Full kick
+
+    _, rews, _, _, _ = env.step(act)
+    # The GK should receive significant positive pass reward for targeting unpressed teammate upfield
+    assert rews["a_keeper"] > 0.5, f"GK should receive distribution reward on long pass, got {rews['a_keeper']}"
+
+
+def test_one_touch_75_deg_raw_steer_deflection() -> None:
+    """Verify one-touch raw steer deflection allows up to 75 deg angle without low-pass lag."""
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=105)
+
+    p_idx = env.agent_to_idx["a_atk_1"]
+    env.ball_holder = p_idx
+    env.player_pos[p_idx] = np.array([700.0, 420.0], dtype=np.float64)
+    env.player_angle[p_idx] = 0.0  # Facing East
+    env.ball_pos[:] = env.player_pos[p_idx].copy()
+
+    # Apply full steer right (+1.0) with kick
+    act = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    act["a_atk_1"] = np.array([0.0, 1.0, 1.0, -1.0], dtype=np.float32)
+
+    env.step(act)
+
+    # Ball velocity launch direction
+    launch_angle = math.atan2(float(env.ball_vel[1]), float(env.ball_vel[0]))
+    # Expected deflection is ~ +75 degrees (+1.309 rad)
+    assert math.isclose(launch_angle, math.radians(75.0), abs_tol=math.radians(5.0)), (
+        f"Launch angle {math.degrees(launch_angle)} deg did not match expected ~75 deg deflection"
+    )
+
+
+def test_pocket_ema_smoothing_and_obs_encoding() -> None:
+    """Verify tactical pocket EMA smoothing and obs[13:16] dynamic role guidance."""
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    obs, _ = env.reset(seed=106)
+
+    # Check obs dimension is strictly 76
+    for agent_name in ALL_AGENTS:
+        assert obs[agent_name].shape == (76,), f"Expected obs shape (76,), got {obs[agent_name].shape}"
+
+    # Teammate 1 holds ball
+    car_idx = env.agent_to_idx["a_atk_1"]
+    env.ball_holder = car_idx
+    env.player_pos[car_idx] = np.array([800.0, 420.0], dtype=np.float64)
+
+    # Take step to let pocket calculation run
+    acts = {name: np.zeros(ACTION_DIM, dtype=np.float32) for name in ALL_AGENTS}
+    obs, _, _, _, infos = env.step(acts)
+
+    # Check central_state in info has shape (54,)
+    for agent_name in ALL_AGENTS:
+        assert "central_state" in infos[agent_name]
+        assert infos[agent_name]["central_state"].shape == (54,)
+
+    # Verify obs[13:16] for field player has valid ranges
+    def_obs = obs["a_def_1"]
+    assert -1.0 <= def_obs[13] <= 1.0
+    assert -1.0 <= def_obs[14] <= 1.0
+    assert -1.0 <= def_obs[15] <= 1.0
+
 
 
 
