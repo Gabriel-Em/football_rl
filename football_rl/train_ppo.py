@@ -155,6 +155,11 @@ class ParameterSharingPPOTrainer:
         self.seed = seed
         self.separate_teams = separate_teams
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
+        if self.save_best_only != self.cfg.replay.save_best_only:
+            self.cfg = replace(
+                self.cfg,
+                replay=replace(self.cfg.replay, save_best_only=self.save_best_only),
+            )
 
         # Cumulative training & match tracking across resumed sessions
         self.current_generation: int = 0
@@ -315,12 +320,11 @@ class ParameterSharingPPOTrainer:
             {"generation": target_gen, "match_id": self._allocate_match_id()}
             for _ in range(self.num_envs)
         ]
-        obs_list, info_list = self.vec_env.reset(seeds=seeds, options_list=options_list)
-        for env_i in range(self.num_envs):
-            for agent_i, agent_name in enumerate(ALL_AGENTS):
-                self.current_obs[env_i, agent_i] = obs_list[env_i][agent_name]
-                if "central_state" in info_list[env_i].get(agent_name, {}):
-                    self.current_central_state[env_i, agent_i] = info_list[env_i][agent_name]["central_state"]
+        obs_batch, central_batch = self.vec_env.reset_array(
+            seeds=seeds, options_list=options_list
+        )
+        self.current_obs[:] = obs_batch
+        self.current_central_state[:] = central_batch
 
     @torch.no_grad()
     def _select_actions(
@@ -471,7 +475,7 @@ class ParameterSharingPPOTrainer:
         completed_episodes = 0
         max_interest = 0.0
         exported_replays: List[str] = []
-        gen_completed_matches: List[Dict[str, Any]] = []
+        gen_completed_matches: List[Tuple[int, Dict[str, Any]]] = []
 
         self.vec_env.set_generation(active_generation)
 
@@ -485,47 +489,32 @@ class ParameterSharingPPOTrainer:
             buf_logp[t] = logprobs
             buf_val[t] = values
 
-            actions_by_env = [
-                {
-                    agent_name: np.clip(actions[env_i, agent_i], -1.0, 1.0)
-                    for agent_i, agent_name in enumerate(ALL_AGENTS)
-                }
-                for env_i in range(N)
-            ]
-            obs_list, rew_list, term_list, trunc_list, info_list, done_list = self.vec_env.step(actions_by_env)
+            act_clipped = np.clip(actions, -1.0, 1.0)
+            obs_batch, central_batch, rew_batch, done_batch, ep_summaries = (
+                self.vec_env.step_array(act_clipped)
+            )
+            buf_rew[t] = rew_batch
+            buf_done[t] = done_batch[:, None].astype(np.float32)
 
             for env_i in range(N):
-                next_obs_dict = obs_list[env_i]
-                rew_dict = rew_list[env_i]
-                term_dict = term_list[env_i]
-                trunc_dict = trunc_list[env_i]
-                info_dict = info_list[env_i]
-                is_env_done = done_list[env_i]
-
-                for agent_i, agent_name in enumerate(ALL_AGENTS):
-                    buf_rew[t, env_i, agent_i] = rew_dict[agent_name]
-                    is_done = term_dict[agent_name] or trunc_dict[agent_name]
-                    buf_done[t, env_i, agent_i] = 1.0 if is_done else 0.0
-
-                # Check if episode ended
-                if is_env_done:
+                if done_batch[env_i]:
                     completed_episodes += 1
-                    k_info = info_dict["a_keeper"]
-                    ep_interest = float(k_info["interest_score"])
+                    ep_summary = ep_summaries[env_i] or {}
+                    ep_interest = float(ep_summary.get("interest_score", 0.0))
                     max_interest = max(max_interest, ep_interest)
-                    rpath = k_info["last_saved_replay"]
+                    rpath = ep_summary.get("last_saved_replay")
                     if rpath:
                         exported_replays.append(rpath)
 
                     # Record match summary entry
-                    fstats = k_info.get("final_stats", {})
+                    fstats = ep_summary.get("final_stats", {})
                     total_poss = max(1, sum(fstats.get("possession_frames", [1, 1])))
                     poss_pct = [
                         round(100.0 * fstats.get("possession_frames", [1, 1])[0] / total_poss, 1),
                         round(100.0 * fstats.get("possession_frames", [1, 1])[1] / total_poss, 1),
                     ]
                     match_record = {
-                        "match_id": int(k_info.get("match_id", self.next_match_id)),
+                        "match_id": int(ep_summary.get("match_id", self.next_match_id)),
                         "generation": int(active_generation),
                         "score": list(fstats.get("score", [0, 0])),
                         "goals": int(fstats.get("goals", 0)),
@@ -545,43 +534,42 @@ class ParameterSharingPPOTrainer:
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     self.match_history.append(match_record)
-                    gen_completed_matches.append(match_record)
+                    gen_completed_matches.append((env_i, match_record))
 
                     # Auto-reset environment for seamless rollout collection
                     next_gen_hint = active_generation + (1 if t == T - 1 else 0)
-                    reset_obs_list, reset_info_list = self.vec_env.reset(
+                    reset_obs, reset_central = self.vec_env.reset_array(
                         options_list=[{
                             "generation": next_gen_hint,
                             "match_id": self._allocate_match_id(),
                         }],
                         env_indices=[env_i],
                     )
-                    next_obs_dict = reset_obs_list[0]
-                    info_dict = reset_info_list[0]
+                    obs_batch[env_i] = reset_obs[0]
+                    central_batch[env_i] = reset_central[0]
 
-                for agent_i, agent_name in enumerate(ALL_AGENTS):
-                    self.current_obs[env_i, agent_i] = next_obs_dict[agent_name]
-                    if "central_state" in info_dict.get(agent_name, {}):
-                        self.current_central_state[env_i, agent_i] = info_dict[agent_name]["central_state"]
+            self.current_obs[:] = obs_batch
+            self.current_central_state[:] = central_batch
 
-        # If save_best_only is enabled, retain only the single best match replay per generation
-        if self.save_best_only and gen_completed_matches:
-            matches_with_replays = [m for m in gen_completed_matches if m.get("replay_path")]
-            if matches_with_replays:
-                best_match = max(
-                    matches_with_replays,
-                    key=lambda m: (float(m.get("interest_score", 0.0)), int(m.get("goals", 0))),
+        # If save_best_only is enabled, export only the single best match replay from the winning worker
+        if self.save_best_only and gen_completed_matches and self.cfg.replay.enable_recording:
+            eligible = [
+                (env_idx, m)
+                for env_idx, m in gen_completed_matches
+                if float(m.get("interest_score", 0.0)) >= self.cfg.replay.interest_threshold
+            ]
+            if eligible:
+                best_env_idx, best_match = max(
+                    eligible,
+                    key=lambda item: (
+                        float(item[1].get("interest_score", 0.0)),
+                        int(item[1].get("goals", 0)),
+                    ),
                 )
-                for m in matches_with_replays:
-                    if m is not best_match:
-                        rpath_to_remove = m.get("replay_path")
-                        if rpath_to_remove and os.path.exists(rpath_to_remove):
-                            try:
-                                os.remove(rpath_to_remove)
-                            except OSError:
-                                pass
-                        m["replay_path"] = ""
-                exported_replays = [best_match["replay_path"]] if best_match.get("replay_path") else []
+                rpath = self.vec_env.export_replay(best_env_idx)
+                if rpath:
+                    best_match["replay_path"] = rpath
+                    exported_replays = [rpath]
 
         # Compute Generalized Advantage Estimation (GAE) per agent trajectory
         next_values = self._compute_values(self.current_obs, self.current_central_state)
@@ -614,6 +602,28 @@ class ParameterSharingPPOTrainer:
             "exported_replays": exported_replays,
         }
 
+    @staticmethod
+    def _normalize_advantages_per_role(
+        obs: torch.Tensor, advantages: torch.Tensor
+    ) -> torch.Tensor:
+        """Normalize advantages per outfield role (DEF, MID, ATK) when role one-hot masks are present."""
+        if advantages.numel() <= 1:
+            return advantages
+        is_def = obs[:, 13] > 0.5
+        if bool(is_def.any()):
+            is_mid = (obs[:, 13] <= 0.5) & (obs[:, 14] > 0.5) & (obs[:, 15] <= 0.5)
+            is_atk = (obs[:, 13] <= 0.5) & (obs[:, 14] <= 0.5) & (obs[:, 15] > 0.5)
+            norm_adv = advantages.clone()
+            for mask in (is_def, is_mid, is_atk):
+                cnt = int(mask.sum().item())
+                if cnt > 1:
+                    r_adv = norm_adv[mask]
+                    norm_adv[mask] = (r_adv - r_adv.mean()) / (r_adv.std() + 1e-8)
+                elif cnt == 1:
+                    norm_adv[mask] = 0.0
+            return norm_adv
+        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
     def _ppo_update_role(
         self,
         policy: ActorCritic,
@@ -631,6 +641,8 @@ class ParameterSharingPPOTrainer:
         num_minibatches = min(self.cfg.ppo.num_minibatches, batch_size)
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
+
+        b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
 
         pg_losses: List[float] = []
         v_losses: List[float] = []
@@ -650,11 +662,9 @@ class ParameterSharingPPOTrainer:
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
-                mb_advantages = b_advantages[mb_inds]
-                if mb_advantages.numel() > 1:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std() + 1e-8
-                    )
+                mb_advantages = self._normalize_advantages_per_role(
+                    b_obs[mb_inds], b_advantages[mb_inds]
+                )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio

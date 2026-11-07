@@ -78,3 +78,29 @@ def test_adapted_weights_loader_zero_pads_legacy_critic() -> None:
     assert torch.allclose(loaded_critic_w[:, :OBS_DIM], torch.ones((loaded_critic_w.shape[0], OBS_DIM)))
     # Remaining 54 cols should be zero-padded
     assert torch.allclose(loaded_critic_w[:, OBS_DIM:], torch.zeros((loaded_critic_w.shape[0], CENTRAL_STATE_DIM)))
+
+
+def test_per_role_advantage_normalization() -> None:
+    """Verify _normalize_advantages_per_role normalizes DEF, MID, and ATK advantages independently to unit variance."""
+    obs = torch.zeros((12, OBS_DIM), dtype=torch.float32)
+    # 4 DEF [1,0,0], 4 MID [0,1,0], 4 ATK [0,0,1]
+    obs[0:4, 13:16] = torch.tensor([1.0, 0.0, 0.0])
+    obs[4:8, 13:16] = torch.tensor([0.0, 1.0, 0.0])
+    obs[8:12, 13:16] = torch.tensor([0.0, 0.0, 1.0])
+
+    # Give ATK 100x larger raw advantage scale than DEF
+    adv = torch.tensor(
+        [
+            -0.02, -0.01, 0.01, 0.02,     # DEF
+            -0.50, -0.20, 0.20, 0.50,     # MID
+            -20.0, -10.0, 10.0, 20.0,     # ATK
+        ],
+        dtype=torch.float32,
+    )
+
+    norm_adv = ParameterSharingPPOTrainer._normalize_advantages_per_role(obs, adv)
+    for sl in (slice(0, 4), slice(4, 8), slice(8, 12)):
+        role_slice = norm_adv[sl]
+        assert abs(float(role_slice.mean().item())) < 1e-6
+        assert abs(float(role_slice.std().item()) - 1.0) < 1e-5
+

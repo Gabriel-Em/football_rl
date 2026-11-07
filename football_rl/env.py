@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import functools
 import json
@@ -202,22 +203,43 @@ class FootballParallelEnv(ParallelEnv):
             assert len(enemy_keeper) == 1, f"Expected 1 enemy keeper, got {len(enemy_keeper)}"
             self._entity_player_slots[idx] = teammates + field_opponents + enemy_keeper
 
+        self._entity_slot_matrix: np.ndarray = np.array(
+            [self._entity_player_slots[i] for i in range(self.num_players)],
+            dtype=np.int32,
+        )
+        self._row_idx_12x1: np.ndarray = np.arange(self.num_players, dtype=np.int32)[:, None]
+        self._max_self_vel: np.ndarray = np.array(
+            [
+                self.cfg.mechanics.lunge_speed
+                if self.player_role[i] == ROLE_KEEPER
+                else self._get_player_max_speed(i)
+                for i in range(self.num_players)
+            ],
+            dtype=np.float64,
+        )
+        self._role_tackle_reach: np.ndarray = np.array(
+            [self._get_role_tackle_params(i)[0] for i in range(self.num_players)],
+            dtype=np.float64,
+        )
+        self._field_role_onehot: np.ndarray = np.zeros((self.num_players, 3), dtype=np.float32)
+        for i in range(self.num_players):
+            if self.player_role[i] == ROLE_DEF:
+                self._field_role_onehot[i, 0] = 1.0
+            elif self.player_role[i] == ROLE_MID:
+                self._field_role_onehot[i, 1] = 1.0
+            elif self.player_role[i] == ROLE_ATK:
+                self._field_role_onehot[i, 2] = 1.0
+
         # Precompute max diagonal distance for normalization
         self._max_field_dist: float = math.hypot(
             self.cfg.physics.field_width, self.cfg.physics.field_height
         )
         self.max_pitch_diag: float = float(self._max_field_dist)
 
-        # Tactical Pocket Smoothing, Potential State & Observation Vectors
-        self.active_tactical_target_canon: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float32)
+        # Potential State & Steering Vectors
         self.raw_steer_input: np.ndarray = np.zeros(self.num_players, dtype=np.float32)
-        self.prev_best_cand_canon: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float32)
-        self.smoothed_pocket_canon: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float32)
-        self.pocket_initialized: np.ndarray = np.zeros(self.num_players, dtype=bool)
         self.prev_ball_potential: np.ndarray = np.zeros(2, dtype=np.float64)
         self.prev_tactical_potential: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
-        self.prev_tactical_mode: np.ndarray = np.full(self.num_players, -1, dtype=np.int32)
-        self._last_tactical_player_pos: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
 
         # Spaces
         self._obs_space = spaces.Box(
@@ -274,10 +296,10 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_hold_timer: float = 0.0
         self.kick_grace_timer: float = 0.0
         self._box_loose_ball_timer: _DualBoxTimer = _DualBoxTimer(0.0, 0.0)
-        self.box_recovery_rewarded: List[bool] = [False, False]
         self.last_ball_holder: Optional[int] = None
         self.last_ball_team: Optional[int] = None
         self.ball_kick_origin: np.ndarray = np.zeros(2, dtype=np.float64)
+        self.ball_kick_orig_opp_dist: float = -1.0
         self.ball_kicked_in_flight: bool = False
         self.ball_kick_flight_timer: float = 0.0
         self.ball_wall_bounces: int = 0
@@ -290,35 +312,16 @@ class FootballParallelEnv(ParallelEnv):
             [self.cfg.physics.keeper_box_radius, self.cfg.physics.keeper_box_radius],
             dtype=np.float64,
         )
-        self.kick_frame_player_pos: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
-        self.kick_frame_player_angle: np.ndarray = np.zeros(self.num_players, dtype=np.float32)
-        self.prev_longitudinal_vel: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
-        self.prev_ball_x: float = 700.0
-        self.step_external_push: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
-        self.prev_ball_at_step_start: np.ndarray = np.zeros(2, dtype=np.float64)
         self.smoothed_steer: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.prev_steer: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.dive_dir: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
-        self.prev_dynamic_role_key: Dict[int, str] = {i: self.player_role_key[i] for i in range(self.num_players)}
+        self.dive_speed: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
 
-        # Pass chains & pairwise history tracking
+        # Pass chain & goal assist tracking
         self.team_pass_chain: List[int] = [0, 0]
-        self.team_possession_max_x: np.ndarray = np.zeros(2, dtype=np.float32)
-        self.team_possession_min_goal_dist: np.ndarray = np.full(2, self.max_pitch_diag, dtype=np.float32)
-        self._synced_max_x: np.ndarray = np.zeros(2, dtype=np.float32)
-        self.box_switch_used_in_spell: List[bool] = [False, False]
-        self.non_fresh_pass_count: List[int] = [0, 0]
-        self.recent_passers: list[list[int]] = [[], []]
         self.last_completed_pass_passer: list[Optional[int]] = [None, None]
         self.last_completed_pass_receiver: list[Optional[int]] = [None, None]
         self.last_completed_pass_time: np.ndarray = np.full(2, -999.0, dtype=np.float32)
-        self.last_pass_pair: Optional[Tuple[int, int]] = None
-        self.last_passer_idx: Optional[int] = None
-        self.pairwise_repeat_count: int = 0
-        self.last_kick_pos: np.ndarray = np.zeros((self.num_players, 2), dtype=np.float64)
-        self.last_kick_hold_time: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
-        self.primary_loose_ball_chaser: np.ndarray = np.full(2, -1, dtype=np.int32)
-        self.dive_speed: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
 
         # Match progression & side assignment
         self.rl_step_count: int = 0
@@ -333,6 +336,7 @@ class FootballParallelEnv(ParallelEnv):
         self.replay_frames: List[Dict[str, Any]] = []
         self._frame_events: List[Dict[str, Any]] = []
         self.last_saved_replay_path: Optional[str] = None
+        self._deferred_replay: Optional[Dict[str, Any]] = None
         self.current_generation: int = 0
         self.current_match_id: int = 0
 
@@ -357,6 +361,10 @@ class FootballParallelEnv(ParallelEnv):
         return self.team_pass_chain
 
     @property
+    def prev_player_potential(self) -> np.ndarray:
+        return self.prev_tactical_potential
+
+    @property
     def box_loose_ball_timer(self) -> _DualBoxTimer:
         return self._box_loose_ball_timer
 
@@ -377,30 +385,12 @@ class FootballParallelEnv(ParallelEnv):
             or ((self.stun_timer[idx] > 0.0) and (self.lunge_timer[idx] <= 0.0))
         )
 
-    def _set_possession_high_water_mark(self, team: int, world_pos: np.ndarray) -> None:
-        """Initialize both canonical X and goal-distance possession high-water marks for `team`."""
-        c_pos = self._to_canonical_pos(world_pos, team)
-        cx = float(c_pos[0])
-        cy = float(c_pos[1])
-        self.team_possession_max_x[team] = cx
-        self._synced_max_x[team] = cx
-        self.team_possession_min_goal_dist[team] = float(math.hypot(1400.0 - cx, 420.0 - cy))
-        self.box_switch_used_in_spell[team] = False
-        self.non_fresh_pass_count[team] = 0
-
-    def _sync_possession_high_water_mark(self, team: int) -> None:
-        """Sync goal-distance high-water mark if team_possession_max_x was externally reassigned."""
-        curr_max_x = float(self.team_possession_max_x[team])
-        if abs(curr_max_x - float(self._synced_max_x[team])) > 1e-4:
-            self.team_possession_min_goal_dist[team] = max(0.0, 1400.0 - curr_max_x)
-            self._synced_max_x[team] = curr_max_x
-
     def _compute_ball_potential(
         self,
         team_id: int,
         ref_world_pos: Optional[np.ndarray] = None,
     ) -> float:
-        """Compute bounded territorial ball potential in [0.0, 1.0] for `team_id`."""
+        """Compute bounded territorial ball threat potential in [0.0, 1.0] for `team_id`."""
         if ref_world_pos is None:
             ref_world_pos = (
                 self.player_pos[self.ball_holder]
@@ -409,7 +399,9 @@ class FootballParallelEnv(ParallelEnv):
             )
         c_ref = self._to_canonical_pos(ref_world_pos, team_id)
         d_goal = math.hypot(1400.0 - float(c_ref[0]), 420.0 - float(c_ref[1]))
-        return _fast_clip(1.0 - (d_goal / self.max_pitch_diag), 0.0, 1.0)
+        linear_term = _fast_clip(1.0 - (d_goal / self.max_pitch_diag), 0.0, 1.0)
+        gauss_term = math.exp(-(d_goal * d_goal) / (2.0 * 380.0 * 380.0))
+        return _fast_clip(0.65 * linear_term + 0.35 * gauss_term, 0.0, 1.0)
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """Convenience alias for _get_observations()."""
@@ -467,13 +459,15 @@ class FootballParallelEnv(ParallelEnv):
 
     @staticmethod
     def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-        ab = b - a
-        d2 = float(np.dot(ab, ab))
+        ax, ay = float(a[0]), float(a[1])
+        abx = float(b[0]) - ax
+        aby = float(b[1]) - ay
+        px, py = float(p[0]), float(p[1])
+        d2 = abx * abx + aby * aby
         if d2 < 1e-12:
-            return float(np.linalg.norm(p - a))
-        t = float(np.clip(np.dot(p - a, ab) / d2, 0.0, 1.0))
-        proj = a + t * ab
-        return float(np.linalg.norm(p - proj))
+            return math.hypot(px - ax, py - ay)
+        t = _fast_clip(((px - ax) * abx + (py - ay) * aby) / d2, 0.0, 1.0)
+        return math.hypot(px - (ax + t * abx), py - (ay + t * aby))
 
     def _is_ball_heading_into_goal(
         self,
@@ -494,7 +488,7 @@ class FootballParallelEnv(ParallelEnv):
             return False
         y_intersect = float(ball_pos[1]) + vy * t_hit
         dist_to_goal_line = math.hypot(goal_x - float(ball_pos[0]), y_intersect - float(ball_pos[1]))
-        max_reach = (float(np.linalg.norm(ball_vel)) ** 2) / (2.0 * phys.ball_friction_decel) + 35.0
+        max_reach = (vx * vx + vy * vy) / (2.0 * phys.ball_friction_decel) + 35.0
         return bool(
             dist_to_goal_line <= max_reach
             and (phys.goal_y_min - y_margin) <= y_intersect <= (phys.goal_y_max + y_margin)
@@ -564,40 +558,24 @@ class FootballParallelEnv(ParallelEnv):
         self.pinned_ball_timer = 0.0
         self.kickoff_protection_timer = 0.0
         self.pickup_tackle_grace_timer = 0.0
-        self.prev_longitudinal_vel[:] = 0.0
-        self.step_external_push.fill(0.0)
-        self.prev_ball_at_step_start = self.ball_pos.copy()
         self.smoothed_steer.fill(0.0)
         self.prev_steer.fill(0.0)
         self.dive_dir.fill(0.0)
-        self.prev_dynamic_role_key = {i: self.player_role_key[i] for i in range(self.num_players)}
-        self.last_kick_pos.fill(0.0)
-        self.last_kick_hold_time.fill(0.0)
-        self.primary_loose_ball_chaser.fill(-1)
         self.dive_speed.fill(0.0)
         self.raw_steer_input.fill(0.0)
-        self.prev_best_cand_canon.fill(0.0)
-        self.smoothed_pocket_canon.fill(0.0)
-        self.pocket_initialized[:] = False
         self.prev_tactical_potential.fill(0.0)
-        self.prev_tactical_mode.fill(-1)
-        self.box_recovery_rewarded = [False, False]
         self._box_loose_ball_timer.fill(0.0)
         self._reset_pass_chains()
 
-        # Set initial kickoff formation
+        # Set initial kickoff formation and initialize Markovian potentials
         self._setup_kickoff(starting_team=self.first_half_kickoff_team)
         self.prev_ball_potential[:] = [
             self._compute_ball_potential(TEAM_A),
             self._compute_ball_potential(TEAM_B),
         ]
-        self._last_tactical_player_pos[:] = self.player_pos
-
-        # Initialize tactical target pockets to initial canonical positions
-        c_p_a, _, _ = self._to_team_canonical(self.player_pos, self.player_vel, self.player_angle, TEAM_A)
-        c_p_b, _, _ = self._to_team_canonical(self.player_pos, self.player_vel, self.player_angle, TEAM_B)
-        self.active_tactical_target_canon[:6] = c_p_a[:6]
-        self.active_tactical_target_canon[6:] = c_p_b[6:]
+        self._compute_potential_shaping(
+            np.zeros(self.num_players, dtype=np.float64), any_teleport=True
+        )
 
         # Record initial frame (t = 0.0s) if recording enabled
         if self.cfg.replay.enable_recording:
@@ -606,39 +584,21 @@ class FootballParallelEnv(ParallelEnv):
         observations = self._get_observations()
         central_states = self.get_centralized_state()
         infos = {
-            agent: self._build_agent_info(agent, central_state=central_states[self.agent_to_idx[agent]])
+            agent: self._build_agent_info(
+                agent,
+                central_state=central_states[self.agent_to_idx[agent]],
+                interest_score=0.0,
+            )
             for agent in self.agents
         }
         return observations, infos
 
-    def step(
-        self, actions: Dict[str, np.ndarray]
-    ) -> Tuple[
-        Dict[str, np.ndarray],
-        Dict[str, float],
-        Dict[str, bool],
-        Dict[str, bool],
-        Dict[str, Dict[str, Any]],
-    ]:
-        if not self.agents:
-            return {}, {}, {}, {}, {}
-
-        # Parse and validate actions into (12, 4) float64 array
-        act_array = np.zeros((self.num_players, self.cfg.vision.action_dim), dtype=np.float64)
-        for agent_name, act in actions.items():
-            if agent_name in self.agent_to_idx:
-                idx = self.agent_to_idx[agent_name]
-                act_array[idx] = np.clip(np.asarray(act, dtype=np.float64), -1.0, 1.0)
-
+    def _step_core(self, act_array: np.ndarray) -> Tuple[np.ndarray, bool, bool]:
+        """Execute physics sub-steps, PBRS, and end-of-episode bookkeeping for a (12, 4) action array."""
         # Store raw steering input for instantaneous kick deflection
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
 
         step_rewards = np.zeros(self.num_players, dtype=np.float64)
-        net_goal_advance = np.zeros(2, dtype=np.float64)
-        prev_player_pos = self.player_pos.copy()
-        prev_player_ball_dists = np.linalg.norm(
-            self.player_pos - self.ball_pos[None, :], axis=1
-        )
         phi_ball_start = np.array(
             [
                 self._compute_ball_potential(TEAM_A),
@@ -648,55 +608,13 @@ class FootballParallelEnv(ParallelEnv):
         )
         any_teleport = False
 
-        # Continuous per-step penalty for holding the tackle button in empty space (0% chance of tackle)
-        mech = self.cfg.mechanics
-        rew = self.cfg.rewards
-        phys = self.cfg.physics
-        holder = self.ball_holder
-        for idx in range(self.num_players):
-            if self._is_field_role(self.player_role[idx]) and act_array[idx, 3] > mech.special_trigger_threshold:
-                valid_opp_near = (
-                    holder is not None
-                    and self.player_team[holder] != self.player_team[idx]
-                    and self._is_field_role(self.player_role[holder])
-                    and float(np.linalg.norm(self.player_pos[idx] - self.player_pos[holder]))
-                    <= 1.5 * self._get_role_tackle_params(idx)[0]
-                )
-                if not valid_opp_near:
-                    step_rewards[idx] += rew.reckless_tackle_spam_step_pen
-
         # Run 4 physics sub-steps (60 Hz physics / 15 Hz RL)
-        self.prev_ball_at_step_start = self.ball_pos.copy()
-        self.step_external_push[:] = 0.0
         for _ in range(self.cfg.physics.frame_skip):
             self._frame_events = []
-            prev_ball = (
-                self.player_pos[self.ball_holder].copy()
-                if self.ball_holder is not None
-                else self.ball_pos.copy()
-            )
-            prev_holder = self.ball_holder
             teleported = self._physics_substep(act_array, step_rewards)
             if teleported:
                 any_teleport = True
                 act_array = np.zeros_like(act_array)
-            else:
-                curr_ref_pos = (
-                    self.player_pos[self.ball_holder]
-                    if (self.ball_holder is not None and self.ball_holder == prev_holder)
-                    else self.ball_pos
-                )
-                for team_id in (TEAM_A, TEAM_B):
-                    enemy_goal = np.array(
-                        self.cfg.physics.right_goal_center
-                        if self.team_side[team_id] == SIDE_LEFT
-                        else self.cfg.physics.left_goal_center,
-                        dtype=np.float64,
-                    )
-                    d_before = float(np.linalg.norm(prev_ball - enemy_goal))
-                    d_after = float(np.linalg.norm(curr_ref_pos - enemy_goal))
-                    net_goal_advance[team_id] += d_before - d_after
-            self.prev_ball_x = float(self.ball_pos[0])
 
             self.physics_frame_count += 1
 
@@ -713,136 +631,7 @@ class FootballParallelEnv(ParallelEnv):
 
         self.rl_step_count += 1
 
-        # Dense per-RL-step rewards:
-        # 1. Possession Tick + High-Water-Mark Gated Carrier Advance Bonus
-        if self.ball_holder is not None:
-            carrier_idx = self.ball_holder
-            carrier_team = int(self.player_team[carrier_idx])
-            is_field_carrier = self._is_field_role(self.player_role[carrier_idx])
-
-            c_car_pos = self._to_canonical_pos(self.player_pos[carrier_idx], carrier_team)
-            c_car_x = float(c_car_pos[0])
-            c_car_y = float(c_car_pos[1])
-            d_car_goal = float(math.hypot(1400.0 - c_car_x, 420.0 - c_car_y))
-            self.team_possession_max_x[carrier_team] = max(
-                float(self.team_possession_max_x[carrier_team]), c_car_x
-            )
-            self._synced_max_x[carrier_team] = float(self.team_possession_max_x[carrier_team])
-
-            # Gate possession tick: <= 2.5s for field players, <= 1.2s for Goalkeepers (prevents stall farming)
-            max_poss_tick_time = 2.5 if is_field_carrier else 1.2
-            if self.ball_hold_timer <= max_poss_tick_time:
-                step_rewards[carrier_idx] += self.cfg.rewards.possession_carrier_ind
-                self._add_team_reward(step_rewards, carrier_team, self.cfg.rewards.possession_team)
-
-            carrier_adv = float(net_goal_advance[carrier_team])
-            prev_min_goal_d = float(self.team_possession_min_goal_dist[carrier_team])
-            delta_d_fresh = max(
-                0.0,
-                min(carrier_adv, prev_min_goal_d - d_car_goal),
-            )
-            if delta_d_fresh > 0.0:
-                long_v_car = float(
-                    self.player_vel[carrier_idx, 0] * math.cos(self.player_angle[carrier_idx])
-                    + self.player_vel[carrier_idx, 1] * math.sin(self.player_angle[carrier_idx])
-                )
-                # Only reward forward dribbling beyond the possession high-water mark
-                if long_v_car >= -5.0:
-                    self.team_possession_min_goal_dist[carrier_team] = min(prev_min_goal_d, d_car_goal)
-                    role_adv_mult = 1.0
-                    if self.player_role[carrier_idx] == ROLE_DEF and c_car_x > 680.0:
-                        role_adv_mult = 0.25
-                    hold_decay = (
-                        1.0
-                        if self.ball_hold_timer <= self.cfg.rewards.carrier_dribble_decay_start
-                        else max(
-                            0.20,
-                            1.0 - (self.ball_hold_timer - self.cfg.rewards.carrier_dribble_decay_start) / 2.0,
-                        )
-                    )
-
-                    # Open-space carry multiplier: check if forward corridor is unpressed
-                    unpressed_mult = 1.0
-                    if is_field_carrier and self.ball_hold_timer <= self.cfg.rewards.carrier_dribble_decay_start:
-                        opp_team = 1 - carrier_team
-                        opp_indices = [oi for oi in range(self.num_players) if self.player_team[oi] == opp_team]
-                        has_front_press = False
-                        clear_dist = self.cfg.rewards.unpressed_carry_clear_dist
-                        p_carrier = self.player_pos[carrier_idx]
-                        for oi in opp_indices:
-                            d_oi = float(np.linalg.norm(self.player_pos[oi] - p_carrier))
-                            if d_oi < clear_dist:
-                                c_oi_x = float(self._to_canonical_pos(self.player_pos[oi], carrier_team)[0])
-                                if c_oi_x >= c_car_x - 15.0:
-                                    has_front_press = True
-                                    break
-                        if not has_front_press:
-                            unpressed_mult = self.cfg.rewards.unpressed_carry_advance_mult
-
-                    step_rewards[carrier_idx] += (
-                        self.cfg.rewards.carrier_goal_advance_ind_scale
-                        * unpressed_mult
-                        * delta_d_fresh
-                        * role_adv_mult
-                        * hold_decay
-                    )
-
-            # Escalating Hold-Timer Urgency Penalty
-            if is_field_carrier and self.ball_hold_timer > 3.2:
-                urg_ratio = (self.ball_hold_timer - 3.2) / max(
-                    1e-6, self.cfg.mechanics.field_max_hold_time - 3.2
-                )
-                step_rewards[carrier_idx] -= (
-                    self.cfg.rewards.hold_urgency_pen_scale * (urg_ratio ** 2)
-                )
-            elif (not is_field_carrier) and self.ball_hold_timer > self.cfg.rewards.keeper_hold_urgency_start:
-                gk_urg = (
-                    (self.ball_hold_timer - self.cfg.rewards.keeper_hold_urgency_start)
-                    / max(1e-6, self.cfg.mechanics.keeper_max_hold_time - self.cfg.rewards.keeper_hold_urgency_start)
-                ) ** 2
-                step_rewards[carrier_idx] -= self.cfg.rewards.keeper_hold_urgency_scale * gk_urg
-
-            # Prime-Scoring-Zone Hesitation & Stall Penalty
-            if is_field_carrier and self.kick_grace_timer <= 0.0:
-                enemy_goal_c = (
-                    np.array(self.cfg.physics.right_goal_center, dtype=np.float64)
-                    if self.team_side[carrier_team] == SIDE_LEFT
-                    else np.array(self.cfg.physics.left_goal_center, dtype=np.float64)
-                )
-                dist_to_enemy_goal = float(
-                    np.linalg.norm(self.player_pos[carrier_idx] - enemy_goal_c)
-                )
-                if dist_to_enemy_goal <= 360.0:
-                    enemy_side = 1 - int(self.team_side[carrier_team])
-                    max_kick_spd, _ = self._get_role_kick_params(carrier_idx)
-                    facing_vec = np.array(
-                        [
-                            math.cos(self.player_angle[carrier_idx]),
-                            math.sin(self.player_angle[carrier_idx]),
-                        ],
-                        dtype=np.float64,
-                    )
-                    hyp_ball_pos = (
-                        self.player_pos[carrier_idx]
-                        + facing_vec * self.cfg.mechanics.ball_carry_offset
-                    )
-                    hyp_ball_vel = facing_vec * max_kick_spd
-                    is_aimed_at_goal = self._is_ball_heading_into_goal(
-                        hyp_ball_pos, hyp_ball_vel, enemy_side
-                    )
-                    is_arc_stall = (
-                        dist_to_enemy_goal <= 235.0
-                        and self.ball_hold_timer >= 0.75
-                        and carrier_adv <= 1.5
-                    )
-                    if is_aimed_at_goal or is_arc_stall or (
-                        dist_to_enemy_goal <= 320.0
-                        and self.ball_hold_timer >= 1.8
-                        and carrier_adv <= 1.0
-                    ):
-                        step_rewards[carrier_idx] += self.cfg.rewards.prime_shot_hesitation_pen
-
-        # 2. Conservative Potential-Based Ball-Advance Shaping towards Enemy Goal Center
+        # Tier 2: Strict Policy-Invariant PBRS (Ball Threat & Off-Ball Positioning)
         phi_ball_end = np.array(
             [
                 self._compute_ball_potential(TEAM_A),
@@ -853,30 +642,16 @@ class FootballParallelEnv(ParallelEnv):
         self.prev_ball_potential[:] = phi_ball_end
         if not any_teleport:
             gamma = self.cfg.ppo.gamma
-            w_team_adv = self.cfg.rewards.team_advance_pbrs_weight
+            rew = self.cfg.rewards
             for team_id in (TEAM_A, TEAM_B):
-                pbrs_adv = w_team_adv * (gamma * float(phi_ball_end[team_id]) - float(phi_ball_start[team_id]))
+                delta_phi = gamma * float(phi_ball_end[team_id]) - float(phi_ball_start[team_id])
+                pbrs_adv = rew.team_advance_pbrs_weight * delta_phi
                 if abs(pbrs_adv) > 1e-12:
                     self._add_team_reward(step_rewards, team_id, pbrs_adv)
+                if self.ball_holder is not None and int(self.player_team[self.ball_holder]) == team_id:
+                    step_rewards[self.ball_holder] += rew.carrier_advance_pbrs_weight * delta_phi
 
-        # 2b. Anti-Jitter Velocity-Reversal Shaping
-        if not any_teleport:
-            for idx in range(self.num_players):
-                long_v = float(
-                    self.player_vel[idx, 0] * math.cos(self.player_angle[idx])
-                    + self.player_vel[idx, 1] * math.sin(self.player_angle[idx])
-                )
-                if long_v * self.prev_longitudinal_vel[idx] < -400.0:
-                    step_rewards[idx] += self.cfg.rewards.jitter_reverse_pen
-                self.prev_longitudinal_vel[idx] = long_v
-        else:
-            self.prev_longitudinal_vel[:] = 0.0
-
-        # 3. Context-Dependent Tactical Positioning (Spread Out / Loose Ball Chase / Press & Cover / Keeper Arc)
-        self._compute_tactical_positioning_rewards(
-            step_rewards, prev_player_pos, prev_player_ball_dists, any_teleport
-        )
-        self._last_tactical_player_pos[:] = self.player_pos
+        self._compute_potential_shaping(step_rewards, any_teleport)
 
         # Update reward tracking arrays for visual feedback & replay recording
         self.last_step_rewards = step_rewards.astype(np.float32)
@@ -892,13 +667,6 @@ class FootballParallelEnv(ParallelEnv):
         # Episode termination / truncation at t = 180.0s (2,700 RL steps)
         is_truncated = self.rl_step_count >= self.cfg.physics.max_rl_steps
         is_terminated = False
-
-        observations = self._get_observations()
-        rewards = {
-            agent: float(step_rewards[self.agent_to_idx[agent]]) for agent in self.agents
-        }
-        terminations = {agent: is_terminated for agent in self.agents}
-        truncations = {agent: is_truncated for agent in self.agents}
 
         if is_truncated or is_terminated:
             self._emit_event(
@@ -921,9 +689,71 @@ class FootballParallelEnv(ParallelEnv):
             if self.cfg.replay.enable_recording:
                 self._maybe_export_replay()
 
+        return step_rewards, is_terminated, is_truncated
+
+    def step_array(
+        self, actions_array: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Optional[Dict[str, Any]]]:
+        """Execute one RL step using a (12, 4) action array and return contiguous NumPy arrays."""
+        act_array = np.clip(np.asarray(actions_array, dtype=np.float64), -1.0, 1.0)
+        step_rewards, is_terminated, is_truncated = self._step_core(act_array)
+
+        obs_arr = self._get_observations_array()
+        central_arr = self.get_centralized_state()
+        rew_arr = self.last_step_rewards.copy()
+        is_done = bool(is_terminated or is_truncated)
+
+        if is_done:
+            ep_interest = self.compute_interest_score()
+            ep_summary: Optional[Dict[str, Any]] = {
+                "match_id": self.current_match_id,
+                "generation": self.current_generation,
+                "interest_score": ep_interest,
+                "final_stats": dict(self.stats),
+                "last_saved_replay": self.last_saved_replay_path,
+            }
+            self.agents = []
+        else:
+            ep_summary = None
+
+        return obs_arr, central_arr, rew_arr, is_done, ep_summary
+
+    def step(
+        self, actions: Dict[str, np.ndarray]
+    ) -> Tuple[
+        Dict[str, np.ndarray],
+        Dict[str, float],
+        Dict[str, bool],
+        Dict[str, bool],
+        Dict[str, Dict[str, Any]],
+    ]:
+        if not self.agents:
+            return {}, {}, {}, {}, {}
+
+        # Parse and validate actions into (12, 4) float64 array
+        act_array = np.zeros((self.num_players, self.cfg.vision.action_dim), dtype=np.float64)
+        for agent_name, act in actions.items():
+            if agent_name in self.agent_to_idx:
+                idx = self.agent_to_idx[agent_name]
+                act_array[idx] = np.clip(np.asarray(act, dtype=np.float64), -1.0, 1.0)
+
+        step_rewards, is_terminated, is_truncated = self._step_core(act_array)
+
+        observations = self._get_observations()
+        rewards = {
+            agent: float(step_rewards[self.agent_to_idx[agent]]) for agent in self.agents
+        }
+        terminations = {agent: is_terminated for agent in self.agents}
+        truncations = {agent: is_truncated for agent in self.agents}
+
+        ep_interest = self.compute_interest_score() if (is_truncated or is_terminated) else 0.0
         central_states = self.get_centralized_state()
         infos = {
-            agent: self._build_agent_info(agent, central_state=central_states[self.agent_to_idx[agent]])
+            agent: self._build_agent_info(
+                agent,
+                central_state=central_states[self.agent_to_idx[agent]],
+                interest_score=ep_interest,
+            )
             for agent in self.agents
         }
 
@@ -986,8 +816,6 @@ class FootballParallelEnv(ParallelEnv):
 
         for side_idx, (in_box, d_goal) in enumerate([(in_left_box, d_left), (in_right_box, d_right)]):
             defending_team = 0 if self.team_side[0] == side_idx else 1
-            if d_goal > 220.0:
-                self.box_recovery_rewarded[side_idx] = False
 
             if not in_box or (self.ball_holder is not None and int(self.player_team[self.ball_holder]) != defending_team):
                 # Ball cleared the box or opponent claimed it -> reset timer & expand
@@ -1031,7 +859,6 @@ class FootballParallelEnv(ParallelEnv):
                 and self.ball_hold_timer >= mech.keeper_max_hold_time - 1e-9
             ):
                 self._handle_keeper_5s_violation(self.ball_holder, step_rewards, is_hold_violation=True)
-                return True
 
         # ----------------------------------------------------------------------
         # 2. Process Player Actions (Steering, Throttle, Kick, Special)
@@ -1048,14 +875,12 @@ class FootballParallelEnv(ParallelEnv):
 
             throttle_raw, steer_raw, kick_power, special_trig = act_array[idx]
 
-            # Steering smoothing filter: 0.65 * raw_steer + 0.35 * prev_steer
-            smoothed_steer = 0.65 * steer_raw + 0.35 * self.prev_steer[idx]
-            self.prev_steer[idx] = smoothed_steer
-            self.smoothed_steer[idx] = smoothed_steer
+            self.prev_steer[idx] = steer_raw
+            self.smoothed_steer[idx] = steer_raw
 
             # Steering: [-1, 1] rotates facing_angle (locked during field lunge)
             if not (self._is_field_role(self.player_role[idx]) and self.lunge_timer[idx] > 0.0):
-                turn_delta = smoothed_steer * phys.player_max_turn_rate * dt
+                turn_delta = steer_raw * phys.player_max_turn_rate * dt
                 self.player_angle[idx] = float(wrap_to_pi(self.player_angle[idx] + turn_delta))
 
             # Special Action (action[3] > 0.5): Lunge for Keepers, Tackle for Field Players
@@ -1066,205 +891,19 @@ class FootballParallelEnv(ParallelEnv):
                     if self.ball_holder != idx and self.lunge_cooldown[idx] <= 0.0:
                         self.lunge_timer[idx] = mech.lunge_duration
                         self.lunge_cooldown[idx] = mech.keeper_lunge_cooldown
-                        d_to_ball = float(np.linalg.norm(self.player_pos[idx] - self.ball_pos))
-                        k_team = int(self.player_team[idx])
-                        k_side = int(self.team_side[k_team])
-                        own_goal_x = 0.0 if k_side == SIDE_LEFT else phys.field_width
-                        own_goal_center = np.array([own_goal_x, 420.0], dtype=np.float64)
-
-                        # Check if ball heading toward own goal line
-                        ball_vx = float(self.ball_vel[0])
-                        ball_vy = float(self.ball_vel[1])
-                        heading_toward_goal = (k_side == SIDE_LEFT and ball_vx < -40.0) or (
-                            k_side == SIDE_RIGHT and ball_vx > 40.0
-                        )
-
-                        # Ball must be in front of keeper along goal direction (not already flown past keeper towards goal)
-                        is_ball_in_front = (
-                            (k_side == SIDE_LEFT and self.ball_pos[0] >= self.player_pos[idx, 0] - 15.0)
-                            or (k_side == SIDE_RIGHT and self.ball_pos[0] <= self.player_pos[idx, 0] + 15.0)
-                        )
-                        t_goal = (
-                            (own_goal_x - float(self.ball_pos[0])) / (ball_vx if abs(ball_vx) > 1e-6 else 1e-6)
-                            if heading_toward_goal
-                            else 999.0
-                        )
-
-                        u_dive = None
-                        is_shot_at_keeper = False
-                        dive_target_cpa = None
-                        v_dive = mech.keeper_dive_speed
-                        if heading_toward_goal and d_to_ball <= 480.0 and is_ball_in_front and t_goal > dt:
-                            ball_spd_sq = float(np.dot(self.ball_vel, self.ball_vel))
-                            ball_spd = math.sqrt(ball_spd_sq)
-                            t_cpa = float(
-                                np.clip(
-                                    np.dot(self.player_pos[idx] - self.ball_pos, self.ball_vel)
-                                    / max(ball_spd_sq, 1e-6),
-                                    0.0,
-                                    t_goal,
-                                )
+                        dive_angle = float(
+                            wrap_to_pi(
+                                self.player_angle[idx]
+                                + steer_raw * math.radians(phys.kick_steer_max_deflection_deg)
                             )
-                            a_fric = phys.ball_friction_decel  # 155.0
-                            t_stop = ball_spd / a_fric if a_fric > 0.0 else 999.0
-                            t_eff = min(t_cpa, t_stop)
-                            u_ball = self.ball_vel / max(ball_spd, 1e-6)
-                            dist_cpa_along_ray = ball_spd * t_eff - 0.5 * a_fric * (t_eff ** 2)
-                            p_cpa = self.ball_pos + dist_cpa_along_ray * u_ball
-                            if k_side == SIDE_LEFT:
-                                p_cpa[0] = max(phys.player_radius, p_cpa[0])
-                            else:
-                                p_cpa[0] = min(phys.field_width - phys.player_radius, p_cpa[0])
-                            p_cpa[1] = float(np.clip(p_cpa[1], phys.goal_y_min, phys.goal_y_max))
-                            dive_target_cpa = p_cpa.copy()
-
-                            d_cpa = float(np.linalg.norm(p_cpa - self.player_pos[idx]))
-                            smother_radius = phys.keeper_smother_cpa_radius  # 30.0
-                            if d_cpa <= phys.player_radius:
-                                is_shot_at_keeper = True
-                                req_speed = d_cpa / max(dt, min(0.25, max(t_cpa, 0.08)))
-                                v_dive = min(140.0, req_speed)
-                                if d_cpa > 2.0:
-                                    u_dive = (p_cpa - self.player_pos[idx]) / d_cpa
-                                else:
-                                    u_dive = -u_ball
-                            elif d_cpa <= smother_radius:
-                                is_shot_at_keeper = False
-                                req_speed = d_cpa / max(dt, min(0.25, max(t_cpa, 0.08)))
-                                v_dive = min(140.0, req_speed)
-                                u_dive = (p_cpa - self.player_pos[idx]) / d_cpa
-                            else:
-                                is_shot_at_keeper = False
-                                u_dive = (p_cpa - self.player_pos[idx]) / d_cpa
-                                time_window = max(0.06, min(0.25, t_cpa if t_cpa > 0.04 else 0.20))
-                                v_dive = float(np.clip(d_cpa / time_window, 160.0, mech.keeper_dive_speed))
-                        elif (
-                            self.ball_holder is None
-                            and float(np.linalg.norm(self.ball_pos - own_goal_center))
-                            <= phys.keeper_box_radius
-                        ):
-                            dive_vec = self.ball_pos - self.player_pos[idx]
-                            dive_dist = float(np.linalg.norm(dive_vec))
-                            if dive_dist > 1e-6:
-                                u_dive = dive_vec / dive_dist
-                            v_dive = mech.keeper_dive_speed
-
-                            # Auto-Align Goalkeeper Body Heading on Loose-Ball Box Dives (Regime 2)
-                            if u_dive is not None:
-                                dive_angle = float(math.atan2(u_dive[1], u_dive[0]))
-                                if k_side == SIDE_LEFT and math.cos(dive_angle) < 0.0:
-                                    dive_angle = float(math.atan2(math.sin(dive_angle), abs(math.cos(dive_angle))))
-                                elif k_side == SIDE_RIGHT and math.cos(dive_angle) > 0.0:
-                                    dive_angle = float(math.atan2(math.sin(dive_angle), -abs(math.cos(dive_angle))))
-                                self.player_angle[idx] = dive_angle
-
-                        if u_dive is None:
-                            steer_input = float(smoothed_steer)
-                            if abs(steer_input) > 0.1:
-                                sign_y = 1.0 if steer_input > 0.0 else -1.0
-                                u_dive = np.array([0.0, sign_y], dtype=np.float64)
-                            else:
-                                u_dive = np.array(
-                                    [
-                                        math.cos(self.player_angle[idx]),
-                                        math.sin(self.player_angle[idx]),
-                                    ],
-                                    dtype=np.float64,
-                                )
-                            v_dive = mech.keeper_dive_speed
-
-                        # Prevent diving into the back wall behind own goal line
-                        if (
-                            k_side == SIDE_LEFT
-                            and self.player_pos[idx, 0] <= phys.player_radius + 2.0
-                            and u_dive[0] < 0.0
-                        ):
-                            u_dive[0] = 0.0
-                            norm_u = float(np.linalg.norm(u_dive))
-                            if norm_u > 1e-6:
-                                u_dive = u_dive / norm_u
-                        elif (
-                            k_side == SIDE_RIGHT
-                            and self.player_pos[idx, 0]
-                            >= phys.field_width - phys.player_radius - 2.0
-                            and u_dive[0] > 0.0
-                        ):
-                            u_dive[0] = 0.0
-                            norm_u = float(np.linalg.norm(u_dive))
-                            if norm_u > 1e-6:
-                                u_dive = u_dive / norm_u
-
+                        )
+                        u_dive = np.array(
+                            [math.cos(dive_angle), math.sin(dive_angle)],
+                            dtype=np.float64,
+                        )
                         self.dive_dir[idx] = u_dive
-                        self.dive_speed[idx] = v_dive
-                        self.player_vel[idx] = u_dive * self.dive_speed[idx]
-
-                        # Dive Save Gating & Anti-Farming: verify ball is genuinely heading into net
-                        ball_spd = float(np.linalg.norm(self.ball_vel))
-                        c_ball_vel_x = self.ball_vel[0] if k_side == SIDE_LEFT else -self.ball_vel[0]
-                        heading_goal_check = (
-                            is_ball_in_front
-                            and (not (heading_toward_goal and t_goal <= dt))
-                            and (
-                                self._is_ball_heading_into_goal(
-                                    self.ball_pos, self.ball_vel, k_side, y_margin=15.0
-                                )
-                                or (self.ball_kick_was_shot_on_target and c_ball_vel_x < -100.0)
-                            )
-                        )
-
-                        is_in_box = (
-                            float(np.linalg.norm(self.ball_pos - own_goal_center))
-                            <= phys.keeper_box_radius + 25.0
-                        )
-                        d_cpa_val = d_cpa if dive_target_cpa is not None else 999.0
-
-                        valid_dive_trajectory = True
-                        if heading_toward_goal and dive_target_cpa is not None and not is_shot_at_keeper:
-                            to_target = dive_target_cpa - self.player_pos[idx]
-                            d_tgt = float(np.linalg.norm(to_target))
-                            if d_tgt > 1e-6:
-                                valid_dive_trajectory = (float(np.dot(u_dive, to_target / d_tgt)) >= 0.35)
-                            else:
-                                valid_dive_trajectory = False
-
-                        if (
-                            self.ball_holder is None
-                            and heading_goal_check
-                            and not is_shot_at_keeper
-                            and valid_dive_trajectory
-                            and d_cpa_val > 18.0
-                            and d_to_ball <= 480.0
-                        ):
-                            if step_rewards is not None:
-                                step_rewards[idx] += self.cfg.rewards.keeper_dive_save_attempt_ind
-                            self.post_save_box_grace_timer = mech.post_save_box_grace_time
-                            self._emit_event(
-                                "GK DIVE!",
-                                self.player_pos[idx],
-                                team=k_team,
-                                agent=self.idx_to_agent[idx],
-                                reward=self.cfg.rewards.keeper_dive_save_attempt_ind,
-                            )
-                        elif (
-                            (is_in_box and ball_spd < 80.0)
-                            or (dive_target_cpa is not None and is_shot_at_keeper)
-                        ):
-                            if step_rewards is not None:
-                                step_rewards[idx] += self.cfg.rewards.keeper_unnecessary_dive_pen
-                            self._emit_event(
-                                "UNNECESSARY DIVE!",
-                                self.player_pos[idx],
-                                team=k_team,
-                                agent=self.idx_to_agent[idx],
-                                reward=self.cfg.rewards.keeper_unnecessary_dive_pen,
-                            )
-                        elif (
-                            (d_to_ball > 480.0 or not is_ball_in_front or not valid_dive_trajectory)
-                            and self.ball_holder != idx
-                            and not is_shot_at_keeper
-                        ):
-                            if step_rewards is not None:
-                                step_rewards[idx] += self.cfg.rewards.keeper_reckless_lunge_pen
+                        self.dive_speed[idx] = mech.keeper_dive_speed
+                        self.player_vel[idx] = u_dive * mech.keeper_dive_speed
                 else:
                     # Field Player Tackle attempt
                     if (
@@ -1280,25 +919,8 @@ class FootballParallelEnv(ParallelEnv):
                 self.player_vel[idx] = self.dive_dir[idx] * (
                     self.dive_speed[idx] if self.dive_speed[idx] > 1e-6 else mech.keeper_dive_speed
                 )
-                # Sub-Step Ray-Lock Braking: damp perpendicular velocity near shot line to avoid overshooting
-                if self.ball_holder is None:
-                    k_team = int(self.player_team[idx])
-                    k_side = int(self.team_side[k_team])
-                    v_x_ball_canon = float(self.ball_vel[0] if k_side == SIDE_LEFT else -self.ball_vel[0])
-                    if v_x_ball_canon < -40.0:
-                        b_spd = float(np.linalg.norm(self.ball_vel))
-                        if b_spd > 1e-6:
-                            u_b = self.ball_vel / b_spd
-                            rel_pos = self.player_pos[idx] - self.ball_pos
-                            s_proj = float(np.dot(rel_pos, u_b))
-                            if s_proj > 0.0:
-                                perp_vec = rel_pos - s_proj * u_b
-                                d_perp = float(np.linalg.norm(perp_vec))
-                                if d_perp <= 10.0:
-                                    v_perp_vec = self.player_vel[idx] - np.dot(self.player_vel[idx], u_b) * u_b
-                                    self.player_vel[idx] = self.player_vel[idx] - 0.85 * v_perp_vec
             elif self._is_field_role(self.player_role[idx]) and self.lunge_timer[idx] > 0.0:
-                # Field player lunge: instant override at field_lunge_speed directed at target,
+                # Field player lunge: instant override at field_lunge_speed,
                 # standard exponential acceleration smoothing is bypassed for the duration
                 pass
             else:
@@ -1342,11 +964,8 @@ class FootballParallelEnv(ParallelEnv):
         # Player-to-player solid circle collisions (skip players in Ghost Mode)
         self._resolve_player_collisions()
 
-        # Semi-Circle Barrier & Field Wall Clamping (apply smooth push on first pass)
+        # Semi-Circle Barrier & Field Wall Clamping
         self._clamp_players_to_boundaries(apply_dynamic_push=True)
-
-        # Re-run boundary pass once more without dynamic push to guarantee hard constraints
-        self._clamp_players_to_boundaries(apply_dynamic_push=False)
 
         # ----------------------------------------------------------------------
         # 4. Update Ball Kinematics & Check Goals / Wall Bounces
@@ -1497,108 +1116,27 @@ class FootballParallelEnv(ParallelEnv):
     # ==========================================================================
     # Mechanics Helpers: Kicks, Tackles, Violations, Pickups, Collisions
     # ==========================================================================
-    def _simulate_ball_trajectory(
-        self,
-        start_pos: np.ndarray,
-        start_vel: np.ndarray,
-        num_samples: int = 16,
-        t_min: float = 0.35,
-        t_max: float = 2.80,
-    ) -> Tuple[np.ndarray, int, float]:
-        """Simulate ball trajectory under linear friction (155.0 u/s^2) and up to 1 sideline wall bounce.
-        Returns:
-            sample_points: shape (num_samples, 2) in world coordinates
-            n_side_bounces: 0 or 1
-            first_wall_x_world: X-coordinate where ball hit sideline wall (or -1.0 if no bounce)
-        """
-        v0 = float(np.linalg.norm(start_vel))
-        if v0 < 1e-4:
-            pts = np.repeat(start_pos[None, :], num_samples, axis=0)
-            return pts, 0, -1.0
-
-        a_fric = self.cfg.physics.ball_friction_decel  # 155.0
-        e_wall = self.cfg.physics.ball_wall_restitution  # 0.85
-        t_stop = v0 / a_fric
-        u0 = start_vel / v0
-
-        # Check if trajectory hits top (y=10) or bottom (y=830) sideline before stopping
-        d_stop = 0.5 * v0 * t_stop
-        vy0 = float(start_vel[1])
-        t_wall = 999.0
-        wall_y = 0.0
-        if abs(vy0) > 1e-4:
-            target_y = 10.0 if vy0 < 0.0 else (self.cfg.physics.field_height - 10.0)
-            dy_wall = abs(target_y - float(start_pos[1]))
-            # Distance along ray to reach target_y
-            sin_abs = abs(float(u0[1]))
-            s_wall = dy_wall / max(sin_abs, 1e-6)
-            if s_wall < d_stop:
-                # Solve v0 * t - 0.5 * a_fric * t^2 = s_wall
-                disc = max(0.0, v0 * v0 - 2.0 * a_fric * s_wall)
-                t_wall = (v0 - math.sqrt(disc)) / a_fric
-                wall_y = target_y
-
-        times = np.linspace(t_min, t_max, num_samples, dtype=np.float32)
-        pts = np.zeros((num_samples, 2), dtype=np.float32)
-        n_bounces = 0
-        wall_x_world = -1.0
-
-        if t_wall < t_stop:
-            n_bounces = 1
-            s_at_wall = v0 * t_wall - 0.5 * a_fric * (t_wall ** 2)
-            p_wall = start_pos + s_at_wall * u0
-            p_wall[1] = wall_y
-            wall_x_world = float(p_wall[0])
-            v_before_wall = max(0.0, v0 - a_fric * t_wall)
-            v_after_wall = e_wall * v_before_wall
-            u_after = np.array([u0[0], -u0[1]], dtype=np.float32)
-            t_stop_after = v_after_wall / a_fric
-        else:
-            p_wall = start_pos
-            v_after_wall = 0.0
-            u_after = u0
-            t_stop_after = 0.0
-
-        for idx, t in enumerate(times):
-            t_val = float(t)
-            if t_val <= t_wall:
-                t_eff = min(t_val, t_stop)
-                s = v0 * t_eff - 0.5 * a_fric * (t_eff ** 2)
-                p = start_pos + s * u0
-            else:
-                dt_after = min(t_val - t_wall, t_stop_after)
-                s_after = v_after_wall * dt_after - 0.5 * a_fric * (dt_after ** 2)
-                p = p_wall + s_after * u_after
-            p[0] = np.clip(p[0], 10.0, self.cfg.physics.field_width - 10.0)
-            p[1] = np.clip(p[1], 10.0, self.cfg.physics.field_height - 10.0)
-            pts[idx] = p
-
-        return pts, n_bounces, wall_x_world
-
     def _execute_kick(
         self,
         kicker_idx: int,
         kick_power: float,
         step_rewards: Optional[np.ndarray] = None,
     ) -> None:
-        """Launch the ball from kicker with role-specific speed & jitter, check shot-on-target, and apply cooldown."""
+        """Launch the ball from kicker, record release state, check shot-on-target, and apply pickup cooldown."""
         self.kickoff_protection_timer = 0.0
         self.pickup_tackle_grace_timer = 0.0
         phys = self.cfg.physics
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
-        phys = self.cfg.physics
 
         kicker_role = int(self.player_role[kicker_idx])
         kicker_team = int(self.player_team[kicker_idx])
 
-        power_norm = float(
-            np.clip(
-                (kick_power - mech.kick_trigger_threshold)
-                / max(1e-6, 1.0 - mech.kick_trigger_threshold),
-                0.0,
-                1.0,
-            )
+        power_norm = _fast_clip(
+            (kick_power - mech.kick_trigger_threshold)
+            / max(1e-6, 1.0 - mech.kick_trigger_threshold),
+            0.0,
+            1.0,
         )
         max_kick_spd, jitter_rad = self._get_role_kick_params(kicker_idx)
         launch_speed = phys.ball_min_kick_speed + power_norm * (max_kick_spd - phys.ball_min_kick_speed)
@@ -1610,13 +1148,11 @@ class FootballParallelEnv(ParallelEnv):
         # Kick Deflection Realism & Taper
         abs_deflect_deg = abs(float(self.raw_steer_input[kicker_idx])) * phys.kick_steer_max_deflection_deg
         if abs_deflect_deg > 35.0 and kicker_role != ROLE_KEEPER:
-            deflect_excess = float(
-                np.clip(
-                    (abs_deflect_deg - 35.0)
-                    / max(1.0, phys.kick_steer_max_deflection_deg - 35.0),
-                    0.0,
-                    1.0,
-                )
+            deflect_excess = _fast_clip(
+                (abs_deflect_deg - 35.0)
+                / max(1.0, phys.kick_steer_max_deflection_deg - 35.0),
+                0.0,
+                1.0,
             )
             bonus_speed = power_norm * (max_kick_spd - phys.ball_min_kick_speed) * (1.0 - 0.25 * deflect_excess)
             launch_speed = phys.ball_min_kick_speed + bonus_speed
@@ -1636,51 +1172,19 @@ class FootballParallelEnv(ParallelEnv):
                 )
             )
 
-        # GK Forward-Hemisphere Distribution Clamp
-        if kicker_role == ROLE_KEEPER:
-            cos_forward = (
-                math.cos(base_angle)
-                if self.team_side[kicker_team] == SIDE_LEFT
-                else -math.cos(base_angle)
-            )
-            if cos_forward < 0.15:
-                if step_rewards is not None:
-                    step_rewards[kicker_idx] += rew.keeper_kick_backward_pen
-                    self._emit_event(
-                        "GK BACK-KICK!",
-                        self.player_pos[kicker_idx],
-                        team=kicker_team,
-                        agent=self.idx_to_agent[kicker_idx],
-                        reward=rew.keeper_kick_backward_pen,
-                    )
-                sin_sign = 1.0 if math.sin(base_angle) >= 0.0 else -1.0
-                theta = math.acos(0.35)
-                if self.team_side[kicker_team] == SIDE_LEFT:
-                    base_angle = sin_sign * theta
-                else:
-                    base_angle = float(wrap_to_pi(math.pi - sin_sign * theta))
-                kick_angle = base_angle
-
         facing_vec = np.array([math.cos(base_angle), math.sin(base_angle)], dtype=np.float64)
         kick_vec = np.array([math.cos(kick_angle), math.sin(kick_angle)], dtype=np.float64)
 
         self.ball_pos = self.player_pos[kicker_idx] + facing_vec * mech.ball_carry_offset
         self.ball_vel = kick_vec * launch_speed
 
-        # Option A: Immediate Defensive-Third Own-Goal Kick Threat Shaping (resolves temporal credit assignment delay)
-        if step_rewards is not None and kicker_role != ROLE_KEEPER:
-            own_side = int(self.team_side[kicker_team])
-            c_kp, _, _ = self._to_team_canonical(
-                self.player_pos[kicker_idx : kicker_idx + 1], np.zeros((1, 2)), 0.0, kicker_team
-            )
-            if float(c_kp[0, 0]) <= 350.0:
-                if self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, own_side, y_margin=25.0):
-                    step_rewards[kicker_idx] += rew.dangerous_own_goal_kick_pen
+        opp_mask = self.player_team != kicker_team
+        opp_dists = np.hypot(
+            self.player_pos[opp_mask, 0] - self.ball_pos[0],
+            self.player_pos[opp_mask, 1] - self.ball_pos[1],
+        )
+        self.ball_kick_orig_opp_dist = float(np.min(opp_dists)) if len(opp_dists) > 0 else 999.0
 
-        self.last_kick_pos[kicker_idx] = self.ball_pos.copy()
-        self.last_kick_hold_time[kicker_idx] = self.ball_hold_timer
-        self.kick_frame_player_pos = self.player_pos.copy()
-        self.kick_frame_player_angle = self.player_angle.copy()
         self.ball_holder = None
         self.ball_hold_timer = 0.0
         self.last_ball_holder = kicker_idx
@@ -1691,7 +1195,6 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_wall_bounces = 0
         self.is_wall_pass_in_flight = False
 
-        # 1.0s pickup cooldown on kicker
         self.pickup_cooldown[kicker_idx] = max(
             self.pickup_cooldown[kicker_idx], mech.kick_pickup_cooldown
         )
@@ -1701,40 +1204,27 @@ class FootballParallelEnv(ParallelEnv):
             self.last_keeper_kick_time[kicker_team] = self.physics_frame_count * phys.dt
 
         # Check if this kick is a True Shot on Target (inside goal mouth)
-        # or a Near Shot (hitting the end wall beside the goal within 75u)
         enemy_side = 1 - int(self.team_side[kicker_team])
         is_true_sot = self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, enemy_side, y_margin=0.0)
-        is_near_sot = (
-            False
-            if is_true_sot
-            else self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, enemy_side, y_margin=75.0)
-        )
         cx = 0.0
         cy = 420.0
         flank_angle_mult = 1.0
-        if is_true_sot or is_near_sot:
-            c_kicker_pos, _, _ = self._to_team_canonical(
-                self.player_pos[kicker_idx:kicker_idx + 1],
-                self.player_vel[kicker_idx:kicker_idx + 1],
-                self.player_angle[kicker_idx],
-                kicker_team,
-            )
-            cx = float(c_kicker_pos[0, 0])
-            cy = float(c_kicker_pos[0, 1])
+        if is_true_sot:
+            c_kicker_pos = self._to_canonical_pos(self.player_pos[kicker_idx], kicker_team)
+            cx = float(c_kicker_pos[0])
+            cy = float(c_kicker_pos[1])
             if cx >= 1210.0 and abs(cy - 420.0) >= 135.0:
                 flank_angle_mult = 0.35
-            # A shot on target must originate from attacking territory (cx >= 680.0)
             if cx < 680.0:
                 is_true_sot = False
-                is_near_sot = False
             else:
-                # Disqualify if this kick is aimed at an intermediate teammate in the pass reception corridor
+                # Disqualify if aimed at an intermediate teammate in the pass reception corridor
                 ball_spd = float(np.linalg.norm(self.ball_vel))
                 if ball_spd > 1e-6:
                     u_kick = self.ball_vel / ball_spd
                     goal_x = 0.0 if enemy_side == SIDE_LEFT else phys.field_width
                     dist_to_goal = abs(goal_x - float(self.ball_pos[0]))
-                    tau_lead = rew.pass_lead_tau
+                    tau_lead = 0.35
                     for tm_idx in range(self.num_players):
                         if tm_idx != kicker_idx and self.player_team[tm_idx] == kicker_team:
                             raw_lead = self.player_pos[tm_idx] + tau_lead * self.player_vel[tm_idx]
@@ -1746,539 +1236,152 @@ class FootballParallelEnv(ParallelEnv):
                                     dist_perp = float(np.linalg.norm(perp_vec))
                                     d_tm = float(np.linalg.norm(to_tm))
                                     cos_angle = proj_along / max(1e-6, d_tm)
-                                    if dist_perp <= 45.0 or cos_angle >= 0.95:  # within ~18 deg pass corridor
+                                    if dist_perp <= 45.0 or cos_angle >= 0.95:
                                         is_true_sot = False
-                                        is_near_sot = False
                                         break
-                            if not is_true_sot and not is_near_sot:
+                            if not is_true_sot:
                                 break
 
         self.ball_kick_was_shot_on_target = is_true_sot
 
-        # Compute xG Quality factor and hard range gated M_chain for shots
-        if is_true_sot or is_near_sot:
-            d_shot = math.hypot(1400.0 - cx, 420.0 - cy)
-            mu_dist = math.exp(- (max(0.0, d_shot - 220.0) ** 2) / (2.0 * (210.0 ** 2)))
-            opp_gk_idx = 0 if enemy_side == SIDE_LEFT else 6
-            to_gk = self.player_pos[opp_gk_idx] - self.ball_pos
-            b_spd = max(1e-6, float(np.linalg.norm(self.ball_vel)))
-            u_kick = self.ball_vel / b_spd
-            proj_gk = float(np.dot(to_gk, u_kick))
-            if proj_gk > 0.0:
-                d_gk_ray = math.hypot(to_gk[0] - proj_gk * u_kick[0], to_gk[1] - proj_gk * u_kick[1])
-            else:
-                d_gk_ray = float(np.linalg.norm(to_gk))
-            mu_gk_open = float(np.clip(d_gk_ray / 45.0, 0.15, 1.0))
-            power_factor = 0.6 + 0.4 * power_norm
-            mu_xg = float(np.clip(mu_dist * mu_gk_open * flank_angle_mult * power_factor, 0.05, 1.0))
+        if is_true_sot:
+            self.stats["shots"][kicker_team] += 1
+            if step_rewards is not None and self.shot_on_target_cd[kicker_idx] <= 0.0:
+                d_shot = math.hypot(1400.0 - cx, 420.0 - cy)
+                mu_dist = math.exp(-((max(0.0, d_shot - 220.0) ** 2) / (2.0 * (210.0 ** 2))))
+                opp_gk_idx = 0 if enemy_side == SIDE_LEFT else 6
+                to_gk = self.player_pos[opp_gk_idx] - self.ball_pos
+                b_spd = max(1e-6, float(np.linalg.norm(self.ball_vel)))
+                u_kick = self.ball_vel / b_spd
+                proj_gk = float(np.dot(to_gk, u_kick))
+                if proj_gk > 0.0:
+                    d_gk_ray = math.hypot(to_gk[0] - proj_gk * u_kick[0], to_gk[1] - proj_gk * u_kick[1])
+                else:
+                    d_gk_ray = float(np.linalg.norm(to_gk))
+                mu_gk_open = _fast_clip(d_gk_ray / 45.0, 0.15, 1.0)
+                power_factor = 0.6 + 0.4 * power_norm
+                mu_xg = _fast_clip(mu_dist * mu_gk_open * flank_angle_mult * power_factor, 0.05, 1.0)
 
-            chain_len = self.team_pass_chain[kicker_team]
-            chain_mult = 1.0 + (rew.pass_chain_multiplier_coeff * chain_len)
-            m_shot_chain = chain_mult if (d_shot <= self.cfg.rewards.shot_m_chain_max_dist and d_gk_ray >= 22.0) else 1.0
-
-            base_sot = (
-                rew.atk_shot_on_target_ind
-                if kicker_role == ROLE_ATK
-                else rew.other_shot_on_target_ind
-            )
-
-            if is_true_sot:
-                self.stats["shots"][kicker_team] += 1
-                if step_rewards is not None and self.shot_on_target_cd[kicker_idx] <= 0.0:
-                    sot_rew = base_sot * mu_xg * m_shot_chain
-                    team_sot_rew = rew.shot_on_target_team * mu_xg * m_shot_chain
-                    step_rewards[kicker_idx] += sot_rew
-                    self._add_team_reward(step_rewards, kicker_team, team_sot_rew)
-                    self.shot_on_target_cd[kicker_idx] = 1.5
-                    self._emit_event(
-                        "SHOT ON TARGET!",
-                        self.player_pos[kicker_idx],
-                        team=kicker_team,
-                        agent=self.idx_to_agent[kicker_idx],
-                        reward=sot_rew + team_sot_rew,
-                    )
-            elif is_near_sot:
-                if step_rewards is not None and self.shot_on_target_cd[kicker_idx] <= 0.0:
-                    near_sot_rew = rew.shot_near_target_mult * base_sot * mu_xg * m_shot_chain
-                    near_team_sot_rew = rew.shot_near_target_mult * rew.shot_on_target_team * mu_xg * m_shot_chain
-                    step_rewards[kicker_idx] += near_sot_rew
-                    self._add_team_reward(step_rewards, kicker_team, near_team_sot_rew)
-                    self.shot_on_target_cd[kicker_idx] = 1.5
-                    self._emit_event(
-                        "NEAR SHOT!",
-                        self.player_pos[kicker_idx],
-                        team=kicker_team,
-                        agent=self.idx_to_agent[kicker_idx],
-                        reward=near_sot_rew + near_team_sot_rew,
-                    )
-
-        # Keeper distribution, wall bypass & Gaussian long pass evaluation
-        if step_rewards is not None and kicker_role == ROLE_KEEPER:
-            cos_kick_canon = (
-                float(kick_vec[0])
-                if self.team_side[kicker_team] == SIDE_LEFT
-                else float(-kick_vec[0])
-            )
-            if cos_kick_canon > 0.20:
-                opp_team = 1 - kicker_team
-                opp_indices = [idx for idx in range(self.num_players) if self.player_team[idx] == opp_team]
-                kick_dir = kick_vec / max(1e-6, float(np.linalg.norm(kick_vec)))
-
-                # Dynamic time-of-flight interception check along the initial kick ray
-                corridor_clear = True
-                for opp_idx in opp_indices:
-                    rel_opp = self.player_pos[opp_idx] - self.ball_pos
-                    s_proj = float(np.dot(rel_opp, kick_dir))
-                    if 0.0 < s_proj <= 560.0:
-                        d_perp = float(abs(rel_opp[0] * kick_dir[1] - rel_opp[1] * kick_dir[0]))
-                        t_ball_reach = s_proj / max(launch_speed, 260.0)
-                        opp_reach_radius = 28.0 + 0.55 * self._get_player_max_speed(opp_idx) * t_ball_reach
-                        if d_perp < opp_reach_radius:
-                            corridor_clear = False
-                            break
-
-                sim_pts, n_sim_bounces, wall_x_world = self._simulate_ball_trajectory(
-                    self.ball_pos, self.ball_vel
+                base_sot = (
+                    rew.atk_shot_on_target_ind
+                    if kicker_role == ROLE_ATK
+                    else rew.other_shot_on_target_ind
                 )
-                times = np.linspace(0.35, 2.80, 16)
-                m_cut = -1
-                for m, t_m in enumerate(times):
-                    for o in opp_indices:
-                        d_o_sim = float(np.linalg.norm(self.player_pos[o] - sim_pts[m]))
-                        v_max_o = self._get_player_max_speed(o)
-                        if d_o_sim <= 28.0 + 0.55 * v_max_o * float(t_m):
-                            m_cut = m
-                            break
-                    if m_cut != -1:
-                        break
-
-                if m_cut == 0:
-                    corridor_clear = False
-                elif m_cut > 0:
-                    sim_pts = sim_pts[:m_cut]
-
-                if corridor_clear and len(sim_pts) > 0:
-                    sim_pts_canon, _, _ = self._to_team_canonical(
-                        sim_pts, np.zeros_like(sim_pts), 0.0, kicker_team
-                    )
-
-                    # A. Deep Side-Wall Bypass Bonus (keeper_wall_bypass_deep_bonus = +1.40)
-                    wall_bypass_awarded = False
-                    if n_sim_bounces == 1 and power_norm >= 0.55:
-                        wall_x_canon = (
-                            wall_x_world
-                            if self.team_side[kicker_team] == SIDE_LEFT
-                            else (phys.field_width - wall_x_world)
-                        )
-                        if 150.0 <= wall_x_canon <= 1050.0:
-                            end_pt_canon = sim_pts_canon[-1]
-                            nearest_opp_dist_end = min(
-                                (
-                                    float(np.linalg.norm(self.player_pos[o] - sim_pts[-1]))
-                                    for o in opp_indices
-                                ),
-                                default=999.0,
-                            )
-                            if end_pt_canon[0] >= 680.0 and nearest_opp_dist_end >= 115.0:
-                                step_rewards[kicker_idx] += rew.keeper_wall_bypass_deep_bonus * power_norm
-                                wall_bypass_awarded = True
-                                self._emit_event(
-                                    "DEEP WALL BYPASS!",
-                                    self.player_pos[kicker_idx],
-                                    team=kicker_team,
-                                    agent=self.idx_to_agent[kicker_idx],
-                                    reward=rew.keeper_wall_bypass_deep_bonus * power_norm,
-                                )
-                            elif 150.0 <= wall_x_canon <= 750.0 and power_norm >= 0.65:
-                                step_rewards[kicker_idx] += rew.keeper_wall_clear_bonus * power_norm
-                                wall_bypass_awarded = True
-                                self._emit_event(
-                                    "WALL CLEARANCE!",
-                                    self.player_pos[kicker_idx],
-                                    team=kicker_team,
-                                    agent=self.idx_to_agent[kicker_idx],
-                                    reward=rew.keeper_wall_clear_bonus * power_norm,
-                                )
-
-                    # B. Continuous Gaussian Trajectory Reward Toward Unpressed Teammates
-                    best_target_score = 0.0
-                    for j in range(self.num_players):
-                        if j != kicker_idx and self.player_team[j] == kicker_team:
-                            p_lead_j = self.player_pos[j] + 0.60 * self.player_vel[j]
-                            p_lead_j_c, _, _ = self._to_team_canonical(
-                                p_lead_j.reshape(1, 2), np.zeros((1, 2)), 0.0, kicker_team
-                            )
-                            x_lead_canon = float(p_lead_j_c[0, 0])
-                            if x_lead_canon >= 380.0:
-                                d_opp_j = min(
-                                    (
-                                        float(np.linalg.norm(self.player_pos[o] - p_lead_j))
-                                        for o in opp_indices
-                                    ),
-                                    default=999.0,
-                                )
-                                u_j = float(np.clip((d_opp_j - 65.0) / (220.0 - 65.0), 0.0, 1.0))
-                                d_miss_j = min(
-                                    float(np.linalg.norm(sim_pts[m] - p_lead_j))
-                                    for m in range(len(sim_pts))
-                                )
-                                if d_miss_j <= rew.keeper_long_pass_max_miss:
-                                    a_j = math.exp(-(d_miss_j ** 2) / (2.0 * (rew.keeper_long_pass_sigma ** 2)))
-                                    f_j = float(np.clip((x_lead_canon - 350.0) / 650.0, 0.25, 1.0))
-                                    score_j = u_j * a_j * f_j
-                                    if score_j > best_target_score:
-                                        best_target_score = score_j
-
-                    if best_target_score > 0.0:
-                        long_pass_reward = rew.keeper_long_pass_target_max_bonus * best_target_score
-                        step_rewards[kicker_idx] += long_pass_reward
-                        self._emit_event(
-                            "GK TARGET PASS!",
-                            self.player_pos[kicker_idx],
-                            team=kicker_team,
-                            agent=self.idx_to_agent[kicker_idx],
-                            reward=long_pass_reward,
-                        )
-                    elif not wall_bypass_awarded and m_cut == -1:
-                        aim_bonus = 1.0
-                        for j in range(self.num_players):
-                            if j != kicker_idx and self.player_team[j] == kicker_team:
-                                to_tm = self.player_pos[j] - self.player_pos[kicker_idx]
-                                d_tm = float(np.linalg.norm(to_tm))
-                                if d_tm > 40.0 and float(np.dot(facing_vec, to_tm / d_tm)) >= 0.85:
-                                    aim_bonus = 1.5
-                                    break
-                        step_rewards[kicker_idx] += (
-                            rew.keeper_clear_forward_ind
-                            * cos_kick_canon
-                            * (0.5 + 0.5 * power_norm)
-                            * aim_bonus
-                        )
-
-        # Immediate Kick-Direction Evaluation (for all players when step_rewards is not None)
-        if step_rewards is not None:
-            opp_team = 1 - kicker_team
-            opp_indices = [idx for idx in range(self.num_players) if self.player_team[idx] == opp_team]
-            tm_indices = [idx for idx in range(self.num_players) if self.player_team[idx] == kicker_team and idx != kicker_idx]
-
-            # Check if any opponent lies within 0.0 < proj <= 185.0 and perp_dist <= 30.0 along kick_vec (and closer than any intended teammate)
-            is_blocked = False
-            for opp_idx in opp_indices:
-                if (is_true_sot or is_near_sot) and int(self.player_role[opp_idx]) == ROLE_KEEPER:
-                    continue
-                to_opp = self.player_pos[opp_idx] - self.ball_pos
-                proj = float(np.dot(to_opp, kick_vec))
-                if 0.0 < proj <= 185.0:
-                    perp_dist = math.hypot(
-                        to_opp[0] - proj * kick_vec[0],
-                        to_opp[1] - proj * kick_vec[1],
-                    )
-                    if perp_dist <= 30.0:
-                        has_closer_tm = False
-                        for tm_idx in tm_indices:
-                            to_tm = self.player_pos[tm_idx] - self.ball_pos
-                            tm_proj = float(np.dot(to_tm, kick_vec))
-                            if 0.0 < tm_proj < proj:
-                                tm_perp = math.hypot(
-                                    to_tm[0] - tm_proj * kick_vec[0],
-                                    to_tm[1] - tm_proj * kick_vec[1],
-                                )
-                                if tm_perp <= 30.0:
-                                    has_closer_tm = True
-                                    break
-                        if not has_closer_tm:
-                            is_blocked = True
-                            break
-
-            if is_blocked:
-                step_rewards[kicker_idx] += rew.blocked_kick_pen
-            else:
-                # Check if kick_vec is aimed at an open teammate or their kinematic projection
-                aimed_at_teammate = False
-                matched_tm_idx = -1
-                best_tm_dist = 9999.0
-                for tm_idx in range(self.num_players):
-                    if tm_idx != kicker_idx and self.player_team[tm_idx] == kicker_team:
-                        d_ij = float(np.linalg.norm(self.player_pos[tm_idx] - self.ball_pos))
-                        t_tof = float(np.clip(d_ij / max(launch_speed, 260.0), 0.12, 1.15))
-                        target_pt = np.clip(
-                            self.player_pos[tm_idx] + t_tof * self.player_vel[tm_idx],
-                            [40.0, 40.0],
-                            [phys.field_width - 40.0, phys.field_height - 40.0],
-                        )
-                        to_target = target_pt - self.ball_pos
-                        d_target = float(np.linalg.norm(to_target))
-                        if 75.0 <= d_target <= 560.0 and d_target < best_tm_dist:
-                            unit_target = to_target / d_target
-                            if float(np.dot(kick_vec, unit_target)) >= 0.90:
-                                lane_clear = True
-                                for opp_idx in opp_indices:
-                                    to_opp = self.player_pos[opp_idx] - self.ball_pos
-                                    proj = float(np.dot(to_opp, unit_target))
-                                    if 0.0 < proj < d_target:
-                                        perp_dist = math.hypot(
-                                            to_opp[0] - proj * unit_target[0],
-                                            to_opp[1] - proj * unit_target[1],
-                                        )
-                                        if perp_dist < 36.0:
-                                            lane_clear = False
-                                            break
-                                if lane_clear:
-                                    aimed_at_teammate = True
-                                    matched_tm_idx = tm_idx
-                                    best_tm_dist = d_target
-
-                if aimed_at_teammate:
-                    aim_bonus = rew.pass_target_aim_ind
-                    if self.last_passer_idx is not None and matched_tm_idx == self.last_passer_idx:
-                        aim_bonus *= (rew.pass_pairwise_decay_base ** (self.pairwise_repeat_count + 1))
-
-                    # Central fovea vs peripheral body-heading aim multiplier
-                    tm_pos = self.player_pos[matched_tm_idx]
-                    body_ang_diff = abs(
-                        float(
-                            wrap_to_pi(
-                                math.atan2(tm_pos[1] - self.player_pos[kicker_idx, 1], tm_pos[0] - self.player_pos[kicker_idx, 0])
-                                - self.player_angle[kicker_idx]
-                            )
-                        )
-                    )
-                    if body_ang_diff <= math.radians(45.0):
-                        aim_bonus *= 1.20
-                    elif body_ang_diff <= math.radians(105.0):
-                        aim_bonus *= 1.00
-                    else:
-                        aim_bonus *= 0.70
-
-                    # Rolling touch decay on aim bonus across full pitch
-                    rx_aim_count = self.recent_passers[kicker_team].count(matched_tm_idx)
-                    if rx_aim_count > 0:
-                        aim_bonus *= (rew.triangle_repeat_decay_base ** rx_aim_count)
-
-                    enemy_side = 1 - int(self.team_side[kicker_team])
-                    enemy_goal_c = np.array(
-                        phys.left_goal_center if enemy_side == SIDE_LEFT else phys.right_goal_center,
-                        dtype=np.float64,
-                    )
-                    d_kicker_enemy_goal = float(np.linalg.norm(self.player_pos[kicker_idx] - enemy_goal_c))
-                    if d_kicker_enemy_goal <= 250.0:
-                        aim_bonus *= 1.5
-                    step_rewards[kicker_idx] += aim_bonus
-                elif not (is_true_sot or is_near_sot):
-                    # Open-Space Clearance check
-                    nearest_opp_dist = min(
-                        (
-                            float(np.linalg.norm(self.player_pos[opp_idx] - self.player_pos[kicker_idx]))
-                            for opp_idx in opp_indices
-                        ),
-                        default=999.0,
-                    )
-                    if self.ball_hold_timer >= 2.2 or nearest_opp_dist <= 95.0:
-                        landing_pt = self.ball_pos + kick_vec * 260.0
-                        landing_pt[0] = np.clip(landing_pt[0], 40.0, 1360.0)
-                        landing_pt[1] = np.clip(landing_pt[1], 40.0, 800.0)
-
-                        my_side = int(self.team_side[kicker_team])
-                        own_goal_c = np.array(
-                            phys.left_goal_center if my_side == SIDE_LEFT else phys.right_goal_center,
-                            dtype=np.float64,
-                        )
-                        in_own_box = float(np.linalg.norm(landing_pt - own_goal_c)) <= phys.keeper_box_radius
-
-                        if not in_own_box:
-                            nearest_opp_to_landing = min(
-                                (
-                                    float(np.linalg.norm(self.player_pos[opp_idx] - landing_pt))
-                                    for opp_idx in opp_indices
-                                ),
-                                default=999.0,
-                            )
-                            if nearest_opp_to_landing >= 120.0:
-                                step_rewards[kicker_idx] += rew.open_clearance_ind
+                sot_rew = base_sot * mu_xg
+                team_sot_rew = rew.shot_on_target_team * mu_xg
+                step_rewards[kicker_idx] += sot_rew
+                self._add_team_reward(step_rewards, kicker_team, team_sot_rew)
+                self.shot_on_target_cd[kicker_idx] = 1.5
+                self._emit_event(
+                    "SHOT ON TARGET!",
+                    self.player_pos[kicker_idx],
+                    team=kicker_team,
+                    agent=self.idx_to_agent[kicker_idx],
+                    reward=sot_rew + team_sot_rew,
+                )
 
     def _attempt_tackle(self, tackler_idx: int, step_rewards: np.ndarray) -> None:
         """Execute kinematic lunge and dynamic distance-based tackle check when action[3] > 0.5."""
-        if self.kickoff_protection_timer > 0.0 or self.pickup_tackle_grace_timer > 0.0:
+        if self.kickoff_protection_timer > 0.0:
             return
 
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
-        phys = self.cfg.physics
 
-        # 0. A physical tackle may ONLY execute when an opposing player currently holds the ball.
-        # If the ball is loose (ball_holder is None) or tackler's OWN team holds the ball,
-        # return immediately (zero stun, zero popup).
-        holder = self.ball_holder
-        if holder is None or self.player_team[holder] == self.player_team[tackler_idx]:
-            return
-
-        dist_to_ball = min(
-            float(np.linalg.norm(self.player_pos[tackler_idx] - self.ball_pos)),
-            float(np.linalg.norm(self.player_pos[tackler_idx] - self.player_pos[holder])),
-        )
-        if dist_to_ball > mech.tackle_whiff_max_ball_dist:
-            return
-
-        R_max_lunge, P_max = self._get_role_tackle_params(tackler_idx)
-        aiming_range = 1.5 * R_max_lunge
-
-        # Valid target: an opponent field player currently holding the ball
-        has_carrier = self._is_field_role(self.player_role[holder])
-        dist = (
-            float(np.linalg.norm(self.player_pos[tackler_idx] - self.player_pos[holder]))
-            if has_carrier
-            else 999.0
-        )
-
-        # 1. Check facing alignment toward carrier: forward cone facing dot >= 0.25 (<= 75.5 deg)
-        to_carrier = self.player_pos[holder] - self.player_pos[tackler_idx]
-        if dist < 1e-4:
-            u_facing = np.array(
-                [math.cos(self.player_angle[tackler_idx]), math.sin(self.player_angle[tackler_idx])],
-                dtype=np.float64,
-            )
-            dir_vec = u_facing.copy()
-            facing_dot = 1.0
-        else:
-            dir_vec = to_carrier / dist
-            u_facing = np.array(
-                [math.cos(self.player_angle[tackler_idx]), math.sin(self.player_angle[tackler_idx])],
-                dtype=np.float64,
-            )
-            facing_dot = float(np.dot(u_facing, dir_vec))
-
-        if (not has_carrier) or dist > aiming_range or facing_dot < 0.25:
-            self.stun_timer[tackler_idx] = mech.tackle_miss_stun_time
-            self.player_vel[tackler_idx] = 0.0
-            self.is_ghost[tackler_idx] = True
-            self.tackle_cooldown[tackler_idx] = max(
-                self.tackle_cooldown[tackler_idx], mech.tackle_fail_cooldown
-            )
-            if step_rewards is not None:
-                step_rewards[tackler_idx] += rew.reckless_tackle_ind
-            self.stats["failed_tackles"] += 1
-            self._emit_event(
-                "AIR TACKLE!",
-                self.player_pos[tackler_idx],
-                team=int(self.player_team[tackler_idx]),
-                agent=self.idx_to_agent[tackler_idx],
-                reward=rew.reckless_tackle_ind,
-            )
-            return
-
-        # 2. Carrier within aiming range & facing cone -> Kinematic lunge (remains solid)
-        self.player_vel[tackler_idx] = dir_vec * mech.field_lunge_speed
-        self.player_angle[tackler_idx] = float(math.atan2(dir_vec[1], dir_vec[0]))
+        # Always execute physical forward lunge along player_angle
+        t_angle = float(self.player_angle[tackler_idx])
+        u_facing = np.array([math.cos(t_angle), math.sin(t_angle)], dtype=np.float64)
+        self.player_vel[tackler_idx] = u_facing * mech.field_lunge_speed
         self.lunge_timer[tackler_idx] = mech.field_lunge_duration
         self.tackle_cooldown[tackler_idx] = max(
             self.tackle_cooldown[tackler_idx], mech.field_lunge_duration + mech.tackle_fail_cooldown
         )
         self.is_ghost[tackler_idx] = False
 
-        # 3. Dynamic Tackle Evaluation: P_success = P_max * (1.0 - (d / R_max_lunge)**2)
-        if dist > R_max_lunge:
-            # Outside maximum reach -> Automatic failure (coasts solid during lunge)
-            self.stun_timer[tackler_idx] = mech.tackle_miss_stun_time
-            self.is_ghost[tackler_idx] = self._is_ghost(tackler_idx)
-            if step_rewards is not None:
-                step_rewards[tackler_idx] += rew.failed_tackle_ind
-            self.stats["failed_tackles"] += 1
-            self._emit_event(
-                "TACKLE FAILED!",
-                self.player_pos[tackler_idx],
-                team=int(self.player_team[tackler_idx]),
-                agent=self.idx_to_agent[tackler_idx],
-                reward=rew.failed_tackle_ind,
-            )
-            return
+        R_max_lunge, P_max = self._get_role_tackle_params(tackler_idx)
+        holder = self.ball_holder
+        tackler_team = int(self.player_team[tackler_idx])
 
-        p_success = float(P_max * (1.0 - (dist / R_max_lunge) ** 2))
-        p_success = max(0.0, min(1.0, p_success))
+        valid_target = (
+            holder is not None
+            and int(self.player_team[holder]) != tackler_team
+            and self._is_field_role(self.player_role[holder])
+            and self.pickup_tackle_grace_timer <= 0.0
+        )
 
-        if self.np_random.random() < p_success:
-            # Successful tackle!
-            old_carrier = holder
-            self._reset_pass_chains(int(self.player_team[old_carrier]))
-            self.ball_holder = tackler_idx
-            self.ball_hold_timer = 0.0
-            self.kick_grace_timer = mech.pickup_kick_grace
-            self.last_ball_holder = tackler_idx
-            tackler_team = int(self.player_team[tackler_idx])
-            self.last_ball_team = tackler_team
-            self.ball_kicked_in_flight = False
+        if valid_target:
+            to_carrier = self.player_pos[holder] - self.player_pos[tackler_idx]
+            dist = math.hypot(float(to_carrier[0]), float(to_carrier[1]))
+            if dist < 1e-4:
+                facing_dot = 1.0
+            else:
+                facing_dot = (
+                    u_facing[0] * float(to_carrier[0]) + u_facing[1] * float(to_carrier[1])
+                ) / dist
 
-            # Possession spell high-water mark & recent passers initialization on tackle recovery
-            self._set_possession_high_water_mark(tackler_team, self.player_pos[tackler_idx])
-            self.recent_passers[tackler_team] = [int(tackler_idx)]
-            self.box_switch_used_in_spell[tackler_team] = False
-            self.non_fresh_pass_count[tackler_team] = 0
+            if dist <= R_max_lunge and facing_dot >= 0.25:
+                p_success = max(0.0, min(1.0, float(P_max * (1.0 - (dist / R_max_lunge) ** 2))))
+                if self.np_random.random() < p_success:
+                    old_carrier = holder
+                    old_team = int(self.player_team[old_carrier])
+                    self._reset_pass_chains(old_team)
+                    self.ball_holder = tackler_idx
+                    self.ball_hold_timer = 0.0
+                    self.kick_grace_timer = mech.pickup_kick_grace
+                    self.last_ball_holder = tackler_idx
+                    self.last_ball_team = tackler_team
+                    self.ball_kicked_in_flight = False
+                    self.ball_kick_orig_opp_dist = -1.0
 
-            self._on_new_player_touched_ball(tackler_idx)
+                    self._on_new_player_touched_ball(tackler_idx)
 
-            # Freeze and ghost the victim
-            self.stun_timer[old_carrier] = mech.tackle_victim_stun_time
-            self.player_vel[old_carrier] = 0.0
-            self.is_ghost[old_carrier] = True
-            self.tackle_cooldown[old_carrier] = max(
-                self.tackle_cooldown[old_carrier], mech.tackled_opponent_cooldown
-            )
-            self.pickup_cooldown[old_carrier] = max(
-                self.pickup_cooldown[old_carrier], mech.tackle_victim_stun_time
-            )
+                    self.stun_timer[old_carrier] = mech.tackle_victim_stun_time
+                    self.player_vel[old_carrier] = 0.0
+                    self.is_ghost[old_carrier] = True
+                    self.tackle_cooldown[old_carrier] = max(
+                        self.tackle_cooldown[old_carrier], mech.tackled_opponent_cooldown
+                    )
+                    self.pickup_cooldown[old_carrier] = max(
+                        self.pickup_cooldown[old_carrier], mech.tackle_victim_stun_time
+                    )
 
-            facing_vec = np.array(
-                [
-                    math.cos(self.player_angle[tackler_idx]),
-                    math.sin(self.player_angle[tackler_idx]),
-                ],
-                dtype=np.float64,
-            )
-            self.ball_pos = (
-                self.player_pos[tackler_idx] + facing_vec * mech.ball_carry_offset
-            )
-            self.ball_vel[:] = self.player_vel[tackler_idx]
+                    self.ball_pos = (
+                        self.player_pos[tackler_idx] + u_facing * mech.ball_carry_offset
+                    )
+                    self.ball_vel[:] = self.player_vel[tackler_idx]
 
-            tackler_team = int(self.player_team[tackler_idx])
-            tackler_ind = rew.successful_tackle_tackler_ind
+                    if step_rewards is not None:
+                        step_rewards[tackler_idx] += rew.successful_tackle_tackler_ind
+                        step_rewards[old_carrier] += rew.successful_tackle_carrier_ind
+                        self._add_team_reward(
+                            step_rewards, tackler_team, rew.successful_tackle_team
+                        )
+                        self._add_team_reward(
+                            step_rewards, old_team, rew.intercepted_team
+                        )
+                    self.stats["successful_tackles"] += 1
+                    self.stats["team_tackles"][tackler_team] += 1
+                    self._emit_event(
+                        "TACKLE!",
+                        self.player_pos[tackler_idx],
+                        team=tackler_team,
+                        agent=self.idx_to_agent[tackler_idx],
+                        reward=rew.successful_tackle_tackler_ind + rew.successful_tackle_team,
+                    )
+                    return
 
-            # Check Defender own half ball-winning bonus
-            if self.player_role[tackler_idx] == ROLE_DEF:
-                c_tackler_pos, _, _ = self._to_team_canonical(
-                    self.player_pos[tackler_idx : tackler_idx + 1],
-                    self.player_vel[tackler_idx : tackler_idx + 1],
-                    0.0,
-                    tackler_team,
-                )
-                if float(c_tackler_pos[0, 0]) < 700.0:
-                    tackler_ind += rew.def_own_half_tackle_bonus
-
-            if step_rewards is not None:
-                step_rewards[tackler_idx] += tackler_ind
-                step_rewards[old_carrier] += rew.successful_tackle_carrier_ind
-                self._add_team_reward(step_rewards, tackler_team, rew.successful_tackle_team)
-            self.stats["successful_tackles"] += 1
-            self.stats["team_tackles"][tackler_team] += 1
-            self._emit_event(
-                "TACKLE!",
-                self.player_pos[tackler_idx],
-                team=tackler_team,
-                agent=self.idx_to_agent[tackler_idx],
-                reward=tackler_ind + rew.successful_tackle_team,
-            )
-            return
-
-        # RNG failure on valid in-range attempt
+        # Uniform whiff cost and post-lunge recovery stun
         self.stun_timer[tackler_idx] = mech.tackle_miss_stun_time
         self.is_ghost[tackler_idx] = self._is_ghost(tackler_idx)
         if step_rewards is not None:
-            step_rewards[tackler_idx] += rew.failed_tackle_in_range_ind
+            step_rewards[tackler_idx] += rew.failed_tackle_ind
         self.stats["failed_tackles"] += 1
         self._emit_event(
             "TACKLE FAILED!",
             self.player_pos[tackler_idx],
-            team=int(self.player_team[tackler_idx]),
+            team=tackler_team,
             agent=self.idx_to_agent[tackler_idx],
-            reward=rew.failed_tackle_in_range_ind,
+            reward=rew.failed_tackle_ind,
         )
 
     def _check_keeper_perimeter_strip(
@@ -2287,7 +1390,6 @@ class FootballParallelEnv(ParallelEnv):
         """Keeper strips ball if opponent field player holds it within pickup distance."""
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
-        phys = self.cfg.physics
 
         carrier_team = int(self.player_team[carrier_idx])
         opp_team = 1 - carrier_team
@@ -2306,13 +1408,8 @@ class FootballParallelEnv(ParallelEnv):
             self.last_ball_holder = keeper_idx
             self.last_ball_team = opp_team
             self.ball_kicked_in_flight = False
+            self.ball_kick_orig_opp_dist = -1.0
             self._reset_pass_chains(carrier_team)
-
-            # Possession spell high-water mark & recent passers initialization on keeper strip
-            self.team_possession_max_x[opp_team] = float(
-                self._to_canonical_pos(self.player_pos[keeper_idx], opp_team)[0]
-            )
-            self.recent_passers[opp_team] = [int(keeper_idx)]
 
             # Stun the stripped field player for 0.2s
             self.stun_timer[carrier_idx] = mech.keeper_strip_stun_duration
@@ -2326,16 +1423,6 @@ class FootballParallelEnv(ParallelEnv):
 
             self._on_new_player_touched_ball(keeper_idx)
 
-            k_ang = float(self.player_angle[keeper_idx])
-            if self.team_side[opp_team] == SIDE_LEFT and math.cos(k_ang) < 0.0:
-                self.player_angle[keeper_idx] = float(
-                    math.atan2(math.sin(k_ang), abs(math.cos(k_ang)))
-                )
-            elif self.team_side[opp_team] == SIDE_RIGHT and math.cos(k_ang) > 0.0:
-                self.player_angle[keeper_idx] = float(
-                    math.atan2(math.sin(k_ang), -abs(math.cos(k_ang)))
-                )
-
             facing_vec = np.array(
                 [
                     math.cos(self.player_angle[keeper_idx]),
@@ -2347,18 +1434,20 @@ class FootballParallelEnv(ParallelEnv):
             self.ball_vel[:] = self.player_vel[keeper_idx]
 
             if not recently_kicked_by_gk:
-                step_rewards[keeper_idx] += rew.keeper_strip_ind
-                self._add_team_reward(step_rewards, opp_team, rew.keeper_strip_team)
+                step_rewards[keeper_idx] += rew.successful_tackle_tackler_ind
+                step_rewards[carrier_idx] += rew.successful_tackle_carrier_ind
+                self._add_team_reward(step_rewards, opp_team, rew.successful_tackle_team)
+                self._add_team_reward(step_rewards, carrier_team, rew.intercepted_team)
                 self._emit_event(
                     "GK STRIP!",
                     self.player_pos[keeper_idx],
                     team=opp_team,
                     agent=self.idx_to_agent[keeper_idx],
-                    reward=rew.keeper_strip_ind + rew.keeper_strip_team,
+                    reward=rew.successful_tackle_tackler_ind + rew.successful_tackle_team,
                 )
 
     def _check_free_ball_pickup(self, step_rewards: np.ndarray) -> None:
-        """Check if any eligible player picks up the free ball."""
+        """Check if any eligible player picks up the free ball and award Markovian pass/transition rewards."""
         if self.ball_holder is not None:
             return
 
@@ -2366,7 +1455,10 @@ class FootballParallelEnv(ParallelEnv):
         rew = self.cfg.rewards
         phys = self.cfg.physics
 
-        dists = np.linalg.norm(self.player_pos - self.ball_pos[None, :], axis=1)
+        dists = np.hypot(
+            self.player_pos[:, 0] - self.ball_pos[0],
+            self.player_pos[:, 1] - self.ball_pos[1],
+        )
         eligible = np.where(
             (dists <= mech.pickup_distance)
             & (self.pickup_cooldown <= 0.0)
@@ -2397,319 +1489,97 @@ class FootballParallelEnv(ParallelEnv):
         ):
             kicker_idx = self.last_ball_holder
             kicker_team = int(self.last_ball_team) if self.last_ball_team is not None else new_team
-            kicker_role = int(self.player_role[kicker_idx])
-            kick_travel_dist = float(np.linalg.norm(self.ball_pos - self.ball_kick_origin))
+            kick_travel_dist = math.hypot(
+                float(self.ball_pos[0] - self.ball_kick_origin[0]),
+                float(self.ball_pos[1] - self.ball_kick_origin[1]),
+            )
             is_wall_pass = bool(self.is_wall_pass_in_flight and self.ball_wall_bounces == 1)
 
             if new_team == kicker_team and new_holder != kicker_idx:
                 is_teammate_pass = True
+                c_dest = self._to_canonical_pos(self.ball_pos, new_team)
+                d_dest_goal = math.hypot(1400.0 - float(c_dest[0]), 420.0 - float(c_dest[1]))
                 min_dist = mech.min_wall_pass_distance if is_wall_pass else mech.min_pass_distance
                 if kick_travel_dist >= min_dist:
-                    # Completed pass
-                    self.last_passer_idx = kicker_idx
-                    kicker_role = int(self.player_role[kicker_idx])
-                    receiver_role = int(self.player_role[new_holder])
+                    # 1. Territorial Threat Gain (Delta Phi_threat)
+                    phi_orig = self._compute_ball_potential(new_team, self.ball_kick_origin)
+                    phi_dest = self._compute_ball_potential(new_team, self.ball_pos)
+                    d_phi_threat = phi_dest - phi_orig
 
-                    # 1. Compute canonical pass coordinates & goal-distance progression:
-                    c_orig, _, _ = self._to_team_canonical(
-                        self.ball_kick_origin.reshape(1, 2),
-                        np.zeros((1, 2)),
-                        0.0,
-                        new_team,
-                    )
-                    c_dest, _, _ = self._to_team_canonical(
-                        self.ball_pos.reshape(1, 2),
-                        np.zeros((1, 2)),
-                        0.0,
-                        new_team,
-                    )
-
-                    canon_dx = float(c_dest[0, 0] - c_orig[0, 0])
-                    enemy_goal_canon = np.array([1400.0, 420.0], dtype=np.float64)
-                    d_orig_goal = float(np.linalg.norm(c_orig[0] - enemy_goal_canon))
-                    d_dest_goal = float(np.linalg.norm(c_dest[0] - enemy_goal_canon))
-                    goal_dist_gain = d_orig_goal - d_dest_goal
-
-                    # Effective territorial gain: max of forward X gain and Euclidean goal-distance reduction
-                    effective_dx = max(canon_dx, goal_dist_gain)
-                    is_progressive = effective_dx >= rew.min_progressive_dx_threshold
-
-                    # Check Final-Third "Better Angle Around the Keeper" (Cutback / Semicircle Switch):
-                    # e.g. Striker below semicircle (y > 480) passing to Midfielder above semicircle (y < 360)
-                    in_attacking_third = (
-                        float(c_orig[0, 0]) >= 960.0
-                        and float(c_dest[0, 0]) >= 960.0
-                        and d_dest_goal <= 380.0
-                    )
-                    ang_orig = math.atan2(float(c_orig[0, 1]) - 420.0, 1400.0 - float(c_orig[0, 0]))
-                    ang_dest = math.atan2(float(c_dest[0, 1]) - 420.0, 1400.0 - float(c_dest[0, 0]))
-                    goal_angle_shift = abs(float(wrap_to_pi(ang_dest - ang_orig)))
-                    is_box_angle_switch = in_attacking_third and (goal_angle_shift >= math.radians(25.0))
-
-                    # Always ensure last_kick_pos for kicker_idx matches ball_kick_origin
-                    self.last_kick_pos[kicker_idx] = self.ball_kick_origin.copy()
-
-                    # 2. Pairwise repeat decay and Give-and-Go evaluation:
-                    current_pair = (min(kicker_idx, new_holder), max(kicker_idx, new_holder))
-                    is_return_pass = (self.last_pass_pair == current_pair)
-                    if is_return_pass:
-                        self.pairwise_repeat_count += 1
+                    # 2. Pressure Relief / Space Gain (Delta sigma_press)
+                    opp_mask = self.player_team != new_team
+                    if self.ball_kick_orig_opp_dist >= 0.0:
+                        d_opp_orig = self.ball_kick_orig_opp_dist
                     else:
-                        self.last_pass_pair = current_pair
-                        self.pairwise_repeat_count = 0
+                        orig_opp_dists = np.hypot(
+                            self.player_pos[opp_mask, 0] - self.ball_kick_origin[0],
+                            self.player_pos[opp_mask, 1] - self.ball_kick_origin[1],
+                        )
+                        d_opp_orig = float(np.min(orig_opp_dists)) if len(orig_opp_dists) > 0 else 999.0
+                    dest_opp_dists = np.hypot(
+                        self.player_pos[opp_mask, 0] - self.ball_pos[0],
+                        self.player_pos[opp_mask, 1] - self.ball_pos[1],
+                    )
+                    d_opp_dest = float(np.min(dest_opp_dists)) if len(dest_opp_dists) > 0 else 999.0
 
-                    # Check Give-and-Go (One-Two):
-                    # Player A previously passed to Player B, Player B returns to Player A (pairwise_repeat_count == 1)
-                    # and Player A advanced downfield >= 35.0u since their initial kick.
-                    is_give_and_go = False
-                    has_prev_kick = float(np.linalg.norm(self.last_kick_pos[new_holder])) > 1e-6
-                    if is_return_pass and self.pairwise_repeat_count == 1 and has_prev_kick:
-                        c_prev_kick, _, _ = self._to_team_canonical(
-                            self.last_kick_pos[new_holder:new_holder + 1],
-                            np.zeros((1, 2)),
+                    sigma_orig = _fast_clip((d_opp_orig - 45.0) / 135.0, 0.0, 1.0)
+                    sigma_dest = _fast_clip((d_opp_dest - 45.0) / 135.0, 0.0, 1.0)
+                    d_sigma_press = sigma_dest - sigma_orig
+
+                    # 3. In-Stride Through-Ball Bonus (R_stride)
+                    r_stride = 0.0
+                    if d_phi_threat > 0.02:
+                        c_rx_pos, c_rx_vel, _ = self._to_team_canonical(
+                            self.player_pos[new_holder : new_holder + 1],
+                            self.player_vel[new_holder : new_holder + 1],
                             0.0,
                             new_team,
                         )
-                        give_and_go_gain = float(c_dest[0, 0] - c_prev_kick[0, 0])
-                        if give_and_go_gain >= 35.0:
-                            is_give_and_go = True
-
-                    if is_give_and_go:
-                        pair_decay_multiplier = 1.0
-                    else:
-                        pair_decay_multiplier = rew.pass_pairwise_decay_base ** self.pairwise_repeat_count
-
-                    # 3. Line-Breaking Defender Count:
-                    opp_team = 1 - new_team
-                    opp_indices = [
-                        idx for idx in range(self.num_players) if self.player_team[idx] == opp_team
-                    ]
-                    c_opp_pos, _, _ = self._to_team_canonical(
-                        self.player_pos[opp_indices],
-                        np.zeros((len(opp_indices), 2)),
-                        0.0,
-                        new_team,
-                    )
-                    opp_xs = c_opp_pos[:, 0]
-                    bypassed_defenders = int(
-                        np.sum((opp_xs >= c_orig[0, 0]) & (opp_xs < c_dest[0, 0]))
-                    )
-
-                    # 4. Check Backwards / Recycling Tactical Value (Escape Press & Attacking Lay-Off):
-                    is_escape_press = False
-                    is_attacking_layoff = False
-
-                    # Opponent proximity to kicker at pass origin vs receiver at destination
-                    dists_to_passer = [
-                        float(np.linalg.norm(self.player_pos[oi] - self.ball_kick_origin))
-                        for oi in opp_indices
-                    ]
-                    nearest_opp_passer = min(dists_to_passer) if dists_to_passer else 999.0
-
-                    dists_to_receiver = [
-                        float(np.linalg.norm(self.player_pos[oi] - self.ball_pos))
-                        for oi in opp_indices
-                    ]
-                    nearest_opp_receiver = min(dists_to_receiver) if dists_to_receiver else 999.0
-
-                    # A) Escape Press: passer under close pressure (<= 140u) or held >= 1.8s, and receiver has more space
-                    if (nearest_opp_passer <= 140.0 or self.last_kick_hold_time[kicker_idx] >= 1.8) and (
-                        nearest_opp_receiver >= nearest_opp_passer + 35.0 and nearest_opp_receiver >= 110.0
-                    ):
-                        is_escape_press = True
-
-                    # B) Attacking Lay-Off & Semicircle/Byline Cutback:
-                    rx_canon_angle = (
-                        float(self.player_angle[new_holder])
-                        if self.team_side[new_team] == SIDE_LEFT
-                        else float(wrap_to_pi(self.player_angle[new_holder] + math.pi))
-                    )
-                    is_midfield_layoff = (
-                        float(c_orig[0, 0]) >= 700.0
-                        and 460.0 <= float(c_dest[0, 0]) < float(c_orig[0, 0])
-                        and 180.0 <= float(c_dest[0, 1]) <= 660.0
-                        and receiver_role in (ROLE_MID, ROLE_ATK)
-                        and nearest_opp_passer <= 120.0
-                        and nearest_opp_receiver >= 140.0
-                        and math.cos(rx_canon_angle) >= 0.20
-                    )
-                    is_box_cutback = (
-                        (float(c_orig[0, 0]) >= 980.0 or d_orig_goal <= 260.0)
-                        and float(c_dest[0, 0]) >= 720.0
-                        and d_dest_goal <= 400.0
-                        and (
-                            float(c_dest[0, 0]) < float(c_orig[0, 0]) - 15.0
-                            or abs(float(c_dest[0, 1]) - 420.0) < abs(float(c_orig[0, 1]) - 420.0) - 25.0
+                        gx_dx = 1400.0 - float(c_rx_pos[0, 0])
+                        gx_dy = 420.0 - float(c_rx_pos[0, 1])
+                        d_rx_goal = max(1e-6, math.hypot(gx_dx, gx_dy))
+                        v_goal = (
+                            float(c_rx_vel[0, 0]) * (gx_dx / d_rx_goal)
+                            + float(c_rx_vel[0, 1]) * (gx_dy / d_rx_goal)
                         )
+                        if v_goal >= 60.0:
+                            r_stride = (
+                                rew.lead_pass_bonus
+                                * _fast_clip((v_goal - 60.0) / 130.0, 0.0, 1.0)
+                                * _fast_clip(d_phi_threat / 0.08, 0.0, 1.0)
+                            )
+
+                    # Unified State-Based Pass Payout (60% passer, 40% receiver + conditional touch bonus)
+                    r_pass = (
+                        rew.pass_threat_weight * max(0.0, d_phi_threat)
+                        + rew.pass_space_weight * max(0.0, d_sigma_press)
+                        + r_stride
                     )
-
-                    # 5. Compute Dual-Axis Progression across full pitch:
-                    prev_max_x = float(self.team_possession_max_x[new_team])
-                    prev_min_goal_d = float(self.team_possession_min_goal_dist[new_team])
-
-                    delta_x_fresh = max(0.0, float(c_dest[0, 0]) - max(float(c_orig[0, 0]), prev_max_x))
-                    delta_d_goal_fresh = max(0.0, min(d_orig_goal, prev_min_goal_d) - d_dest_goal)
-
-                    delta_fresh = max(delta_x_fresh, delta_d_goal_fresh)
-                    delta_recycled = max(0.0, effective_dx - delta_fresh)
-                    delta_x_prog = delta_fresh + rew.recycled_progression_discount * delta_recycled
-
-                    # Update high-water marks
-                    self.team_possession_max_x[new_team] = max(prev_max_x, float(c_dest[0, 0]))
-                    self.team_possession_min_goal_dist[new_team] = min(prev_min_goal_d, d_dest_goal)
-                    self._synced_max_x[new_team] = float(self.team_possession_max_x[new_team])
-
-                    awarded_bypassed = bypassed_defenders if (delta_fresh >= 25.0 or float(c_dest[0, 0]) >= 900.0) else 0
-
-                    prog_bonus = 0.0
-                    if is_progressive or is_box_angle_switch:
-                        prog_terms = (delta_x_prog * rew.pass_progressive_dx_weight) + (
-                            awarded_bypassed * rew.pass_line_break_bonus
-                        )
-                        if d_dest_goal <= 380.0 and is_progressive:
-                            prog_terms *= rew.final_third_prog_threat_mult
-                        prog_bonus += prog_terms
-                        if is_box_angle_switch:
-                            prog_bonus += rew.box_angle_pass_bonus
-
-                    if is_give_and_go:
-                        prog_bonus += rew.give_and_go_bonus
-
-                    if is_escape_press:
-                        prog_bonus += rew.escape_press_pass_bonus
-
-                    if is_box_cutback:
-                        prog_bonus += rew.attacking_layoff_bonus
-                    elif is_midfield_layoff:
-                        prog_bonus += rew.midfield_layoff_bonus
-
-                    is_valid_wall_pass = False
-                    if is_wall_pass:
-                        # Wall pass: award wall_pass_bonus if it advances downfield (effective_dx >= 30u),
-                        # switches angles, lays off, or escapes opponent pressure
-                        if is_progressive or is_escape_press or is_box_angle_switch or is_box_cutback or is_midfield_layoff or effective_dx >= 30.0:
-                            is_valid_wall_pass = True
-                            prog_bonus += rew.wall_pass_bonus
-
-                    # Universal Rolling-Window Touch Decay (maxlen = 6)
-                    if delta_fresh >= 45.0:
-                        mu_cycle = 1.0
-                    else:
-                        c_rx = self.recent_passers[new_team].count(int(new_holder))
-                        mu_cycle = float(rew.triangle_repeat_decay_base ** c_rx)
-
-                    self.recent_passers[new_team].append(int(new_holder))
-                    if len(self.recent_passers[new_team]) > 6:
-                        self.recent_passers[new_team].pop(0)
-
-                    # Check True Body-Heading Scanned Multiplier (Passer's physical body heading at moment of kick)
-                    to_dest = self.player_pos[new_holder] - self.ball_kick_origin
-                    dist_to_dest = float(np.linalg.norm(to_dest))
-                    kicker_body_angle = float(self.kick_frame_player_angle[kicker_idx])
-                    pass_bearing = math.atan2(float(to_dest[1]), float(to_dest[0]))
-                    ang_diff = abs(float(wrap_to_pi(pass_bearing - kicker_body_angle)))
-
-                    if dist_to_dest > 0.0 and ang_diff <= math.radians(35.0):
-                        prog_bonus *= rew.scanned_pass_mult  # 1.20x foveal scan
-                    elif dist_to_dest > 0.0 and ang_diff <= math.radians(75.0):
-                        prog_bonus *= 1.05                   # 1.05x peripheral vision
-                    else:
-                        prog_bonus *= 0.75                   # 0.75x blind/no-look pass
-
-                    pass_mult = pair_decay_multiplier * mu_cycle
-                    prog_bonus *= pass_mult
-
-                    # Update Tiki-Taka chain:
-                    can_increment_chain = (delta_fresh >= 25.0) or (
-                        (is_box_cutback or is_box_angle_switch) and not self.box_switch_used_in_spell[new_team]
+                    touch_bonus = (
+                        rew.completed_pass_receiver_ind
+                        if (d_phi_threat > 0.01 or d_sigma_press > 0.15)
+                        else 0.0
                     )
-                    if (is_box_cutback or is_box_angle_switch) and not self.box_switch_used_in_spell[new_team]:
-                        self.box_switch_used_in_spell[new_team] = True
+                    passer_bonus = 0.60 * r_pass
+                    receiver_bonus = 0.40 * r_pass + touch_bonus
 
-                    if can_increment_chain:
-                        self.team_pass_chain[new_team] = min(
-                            self.team_pass_chain[new_team] + 1, rew.pass_chain_max_count
-                        )
-                    elif is_escape_press or is_midfield_layoff or is_give_and_go or is_valid_wall_pass:
-                        self.team_pass_chain[new_team] = max(1, self.team_pass_chain[new_team])
+                    if d_phi_threat > 0.01 or d_sigma_press > 0.15:
+                        self.team_pass_chain[new_team] = min(self.team_pass_chain[new_team] + 1, 10)
 
-                    passer_bonus = prog_bonus
-                    receiver_bonus = (rew.completed_pass_receiver_ind + rew.first_touch_reception_bonus) * pass_mult
-                    team_bonus = prog_bonus * 0.5
-
-                    # Role tactical bonuses scaled by pass_mult:
-                    if kicker_role == ROLE_DEF and receiver_role in (ROLE_MID, ROLE_ATK):
-                        passer_bonus += rew.def_breakout_pass_bonus * pass_mult
-                    if receiver_role == ROLE_MID and kicker_role in (ROLE_KEEPER, ROLE_DEF):
-                        receiver_bonus += rew.mid_link_receive_bonus * pass_mult
-                    if kicker_role == ROLE_MID and receiver_role == ROLE_ATK:
-                        passer_bonus += rew.mid_to_atk_pass_bonus * pass_mult
-                    if receiver_role == ROLE_ATK:
-                        c_rx_pos, _, _ = self._to_team_canonical(
-                            self.player_pos[new_holder:new_holder + 1],
-                            self.player_vel[new_holder:new_holder + 1],
-                            0.0,
-                            new_team,
-                        )
-                        if float(c_rx_pos[0, 0]) >= 680.0:
-                            passer_bonus += rew.pass_to_atk_bonus * pass_mult
-
-                    # Check Through-Ball / Lead-Pass Bonus:
-                    # Completed pass to teammate running forward in stride (v_x,c >= 90 u/s),
-                    # displaced forward >= 35u, eff_dx >= 60u, bypassing defenders or in attacking half/third
-                    is_through_ball = False
-                    c_rx_vel = float(
-                        self.player_vel[new_holder, 0]
-                        if self.team_side[new_team] == SIDE_LEFT
-                        else -self.player_vel[new_holder, 0]
-                    )
-                    c_rx_pos_now, _, _ = self._to_team_canonical(
-                        self.player_pos[new_holder : new_holder + 1],
-                        np.zeros((1, 2)),
-                        0.0,
-                        new_team,
-                    )
-                    c_rx_pos_kick, _, _ = self._to_team_canonical(
-                        self.kick_frame_player_pos[new_holder : new_holder + 1],
-                        np.zeros((1, 2)),
-                        0.0,
-                        new_team,
-                    )
-                    rec_disp_canon = float(c_rx_pos_now[0, 0] - c_rx_pos_kick[0, 0])
-                    if (
-                        c_rx_vel >= 90.0
-                        and rec_disp_canon >= 35.0
-                        and effective_dx >= 60.0
-                        and (bypassed_defenders >= 1 or float(c_dest[0, 0]) >= 700.0)
-                        and (delta_fresh >= 35.0 or float(c_dest[0, 0]) >= 900.0)
-                    ):
-                        is_through_ball = True
-                        lead_bonus_half = 0.5 * rew.lead_pass_bonus * pass_mult
-                        passer_bonus += lead_bonus_half
-                        receiver_bonus += lead_bonus_half
-
-                    # Record Goal Assist tracking data
                     self.last_completed_pass_passer[new_team] = kicker_idx
                     self.last_completed_pass_receiver[new_team] = new_holder
                     self.last_completed_pass_time[new_team] = self.match_time
 
                     step_rewards[kicker_idx] += passer_bonus
                     step_rewards[new_holder] += receiver_bonus
-                    self._add_team_reward(step_rewards, new_team, team_bonus)
                     self.stats["completed_passes"] += 1
                     self.stats["team_passes"][new_team] += 1
 
-                    if is_through_ball:
+                    if r_stride > 0.0:
                         lbl = "THROUGH BALL!"
-                    elif is_valid_wall_pass:
+                    elif is_wall_pass:
                         lbl = "WALL PASS!"
-                    elif is_give_and_go:
-                        lbl = "ONE-TWO!"
-                    elif is_box_cutback:
-                        lbl = "CUTBACK!"
-                    elif is_midfield_layoff:
-                        lbl = "MIDFIELD LAY-OFF!"
-                    elif is_escape_press:
+                    elif d_sigma_press > 0.25 and d_phi_threat <= 0.01:
                         lbl = "ESCAPE PRESS!"
                     else:
                         lbl = "PASS!"
@@ -2719,10 +1589,10 @@ class FootballParallelEnv(ParallelEnv):
                         self.player_pos[new_holder],
                         team=new_team,
                         agent=self.idx_to_agent[new_holder],
-                        reward=passer_bonus + receiver_bonus + team_bonus,
+                        reward=passer_bonus + receiver_bonus,
                     )
             elif new_team != kicker_team:
-                # Interception or Keeper Save (Turnover)
+                # Interception or Keeper Save (Possession Transition)
                 self._reset_pass_chains(kicker_team)
                 my_side = int(self.team_side[new_team])
                 is_real_save = (
@@ -2740,172 +1610,58 @@ class FootballParallelEnv(ParallelEnv):
                 )
 
                 if not is_real_save:
-                    if kicker_role == ROLE_KEEPER:
-                        c_rx_pos, _, _ = self._to_team_canonical(
-                            self.player_pos[new_holder : new_holder + 1],
-                            np.zeros((1, 2)),
-                            0.0,
-                            kicker_team,
-                        )
-                        c_rx_x = float(c_rx_pos[0, 0])
-                        if c_rx_x <= 200.0:
-                            gk_turnover_pen = rew.keeper_deep_turnover_pen
-                        elif c_rx_x >= 700.0:
-                            gk_turnover_pen = rew.intercepted_kicker_ind
-                        else:
-                            ratio = (c_rx_x - 200.0) / 500.0
-                            gk_turnover_pen = (
-                                rew.keeper_deep_turnover_pen
-                                + (rew.intercepted_kicker_ind - rew.keeper_deep_turnover_pen) * ratio
-                            )
-                        step_rewards[kicker_idx] += gk_turnover_pen
-                    else:
-                        step_rewards[kicker_idx] += rew.intercepted_kicker_ind
+                    step_rewards[kicker_idx] += rew.intercepted_kicker_ind
                     self._add_team_reward(step_rewards, kicker_team, rew.intercepted_team)
+                    step_rewards[new_holder] += rew.successful_tackle_tackler_ind
+                    self._add_team_reward(step_rewards, new_team, rew.successful_tackle_team)
                     self.stats["interceptions"] += 1
-
-                if new_role == ROLE_KEEPER:
-                    if is_real_save:
-                        self.post_save_box_grace_timer = mech.post_save_box_grace_time
-                        gk_goal_c = np.array([0.0 if my_side == SIDE_LEFT else phys.field_width, 420.0], dtype=np.float64)
-                        d_orig = float(np.linalg.norm(self.ball_kick_origin - gk_goal_c))
-                        v_arr = float(np.linalg.norm(self.ball_vel))
-                        v_fact = float(np.clip((v_arr - 120.0) / (420.0 - 120.0), 0.15, 1.0))
-                        d_fact = float(np.clip((550.0 - d_orig) / (550.0 - 220.0), 0.20, 1.0))
-                        mu_save = float(np.clip(v_fact * d_fact, 0.10, 1.0))
-
-                        step_rewards[new_holder] += rew.keeper_save_ind * mu_save
-                        self._add_team_reward(step_rewards, new_team, rew.keeper_save_team * mu_save)
-
-                        if d_orig > 460.0 or v_arr < 220.0:
-                            step_rewards[kicker_idx] += -0.80 * (1.0 - mu_save)
-
-                        self.stats["keeper_saves"] += 1
-                        self.stats["team_saves"][new_team] += 1
-                        lbl = "LUNGE SAVE!" if self.lunge_timer[new_holder] > 0.0 else "KEEPER SAVE!"
-                        self._emit_event(
-                            lbl,
-                            self.player_pos[new_holder],
-                            team=new_team,
-                            agent=self.idx_to_agent[new_holder],
-                            reward=(rew.keeper_save_ind + rew.keeper_save_team) * mu_save,
-                        )
-                    else:
-                        step_rewards[new_holder] += rew.keeper_harmless_catch_ind
-                        self._add_team_reward(step_rewards, new_team, rew.keeper_harmless_catch_team)
                 else:
-                    # Field player interceptor
-                    intercept_rew = rew.loose_ball_pickup_ind
-                    if new_role == ROLE_DEF:
-                        c_rx_pos, _, _ = self._to_team_canonical(
-                            self.player_pos[new_holder:new_holder + 1],
-                            self.player_vel[new_holder:new_holder + 1],
-                            0.0,
-                            new_team,
-                        )
-                        if float(c_rx_pos[0, 0]) < 700.0:
-                            intercept_rew += rew.def_own_half_intercept_bonus
-                    step_rewards[new_holder] += intercept_rew
-                    self._add_team_reward(step_rewards, new_team, rew.loose_ball_pickup_team)
+                    self.post_save_box_grace_timer = mech.post_save_box_grace_time
+                    gk_goal_c = np.array(
+                        [0.0 if my_side == SIDE_LEFT else phys.field_width, 420.0],
+                        dtype=np.float64,
+                    )
+                    d_orig = float(np.linalg.norm(self.ball_kick_origin - gk_goal_c))
+                    v_arr = float(np.linalg.norm(self.ball_vel))
+                    v_fact = _fast_clip((v_arr - 120.0) / (420.0 - 120.0), 0.15, 1.0)
+                    d_fact = _fast_clip((550.0 - d_orig) / (550.0 - 220.0), 0.20, 1.0)
+                    mu_save = _fast_clip(v_fact * d_fact, 0.10, 1.0)
+
+                    step_rewards[new_holder] += rew.keeper_save_ind * mu_save
+                    self._add_team_reward(step_rewards, new_team, rew.keeper_save_team * mu_save)
+
+                    if d_orig > 460.0 or v_arr < 220.0:
+                        step_rewards[kicker_idx] += rew.intercepted_kicker_ind * (1.0 - mu_save)
+
+                    self.stats["keeper_saves"] += 1
+                    self.stats["team_saves"][new_team] += 1
+                    lbl = "LUNGE SAVE!" if self.lunge_timer[new_holder] > 0.0 else "KEEPER SAVE!"
+                    self._emit_event(
+                        lbl,
+                        self.player_pos[new_holder],
+                        team=new_team,
+                        agent=self.idx_to_agent[new_holder],
+                        reward=(rew.keeper_save_ind + rew.keeper_save_team) * mu_save,
+                    )
         else:
             # Loose ball recovery
             if self.last_ball_team is not None and self.last_ball_team != new_team:
                 self._reset_pass_chains(self.last_ball_team)
-
-            own_side = int(self.team_side[new_team])
-            own_goal_pos = np.array([0.0 if own_side == SIDE_LEFT else phys.field_width, 420.0], dtype=np.float64)
-            in_own_box = (float(np.linalg.norm(self.ball_pos - own_goal_pos)) <= phys.keeper_box_radius + 25.0)
-
-            is_true_opponent_recovery = (self.last_ball_team is None or self.last_ball_team != new_team)
-            is_gk_box_recovery = (
-                new_role == ROLE_KEEPER
-                and in_own_box
-                and (not self.box_recovery_rewarded[own_side])
-                and (self.last_ball_holder != new_holder)
-            )
-
-            eligible_recovery = is_true_opponent_recovery or is_gk_box_recovery
-
-            if eligible_recovery:
-                if is_gk_box_recovery:
-                    self.box_recovery_rewarded[own_side] = True
-                step_rewards[new_holder] += rew.loose_ball_pickup_ind
-                self._add_team_reward(step_rewards, new_team, rew.loose_ball_pickup_team)
-                if new_role == ROLE_KEEPER:
-                    step_rewards[new_holder] += rew.keeper_box_recovery_ind
-                    # Clean Footwork Pickup Bonus: extra reward when loose ball is retrieved on foot without lunging
-                    if self.lunge_timer[new_holder] <= 0.0:
-                        step_rewards[new_holder] += rew.keeper_clean_foot_recovery_bonus
-
-                # Contested loose-ball recovery bonus: if an opponent is within contested_ball_distance
-                opp_team = 1 - new_team
-                opp_indices = [i for i in range(self.num_players) if self.player_team[i] == opp_team]
-                if opp_indices:
-                    opp_dists = np.linalg.norm(
-                        self.player_pos[opp_indices] - self.ball_pos[None, :],
-                        axis=1,
+                step_rewards[new_holder] += rew.successful_tackle_tackler_ind
+                self._add_team_reward(step_rewards, new_team, rew.successful_tackle_team)
+                opp_mask = self.player_team != new_team
+                opp_dists = np.hypot(
+                    self.player_pos[opp_mask, 0] - self.ball_pos[0],
+                    self.player_pos[opp_mask, 1] - self.ball_pos[1],
+                )
+                if len(opp_dists) > 0 and float(np.min(opp_dists)) <= mech.contested_ball_distance:
+                    self._emit_event(
+                        "BALL WON!",
+                        self.player_pos[new_holder],
+                        team=new_team,
+                        agent=self.idx_to_agent[new_holder],
+                        reward=rew.successful_tackle_tackler_ind + rew.successful_tackle_team,
                     )
-                    if float(np.min(opp_dists)) <= mech.contested_ball_distance:
-                        step_rewards[new_holder] += rew.contested_ball_recovery_bonus
-                        # Contested ball micro-separation: apply speed damper (0.35) and 15u soft push away from ball
-                        phys = self.cfg.physics
-                        for oi in opp_indices:
-                            to_oi = self.player_pos[oi] - self.ball_pos
-                            d_oi = float(np.linalg.norm(to_oi))
-                            if d_oi <= 45.0:
-                                self.player_vel[oi] *= 0.35
-                                if d_oi > 1e-4:
-                                    self.player_pos[oi] += (to_oi / d_oi) * 15.0
-                                    np.clip(self.player_pos[oi, 0], phys.player_radius, phys.field_width - phys.player_radius, out=self.player_pos[oi:oi+1, 0])
-                                    np.clip(self.player_pos[oi, 1], phys.player_radius, phys.field_height - phys.player_radius, out=self.player_pos[oi:oi+1, 1])
-                        self._emit_event(
-                            "BALL WON!",
-                            self.player_pos[new_holder],
-                            team=new_team,
-                            agent=self.idx_to_agent[new_holder],
-                            reward=rew.loose_ball_pickup_ind + rew.contested_ball_recovery_bonus,
-                        )
-            else:
-                opp_team = 1 - new_team
-                opp_indices = [i for i in range(self.num_players) if self.player_team[i] == opp_team]
-                if opp_indices:
-                    opp_dists = np.linalg.norm(
-                        self.player_pos[opp_indices] - self.ball_pos[None, :],
-                        axis=1,
-                    )
-                    if float(np.min(opp_dists)) <= mech.contested_ball_distance:
-                        phys = self.cfg.physics
-                        for oi in opp_indices:
-                            to_oi = self.player_pos[oi] - self.ball_pos
-                            d_oi = float(np.linalg.norm(to_oi))
-                            if d_oi <= 45.0:
-                                self.player_vel[oi] *= 0.35
-                                if d_oi > 1e-4:
-                                    self.player_pos[oi] += (to_oi / d_oi) * 15.0
-                                    np.clip(self.player_pos[oi, 0], phys.player_radius, phys.field_width - phys.player_radius, out=self.player_pos[oi:oi+1, 0])
-                                    np.clip(self.player_pos[oi, 1], phys.player_radius, phys.field_height - phys.player_radius, out=self.player_pos[oi:oi+1, 1])
-
-        if not is_teammate_pass:
-            # Loose ball / interception / save recovery: reset possession high-water mark & recent passers
-            self._set_possession_high_water_mark(new_team, self.player_pos[new_holder])
-            self.recent_passers[new_team] = [int(new_holder)]
-            self.box_switch_used_in_spell[new_team] = False
-            self.non_fresh_pass_count[new_team] = 0
-
-            # Discrete Penalty When Opponent Claims Ball Inside a Shrunk Box
-            enemy_team = 1 - new_team
-            enemy_side = int(self.team_side[enemy_team])
-            enemy_goal_pos = np.array(
-                [0.0 if enemy_side == SIDE_LEFT else phys.field_width, 420.0],
-                dtype=np.float64,
-            )
-            dist_to_enemy_goal = float(np.linalg.norm(self.ball_pos - enemy_goal_pos))
-            if (
-                dist_to_enemy_goal <= phys.keeper_box_radius + phys.ball_radius
-                and self.active_box_radius[enemy_side] < phys.keeper_box_radius - 5.0
-            ):
-                enemy_gk_idx = 0 if new_team == TEAM_B else 6
-                step_rewards[enemy_gk_idx] += rew.keeper_shrunk_box_loss_pen
 
         # Assign possession to new_holder
         self.ball_holder = new_holder
@@ -2928,19 +1684,9 @@ class FootballParallelEnv(ParallelEnv):
         self.last_ball_holder = new_holder
         self.last_ball_team = new_team
         self.ball_kicked_in_flight = False
+        self.ball_kick_orig_opp_dist = -1.0
         self.ball_wall_bounces = 0
         self.is_wall_pass_in_flight = False
-
-        if new_role == ROLE_KEEPER:
-            k_ang = float(self.player_angle[new_holder])
-            if self.team_side[new_team] == SIDE_LEFT and math.cos(k_ang) < 0.0:
-                self.player_angle[new_holder] = float(
-                    math.atan2(math.sin(k_ang), abs(math.cos(k_ang)))
-                )
-            elif self.team_side[new_team] == SIDE_RIGHT and math.cos(k_ang) > 0.0:
-                self.player_angle[new_holder] = float(
-                    math.atan2(math.sin(k_ang), -abs(math.cos(k_ang)))
-                )
 
         facing_vec = np.array(
             [
@@ -2963,7 +1709,6 @@ class FootballParallelEnv(ParallelEnv):
     def _on_new_player_touched_ball(self, toucher_idx: int) -> None:
         """Reset violation and kick pickup cooldowns for all other players when toucher grabs ball."""
         toucher_team = int(self.player_team[toucher_idx])
-        kick_dist = float(np.linalg.norm(self.ball_pos - self.ball_kick_origin))
         for idx in range(self.num_players):
             if idx == toucher_idx:
                 continue
@@ -2972,9 +1717,8 @@ class FootballParallelEnv(ParallelEnv):
                     self.pickup_cooldown[idx] = 0.0
                     self.violation_cooldown_active[idx] = False
             if self.kick_cooldown_active[idx]:
-                if int(self.player_team[idx]) != toucher_team or kick_dist >= 30.0:
-                    self.pickup_cooldown[idx] = 0.0
-                    self.kick_cooldown_active[idx] = False
+                self.pickup_cooldown[idx] = 0.0
+                self.kick_cooldown_active[idx] = False
 
     def _handle_field_5s_violation(
         self, violator_idx: int, step_rewards: np.ndarray
@@ -2982,7 +1726,6 @@ class FootballParallelEnv(ParallelEnv):
         """Enforce Field Player 5-Second Hold Violation: drop ball and enter Ghost Mode for 3.0s."""
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
-        phys = self.cfg.physics
         team = int(self.player_team[violator_idx])
 
         self.ball_holder = None
@@ -3017,9 +1760,11 @@ class FootballParallelEnv(ParallelEnv):
     def _handle_keeper_5s_violation(
         self, keeper_idx: int, step_rewards: np.ndarray, is_hold_violation: bool = True
     ) -> None:
-        """Enforce Keeper 5-Second Hold Violation or Unclaimed Box Ball Timeout: reward penalty + Foul Teleport Reset."""
+        """Enforce Keeper 5-Second Hold Violation or Unclaimed Box Ball Timeout with a ball drop and radial nudge out of the box."""
         rew = self.cfg.rewards
+        phys = self.cfg.physics
         penalized_team = int(self.player_team[keeper_idx])
+        own_side = int(self.team_side[penalized_team])
 
         step_rewards[keeper_idx] += rew.keeper_5s_violation_ind
         self._add_team_reward(step_rewards, penalized_team, rew.keeper_5s_violation_team)
@@ -3033,7 +1778,44 @@ class FootballParallelEnv(ParallelEnv):
             reward=rew.keeper_5s_violation_ind + rew.keeper_5s_violation_team,
         )
 
-        self._setup_keeper_foul_teleport(penalized_team=penalized_team)
+        # Standard ball drop + 2.0s keeper pickup cooldown + radial nudge out of the box toward midfield
+        self.ball_holder = None
+        self.ball_hold_timer = 0.0
+        self.ball_kicked_in_flight = False
+        self._box_loose_ball_timer[own_side] = 0.0
+        self._reset_pass_chains(penalized_team)
+
+        self.pickup_cooldown[keeper_idx] = max(self.pickup_cooldown[keeper_idx], 2.0)
+        self.violation_cooldown_active[keeper_idx] = True
+        self.kick_cooldown_active[keeper_idx] = False
+
+        own_goal_c = np.array(
+            phys.left_goal_center if own_side == SIDE_LEFT else phys.right_goal_center,
+            dtype=np.float64,
+        )
+        midfield_c = np.array(phys.field_center, dtype=np.float64)
+        delta = self.ball_pos - own_goal_c
+        dist = math.hypot(float(delta[0]), float(delta[1]))
+        to_mid = midfield_c - own_goal_c
+        to_mid_norm = math.hypot(float(to_mid[0]), float(to_mid[1]))
+        u_mid = to_mid / max(1e-6, to_mid_norm)
+        if dist < 1e-4:
+            nudge_dir = u_mid
+        else:
+            u_rad = delta / dist
+            blend = 0.65 * u_rad + 0.35 * u_mid
+            blend_norm = math.hypot(float(blend[0]), float(blend[1]))
+            nudge_dir = blend / max(1e-6, blend_norm)
+
+        target_r = phys.keeper_box_radius + phys.ball_radius + 25.0
+        self.ball_pos = own_goal_c + nudge_dir * max(dist + 35.0, target_r)
+        self.ball_pos[0] = float(
+            np.clip(self.ball_pos[0], phys.ball_radius, phys.field_width - phys.ball_radius)
+        )
+        self.ball_pos[1] = float(
+            np.clip(self.ball_pos[1], phys.ball_radius, phys.field_height - phys.ball_radius)
+        )
+        self.ball_vel = nudge_dir * 160.0
 
     # ==========================================================================
     # Collisions, Semi-Circle Barriers & Boundary Clamping
@@ -3041,24 +1823,42 @@ class FootballParallelEnv(ParallelEnv):
     def _resolve_player_collisions(self) -> None:
         """Solid circle-circle collision resolution between non-ghost players (R=18 -> min_dist=36)."""
         min_dist = 2.0 * self.cfg.physics.player_radius
-        for i in range(self.num_players):
-            if self.is_ghost[i]:
+        pos = self.player_pos
+        ghost = self.is_ghost
+        n = self.num_players
+        for i in range(n):
+            if ghost[i]:
                 continue
-            for j in range(i + 1, self.num_players):
-                if self.is_ghost[j]:
+            xi = float(pos[i, 0])
+            yi = float(pos[i, 1])
+            for j in range(i + 1, n):
+                if ghost[j]:
                     continue
-                delta = self.player_pos[j] - self.player_pos[i]
-                dist = float(np.linalg.norm(delta))
+                dx = float(pos[j, 0]) - xi
+                if abs(dx) >= min_dist:
+                    continue
+                dy = float(pos[j, 1]) - yi
+                if abs(dy) >= min_dist:
+                    continue
+                dist = math.hypot(dx, dy)
                 if dist < min_dist:
                     if dist < 1e-6:
-                        angle = (i * 0.7 + j * 1.3)
-                        normal = np.array([math.cos(angle), math.sin(angle)], dtype=np.float64)
+                        angle = i * 0.7 + j * 1.3
+                        nx = math.cos(angle)
+                        ny = math.sin(angle)
                         overlap = min_dist
                     else:
-                        normal = delta / dist
+                        inv_d = 1.0 / dist
+                        nx = dx * inv_d
+                        ny = dy * inv_d
                         overlap = min_dist - dist
-                    self.player_pos[i] -= 0.5 * overlap * normal
-                    self.player_pos[j] += 0.5 * overlap * normal
+                    half_ov = 0.5 * overlap
+                    pos[i, 0] -= half_ov * nx
+                    pos[i, 1] -= half_ov * ny
+                    pos[j, 0] += half_ov * nx
+                    pos[j, 1] += half_ov * ny
+                    xi = float(pos[i, 0])
+                    yi = float(pos[i, 1])
 
     def _clamp_players_to_boundaries(self, apply_dynamic_push: bool = True) -> None:
         """Enforce field walls and semi-circle barriers (Keepers inside own box, Field outside both)."""
@@ -3078,7 +1878,7 @@ class FootballParallelEnv(ParallelEnv):
             if role == ROLE_KEEPER:
                 own_goal = goal_centers[my_side]
                 delta = self.player_pos[idx] - own_goal
-                dist = math.hypot(delta[0], delta[1])
+                dist = math.hypot(float(delta[0]), float(delta[1]))
                 if dist > box_r:
                     self.player_pos[idx] = own_goal + (delta / dist) * box_r
             else:
@@ -3087,7 +1887,7 @@ class FootballParallelEnv(ParallelEnv):
                     if eff_box_r <= 1e-3:
                         continue
                     delta = self.player_pos[idx] - g_center
-                    dist = math.hypot(delta[0], delta[1])
+                    dist = math.hypot(float(delta[0]), float(delta[1]))
                     if dist <= eff_box_r:
                         if dist < 1e-6:
                             push_dir = np.array(
@@ -3097,15 +1897,10 @@ class FootballParallelEnv(ParallelEnv):
                             push_dir = delta / dist
                         new_pos = g_center + push_dir * (eff_box_r + 1e-3)
                         if apply_dynamic_push:
-                            self.step_external_push[idx] += new_pos - self.player_pos[idx]
                             rad_v = float(np.dot(self.player_vel[idx], push_dir))
                             if rad_v < 0.0:
                                 self.player_vel[idx] -= rad_v * push_dir
                         self.player_pos[idx] = new_pos
-
-        # Vectorized outer boundary clamping for all players in a single operation
-        np.clip(self.player_pos[:, 0], r_player, phys.field_width - r_player, out=self.player_pos[:, 0])
-        np.clip(self.player_pos[:, 1], r_player, phys.field_height - r_player, out=self.player_pos[:, 1])
 
         # Kickoff Exclusion Circle: Smoothly or firmly keep opposing players outside center spot (r = 130.0)
         if self.kickoff_protection_timer > 0.0 and self.ball_holder is not None:
@@ -3115,7 +1910,7 @@ class FootballParallelEnv(ParallelEnv):
             for idx in range(self.num_players):
                 if self.player_team[idx] != start_team:
                     delta = self.player_pos[idx] - field_center
-                    dist = float(np.linalg.norm(delta))
+                    dist = math.hypot(float(delta[0]), float(delta[1]))
                     if dist < excl_r:
                         push_dir = (
                             np.array([1.0, 0.0], dtype=np.float64)
@@ -3123,7 +1918,6 @@ class FootballParallelEnv(ParallelEnv):
                             else delta / dist
                         )
                         new_pos = field_center + push_dir * excl_r
-                        self.step_external_push[idx] += new_pos - self.player_pos[idx]
                         self.player_pos[idx] = new_pos
 
         # Smooth GK Possession Repulsion Wave (gk_hold_opponent_buffer = 230.0):
@@ -3141,7 +1935,7 @@ class FootballParallelEnv(ParallelEnv):
             for idx in range(self.num_players):
                 if self.player_team[idx] != gk_team:
                     delta = self.player_pos[idx] - gk_goal_center
-                    dist = float(np.linalg.norm(delta))
+                    dist = math.hypot(float(delta[0]), float(delta[1]))
                     if dist < buf_r:
                         if dist < 1e-6:
                             push_dir = np.array(
@@ -3152,20 +1946,24 @@ class FootballParallelEnv(ParallelEnv):
                         push_mag = min(buf_r - dist, max_step_push)
                         disp = push_dir * push_mag
                         self.player_pos[idx] += disp
-                        self.step_external_push[idx] += disp
                         # Strip any inward radial velocity so the player smoothly slides outward
                         rad_v = float(np.dot(self.player_vel[idx], push_dir))
                         if rad_v < 0.0:
                             self.player_vel[idx] -= rad_v * push_dir
 
-        # Final pass: re-clamp all players to pitch boundaries
-        for idx in range(self.num_players):
-            self.player_pos[idx, 0] = float(
-                np.clip(self.player_pos[idx, 0], r_player, phys.field_width - r_player)
-            )
-            self.player_pos[idx, 1] = float(
-                np.clip(self.player_pos[idx, 1], r_player, phys.field_height - r_player)
-            )
+        # Single vectorized outer boundary clamp for all players
+        np.clip(
+            self.player_pos[:, 0],
+            r_player,
+            phys.field_width - r_player,
+            out=self.player_pos[:, 0],
+        )
+        np.clip(
+            self.player_pos[:, 1],
+            r_player,
+            phys.field_height - r_player,
+            out=self.player_pos[:, 1],
+        )
 
     def _check_goal_scored(self) -> Optional[int]:
         """Check if the ball crossed X <= 0 or X >= 1400 within Y in [340.0, 500.0]."""
@@ -3257,15 +2055,13 @@ class FootballParallelEnv(ParallelEnv):
 
         is_own_goal = False
         scorer_ind = 0.0
-        chain_len = self.team_pass_chain[scoring_team]
-        chain_mult = 1.0 + (rew.pass_chain_multiplier_coeff * chain_len)
 
         if self.last_ball_holder is not None:
             if int(self.player_team[self.last_ball_holder]) == scoring_team:
                 if int(self.player_role[self.last_ball_holder]) == ROLE_ATK:
-                    scorer_ind = rew.atk_goal_scorer_ind * chain_mult
+                    scorer_ind = rew.atk_goal_scorer_ind
                 else:
-                    scorer_ind = rew.goal_scorer_ind * chain_mult
+                    scorer_ind = rew.goal_scorer_ind
                 step_rewards[self.last_ball_holder] += scorer_ind
 
                 # Goal Assist Award (within goal_assist_window_sec)
@@ -3276,8 +2072,7 @@ class FootballParallelEnv(ParallelEnv):
                     and (self.match_time - self.last_completed_pass_time[scoring_team]) <= rew.goal_assist_window_sec
                 ):
                     assister = self.last_completed_pass_passer[scoring_team]
-                    assist_ind = rew.goal_assist_ind * chain_mult
-                    step_rewards[assister] += assist_ind
+                    step_rewards[assister] += rew.goal_assist_ind
                     self.stats["assists"] = self.stats.get("assists", 0) + 1
                     if "team_assists" in self.stats:
                         self.stats["team_assists"][scoring_team] += 1
@@ -3287,11 +2082,7 @@ class FootballParallelEnv(ParallelEnv):
                 self.stats["own_goals"] = self.stats.get("own_goals", 0) + 1
                 is_own_goal = True
 
-        if is_own_goal:
-            scoring_team_reward = rew.goal_team_shared
-        else:
-            scoring_team_reward = rew.goal_team_shared * chain_mult
-
+        scoring_team_reward = rew.goal_team_shared
         self._add_team_reward(step_rewards, scoring_team, scoring_team_reward)
         self._add_team_reward(step_rewards, conceding_team, rew.goal_concede_team_shared)
 
@@ -3356,56 +2147,33 @@ class FootballParallelEnv(ParallelEnv):
         self._box_loose_ball_timer = _DualBoxTimer(0.0, 0.0)
         self.post_save_box_grace_timer = 0.0
         self.active_box_radius[:] = self.cfg.physics.keeper_box_radius
-        self.kick_frame_player_pos.fill(0.0)
-        self.kick_frame_player_angle.fill(0.0)
         self.ball_kicked_in_flight = False
         self.ball_kick_was_shot_on_target = False
         self.ball_kick_flight_timer = 0.0
+        self.ball_kick_orig_opp_dist = -1.0
         self.ball_wall_bounces = 0
         self.is_wall_pass_in_flight = False
         self.pinned_ball_timer = 0.0
         self.kickoff_protection_timer = 0.0
         self.pickup_tackle_grace_timer = 0.0
-        self.prev_longitudinal_vel[:] = 0.0
-        self.step_external_push.fill(0.0)
-        self.prev_ball_at_step_start = self.ball_pos.copy()
         self.smoothed_steer.fill(0.0)
         self.prev_steer.fill(0.0)
         self.dive_dir.fill(0.0)
-        self.prev_dynamic_role_key = {i: self.player_role_key[i] for i in range(self.num_players)}
-        self.last_kick_pos.fill(0.0)
-        self.last_kick_hold_time.fill(0.0)
-        self.primary_loose_ball_chaser.fill(-1)
         self.dive_speed.fill(0.0)
         self._reset_pass_chains()
 
     def _reset_pass_chains(self, team: Optional[int] = None) -> None:
-        """Reset pass chain and pairwise history on turnover or dead ball."""
+        """Reset pass chain and assist tracking on turnover or dead ball."""
         if team is None:
             self.team_pass_chain = [0, 0]
-            self.team_possession_max_x.fill(0.0)
-            self._synced_max_x.fill(0.0)
-            self.team_possession_min_goal_dist.fill(float(self._max_field_dist))
-            self.recent_passers = [[], []]
-            self.box_switch_used_in_spell = [False, False]
-            self.non_fresh_pass_count = [0, 0]
             self.last_completed_pass_passer = [None, None]
             self.last_completed_pass_receiver = [None, None]
             self.last_completed_pass_time.fill(-999.0)
         else:
             self.team_pass_chain[team] = 0
-            self.team_possession_max_x[team] = 0.0
-            self._synced_max_x[team] = 0.0
-            self.team_possession_min_goal_dist[team] = float(self._max_field_dist)
-            self.recent_passers[team].clear()
-            self.box_switch_used_in_spell[team] = False
-            self.non_fresh_pass_count[team] = 0
             self.last_completed_pass_passer[team] = None
             self.last_completed_pass_receiver[team] = None
             self.last_completed_pass_time[team] = -999.0
-        self.last_pass_pair = None
-        self.last_passer_idx = None
-        self.pairwise_repeat_count = 0
 
     def _CanonicalToWorld(
         self, pos: Tuple[float, float], angle: float, side: int
@@ -3447,10 +2215,6 @@ class FootballParallelEnv(ParallelEnv):
         self.last_ball_team = starting_team
 
         self._reset_pass_chains()
-        self._set_possession_high_water_mark(starting_team, self.player_pos[carrier_idx])
-        self.recent_passers[starting_team] = [int(carrier_idx)]
-        self.box_switch_used_in_spell[starting_team] = False
-        self.non_fresh_pass_count[starting_team] = 0
 
         facing_vec = np.array(
             [
@@ -3462,93 +2226,16 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_pos = (
             self.player_pos[carrier_idx] + facing_vec * self.cfg.mechanics.ball_carry_offset
         )
-        self.prev_ball_x = float(self.ball_pos[0])
-
-    def _setup_keeper_foul_teleport(self, penalized_team: int) -> None:
-        """Position both teams for the Foul Restart (Open 3-2 Attacking Overload & Zonal Block)."""
-        self._clear_all_dynamic_timers()
-        attacking_team = 1 - penalized_team
-        attacking_side = int(self.team_side[attacking_team])
-
-        att_c_pos = {
-            "atk_1": (820.0, 420.0),
-            "mid_1": (965.0, 235.0),
-            "mid_2": (965.0, 605.0),
-            "def_1": (540.0, 260.0),
-            "def_2": (540.0, 580.0),
-            "keeper": (40.0, 420.0),
-        }
-        att_c_ang = {
-            "atk_1": 0.0,
-            "mid_1": 0.32,
-            "mid_2": -0.32,
-            "def_1": 0.0,
-            "def_2": 0.0,
-            "keeper": 0.0,
-        }
-        def_c_pos = {
-            "atk_1": (640.0, 420.0),
-            "def_1": (1115.0, 315.0),
-            "def_2": (1115.0, 525.0),
-            "mid_1": (1030.0, 130.0),
-            "mid_2": (1030.0, 710.0),
-            "keeper": (1360.0, 420.0),
-        }
-        def_c_ang = {
-            "atk_1": 0.0,
-            "def_1": math.pi,
-            "def_2": math.pi,
-            "mid_1": math.pi,
-            "mid_2": math.pi,
-            "keeper": math.pi,
-        }
-
-        for idx in range(self.num_players):
-            team = int(self.player_team[idx])
-            role_key = self.player_role_key[idx]
-            if team == attacking_team:
-                canon_pos = att_c_pos[role_key]
-                canon_angle = att_c_ang[role_key]
-            else:
-                canon_pos = def_c_pos[role_key]
-                canon_angle = def_c_ang[role_key]
-
-            world_pos, world_angle = self._CanonicalToWorld(
-                canon_pos, canon_angle, attacking_side
-            )
-            self.player_pos[idx] = world_pos
-            self.player_angle[idx] = world_angle
-
-        # Attacking team's atk_1 starts holding the ball
-        carrier_name = "a_atk_1" if attacking_team == TEAM_A else "b_atk_1"
-        carrier_idx = self.agent_to_idx[carrier_name]
-        self.ball_holder = carrier_idx
-        self.last_ball_holder = carrier_idx
-        self.last_ball_team = attacking_team
-
-        self._reset_pass_chains()
-        self._set_possession_high_water_mark(attacking_team, self.player_pos[carrier_idx])
-        self.recent_passers[attacking_team] = [int(carrier_idx)]
-        self.box_switch_used_in_spell[attacking_team] = False
-        self.non_fresh_pass_count[attacking_team] = 0
-
-        facing_vec = np.array(
-            [
-                math.cos(self.player_angle[carrier_idx]),
-                math.sin(self.player_angle[carrier_idx]),
-            ],
-            dtype=np.float64,
-        )
-        self.ball_pos = (
-            self.player_pos[carrier_idx] + facing_vec * self.cfg.mechanics.ball_carry_offset
-        )
-        self.prev_ball_x = float(self.ball_pos[0])
 
     # ==========================================================================
-    # Team-Canonical Observation Builder (76 Floats)
+    # Team-Canonical Observation Builder (76 Floats, Vectorized Across 12 Agents)
     # ==========================================================================
-    def _get_observations(self) -> Dict[str, np.ndarray]:
-        """Compute the 76-float normalized observation vector for all 12 agents."""
+    def _get_observations_array(self) -> np.ndarray:
+        """Compute the (12, 76) normalized observation matrix for all 12 agents simultaneously."""
+        phys = self.cfg.physics
+        mech = self.cfg.mechanics
+        vis = self.cfg.vision
+
         c_p_a, c_v_a, c_ang_a = self._to_team_canonical(
             self.player_pos, self.player_vel, self.player_angle, TEAM_A
         )
@@ -3562,17 +2249,214 @@ class FootballParallelEnv(ParallelEnv):
             self.ball_pos, self.ball_vel, 0.0, TEAM_B
         )
 
-        obs_dict: Dict[str, np.ndarray] = {}
-        for idx, agent_name in enumerate(self.possible_agents):
-            if idx < 6:
-                obs_dict[agent_name] = self._build_single_observation(
-                    idx, c_p_a, c_v_a, c_ang_a, c_b_a, c_bv_a
+        obs = np.zeros((self.num_players, vis.obs_dim), dtype=np.float32)
+
+        # Own canonical state for each of the 12 agents (0..5 = Team A, 6..11 = Team B)
+        sx = np.empty(self.num_players, dtype=np.float64)
+        sy = np.empty(self.num_players, dtype=np.float64)
+        svx = np.empty(self.num_players, dtype=np.float64)
+        svy = np.empty(self.num_players, dtype=np.float64)
+        s_ang = np.empty(self.num_players, dtype=np.float64)
+
+        sx[:6], sy[:6] = c_p_a[:6, 0], c_p_a[:6, 1]
+        sx[6:], sy[6:] = c_p_b[6:, 0], c_p_b[6:, 1]
+        svx[:6], svy[:6] = c_v_a[:6, 0], c_v_a[:6, 1]
+        svx[6:], svy[6:] = c_v_b[6:, 0], c_v_b[6:, 1]
+        s_ang[:6] = c_ang_a[:6]
+        s_ang[6:] = c_ang_b[6:]
+
+        # Part A: Self & Global State (indices 0..15)
+        obs[:, 0] = (sx / phys.field_width) * 2.0 - 1.0
+        obs[:, 1] = (sy / phys.field_height) * 2.0 - 1.0
+        obs[:, 2] = np.sin(s_ang)
+        obs[:, 3] = np.cos(s_ang)
+        obs[:, 4] = svx / self._max_self_vel
+        obs[:, 5] = svy / self._max_self_vel
+
+        scores = self.stats.get("score", [0, 0])
+        score_diff_a = (scores[0] - scores[1]) / 3.0
+        obs[:6, 6] = score_diff_a
+        obs[6:, 6] = -score_diff_a
+
+        holder = self.ball_holder
+        if holder is not None:
+            obs[holder, 7] = 1.0
+            holder_team = int(self.player_team[holder])
+            max_hold = (
+                mech.keeper_max_hold_time
+                if self.player_role[holder] == ROLE_KEEPER
+                else mech.field_max_hold_time
+            )
+            # Carrier: ball_hold_timer / 5.0 in [0, 1]
+            obs[holder, 8] = min(1.0, max(0.0, self.ball_hold_timer / max_hold))
+
+            # Teammates of carrier: -0.25
+            tm_mask = (self.player_team == holder_team)
+            tm_mask[holder] = False
+            obs[tm_mask, 8] = -0.25
+
+            # Opponents of carrier: continuous tackle readiness in [-1.0, -0.3]
+            opp_mask = ~tm_mask
+            opp_mask[holder] = False
+            dx_h = self.player_pos[holder, 0] - self.player_pos[opp_mask, 0]
+            dy_h = self.player_pos[holder, 1] - self.player_pos[opp_mask, 1]
+            d_h = np.hypot(dx_h, dy_h)
+            r_max = self._role_tackle_reach[opp_mask]
+            dist_excess = np.clip((d_h - r_max) / (2.0 * r_max), 0.0, 1.0)
+
+            can_tackle_carrier = (
+                self._is_field_role(self.player_role[holder])
+                and self.pickup_tackle_grace_timer <= 0.0
+                and self.kickoff_protection_timer <= 0.0
+            )
+            if can_tackle_carrier:
+                opp_ang = self.player_angle[opp_mask]
+                u_fx = np.cos(opp_ang)
+                u_fy = np.sin(opp_ang)
+                facing_dot = np.where(
+                    d_h < 1e-4,
+                    1.0,
+                    (u_fx * dx_h + u_fy * dy_h) / np.maximum(d_h, 1e-6),
+                )
+                tackleable_now = (d_h <= r_max) & (facing_dot >= 0.25)
+                ang_deficit = np.clip((0.25 - facing_dot) / 1.25, 0.0, 1.0)
+                not_ready_penalty = np.maximum(dist_excess, 0.3 + 0.7 * ang_deficit)
+                obs[opp_mask, 8] = np.where(
+                    tackleable_now,
+                    -1.0,
+                    -1.0 + 0.7 * np.where(facing_dot >= 0.25, dist_excess, not_ready_penalty),
                 )
             else:
-                obs_dict[agent_name] = self._build_single_observation(
-                    idx, c_p_b, c_v_b, c_ang_b, c_b_b, c_bv_b
-                )
-        return obs_dict
+                obs[opp_mask, 8] = -0.65 + 0.35 * dist_excess
+        else:
+            obs[:, 8] = 0.0
+
+        # Ability cooldown normalized to [0.0, 1.0]
+        max_tackle_cd = max(mech.tackle_fail_cooldown, mech.field_violation_tackle_cooldown)
+        obs[:, 9] = np.clip(self.tackle_cooldown / max_tackle_cd, 0.0, 1.0)
+        keeper_cd_denom = max(1e-6, mech.keeper_lunge_cooldown)
+        obs[0, 9] = min(1.0, max(0.0, self.lunge_cooldown[0] / keeper_cd_denom))
+        obs[6, 9] = min(1.0, max(0.0, self.lunge_cooldown[6] / keeper_cd_denom))
+
+        # Ghost or Stun timer normalized to [0.0, 1.0]
+        obs[:, 10] = np.clip(
+            np.maximum(self.ghost_timer, self.stun_timer) / mech.ghost_duration, 0.0, 1.0
+        )
+
+        # Relative angle and distance to Enemy Goal (1400.0, 420.0) in canonical space
+        enemy_goal_dx = phys.field_width - sx
+        enemy_goal_dy = (phys.field_height * 0.5) - sy
+        goal_dist = np.hypot(enemy_goal_dx, enemy_goal_dy)
+        rel_goal_angle = (
+            np.arctan2(enemy_goal_dy, enemy_goal_dx) - s_ang + math.pi
+        ) % (2.0 * math.pi) - math.pi
+        obs[:, 11] = rel_goal_angle / math.pi
+        obs[:, 12] = np.clip(goal_dist / self._max_field_dist, 0.0, 1.0)
+
+        # Clean Role One-Hot (field players) & GK Box State (goalkeepers) in obs[:, 13:16]
+        obs[:, 13:16] = self._field_role_onehot
+        side_a = int(self.team_side[TEAM_A])
+        side_b = int(self.team_side[TEAM_B])
+        obs[0, 13] = 0.0
+        obs[0, 14] = np.clip(self.active_box_radius[side_a] / phys.keeper_box_radius, 0.0, 1.0)
+        obs[0, 15] = np.clip(
+            self._box_loose_ball_timer[side_a] / mech.keeper_box_loose_max_time, 0.0, 1.0
+        )
+        obs[6, 13] = 0.0
+        obs[6, 14] = np.clip(self.active_box_radius[side_b] / phys.keeper_box_radius, 0.0, 1.0)
+        obs[6, 15] = np.clip(
+            self._box_loose_ball_timer[side_b] / mech.keeper_box_loose_max_time, 0.0, 1.0
+        )
+
+        # Part B: Vision Cone Entity Slots (12 Entities x 5 floats = 60 floats, indices 16..75)
+        ent_pos = np.empty((self.num_players, vis.num_entity_slots, 2), dtype=np.float64)
+        ent_vel = np.empty((self.num_players, vis.num_entity_slots, 2), dtype=np.float64)
+
+        ent_pos[:6, 0] = c_b_a
+        ent_vel[:6, 0] = c_bv_a
+        ent_pos[:6, 1:] = c_p_a[self._entity_slot_matrix[:6]]
+        ent_vel[:6, 1:] = c_v_a[self._entity_slot_matrix[:6]]
+
+        ent_pos[6:, 0] = c_b_b
+        ent_vel[6:, 0] = c_bv_b
+        ent_pos[6:, 1:] = c_p_b[self._entity_slot_matrix[6:]]
+        ent_vel[6:, 1:] = c_v_b[self._entity_slot_matrix[6:]]
+
+        dx = ent_pos[:, :, 0] - sx[:, None]
+        dy = ent_pos[:, :, 1] - sy[:, None]
+        dist = np.hypot(dx, dy)
+        ang_to_ent = np.arctan2(dy, dx)
+        rel_ang = np.where(
+            dist < 1e-6,
+            0.0,
+            (ang_to_ent - s_ang[:, None] + math.pi) % (2.0 * math.pi) - math.pi,
+        )
+        abs_rel_ang = np.abs(rel_ang)
+
+        # Slot 0 (Ball): 360-degree awareness with half-time clock multiplexing
+        in_ball_cone = (dist[:, 0] <= vis.max_range) & (abs_rel_ang[:, 0] <= vis.half_fov_rad)
+        half_time_len = float(phys.half_duration)
+        t_in_half = self.match_time % half_time_len
+        t_rem_ratio = min(1.0, max(0.0, (half_time_len - t_in_half) / half_time_len))
+        ball_vis = np.where(
+            in_ball_cone,
+            0.20 + 0.80 * t_rem_ratio,
+            -0.20 - 0.80 * t_rem_ratio,
+        )
+
+        # Slots 1..11 (Teammates & Opponents)
+        dist_p = dist[:, 1:]
+        abs_ang_p = abs_rel_ang[:, 1:]
+        fade_rad = math.radians(15.0)
+        rad_90 = math.radians(90.0)
+        rad_105 = vis.half_fov_rad
+        in_ent_cone = (dist_p <= vis.max_range) & (abs_ang_p <= rad_105)
+        w_phi = np.where(abs_ang_p <= rad_90, 1.0, (rad_105 - abs_ang_p) / fade_rad)
+        w_d = 1.0 - 0.35 * (dist_p / vis.max_range)
+        fov_factor = np.where(in_ent_cone, w_phi * w_d, 0.0)
+
+        base_presence = np.clip(0.25 + 0.65 * fov_factor, 0.25, 0.90)
+        disabled_presence = -np.clip(0.25 + 0.65 * fov_factor, 0.25, 0.95)
+        other_disabled = (np.maximum(self.ghost_timer, self.stun_timer) > 0.0)[
+            self._entity_slot_matrix
+        ]
+        vis_p = np.where(other_disabled, disabled_presence, base_presence)
+        if holder is not None:
+            vis_p = np.where(self._entity_slot_matrix == holder, 1.0, vis_p)
+
+        max_rel_vel = phys.ball_max_launch_speed + phys.player_max_speed
+        ent_view = obs[:, vis.self_feature_dim :].reshape(
+            self.num_players, vis.num_entity_slots, vis.entity_feature_dim
+        )
+        ent_view[:, 0, 0] = ball_vis
+        ent_view[:, 1:, 0] = vis_p
+        ent_view[:, :, 1] = np.clip(dist / self._max_field_dist, 0.0, 1.0)
+        ent_view[:, :, 2] = rel_ang / math.pi
+        ent_view[:, :, 3] = (ent_vel[:, :, 0] - svx[:, None]) / max_rel_vel
+        ent_view[:, :, 4] = (ent_vel[:, :, 1] - svy[:, None]) / max_rel_vel
+
+        np.clip(obs, -1.0, 1.0, out=obs)
+        return obs
+
+    def _get_observations(self) -> Dict[str, np.ndarray]:
+        """Compute the 76-float normalized observation dictionary for all 12 agents."""
+        obs = self._get_observations_array()
+        return {
+            agent_name: obs[idx]
+            for idx, agent_name in enumerate(self.possible_agents)
+        }
+
+    def _build_single_observation(
+        self,
+        idx: int,
+        c_player_pos: Optional[np.ndarray] = None,
+        c_player_vel: Optional[np.ndarray] = None,
+        c_player_angle: Optional[np.ndarray | float] = None,
+        c_ball_pos: Optional[np.ndarray] = None,
+        c_ball_vel: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return the 76-float canonical observation for player `idx`."""
+        return self._get_observations_array()[idx]
 
     @property
     def match_time(self) -> float:
@@ -3606,213 +2490,6 @@ class FootballParallelEnv(ParallelEnv):
         canon_angle = wrap_to_pi(angle + math.pi)
         return canon_pos, canon_vel, canon_angle
 
-    def _build_single_observation(
-        self,
-        idx: int,
-        c_player_pos: Optional[np.ndarray] = None,
-        c_player_vel: Optional[np.ndarray] = None,
-        c_player_angle: Optional[np.ndarray | float] = None,
-        c_ball_pos: Optional[np.ndarray] = None,
-        c_ball_vel: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Build the 76-float canonical observation for player `idx`."""
-        phys = self.cfg.physics
-        mech = self.cfg.mechanics
-        vis = self.cfg.vision
-
-        my_team = int(self.player_team[idx])
-        my_role = int(self.player_role[idx])
-
-        # Transform all players and ball into `my_team`'s canonical coordinate system if not provided
-        if c_player_pos is None or c_player_vel is None or c_player_angle is None:
-            c_player_pos, c_player_vel, c_player_angle = self._to_team_canonical(
-                self.player_pos, self.player_vel, self.player_angle, my_team
-            )
-        if c_ball_pos is None or c_ball_vel is None:
-            c_ball_pos, c_ball_vel, _ = self._to_team_canonical(
-                self.ball_pos, self.ball_vel, 0.0, my_team
-            )
-
-        obs = np.zeros(vis.obs_dim, dtype=np.float32)
-
-        # ----------------------------------------------------------------------
-        # Part A: Self & Global State (16 floats, indices 0..15)
-        # ----------------------------------------------------------------------
-        sx, sy = float(c_player_pos[idx, 0]), float(c_player_pos[idx, 1])
-        s_angle = float(c_player_angle[idx])
-        svx, svy = float(c_player_vel[idx, 0]), float(c_player_vel[idx, 1])
-
-        # Normalize self_x, self_y to [-1.0, 1.0]
-        obs[0] = _fast_clip((sx / phys.field_width) * 2.0 - 1.0, -1.0, 1.0)
-        obs[1] = _fast_clip((sy / phys.field_height) * 2.0 - 1.0, -1.0, 1.0)
-
-        # sin and cos of canonical facing angle
-        obs[2] = math.sin(s_angle)
-        obs[3] = math.cos(s_angle)
-
-        # Normalized self velocity
-        max_self_v = mech.lunge_speed if my_role == ROLE_KEEPER else self._get_player_max_speed(idx)
-        obs[4] = _fast_clip(svx / max_self_v, -1.0, 1.0)
-        obs[5] = _fast_clip(svy / max_self_v, -1.0, 1.0)
-
-        # Score Differential
-        my_score = self.stats.get("score", [0, 0])[my_team]
-        opp_score = self.stats.get("score", [0, 0])[1 - my_team]
-        obs[6] = _fast_clip((my_score - opp_score) / 3.0, -1.0, 1.0)
-        has_ball = 1.0 if self.ball_holder == idx else 0.0
-        obs[7] = has_ball
-
-        # Possession / hold / tackle status
-        max_hold = (
-            mech.keeper_max_hold_time if my_role == ROLE_KEEPER else mech.field_max_hold_time
-        )
-        if has_ball > 0.5:
-            obs[8] = _fast_clip(self.ball_hold_timer / max_hold, 0.0, 1.0)
-        elif self.ball_holder is None:
-            obs[8] = 0.0
-        elif int(self.player_team[self.ball_holder]) == my_team:
-            obs[8] = 0.5
-        else:
-            holder_idx = self.ball_holder
-            d_holder = math.hypot(
-                self.player_pos[idx, 0] - self.player_pos[holder_idx, 0],
-                self.player_pos[idx, 1] - self.player_pos[holder_idx, 1],
-            )
-            my_tackle_reach = self._get_role_tackle_params(idx)[0]
-            if (
-                self._is_field_role(self.player_role[holder_idx])
-                and d_holder <= my_tackle_reach
-            ):
-                obs[8] = -1.0
-            else:
-                obs[8] = -0.5
-
-        # Ability cooldown normalized to [0.0, 1.0]
-        if my_role == ROLE_KEEPER:
-            obs[9] = _fast_clip(self.lunge_cooldown[idx] / max(1e-6, mech.keeper_lunge_cooldown), 0.0, 1.0)
-        else:
-            max_tackle_cd = max(mech.tackle_fail_cooldown, mech.field_violation_tackle_cooldown)
-            obs[9] = _fast_clip(self.tackle_cooldown[idx] / max_tackle_cd, 0.0, 1.0)
-
-        # Ghost or Stun timer normalized to [0.0, 1.0]
-        active_disable_timer = max(float(self.ghost_timer[idx]), float(self.stun_timer[idx]))
-        obs[10] = _fast_clip(active_disable_timer / mech.ghost_duration, 0.0, 1.0)
-
-        # Relative angle and distance to Enemy Goal (always at (1400.0, 420.0) in canonical space)
-        enemy_goal_dx = phys.field_width - sx
-        enemy_goal_dy = (phys.field_height * 0.5) - sy
-        goal_dist = math.hypot(enemy_goal_dx, enemy_goal_dy)
-        angle_to_goal = math.atan2(enemy_goal_dy, enemy_goal_dx)
-        rel_goal_angle = float(wrap_to_pi(angle_to_goal - s_angle))
-
-        obs[11] = _fast_clip(rel_goal_angle / math.pi, -1.0, 1.0)
-        obs[12] = _fast_clip(goal_dist / self._max_field_dist, 0.0, 1.0)
-
-        # Role Encoding, Tactical Pocket Vector & Pass Chain (indices 13..15)
-        if my_role == ROLE_KEEPER:
-            own_goal_center_y = phys.field_height * 0.5
-            ball_dist_to_own_goal = math.hypot(
-                float(c_ball_pos[0]), float(c_ball_pos[1]) - own_goal_center_y
-            )
-            is_ball_loose_in_own_box = (
-                self.ball_holder is None
-                and ball_dist_to_own_goal <= (phys.keeper_box_radius + phys.ball_radius)
-            )
-            if is_ball_loose_in_own_box:
-                obs[13] = _fast_clip(
-                    0.25 + 0.75 * (self.box_loose_ball_timer / mech.keeper_box_loose_max_time),
-                    0.25,
-                    1.0,
-                )
-            else:
-                obs[13] = 0.0
-            own_side = int(self.team_side[my_team])
-            obs[14] = float(np.clip(self.active_box_radius[own_side] / phys.keeper_box_radius, 0.0, 1.0))
-            obs[15] = float(np.clip(self.team_pass_chain[my_team] / 10.0, 0.0, 1.0))
-        else:
-            role_base = -0.75 if my_role == ROLE_DEF else (0.0 if my_role == ROLE_MID else 0.75)
-            obs[13] = float(role_base + 0.20 * np.clip(self.team_pass_chain[my_team] / 10.0, 0.0, 1.0))
-            obs[14] = float(np.clip((self.active_tactical_target_canon[idx, 0] - sx) / 450.0, -1.0, 1.0))
-            obs[15] = float(np.clip((self.active_tactical_target_canon[idx, 1] - sy) / 450.0, -1.0, 1.0))
-
-        # ----------------------------------------------------------------------
-        # Part B: Vision Cone Entity Slots (12 Entities x 5 floats = 60 floats, indices 16..75)
-        # Slot 0: Ball
-        # Slots 1..5: 5 Teammates
-        # Slots 6..10: 5 Field Opponents
-        # Slot 11: Enemy Keeper
-        # ----------------------------------------------------------------------
-        slot_positions = [c_ball_pos]
-        slot_velocities = [c_ball_vel]
-        for other_idx in self._entity_player_slots[idx]:
-            slot_positions.append(c_player_pos[other_idx])
-            slot_velocities.append(c_player_vel[other_idx])
-
-        max_rel_vel = phys.ball_max_launch_speed + phys.player_max_speed
-
-        base_offset = vis.self_feature_dim
-        for slot_i in range(vis.num_entity_slots):
-            epos = slot_positions[slot_i]
-            evel = slot_velocities[slot_i]
-
-            dx = float(epos[0]) - sx
-            dy = float(epos[1]) - sy
-            dist = math.hypot(dx, dy)
-            if dist < 1e-6:
-                rel_ang = 0.0
-            else:
-                ang_to_ent = math.atan2(dy, dx)
-                rel_ang = float(wrap_to_pi(ang_to_ent - s_angle))
-
-            slot_start = base_offset + slot_i * vis.entity_feature_dim
-
-            if slot_i == 0:
-                # Slot 0 (Ball): 360-degree awareness with half-time clock multiplexing
-                in_cone = (dist <= vis.max_range) and (abs(rel_ang) <= vis.half_fov_rad)
-                half_time_len = float(phys.half_duration)  # 90.0s
-                t_in_half = self.match_time % half_time_len
-                t_rem_half = max(0.0, half_time_len - t_in_half)
-                t_rem_ratio = float(np.clip(t_rem_half / half_time_len, 0.0, 1.0))
-                if in_cone:
-                    obs[slot_start + 0] = float(np.clip(0.20 + 0.80 * t_rem_ratio, 0.20, 1.0))
-                else:
-                    obs[slot_start + 0] = float(np.clip(-0.20 - 0.80 * t_rem_ratio, -1.0, -0.20))
-                obs[slot_start + 1] = _fast_clip(dist / self._max_field_dist, 0.0, 1.0)
-                obs[slot_start + 2] = _fast_clip(rel_ang / math.pi, -1.0, 1.0)
-                obs[slot_start + 3] = _fast_clip(
-                    (float(evel[0]) - svx) / max_rel_vel, -1.0, 1.0
-                )
-                obs[slot_start + 4] = _fast_clip(
-                    (float(evel[1]) - svy) / max_rel_vel, -1.0, 1.0
-                )
-            else:
-                other_idx = self._entity_player_slots[idx][slot_i - 1]
-                fade_rad = math.radians(15.0)
-                rad_90 = math.radians(90.0)
-                rad_105 = vis.half_fov_rad
-                in_entity_cone = (dist <= vis.max_range) and (abs(rel_ang) <= rad_105)
-                if in_entity_cone:
-                    w_phi = 1.0 if abs(rel_ang) <= rad_90 else ((rad_105 - abs(rel_ang)) / fade_rad)
-                    w_d = 1.0 - 0.35 * (dist / vis.max_range)
-                    fov_factor = w_phi * w_d
-                else:
-                    fov_factor = 0.0
-
-                if self.ball_holder == other_idx:
-                    vis_presence = 1.0
-                elif max(float(self.ghost_timer[other_idx]), float(self.stun_timer[other_idx])) > 0.0:
-                    vis_presence = -float(np.clip(0.25 + 0.65 * fov_factor, 0.25, 0.95))
-                else:
-                    vis_presence = float(np.clip(0.25 + 0.65 * fov_factor, 0.25, 0.90))
-
-                obs[slot_start + 0] = vis_presence
-                obs[slot_start + 1] = float(np.clip(dist / self._max_field_dist, 0.0, 1.0))
-                obs[slot_start + 2] = float(np.clip(rel_ang / math.pi, -1.0, 1.0))
-                obs[slot_start + 3] = float(np.clip((float(evel[0]) - svx) / max_rel_vel, -1.0, 1.0))
-                obs[slot_start + 4] = float(np.clip((float(evel[1]) - svy) / max_rel_vel, -1.0, 1.0))
-
-        return obs
-
     # ==========================================================================
     # Reward, Event & Replay Serialization Helpers
     # ==========================================================================
@@ -3825,875 +2502,129 @@ class FootballParallelEnv(ParallelEnv):
         mask = self.player_team == team_id
         step_rewards[mask] += amount
 
-    def _compute_tactical_positioning_rewards(
+    def _compute_potential_shaping(
         self,
         step_rewards: np.ndarray,
-        prev_player_pos: np.ndarray,
-        prev_player_ball_dists: np.ndarray,
-        any_teleport: bool,
+        any_teleport: bool = False,
     ) -> None:
-        """Context-dependent off-ball shaping on 1400x840 pitch with role pockets & anti-swarming."""
-        if any_teleport:
-            self.pocket_initialized[:] = False
-            self.prev_tactical_mode[:] = -1
-        gamma = self.cfg.ppo.gamma
+        """Evaluate Tier 2 Markovian off-ball and goalkeeper potentials and apply strict PBRS."""
         rew = self.cfg.rewards
         phys = self.cfg.physics
-        mech = self.cfg.mechanics
-        curr_player_ball_dists = np.linalg.norm(
-            self.player_pos - self.ball_pos[None, :], axis=1
-        )
-        holder_team = (
-            int(self.player_team[self.ball_holder])
-            if self.ball_holder is not None
-            else -1
+        gamma = self.cfg.ppo.gamma
+        inv_max_dist = 1.0 / self._max_field_dist
+
+        pos = self.player_pos
+        bx, by = float(self.ball_pos[0]), float(self.ball_pos[1])
+        ball_dists = np.hypot(pos[:, 0] - bx, pos[:, 1] - by)
+        dist_mat = np.hypot(
+            pos[:, 0:1] - pos[None, :, 0],
+            pos[:, 1:2] - pos[None, :, 1],
         )
 
-        adj_prev_pos = prev_player_pos + self.step_external_push
-        adj_prev_player_ball_dists = np.linalg.norm(
-            adj_prev_pos - self.prev_ball_at_step_start[None, :], axis=1
-        )
+        phi_curr = np.zeros(self.num_players, dtype=np.float64)
+        holder = self.ball_holder
+        holder_team = int(self.player_team[holder]) if holder is not None else -1
 
         for team_id in (TEAM_A, TEAM_B):
-            c_player_pos, _, c_player_angle = self._to_team_canonical(
-                self.player_pos, self.player_vel, self.player_angle, team_id
+            own_side = int(self.team_side[team_id])
+            own_gx = 0.0 if own_side == SIDE_LEFT else phys.field_width
+            own_gy = phys.field_height * 0.5
+            f_start = 1 if team_id == TEAM_A else 7
+            o_start = 7 if team_id == TEAM_A else 1
+            team_fields = range(f_start, f_start + 5)
+            opp_fields = range(o_start, o_start + 5)
+            keeper_idx = 0 if team_id == TEAM_A else 6
+
+            in_possession = (holder_team == team_id) or (
+                holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id
             )
-            c_prev_pos, _, _ = self._to_team_canonical(
-                adj_prev_pos, self.player_vel, self.player_angle, team_id
-            )
-            c_ball_pos, _, _ = self._to_team_canonical(
-                self.ball_pos, self.ball_vel, 0.0, team_id
-            )
+            pass_chaser = -1
+            if holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id:
+                cands = [i for i in team_fields if i != self.last_ball_holder]
+                if cands:
+                    pass_chaser = min(cands, key=lambda i: float(ball_dists[i]))
 
-            team_fields = [
-                i
-                for i in range(self.num_players)
-                if self.player_team[i] == team_id and self._is_field_role(self.player_role[i])
-            ]
-            opp_fields = [
-                i
-                for i in range(self.num_players)
-                if self.player_team[i] != team_id and self._is_field_role(self.player_role[i])
-            ]
-            keeper_idx = self._team_keeper_idx(team_id)
-
-            score_diff = (
-                self.stats.get("score", [0, 0])[team_id]
-                - self.stats.get("score", [0, 0])[1 - team_id]
-            )
-            press_mult = 1.35 if score_diff < 0 else 1.0
-            support_mult = 1.25 if score_diff < 0 else 1.0
-            cover_mult = 1.25 if score_diff > 0 else 1.0
-
-            # Dynamically assign Top ("_1") vs Bottom ("_2") tactical lane slots based on current canonical Y!
-            # With a 25.0u hysteresis deadband using prev_dynamic_role_key to prevent 15 Hz role flapping.
-            def_indices = [i for i in team_fields if self.player_role[i] == ROLE_DEF]
-            mid_indices = [i for i in team_fields if self.player_role[i] == ROLE_MID]
-            atk_indices = [i for i in team_fields if self.player_role[i] == ROLE_ATK]
-
-            dynamic_role_key: Dict[int, str] = {}
-            if len(def_indices) == 2:
-                d0, d1 = def_indices[0], def_indices[1]
-                prev_0 = self.prev_dynamic_role_key.get(d0)
-                prev_1 = self.prev_dynamic_role_key.get(d1)
-                y0 = float(c_player_pos[d0, 1])
-                y1 = float(c_player_pos[d1, 1])
-                if prev_0 == "def_1" and prev_1 == "def_2":
-                    if y1 < y0 - 25.0:
-                        dynamic_role_key[d1] = "def_1"
-                        dynamic_role_key[d0] = "def_2"
-                    else:
-                        dynamic_role_key[d0] = "def_1"
-                        dynamic_role_key[d1] = "def_2"
-                elif prev_0 == "def_2" and prev_1 == "def_1":
-                    if y0 < y1 - 25.0:
-                        dynamic_role_key[d0] = "def_1"
-                        dynamic_role_key[d1] = "def_2"
-                    else:
-                        dynamic_role_key[d1] = "def_1"
-                        dynamic_role_key[d0] = "def_2"
-                else:
-                    if y0 <= y1:
-                        dynamic_role_key[d0] = "def_1"
-                        dynamic_role_key[d1] = "def_2"
-                    else:
-                        dynamic_role_key[d1] = "def_1"
-                        dynamic_role_key[d0] = "def_2"
-                self.prev_dynamic_role_key[d0] = dynamic_role_key[d0]
-                self.prev_dynamic_role_key[d1] = dynamic_role_key[d1]
-            else:
-                for i in def_indices:
-                    dynamic_role_key[i] = self.player_role_key[i]
-
-            if len(mid_indices) == 2:
-                m0, m1 = mid_indices[0], mid_indices[1]
-                prev_0 = self.prev_dynamic_role_key.get(m0)
-                prev_1 = self.prev_dynamic_role_key.get(m1)
-                y0 = float(c_player_pos[m0, 1])
-                y1 = float(c_player_pos[m1, 1])
-                if prev_0 == "mid_1" and prev_1 == "mid_2":
-                    if y1 < y0 - 25.0:
-                        dynamic_role_key[m1] = "mid_1"
-                        dynamic_role_key[m0] = "mid_2"
-                    else:
-                        dynamic_role_key[m0] = "mid_1"
-                        dynamic_role_key[m1] = "mid_2"
-                elif prev_0 == "mid_2" and prev_1 == "mid_1":
-                    if y0 < y1 - 25.0:
-                        dynamic_role_key[m0] = "mid_1"
-                        dynamic_role_key[m1] = "mid_2"
-                    else:
-                        dynamic_role_key[m1] = "mid_1"
-                        dynamic_role_key[m0] = "mid_2"
-                else:
-                    if y0 <= y1:
-                        dynamic_role_key[m0] = "mid_1"
-                        dynamic_role_key[m1] = "mid_2"
-                    else:
-                        dynamic_role_key[m1] = "mid_1"
-                        dynamic_role_key[m0] = "mid_2"
-                self.prev_dynamic_role_key[m0] = dynamic_role_key[m0]
-                self.prev_dynamic_role_key[m1] = dynamic_role_key[m1]
-            else:
-                for i in mid_indices:
-                    dynamic_role_key[i] = self.player_role_key[i]
-
-            for i in atk_indices:
-                dynamic_role_key[i] = "atk_1"
-
-            c_bx = float(c_ball_pos[0])
-            def _effective_chase_dist(p_idx: int) -> float:
-                d_raw = float(curr_player_ball_dists[p_idx])
-                r_p = self.player_role[p_idx]
-                if r_p == ROLE_DEF and c_bx > 660.0:
-                    # In the opponent half, MID and ATK take priority for high pressing / loose balls
-                    # unless the defender is dramatically closer than any MID/ATK
-                    d_raw += 160.0 + 0.35 * (c_bx - 660.0)
-                elif r_p == ROLE_ATK and c_bx < 450.0:
-                    # In deep own third, DEF and MID take priority for defensive recovery
-                    d_raw += 130.0
-                return d_raw
-
-            # Determine tactical right-of-way exemptions for this team:
-            # - Ball carrier is always exempt
-            # - Primary ball chaser/presser (closest field player to ball in State B2/C) is exempt
-            # - Intended pass receiver (best_rx) and passer (last_ball_holder) during pass-in-flight are exempt
-            # - On loose balls, top-2 chasers and teammates contesting near loose ball (<=165u) are exempt from crowding
-            if self.ball_holder is None:
-                cand_0 = min(team_fields, key=_effective_chase_dist)
-                curr_prim = self.primary_loose_ball_chaser[team_id]
-                if curr_prim not in team_fields:
-                    self.primary_loose_ball_chaser[team_id] = cand_0
-                else:
-                    d_curr = _effective_chase_dist(curr_prim)
-                    d_cand = _effective_chase_dist(cand_0)
-                    # Candidate must be at least 18 units closer to snatch primary status
-                    if d_cand < d_curr - 18.0:
-                        self.primary_loose_ball_chaser[team_id] = cand_0
-                closest_field_to_ball = self.primary_loose_ball_chaser[team_id]
-            else:
-                self.primary_loose_ball_chaser[team_id] = -1
-                closest_field_to_ball = min(team_fields, key=_effective_chase_dist)
-
-            ranked_loose_fields = sorted(
-                team_fields,
-                key=lambda i: (0 if i == closest_field_to_ball else 1, _effective_chase_dist(i)),
-            )
-            top_2_loose_chasers = set(ranked_loose_fields[:2])
-
-            pass_in_flight_for_team = (
-                self.ball_holder is None
-                and self.ball_kicked_in_flight
-                and self.last_ball_team == team_id
-            )
-            best_rx_exempt = -1
-            if pass_in_flight_for_team:
-                rx_cands = [i for i in team_fields if i != self.last_ball_holder]
-                if rx_cands:
-                    ray_end = self.ball_pos + self.ball_vel * 1.5
-                    best_rx_exempt = min(
-                        rx_cands,
-                        key=lambda i: self._point_to_segment_dist(
-                            self.player_pos[i], self.ball_pos, ray_end
-                        ),
-                    )
-
-            def _is_exempt_from_crowding(p_idx: int, other_idx: int) -> bool:
-                if p_idx == self.ball_holder:
-                    return True
-                if self.ball_holder is None:
-                    if p_idx in top_2_loose_chasers:
-                        return True
-                    if float(curr_player_ball_dists[p_idx]) <= 165.0 and float(curr_player_ball_dists[other_idx]) <= 165.0:
-                        return True
-                    if p_idx == best_rx_exempt and best_rx_exempt != -1:
-                        return True
-                    if pass_in_flight_for_team and p_idx == self.last_ball_holder and other_idx == best_rx_exempt:
-                        return True
-                if pass_in_flight_for_team:
-                    if p_idx == best_rx_exempt:
-                        return True
-                    if p_idx == self.last_ball_holder and other_idx == best_rx_exempt:
-                        return True
-                if holder_team != team_id and p_idx == closest_field_to_ball:
-                    return True
-                return False
-
-            enemy_goal_c_canon = np.array([1400.0, 420.0], dtype=np.float64)
-
-            # 1. Context-Aware Asymmetric Anti-Clumping & Approach Repulsion across all 5 field players
-            for idx_a in range(len(team_fields)):
-                for idx_b in range(idx_a + 1, len(team_fields)):
-                    p_i = team_fields[idx_a]
-                    p_j = team_fields[idx_b]
-                    d_ij = float(np.linalg.norm(self.player_pos[p_i] - self.player_pos[p_j]))
-                    d_prev_ij = float(np.linalg.norm(adj_prev_pos[p_i] - adj_prev_pos[p_j]))
-
-                    # Check if both players are in the attacking box zone at different angles around the keeper
-                    di_goal = float(np.linalg.norm(c_player_pos[p_i] - enemy_goal_c_canon))
-                    dj_goal = float(np.linalg.norm(c_player_pos[p_j] - enemy_goal_c_canon))
-                    ang_i = math.atan2(
-                        float(c_player_pos[p_i, 1]) - 420.0, 1400.0 - float(c_player_pos[p_i, 0])
-                    )
-                    ang_j = math.atan2(
-                        float(c_player_pos[p_j, 1]) - 420.0, 1400.0 - float(c_player_pos[p_j, 0])
-                    )
-                    ang_diff = abs(float(wrap_to_pi(ang_i - ang_j)))
-
-                    both_near_enemy_box = (di_goal <= 280.0) and (dj_goal <= 280.0)
-                    is_defender_pair = (p_i in def_indices and p_j in def_indices)
-                    in_defensive_half = (float(c_player_pos[p_i, 0]) <= 700.0 and float(c_player_pos[p_j, 0]) <= 700.0)
-                    if is_defender_pair and in_defensive_half:
-                        # Center back pair shielding own goal mouth: relax spacing to allow compact central zoning
-                        min_space = rew.teammate_defender_spacing
-                    elif both_near_enemy_box and ang_diff >= math.radians(40.0):
-                        # Wide angular separation around keeper semicircle (e.g. ST below, MID above):
-                        # Relax spacing threshold so cutback options are never punished!
-                        min_space = rew.teammate_box_cutback_spacing
-                    else:
-                        min_space = rew.teammate_min_spacing
-
-                    if d_ij < min_space:
-                        overlap = 1.0 - (d_ij / max(1e-6, min_space))
-                        pen = rew.crowding_penalty_scale * (overlap + 0.5 * overlap * overlap)
-                        if not _is_exempt_from_crowding(p_i, p_j):
-                            step_rewards[p_i] -= pen
-                        if not _is_exempt_from_crowding(p_j, p_i):
-                            step_rewards[p_j] -= pen
-
-                    # Directional Teammate Approach Repulsion (prevents +0.010 pocket/ball chase from overpowering spacing)
-                    if not any_teleport and d_ij < min(155.0, min_space) and d_ij < d_prev_ij:
-                        # Check which player is actively moving toward the other
-                        vec_ij = self.player_pos[p_j] - self.player_pos[p_i]
-                        norm_ij = max(1e-6, float(np.linalg.norm(vec_ij)))
-                        unit_ij = vec_ij / norm_ij
-                        disp_i = self.player_pos[p_i] - adj_prev_pos[p_i]
-                        disp_j = self.player_pos[p_j] - adj_prev_pos[p_j]
-                        approach_i = max(0.0, float(np.dot(disp_i, unit_ij)))
-                        approach_j = max(0.0, float(np.dot(disp_j, -unit_ij)))
-                        if approach_i > 0.0 and not _is_exempt_from_crowding(p_i, p_j):
-                            step_rewards[p_i] -= rew.teammate_approach_penalty_scale * approach_i
-                        if approach_j > 0.0 and not _is_exempt_from_crowding(p_j, p_i):
-                            step_rewards[p_j] -= rew.teammate_approach_penalty_scale * approach_j
-
-                    # Same-Sector Enemy Box Crowding Penalty:
-                    # If both players are within 240u of enemy goal AND clogging the SAME angular sector (<35 deg),
-                    # penalize ONLY the non-carrier / further-from-ball player (never deterring shooter or wide support!)
-                    if both_near_enemy_box and ang_diff < math.radians(35.0):
-                        sector_overlap = 1.0 - (ang_diff / math.radians(35.0))
-                        sector_pen = rew.box_sector_crowding_pen * sector_overlap
-                        if p_i == self.ball_holder:
-                            step_rewards[p_j] -= sector_pen
-                        elif p_j == self.ball_holder:
-                            step_rewards[p_i] -= sector_pen
-                        elif float(curr_player_ball_dists[p_i]) <= float(curr_player_ball_dists[p_j]):
-                            step_rewards[p_j] -= sector_pen
-                        else:
-                            step_rewards[p_i] -= sector_pen
-
-            # 2. State A: Our Team Has the Ball
-            if holder_team == team_id and self.ball_holder is not None:
-                carrier_idx = self.ball_holder
-                carrier_c = c_player_pos[carrier_idx]
-                cx_car = float(carrier_c[0])
-                is_gk_carrier = (carrier_idx == keeper_idx)
-                self.active_tactical_target_canon[carrier_idx] = carrier_c.copy()
-
-                for idx in team_fields:
-                    if idx == carrier_idx:
+            if in_possession:
+                for i in team_fields:
+                    if i == holder:
+                        phi_curr[i] = 0.0
                         continue
-
-                    d_curr_car = float(
-                        np.linalg.norm(self.player_pos[idx] - self.player_pos[carrier_idx])
+                    if i == pass_chaser:
+                        phi_curr[i] = -rew.def_press_potential_weight * (
+                            float(ball_dists[i]) * inv_max_dist
+                        )
+                        continue
+                    d_ib = float(ball_dists[i])
+                    psi_ring = math.exp(-((d_ib - 240.0) ** 2) / (2.0 * 140.0 * 140.0))
+                    min_seg = min(
+                        self._point_to_segment_dist(pos[o], self.ball_pos, pos[i])
+                        for o in opp_fields
                     )
-                    d_prev_car = float(
-                        np.linalg.norm(adj_prev_pos[idx] - adj_prev_pos[carrier_idx])
+                    psi_lane = _fast_clip(min_seg / 70.0, 0.1, 1.0)
+                    sep_pen = 0.0
+                    for j in team_fields:
+                        if j != i:
+                            d_ij = float(dist_mat[i, j])
+                            if d_ij < 125.0:
+                                ov = 1.0 - d_ij / 125.0
+                                sep_pen += ov * ov
+                    phi_curr[i] = (
+                        rew.support_potential_weight * psi_lane * psi_ring
+                        - rew.teammate_sep_potential_weight * sep_pen
                     )
-
-                    # Anti-Carrier Crowding & Approach Penalty
-                    if d_curr_car < rew.carrier_min_spacing:
-                        step_rewards[idx] -= rew.crowding_penalty_scale * (
-                            1.0 - d_curr_car / rew.carrier_min_spacing
-                        )
-                    if not any_teleport and d_curr_car < 190.0 and d_curr_car < d_prev_car:
-                        step_rewards[idx] -= rew.carrier_approach_penalty_scale * (
-                            d_prev_car - d_curr_car
-                        )
-
-                    role_key = dynamic_role_key[idx]
-
-                    if is_gk_carrier:
-                        # Case 1: GK Holds the Ball -> Show for Keeper with both central channel and wide outlet options
-                        if role_key in ("def_1", "mid_1"):
-                            x_cand_list = (200.0, 330.0) if role_key == "def_1" else (420.0, 560.0)
-                            y_cand_list = (180.0, 265.0, 345.0) if role_key == "def_1" else (95.0, 195.0, 295.0)
-                        elif role_key in ("def_2", "mid_2"):
-                            x_cand_list = (200.0, 330.0) if role_key == "def_2" else (420.0, 560.0)
-                            y_cand_list = (495.0, 575.0, 660.0) if role_key == "def_2" else (545.0, 645.0, 745.0)
-                        else:
-                            x_cand_list = (720.0, 920.0)
-                            y_cand_list = (260.0, 420.0, 580.0)
-
-                        best_cand = None
-                        best_score = -1e9
-                        for cx in x_cand_list:
-                            for cy in y_cand_list:
-                                cand_pt = np.array([cx, cy], dtype=np.float64)
-                                pass_lane_clearance = min(
-                                    self._point_to_segment_dist(c_player_pos[opp], carrier_c, cand_pt)
-                                    for opp in opp_fields
-                                )
-                                nearest_opp_dist = min(
-                                    float(np.linalg.norm(c_player_pos[opp] - cand_pt))
-                                    for opp in opp_fields
-                                )
-                                continuity = -0.25 * float(np.linalg.norm(cand_pt - c_player_pos[idx]))
-                                sc = pass_lane_clearance + 0.6 * nearest_opp_dist + continuity
-                                if self.pocket_initialized[idx] and float(np.linalg.norm(cand_pt - self.prev_best_cand_canon[idx])) < 15.0:
-                                    sc += rew.pocket_sticky_hysteresis_bonus
-                                if sc > best_score:
-                                    best_score = sc
-                                    best_cand = cand_pt
-                        if best_cand is not None:
-                            self.prev_best_cand_canon[idx] = best_cand
-                            if not self.pocket_initialized[idx]:
-                                self.smoothed_pocket_canon[idx] = best_cand.copy()
-                                self.pocket_initialized[idx] = True
-                            else:
-                                alpha = rew.pocket_ema_alpha
-                                self.smoothed_pocket_canon[idx] = (1.0 - alpha) * self.smoothed_pocket_canon[idx] + alpha * best_cand
-                        target_pocket = self.smoothed_pocket_canon[idx]
-                    else:
-                        # Case 2: Field Player Holds the Ball
-                        if role_key in ("def_1", "def_2"):
-                            ideal_x = float(np.clip(min(0.50 * cx_car + 110.0, cx_car - 120.0), 200.0, 660.0))
-                            y_shift = float(np.clip(0.15 * (float(carrier_c[1]) - 420.0), -35.0, 35.0))
-                            if cx_car < 750.0:
-                                ideal_y = (420.0 + y_shift - 175.0) if role_key == "def_1" else (420.0 + y_shift + 175.0)
-                            else:
-                                ideal_y = (420.0 + y_shift - 95.0) if role_key == "def_1" else (420.0 + y_shift + 95.0)
-                            raw_pocket = np.array([ideal_x, ideal_y], dtype=np.float64)
-                            self.prev_best_cand_canon[idx] = raw_pocket
-                            if not self.pocket_initialized[idx]:
-                                self.smoothed_pocket_canon[idx] = raw_pocket.copy()
-                                self.pocket_initialized[idx] = True
-                            else:
-                                alpha = rew.pocket_ema_alpha
-                                self.smoothed_pocket_canon[idx] = (1.0 - alpha) * self.smoothed_pocket_canon[idx] + alpha * raw_pocket
-                            target_pocket = self.smoothed_pocket_canon[idx]
-                        elif role_key in ("mid_1", "mid_2"):
-                            dx_list = (120.0, 220.0, -90.0, -180.0)
-                            y_cand_list = (110.0, 200.0, 290.0) if role_key == "mid_1" else (550.0, 640.0, 730.0)
-                            best_cand = None
-                            best_score = -1e9
-                            for dx in dx_list:
-                                cand_x = float(np.clip(cx_car + dx, 360.0, 1120.0))
-                                for cy in y_cand_list:
-                                    cand_pt = np.array([cand_x, cy], dtype=np.float64)
-                                    pass_lane_clearance = min(
-                                        self._point_to_segment_dist(c_player_pos[opp], carrier_c, cand_pt)
-                                        for opp in opp_fields
-                                    )
-                                    nearest_opp_dist = min(
-                                        float(np.linalg.norm(c_player_pos[opp] - cand_pt))
-                                        for opp in opp_fields
-                                    )
-                                    continuity = -0.30 * float(np.linalg.norm(cand_pt - c_player_pos[idx]))
-                                    sc = pass_lane_clearance + 0.5 * nearest_opp_dist + continuity
-                                    if self.pocket_initialized[idx] and float(np.linalg.norm(cand_pt - self.prev_best_cand_canon[idx])) < 15.0:
-                                        sc += rew.pocket_sticky_hysteresis_bonus
-                                    if cx_car >= 1020.0:
-                                        if float(carrier_c[1]) > 460.0 and cy <= 310.0:
-                                            sc += 40.0
-                                        elif float(carrier_c[1]) < 380.0 and cy >= 530.0:
-                                            sc += 40.0
-                                    if sc > best_score:
-                                        best_score = sc
-                                        best_cand = cand_pt
-                            if best_cand is not None:
-                                self.prev_best_cand_canon[idx] = best_cand
-                                if not self.pocket_initialized[idx]:
-                                    self.smoothed_pocket_canon[idx] = best_cand.copy()
-                                    self.pocket_initialized[idx] = True
-                                else:
-                                    alpha = rew.pocket_ema_alpha
-                                    self.smoothed_pocket_canon[idx] = (1.0 - alpha) * self.smoothed_pocket_canon[idx] + alpha * best_cand
-                            target_pocket = self.smoothed_pocket_canon[idx]
-                        else:
-                            # Attacker (atk_1)
-                            x_atk = float(np.clip(max(720.0, cx_car + 180.0), 720.0, 1240.0))
-                            best_cand = None
-                            best_score = -1e9
-                            for cy in (200.0, 310.0, 420.0, 530.0, 640.0):
-                                cand_pt = np.array([x_atk, cy], dtype=np.float64)
-                                pass_lane_clearance = min(
-                                    self._point_to_segment_dist(c_player_pos[opp], carrier_c, cand_pt)
-                                    for opp in opp_fields
-                                )
-                                nearest_opp_dist = min(
-                                    float(np.linalg.norm(c_player_pos[opp] - cand_pt))
-                                    for opp in opp_fields
-                                )
-                                continuity = -0.30 * float(np.linalg.norm(cand_pt - c_player_pos[idx]))
-                                sc = pass_lane_clearance + 0.6 * nearest_opp_dist + continuity
-                                if self.pocket_initialized[idx] and float(np.linalg.norm(cand_pt - self.prev_best_cand_canon[idx])) < 15.0:
-                                    sc += rew.pocket_sticky_hysteresis_bonus
-                                if cx_car >= 1020.0:
-                                    if float(carrier_c[1]) > 460.0 and cy in (200.0, 310.0):
-                                        sc += 40.0
-                                    elif float(carrier_c[1]) < 380.0 and cy in (530.0, 640.0):
-                                        sc += 40.0
-                                if sc > best_score:
-                                    best_score = sc
-                                    best_cand = cand_pt
-                            if best_cand is not None:
-                                self.prev_best_cand_canon[idx] = best_cand
-                                if not self.pocket_initialized[idx]:
-                                    self.smoothed_pocket_canon[idx] = best_cand.copy()
-                                    self.pocket_initialized[idx] = True
-                                else:
-                                    alpha = rew.pocket_ema_alpha
-                                    self.smoothed_pocket_canon[idx] = (1.0 - alpha) * self.smoothed_pocket_canon[idx] + alpha * best_cand
-                            target_pocket = self.smoothed_pocket_canon[idx]
-
-                    if target_pocket is not None:
-                        self.active_tactical_target_canon[idx] = target_pocket.copy()
-
-                    # Potential-Based Movement Reward Toward target_pocket
-                    if target_pocket is not None:
-                        w_mode = float(support_mult * rew.support_pocket_approach_scale)
-                        d_curr_p = max(0.0, float(np.linalg.norm(c_player_pos[idx] - target_pocket)) - rew.pocket_deadzone_radius)
-                        phi_curr = -w_mode * d_curr_p
-                        if not any_teleport and self.prev_tactical_mode[idx] == 0:
-                            d_prev_p = max(0.0, float(np.linalg.norm(c_prev_pos[idx] - target_pocket)) - rew.pocket_deadzone_radius)
-                            phi_prev = -w_mode * d_prev_p
-                            step_rewards[idx] += gamma * phi_curr - phi_prev
-                        self.prev_tactical_potential[idx] = phi_curr
-                        self.prev_tactical_mode[idx] = 0
-
-                    # "Wait for the Pass" Open-Pocket Bonus / Half-Turn Readiness & Continuous Lateral Unmasking
-                    lane_clear = min(
-                        self._point_to_segment_dist(c_player_pos[opp], carrier_c, c_player_pos[idx])
-                        for opp in opp_fields
-                    )
-                    if 120.0 <= d_curr_car <= 520.0 and lane_clear >= 45.0:
-                        to_ball_c = c_ball_pos - c_player_pos[idx]
-                        d_ball_c = float(np.linalg.norm(to_ball_c))
-                        cos_face_ball = (
-                            float(np.dot([math.cos(c_player_angle[idx]), math.sin(c_player_angle[idx])], to_ball_c / d_ball_c))
-                            if d_ball_c > 1e-6 else 1.0
-                        )
-                        cos_fwd_c = math.cos(c_player_angle[idx])
-                        # Half-Turn / Forward Readiness: ball within 210 deg FOV and angled toward attacking half
-                        if cos_face_ball >= -0.20 and cos_fwd_c >= -0.10:
-                            face_bonus = 0.5 + 0.5 * max(0.0, cos_fwd_c)
-                            lane_factor = float(np.clip(lane_clear / 110.0, 0.3, 1.0))
-                            step_rewards[idx] += (
-                                support_mult
-                                * rew.open_support_bonus_scale
-                                * lane_factor
-                                * face_bonus
-                            )
-                    elif not any_teleport and lane_clear < 42.0:
-                        # Continuous Lateral Unmasking Reward:
-                        # Teammate is shadowed on the passing lane. Find the closest blocker,
-                        # compute unit normal n_perp away from the blocker, and reward lateral displacement unmasking the pass line.
-                        best_blocker = min(
-                            opp_fields,
-                            key=lambda opp: self._point_to_segment_dist(c_player_pos[opp], carrier_c, c_player_pos[idx]),
-                        )
-                        pass_vec = c_player_pos[idx] - carrier_c
-                        pass_len = float(np.linalg.norm(pass_vec))
-                        if pass_len > 1e-4:
-                            pass_dir = pass_vec / pass_len
-                            perp_cand = np.array([-pass_dir[1], pass_dir[0]], dtype=np.float64)
-                            to_blocker = c_player_pos[best_blocker] - carrier_c
-                            perp_proj = float(np.dot(to_blocker, perp_cand))
-                            n_perp = -perp_cand if perp_proj > 0.0 else perp_cand
-                            lat_unmask_disp = float(np.dot(c_player_pos[idx] - c_prev_pos[idx], n_perp))
-                            if lat_unmask_disp > 0.0:
-                                step_rewards[idx] += support_mult * rew.unmask_lateral_scale * lat_unmask_disp
-
-            # 3. State B: Ball is Loose
-            elif self.ball_holder is None:
-                # Keep non-chasing center backs compact (150u separation) guarding the central channel
-                y_shift_loose = float(np.clip(0.15 * (float(c_ball_pos[1]) - 420.0), -35.0, 35.0))
-                def1_loose_y = 420.0 + y_shift_loose - 75.0
-                def2_loose_y = 420.0 + y_shift_loose + 75.0
-                role_anchors = {
-                    "def_1": np.array([np.clip(0.48 * c_bx + 90.0, 200.0, 640.0), def1_loose_y], dtype=np.float64),
-                    "def_2": np.array([np.clip(0.48 * c_bx + 90.0, 200.0, 640.0), def2_loose_y], dtype=np.float64),
-                    "mid_1": np.array([np.clip(0.62 * c_bx + 220.0, 360.0, 960.0), 200.0], dtype=np.float64),
-                    "mid_2": np.array([np.clip(0.62 * c_bx + 220.0, 360.0, 960.0), 640.0], dtype=np.float64),
-                    "atk_1": np.array([np.clip(0.62 * c_bx + 420.0, 600.0, 1180.0), 420.0], dtype=np.float64),
-                }
-
-                # Case B1: Teammate pass in flight
-                if self.ball_kicked_in_flight and self.last_ball_team == team_id:
-                    candidates = [i for i in team_fields if i != self.last_ball_holder]
-                    if len(candidates) > 0:
-                        ray_end = self.ball_pos + self.ball_vel * 1.5
-                        best_rx = min(
-                            candidates,
-                            key=lambda i: self._point_to_segment_dist(self.player_pos[i], self.ball_pos, ray_end),
-                        )
-                        # Compute optimal lead intercept point p_intercept along [ball_pos, ball_pos + 0.8 * ball_vel]
-                        v_ball_norm = float(np.linalg.norm(self.ball_vel))
-                        if v_ball_norm > 1e-3:
-                            u_b = self.ball_vel / v_ball_norm
-                            d_rx = self.player_pos[best_rx] - self.ball_pos
-                            t_proj = float(np.dot(d_rx, u_b))
-                            t_target = float(np.clip(t_proj + 60.0, 0.0, 0.8 * v_ball_norm))
-                            p_intercept = self.ball_pos + u_b * t_target
-                        else:
-                            p_intercept = self.ball_pos.copy()
-
-                        for idx in team_fields:
-                            if idx == best_rx:
-                                c_p_int, _, _ = self._to_team_canonical(p_intercept, np.zeros(2), 0.0, team_id)
-                                self.active_tactical_target_canon[idx] = c_p_int.copy()
-                                if not any_teleport:
-                                    player_disp = self.player_pos[idx] - adj_prev_pos[idx]
-                                    to_int_vec = p_intercept - adj_prev_pos[idx]
-                                    dist_to_int_prev = max(1e-6, float(np.linalg.norm(to_int_vec)))
-                                    u_to_int = to_int_vec / dist_to_int_prev
-                                    active_chase_closed = float(np.dot(player_disp, u_to_int))
-                                    if float(curr_player_ball_dists[idx]) > 55.0:
-                                        step_rewards[idx] += press_mult * rew.loose_ball_chase_scale * max(0.0, active_chase_closed)
-                                to_int = p_intercept - self.player_pos[idx]
-                                d_int = float(np.linalg.norm(to_int))
-                                if d_int > 1e-6:
-                                    facing_vec = np.array(
-                                        [math.cos(self.player_angle[idx]), math.sin(self.player_angle[idx])],
-                                        dtype=np.float64,
-                                    )
-                                    cos_align = float(np.dot(facing_vec, to_int / d_int))
-                                    if cos_align >= 0.9781:  # within +/- 12 degrees
-                                        align_factor = 1.0
-                                    elif cos_align > 0.0:
-                                        align_factor = cos_align
-                                    else:
-                                        align_factor = 0.0
-                                    if align_factor > 0.0:
-                                        step_rewards[idx] += press_mult * rew.ball_heading_align_scale * align_factor
-                            else:
-                                anc = role_anchors[dynamic_role_key[idx]]
-                                self.active_tactical_target_canon[idx] = anc.copy()
-                                w_mode = float(rew.role_zone_anchor_scale)
-                                d_curr_anc = max(0.0, float(np.linalg.norm(c_player_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                                phi_curr = -w_mode * d_curr_anc
-                                if not any_teleport and self.prev_tactical_mode[idx] == 1:
-                                    d_prev_anc = max(0.0, float(np.linalg.norm(c_prev_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                                    phi_prev = -w_mode * d_prev_anc
-                                    step_rewards[idx] += gamma * phi_curr - phi_prev
-                                self.prev_tactical_potential[idx] = phi_curr
-                                self.prev_tactical_mode[idx] = 1
-                    else:
-                        pass
-                else:
-                    # Case B2: Contested / Unclaimed Loose Ball
-                    ranked = ranked_loose_fields
-                    for rank_i, idx in enumerate(ranked):
-                        is_chaser = (rank_i == 0) or (rank_i == 1 and float(curr_player_ball_dists[idx]) <= 280.0)
-                        if is_chaser:
-                            self.active_tactical_target_canon[idx] = c_ball_pos.copy()
-                            w = (1.0 if rank_i == 0 else 0.45) * press_mult
-                            if not any_teleport:
-                                player_disp = self.player_pos[idx] - adj_prev_pos[idx]
-                                to_ball_vec = self.ball_pos - adj_prev_pos[idx]
-                                dist_to_ball_prev = max(1e-6, float(np.linalg.norm(to_ball_vec)))
-                                u_to_ball = to_ball_vec / dist_to_ball_prev
-                                active_chase_closed = float(np.dot(player_disp, u_to_ball))
-                                # Reward active chase continuously all the way until pickup!
-                                d_to_ball_curr = float(curr_player_ball_dists[idx])
-                                if d_to_ball_curr > mech.pickup_distance:
-                                    step_rewards[idx] += w * rew.loose_ball_chase_scale * max(0.0, active_chase_closed)
-                                    # Continuous proximity gravitational pull within 95u to eliminate hesitation / deadlock near loose ball
-                                    if d_to_ball_curr <= 95.0:
-                                        prox_factor = max(0.0, 1.0 - (d_to_ball_curr - mech.pickup_distance) / (95.0 - mech.pickup_distance))
-                                        step_rewards[idx] += w * rew.loose_ball_proximity_scale * prox_factor
-                            to_ball = self.ball_pos - self.player_pos[idx]
-                            d_ball = float(np.linalg.norm(to_ball))
-                            if d_ball > 1e-6:
-                                facing_vec = np.array(
-                                    [math.cos(self.player_angle[idx]), math.sin(self.player_angle[idx])],
-                                    dtype=np.float64,
-                                )
-                                cos_align = float(np.dot(facing_vec, to_ball / d_ball))
-                                if cos_align >= 0.9781:  # within +/- 12 degrees
-                                    align_factor = 1.0
-                                elif cos_align > 0.0:
-                                    align_factor = cos_align
-                                else:
-                                    align_factor = 0.0
-                                if align_factor > 0.0:
-                                    step_rewards[idx] += w * rew.ball_heading_align_scale * align_factor
-                        else:
-                            anc = role_anchors[dynamic_role_key[idx]]
-                            self.active_tactical_target_canon[idx] = anc.copy()
-                            w_mode = float(rew.role_zone_anchor_scale)
-                            d_curr_anc = max(0.0, float(np.linalg.norm(c_player_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                            phi_curr = -w_mode * d_curr_anc
-                            if not any_teleport and self.prev_tactical_mode[idx] == 1:
-                                d_prev_anc = max(0.0, float(np.linalg.norm(c_prev_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                                phi_prev = -w_mode * d_prev_anc
-                                step_rewards[idx] += gamma * phi_curr - phi_prev
-                            self.prev_tactical_potential[idx] = phi_curr
-                            self.prev_tactical_mode[idx] = 1
-                            # non_chaser_ball_repulsion is disabled on loose balls
-
-            # 4. State C: Opponent Has the Ball
             else:
-                # Keep non-pressing center backs compact (150u separation) directly shielding the goal mouth
-                y_shift_opp = float(np.clip(0.18 * (float(c_ball_pos[1]) - 420.0), -40.0, 40.0))
-                def1_opp_y = 420.0 + y_shift_opp - 75.0
-                def2_opp_y = 420.0 + y_shift_opp + 75.0
-                cover_anchors = {
-                    "def_1": np.array([np.clip(0.46 * c_bx + 80.0, 185.0, 600.0), def1_opp_y], dtype=np.float64),
-                    "def_2": np.array([np.clip(0.46 * c_bx + 80.0, 185.0, 600.0), def2_opp_y], dtype=np.float64),
-                    "mid_1": np.array([np.clip(0.58 * c_bx + 190.0, 310.0, 860.0), 210.0], dtype=np.float64),
-                    "mid_2": np.array([np.clip(0.58 * c_bx + 190.0, 310.0, 860.0), 630.0], dtype=np.float64),
-                    "atk_1": np.array([np.clip(0.58 * c_bx + 380.0, 500.0, 1080.0), 420.0], dtype=np.float64),
-                }
-
-                ranked = sorted(team_fields, key=_effective_chase_dist)
-                press_radius_2nd = 320.0 if score_diff < 0 else 260.0
-                for rank_i, idx in enumerate(ranked):
-                    d_curr = float(curr_player_ball_dists[idx])
-                    if rank_i == 0 or (rank_i == 1 and d_curr <= press_radius_2nd):
-                        self.active_tactical_target_canon[idx] = c_ball_pos.copy()
-                        w = (1.0 if rank_i == 0 else 0.6) * press_mult
-                        if not any_teleport:
-                            dist_closed = float(adj_prev_player_ball_dists[idx]) - d_curr
-                            step_rewards[idx] += w * rew.presser_approach_scale * dist_closed
-                        to_ball = self.ball_pos - self.player_pos[idx]
-                        if d_curr > 1e-6:
-                            facing_vec = np.array(
-                                [
-                                    math.cos(self.player_angle[idx]),
-                                    math.sin(self.player_angle[idx]),
-                                ],
-                                dtype=np.float64,
-                            )
-                            cos_align = float(np.dot(facing_vec, to_ball / d_curr))
-                            if cos_align > 0.0:
-                                step_rewards[idx] += w * rew.ball_heading_align_scale * cos_align
-                    else:
-                        anc = cover_anchors[dynamic_role_key[idx]]
-                        self.active_tactical_target_canon[idx] = anc.copy()
-                        w_mode = float(cover_mult * rew.cover_approach_scale)
-                        d_curr_anc = max(0.0, float(np.linalg.norm(c_player_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                        phi_curr = -w_mode * d_curr_anc
-                        if not any_teleport and self.prev_tactical_mode[idx] == 2:
-                            d_prev_anc = max(0.0, float(np.linalg.norm(c_prev_pos[idx] - anc)) - rew.pocket_deadzone_radius)
-                            phi_prev = -w_mode * d_prev_anc
-                            step_rewards[idx] += gamma * phi_curr - phi_prev
-                        self.prev_tactical_potential[idx] = phi_curr
-                        self.prev_tactical_mode[idx] = 2
-                        d_ball = float(curr_player_ball_dists[idx])
-                        if d_ball < rew.non_chaser_ball_repulsion_radius:
-                            step_rewards[idx] -= rew.non_chaser_ball_repulsion_scale * (
-                                1.0 - d_ball / rew.non_chaser_ball_repulsion_radius
-                            )
-
-            # Active GK-Buffer Obstruction Penalty (Only After Enemy GK Holds the Ball):
-            opp_keeper_idx = self._team_keeper_idx(1 - team_id)
-            if self.ball_holder == opp_keeper_idx and self.ball_hold_timer >= 0.15:
-                for idx in team_fields:
-                    d_to_enemy_goal = float(np.linalg.norm(c_player_pos[idx] - enemy_goal_c_canon))
-                    if d_to_enemy_goal < self.cfg.mechanics.gk_hold_opponent_buffer + 5.0:
-                        # Check if player is trying to drive toward enemy goal center instead of vacating the buffer
-                        to_goal_c = enemy_goal_c_canon - c_player_pos[idx]
-                        u_goal = to_goal_c / max(1e-6, d_to_enemy_goal)
-                        facing_c = np.array(
-                            [math.cos(c_player_angle[idx]), math.sin(c_player_angle[idx])],
-                            dtype=np.float64,
+                presser = min(team_fields, key=lambda i: float(ball_dists[i]))
+                for i in team_fields:
+                    if i == presser:
+                        phi_curr[i] = -rew.def_press_potential_weight * (
+                            float(ball_dists[i]) * inv_max_dist
                         )
-                        if float(np.dot(facing_c, u_goal)) > 0.35:
-                            step_rewards[idx] -= rew.gk_buffer_obstruction_pen
+                    else:
+                        px, py = float(pos[i, 0]), float(pos[i, 1])
+                        best_o = min(opp_fields, key=lambda o: float(dist_mat[i, o]))
+                        ox, oy = float(pos[best_o, 0]), float(pos[best_o, 1])
+                        cov_x = ox + 0.35 * (own_gx - ox)
+                        cov_y = oy + 0.35 * (own_gy - oy)
+                        d_cov = math.hypot(px - cov_x, py - cov_y)
+                        sep_pen = 0.0
+                        for j in team_fields:
+                            if j != i:
+                                d_ij = float(dist_mat[i, j])
+                                if d_ij < 125.0:
+                                    ov = 1.0 - d_ij / 125.0
+                                    sep_pen += ov * ov
+                        phi_curr[i] = (
+                            -rew.def_cover_potential_weight * (d_cov * inv_max_dist)
+                            - rew.teammate_sep_potential_weight * sep_pen
+                        )
 
-            # 5. Keeper Goal-Line Positioning
-            own_goal_c = np.array([0.0, 420.0], dtype=np.float64)
-            ray = c_ball_pos - own_goal_c
-            ray_norm = max(1e-6, float(np.linalg.norm(ray)))
-
-            k_angle_c = float(c_player_angle[keeper_idx])
-            k_facing_c = np.array([math.cos(k_angle_c), math.sin(k_angle_c)], dtype=np.float64)
-            to_ball_k = c_ball_pos - c_player_pos[keeper_idx]
-            d_ball_k = float(np.linalg.norm(to_ball_k))
-            cos_k_ball = (
-                float(np.dot(k_facing_c, to_ball_k / d_ball_k)) if d_ball_k > 1e-6 else 1.0
+            # Goalkeeper continuous bisector potential
+            ray_x = bx - own_gx
+            ray_y = by - own_gy
+            ray_norm = max(1e-6, math.hypot(ray_x, ray_y))
+            t_depth = _fast_clip((1400.0 - ray_norm) / (1400.0 - 420.0), 0.0, 1.0)
+            target_depth = 38.0 + (85.0 - 38.0) * t_depth
+            bis_x = own_gx + (ray_x / ray_norm) * target_depth
+            bis_y = _fast_clip(
+                own_gy + (ray_y / ray_norm) * target_depth,
+                phys.goal_y_min + 8.0,
+                phys.goal_y_max - 8.0,
+            )
+            if own_side == SIDE_LEFT:
+                bis_x = _fast_clip(bis_x, 20.0, 95.0)
+            else:
+                bis_x = _fast_clip(bis_x, phys.field_width - 95.0, phys.field_width - 20.0)
+            gk_x, gk_y = float(pos[keeper_idx, 0]), float(pos[keeper_idx, 1])
+            d_bisect = math.hypot(gk_x - bis_x, gk_y - bis_y)
+            loose_in_box = (holder is None) and (ray_norm <= phys.keeper_box_radius + 25.0)
+            d_loose = float(ball_dists[keeper_idx]) if loose_in_box else 0.0
+            phi_curr[keeper_idx] = -rew.keeper_bisect_potential_weight * (
+                (d_bisect + d_loose) / 195.0
             )
 
-            if math.cos(k_angle_c) < -0.15 and self.ball_holder != keeper_idx:
-                step_rewards[keeper_idx] -= rew.keeper_back_wall_face_pen
-
-            if (
-                self.ball_holder is None
-                and ray_norm <= phys.keeper_box_radius + 25.0
-            ):
-                self.active_tactical_target_canon[keeper_idx] = c_ball_pos.copy()
-                if not any_teleport:
-                    player_disp_k = self.player_pos[keeper_idx] - adj_prev_pos[keeper_idx]
-                    to_ball_vec_k = self.ball_pos - adj_prev_pos[keeper_idx]
-                    dist_to_ball_prev_k = max(1e-6, float(np.linalg.norm(to_ball_vec_k)))
-                    u_to_ball_k = to_ball_vec_k / dist_to_ball_prev_k
-                    active_chase_closed_k = float(np.dot(player_disp_k, u_to_ball_k))
-
-                    ball_speed = float(np.linalg.norm(self.ball_vel))
-                    is_lunging = (self.lunge_timer[keeper_idx] > 0.0)
-                    on_lunge_cd = (
-                        self.lunge_cooldown[keeper_idx] > 0.0
-                        and self.lunge_timer[keeper_idx] <= 0.0
-                    )
-                    if is_lunging and ball_speed < 80.0:
-                        chase_mult = rew.keeper_dive_slow_ball_chase_mult
-                    elif on_lunge_cd:
-                        chase_mult = rew.keeper_cooldown_walk_chase_mult
-                    else:
-                        chase_mult = 1.0
-
-                    if active_chase_closed_k > 0.0:
-                        step_rewards[keeper_idx] += (
-                            rew.keeper_sweeper_chase_scale * active_chase_closed_k * chase_mult
-                        )
-                    dist_closed_k = float(adj_prev_player_ball_dists[keeper_idx]) - float(
-                        curr_player_ball_dists[keeper_idx]
-                    )
-                    if dist_closed_k > 0.0:
-                        step_rewards[keeper_idx] += rew.keeper_fetch_box_scale * dist_closed_k * chase_mult
-                    else:
-                        step_rewards[keeper_idx] += rew.keeper_fetch_box_scale * dist_closed_k
-
-                    # Post-Lunge Freeze / Waiting Penalty:
-                    if (
-                        on_lunge_cd
-                        and dist_closed_k < 0.5
-                        and float(curr_player_ball_dists[keeper_idx]) > mech.pickup_distance
-                    ):
-                        step_rewards[keeper_idx] -= rew.keeper_cooldown_stall_pen
-
-                # Per-Step Active Semicircle Shrink Penalty:
-                own_side = int(self.team_side[team_id])
-                if (
-                    ray_norm <= phys.keeper_box_radius + phys.ball_radius
-                    and self.active_box_radius[own_side] < phys.keeper_box_radius - 1.0
-                ):
-                    shrink_frac = float(
-                        np.clip(
-                            1.0 - (self.active_box_radius[own_side] / phys.keeper_box_radius),
-                            0.0,
-                            1.0,
-                        )
-                    )
-                    step_rewards[keeper_idx] -= (
-                        rew.keeper_box_shrink_pen_scale * (0.5 + 1.5 * shrink_frac)
-                    )
-
-                if cos_k_ball >= 0.9781:
-                    step_rewards[keeper_idx] += rew.ball_heading_align_scale
-                elif cos_k_ball > 0.0:
-                    step_rewards[keeper_idx] += rew.ball_heading_align_scale * cos_k_ball
-                # Urgency penalty every step loose ball sits in GK box (flat Frame-1 penalty + ramp)
-                step_rewards[keeper_idx] -= (
-                    0.015
-                    + 0.025
-                    * (
-                        self.box_loose_ball_timer
-                        / max(1e-6, self.cfg.mechanics.keeper_box_loose_max_time)
-                    )
-                )
-            else:
-                # Dynamic bisector depth scaling (38.0u near midfield/deep down to 85.0u as opponent approaches within 420.0u)
-                t_depth = float(np.clip((1400.0 - ray_norm) / (1400.0 - 420.0), 0.0, 1.0))
-                target_depth = 38.0 + (85.0 - 38.0) * t_depth
-                raw_ideal = own_goal_c + (ray / ray_norm) * target_depth
-                ideal_k_pos = np.array(
-                    [
-                        np.clip(raw_ideal[0], 20.0, 95.0),
-                        np.clip(raw_ideal[1], phys.goal_y_min + 8.0, phys.goal_y_max - 8.0),
-                    ],
-                    dtype=np.float64,
-                )
-                self.active_tactical_target_canon[keeper_idx] = ideal_k_pos.copy()
-                w_mode = float(rew.keeper_anchor_approach_scale)
-                d_curr_k_ideal = float(np.linalg.norm(c_player_pos[keeper_idx] - ideal_k_pos))
-                phi_curr = -w_mode * d_curr_k_ideal
-                if not any_teleport and self.prev_tactical_mode[keeper_idx] == 3:
-                    d_prev_k_ideal = float(np.linalg.norm(c_prev_pos[keeper_idx] - ideal_k_pos))
-                    phi_prev = -w_mode * d_prev_k_ideal
-                    delta_ideal = d_prev_k_ideal - d_curr_k_ideal
-                    # Gate positive reward on facing field (cos >= 0) or retreat (delta <= 0)
-                    if delta_ideal <= 0.0 or math.cos(k_angle_c) >= 0.0:
-                        step_rewards[keeper_idx] += gamma * phi_curr - phi_prev
-                self.prev_tactical_potential[keeper_idx] = phi_curr
-                self.prev_tactical_mode[keeper_idx] = 3
-
-                d_curr_k_ideal = float(np.linalg.norm(c_player_pos[keeper_idx] - ideal_k_pos))
-                dist_from_goal = float(np.linalg.norm(c_player_pos[keeper_idx] - own_goal_c))
-                if self.ball_holder != keeper_idx and dist_from_goal <= rew.keeper_edge_camp_radius:
-                    step_rewards[keeper_idx] += (
-                        rew.keeper_angle_track_scale
-                        * max(0.0, 1.0 - d_curr_k_ideal / 70.0)
-                        * (0.25 + 0.75 * max(0.0, cos_k_ball))
-                    )
-
-                # Semicircle Edge-Camping Penalty (> keeper_edge_camp_radius units from own goal center)
-                if dist_from_goal > rew.keeper_edge_camp_radius and self.ball_holder != keeper_idx:
-                    excess = (dist_from_goal - rew.keeper_edge_camp_radius) / max(
-                        1.0, phys.keeper_box_radius - rew.keeper_edge_camp_radius
-                    )
-                    step_rewards[keeper_idx] -= rew.keeper_edge_camp_pen * (
-                        excess + 0.5 * excess * excess
-                    )
-
-            # 6. Margin-Gated Soft Line-Ordering Shaping
-            if self.ball_holder is None:
-                primary_chaser_idx = self.primary_loose_ball_chaser[team_id]
-            elif holder_team != team_id:
-                primary_chaser_idx = ranked[0] if len(ranked) > 0 else -1
-            else:
-                primary_chaser_idx = -1
-
-            if mid_indices:
-                max_mid_x = max(float(c_player_pos[m, 0]) for m in mid_indices)
-                for d_idx in def_indices:
-                    if d_idx != self.ball_holder and d_idx != primary_chaser_idx:
-                        d_x = float(c_player_pos[d_idx, 0])
-                        if d_x > max_mid_x + 45.0:
-                            step_rewards[d_idx] -= rew.line_order_pen_scale
-                            if not any_teleport:
-                                retreat_dist = float(c_prev_pos[d_idx, 0]) - d_x
-                                if retreat_dist > 0.0:
-                                    step_rewards[d_idx] += rew.role_zone_anchor_scale * retreat_dist
-
-            if atk_indices:
-                atk_x = float(c_player_pos[atk_indices[0], 0])
-                for m_idx in mid_indices:
-                    if m_idx != self.ball_holder and m_idx != primary_chaser_idx:
-                        m_x = float(c_player_pos[m_idx, 0])
-                        if m_x > atk_x + 60.0:
-                            step_rewards[m_idx] -= 0.5 * rew.line_order_pen_scale
+        if not any_teleport:
+            step_rewards += gamma * phi_curr - self.prev_tactical_potential
+        self.prev_tactical_potential[:] = phi_curr
 
     def _emit_event(
         self,
@@ -4826,18 +2757,21 @@ class FootballParallelEnv(ParallelEnv):
         final_score = max(0.0, (base_score + two_sided_bonus) * closeness_mult - penalties)
         return round(float(final_score), 2)
 
-    def _maybe_export_replay(self) -> Optional[str]:
-        """Export the full 60 Hz JSON trajectory if `interest_score >= threshold`."""
-        interest_score = self.compute_interest_score()
-        if interest_score < self.cfg.replay.interest_threshold:
-            return None
-
+    def _write_replay_to_disk(
+        self,
+        match_id: int,
+        generation: int,
+        interest_score: float,
+        stats: Dict[str, Any],
+        frames: List[Dict[str, Any]],
+    ) -> str:
+        """Serialize and write a 60 Hz JSON replay trajectory to disk."""
         os.makedirs(self.cfg.replay.save_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         score_str = f"{interest_score:.1f}".replace(".", "_")
-        if self.current_match_id > 0:
+        if match_id > 0:
             filename = (
-                f"match_{self.current_match_id:04d}_gen{self.current_generation:04d}"
+                f"match_{match_id:04d}_gen{generation:04d}"
                 f"_score{score_str}_{timestamp}.json"
             )
         else:
@@ -4845,7 +2779,7 @@ class FootballParallelEnv(ParallelEnv):
         filepath = os.path.join(self.cfg.replay.save_dir, filename)
 
         highlights = []
-        for fr in self.replay_frames:
+        for fr in frames:
             for ev in fr.get("events", []):
                 if ev.get("type") != "TACKLE FAILED!":
                     highlights.append(
@@ -4864,8 +2798,8 @@ class FootballParallelEnv(ParallelEnv):
 
         metadata_block = {
             "env_name": self.metadata["name"],
-            "match_id": self.current_match_id,
-            "generation": self.current_generation,
+            "match_id": match_id,
+            "generation": generation,
             "timestamp": timestamp,
             "interest_score": round(interest_score, 2),
             "physics_hz": self.cfg.physics.physics_hz,
@@ -4880,7 +2814,7 @@ class FootballParallelEnv(ParallelEnv):
             "vision_fov_deg": self.cfg.vision.fov_deg,
             "vision_max_range": self.cfg.vision.max_range,
             "agents": self.possible_agents,
-            "final_stats": self.stats,
+            "final_stats": stats,
             "highlights": highlights,
         }
 
@@ -4890,14 +2824,71 @@ class FootballParallelEnv(ParallelEnv):
             f.write("{\n  \"metadata\": ")
             f.write(meta_indented.lstrip())
             f.write(",\n  \"frames\": [\n")
-            last_idx = len(self.replay_frames) - 1
-            for i, fr in enumerate(self.replay_frames):
+            last_idx = len(frames) - 1
+            for i, fr in enumerate(frames):
                 suffix = ",\n" if i < last_idx else "\n"
                 f.write("    " + json.dumps(fr) + suffix)
             f.write("  ]\n}\n")
 
         self.last_saved_replay_path = filepath
         return filepath
+
+    def _maybe_export_replay(self) -> Optional[str]:
+        """Export or defer the full 60 Hz JSON trajectory if `interest_score >= threshold`."""
+        interest_score = self.compute_interest_score()
+        if interest_score < self.cfg.replay.interest_threshold:
+            return None
+
+        if self.cfg.replay.save_best_only:
+            cur_goals = int(self.stats.get("goals", 0))
+            if self._deferred_replay is None or (
+                interest_score,
+                cur_goals,
+            ) >= (
+                float(self._deferred_replay["interest_score"]),
+                int(self._deferred_replay["stats"].get("goals", 0)),
+            ):
+                self._deferred_replay = {
+                    "match_id": self.current_match_id,
+                    "generation": self.current_generation,
+                    "interest_score": interest_score,
+                    "stats": copy.deepcopy(self.stats),
+                    "frames": list(self.replay_frames),
+                }
+            self.last_saved_replay_path = None
+            return None
+
+        return self._write_replay_to_disk(
+            match_id=self.current_match_id,
+            generation=self.current_generation,
+            interest_score=interest_score,
+            stats=self.stats,
+            frames=self.replay_frames,
+        )
+
+    def export_deferred_replay(self) -> Optional[str]:
+        """Write the deferred replay snapshot to disk when selected as the winning worker."""
+        if self._deferred_replay is not None:
+            payload = self._deferred_replay
+            self._deferred_replay = None
+            return self._write_replay_to_disk(
+                match_id=int(payload["match_id"]),
+                generation=int(payload["generation"]),
+                interest_score=float(payload["interest_score"]),
+                stats=payload["stats"],
+                frames=payload["frames"],
+            )
+        if self.replay_frames:
+            interest_score = self.compute_interest_score()
+            if interest_score >= self.cfg.replay.interest_threshold:
+                return self._write_replay_to_disk(
+                    match_id=self.current_match_id,
+                    generation=self.current_generation,
+                    interest_score=interest_score,
+                    stats=self.stats,
+                    frames=self.replay_frames,
+                )
+        return None
 
     def get_centralized_state(self) -> np.ndarray:
         """Compute the (12, 54) canonical centralized state matrix for the CTDE Critic."""
@@ -4962,7 +2953,12 @@ class FootballParallelEnv(ParallelEnv):
 
         return central_state
 
-    def _build_agent_info(self, agent: str, central_state: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    def _build_agent_info(
+        self,
+        agent: str,
+        central_state: Optional[np.ndarray] = None,
+        interest_score: Optional[float] = None,
+    ) -> Dict[str, Any]:
         idx = self.agent_to_idx[agent]
         team = int(self.player_team[idx])
         role_int = int(self.player_role[idx])
@@ -4975,6 +2971,11 @@ class FootballParallelEnv(ParallelEnv):
         else:
             role_str = "atk"
         c_state = central_state if central_state is not None else self.get_centralized_state()[idx]
+        if interest_score is None:
+            is_done = (len(self.agents) == 0) or (self.rl_step_count >= self.cfg.physics.max_rl_steps)
+            ep_interest = self.compute_interest_score() if is_done else 0.0
+        else:
+            ep_interest = float(interest_score)
         return {
             "team": team,
             "role": role_str,
@@ -4984,7 +2985,7 @@ class FootballParallelEnv(ParallelEnv):
             "physics_frame": self.physics_frame_count,
             "match_id": self.current_match_id,
             "generation": self.current_generation,
-            "interest_score": self.compute_interest_score(),
+            "interest_score": ep_interest,
             "final_stats": dict(self.stats),
             "last_saved_replay": self.last_saved_replay_path,
             "central_state": c_state,

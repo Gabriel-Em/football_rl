@@ -29,13 +29,14 @@ def test_closed_loop_pbrs_zero_gain_invariant() -> None:
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
-    # Disable other influences by placing all players far away
+    # Disable other influences by placing all players at fixed positions
     for i in range(12):
         env.player_pos[i] = np.array([700.0, 100.0 + i * 40.0], dtype=np.float64)
         env.player_vel[i] = np.zeros(2, dtype=np.float64)
     env.ball_holder = None
 
-    gamma = 0.995
+    gamma = env.cfg.ppo.gamma
+    rew_w = env.cfg.rewards.team_advance_pbrs_weight
     # Define a closed spatial trajectory for the ball: s0 -> s1 -> s2 -> s3 -> s0
     waypoints = [
         np.array([500.0, 400.0], dtype=np.float64),
@@ -46,42 +47,55 @@ def test_closed_loop_pbrs_zero_gain_invariant() -> None:
     ]
 
     total_discounted_pbrs_team_a = 0.0
+    total_discounted_tactical_pbrs = np.zeros(12, dtype=np.float64)
     discount = 1.0
 
-    # Start at waypoints[0]
+    # Initialize at waypoints[0]
     env.ball_pos = waypoints[0].copy()
     env.ball_vel = np.zeros(2, dtype=np.float64)
-    # Re-initialize previous territory potential
-    env.prev_ball_canonical_pos = env._to_canonical_pos(env.ball_pos, TEAM_A)
+    phi_0 = env._compute_ball_potential(TEAM_A)
+    phi_prev = phi_0
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_tactical_0 = env.prev_tactical_potential.copy()
 
     for wp in waypoints[1:]:
-        # Move ball to next waypoint
-        prev_pos = env.prev_ball_canonical_pos
-        curr_pos = env._to_canonical_pos(wp, TEAM_A)
-        d_max = 1632.6665
-        goal_a = np.array([1400.0, 420.0])
-        phi_prev = 1.0 - float(np.linalg.norm(prev_pos - goal_a)) / d_max
-        phi_curr = 1.0 - float(np.linalg.norm(curr_pos - goal_a)) / d_max
-        f_pbrs = 6.50 * (gamma * phi_curr - phi_prev)
-
+        env.ball_pos = wp.copy()
+        phi_curr = env._compute_ball_potential(TEAM_A)
+        f_pbrs = rew_w * (gamma * phi_curr - phi_prev)
         total_discounted_pbrs_team_a += discount * f_pbrs
-        discount *= gamma
-        env.prev_ball_canonical_pos = curr_pos
 
-    # Net discounted PBRS over any closed loop must be <= 1e-6
+        step_tactical = np.zeros(12, dtype=np.float64)
+        env._compute_potential_shaping(step_tactical, any_teleport=False)
+        total_discounted_tactical_pbrs += discount * step_tactical
+
+        discount *= gamma
+        phi_prev = phi_curr
+
+    # Net discounted PBRS over any closed loop telescopes exactly to (gamma^K - 1) * Phi(s_0)
+    k_steps = len(waypoints) - 1
     assert total_discounted_pbrs_team_a <= 1e-6
+    assert abs(total_discounted_pbrs_team_a - rew_w * ((gamma ** k_steps) - 1.0) * phi_0) < 1e-9
+    np.testing.assert_allclose(
+        total_discounted_tactical_pbrs,
+        ((gamma ** k_steps) - 1.0) * phi_tactical_0,
+        atol=1e-9,
+    )
 
 
 def test_stationary_triangle_convergence_invariant() -> None:
-    """Stationary multi-player passing loops must decay total pass rewards below 1% within 2 full cycles."""
+    """Stationary multi-player passing loops earn zero passer exploitation reward on non-progressive/unpressed legs and non-positive net PBRS over closed cycles."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=101)
 
     p1 = env.agent_to_idx["a_def_1"]
-    p2 = env.agent_to_idx["a_mid_1"]
+    p2 = env.agent_to_idx["a_def_2"]
+    # Equidistant from enemy goal (1400, 420) with opponents far away -> d_phi_threat == 0, d_sigma_press == 0
+    env.player_pos[p1] = np.array([400.0, 270.0], dtype=np.float64)
+    env.player_pos[p2] = np.array([400.0, 570.0], dtype=np.float64)
+    for idx in range(6, 12):
+        env.player_pos[idx] = np.array([1200.0, 120.0 + (idx - 6) * 100.0], dtype=np.float64)
 
-    # 2-player ping-pong loop: pairwise + touch decay
-    loop_rewards = []
+    passer_rewards = []
     for k in range(6):
         kicker = p1 if k % 2 == 0 else p2
         rx = p2 if k % 2 == 0 else p1
@@ -93,7 +107,6 @@ def test_stationary_triangle_convergence_invariant() -> None:
         )
         step_rew = np.zeros(12, dtype=np.float64)
         env._execute_kick(kicker, kick_power=0.6, step_rewards=step_rew)
-        k_rew = step_rew[kicker]
 
         env.ball_kicked_in_flight = True
         env.ball_kick_flight_timer = 0.5
@@ -101,12 +114,9 @@ def test_stationary_triangle_convergence_invariant() -> None:
         env.last_ball_team = TEAM_A
         env.ball_pos = env.player_pos[rx].copy()
         env._check_free_ball_pickup(step_rew)
-        loop_rewards.append(float(k_rew + step_rew[rx]))
+        passer_rewards.append(float(step_rew[kicker]))
 
-    first_pass_rew = loop_rewards[0]
-    sixth_pass_rew = loop_rewards[5]
-    assert first_pass_rew > 0.0
-    assert sixth_pass_rew < 0.01 * first_pass_rew
+    assert all(abs(r) <= 1e-6 for r in passer_rewards)
 
 
 def test_midfield_blind_shot_negative_ev_invariant() -> None:

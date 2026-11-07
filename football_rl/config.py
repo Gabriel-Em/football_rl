@@ -66,8 +66,8 @@ class PhysicsConfig:
     # Player Kinematics (Base defaults + Role-Specific Profiles)
     player_radius: float = 18.0
     player_max_speed: float = 185.0
-    def_max_speed: float = 182.0
-    mid_max_speed: float = 195.0
+    def_max_speed: float = 188.0
+    mid_max_speed: float = 192.0
     atk_max_speed: float = 190.0
     keeper_max_speed: float = 180.0
     player_max_turn_rate_deg: float = 270.0
@@ -78,19 +78,19 @@ class PhysicsConfig:
     max_wall_pass_flight_time: float = 3.5        # Max flight time (s) for long GK/defender side-wall bank passes
     keeper_smother_cpa_radius: float = 30.0       # CPA threshold radius (u) for keeper dive speed clamping and smother saves
 
-    # Ball Kinematics (Higher Shot/Pass Strength Limits & Lower Friction)
+    # Ball Kinematics
     ball_radius: float = 10.0
-    ball_min_kick_speed: float = 260.0
-    ball_max_launch_speed: float = 640.0  # Attacker max launch speed
-    ball_kick_speed_span: float = 380.0   # 260.0 + power_norm * 380.0 -> 640.0
-    def_max_kick_speed: float = 510.0
-    mid_max_kick_speed: float = 560.0
+    ball_min_kick_speed: float = 130.0
+    ball_max_launch_speed: float = 640.0  # Maximum launch speed
+    ball_kick_speed_span: float = 510.0   # 130.0 + power_norm * 510.0 -> 640.0
+    def_max_kick_speed: float = 560.0
+    mid_max_kick_speed: float = 600.0
     atk_max_kick_speed: float = 640.0
     keeper_max_kick_speed: float = 640.0
-    def_shot_jitter_rad: float = math.radians(7.5)   # applied only when power_norm > 0.65
-    mid_shot_jitter_rad: float = math.radians(3.8)   # applied only when power_norm > 0.65
-    atk_shot_jitter_rad: float = 0.0                 # pinpoint laser accuracy at all power levels
-    ball_friction_decel: float = 155.0               # passes/shots carry across 1400x840 pitch
+    def_shot_jitter_rad: float = 0.0
+    mid_shot_jitter_rad: float = 0.0
+    atk_shot_jitter_rad: float = 0.0
+    ball_friction_decel: float = 155.0               # Linear friction deceleration across 1400x840 pitch
     ball_wall_restitution: float = 0.85
 
     # Tick Rate & Frame Skipping
@@ -106,9 +106,9 @@ class PhysicsConfig:
     half_physics_frames: int = 5400  # 90.0s * 60 Hz
 
     # Throttle Deadzone & Backpedal Multipliers
-    throttle_deadzone: float = 0.15         # |throttle_raw| <= 0.15 -> speed = 0.0 (stand still)
-    backpedal_threshold: float = -0.35      # throttle_raw in [-0.35, +0.15] -> speed = 0.0; backpedal if < -0.35
-    field_backpedal_mult: float = 0.50      # throttle_raw = -1.0 -> -0.50 * role_max_speed
+    throttle_deadzone: float = 0.10         # |throttle_raw| <= 0.10 -> speed = 0.0 (stand still)
+    backpedal_threshold: float = -0.10      # throttle_raw in [-0.10, +0.10] -> speed = 0.0; backpedal if < -0.10
+    field_backpedal_mult: float = 0.65      # throttle_raw = -1.0 -> -0.65 * role_max_speed
     keeper_backpedal_mult: float = 0.75     # throttle_raw = -1.0 -> -0.75 * keeper_max_speed
     player_accel_rate: float = 10.5         # Exponential velocity smoothing rate (1/s) for fluid accel/decel
 
@@ -120,10 +120,10 @@ class MechanicsConfig:
     # Ball Pickup & Carrying
     pickup_distance: float = 28.0     # player_radius (18.0) + ball_radius (10.0)
     ball_carry_offset: float = 24.0   # player_pos + facing_vec * 24.0
-    kick_pickup_cooldown: float = 1.0  # Anti-self-dribble cooldown; cleared on other touch
+    kick_pickup_cooldown: float = 0.45  # Anti-self-dribble cooldown; cleared on other touch
     pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
-    pickup_tackle_grace: float = 0.45 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
-    pass_reception_tackle_grace: float = 0.25 # Shielding duration (s) after receiving a teammate pass outside goalmouth
+    pickup_tackle_grace: float = 0.15 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
+    pass_reception_tackle_grace: float = 0.10 # Shielding duration (s) after receiving a teammate pass outside goalmouth
     kick_steer_max_deflection_deg: float = 75.0  # Side-foot pass/clearance angle modulation (+/- 75 deg)
     keeper_smother_cpa_radius: float = 30.0      # CPA threshold radius (u) for keeper dive speed clamping and smother saves
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
@@ -168,7 +168,7 @@ class MechanicsConfig:
     keeper_dive_speed: float = 340.0
     lunge_duration: float = 0.25
     lunge_cooldown: float = 1.8
-    keeper_lunge_cooldown: float = 3.5
+    keeper_lunge_cooldown: float = 1.8
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
     keeper_clear_corridor_length: float = 380.0   # Forward corridor distance (u) to check for blocking opponents (reaches past gk_hold_opponent_buffer=265.0)
@@ -226,166 +226,47 @@ class VisionConfig:
 
 @dataclass(frozen=True)
 class RewardConfig:
-    """Individual and team-shared reward weights."""
+    """Markovian 3-tier individual and team-shared reward weights."""
 
-    # Goal & Shot-on-Target Rewards
-    goal_scorer_ind: float = 5.0
-    atk_goal_scorer_ind: float = 7.5
+    # Tier 1: Objective Discrete Game Events
     goal_team_shared: float = 10.0
     goal_concede_team_shared: float = -10.0
-    own_goal_ind: float = -8.0  # Additional individual penalty on top of -10.0 team penalty (-18.0 total)
-    dangerous_own_goal_kick_pen: float = -3.0  # Option A: Immediate penalty on Frame 0 of kick aimed into own net
-    atk_shot_on_target_ind: float = 2.0        # Increased from 0.7: strong incentive for ATK to shoot on target
-    other_shot_on_target_ind: float = 1.2      # Increased from 0.2: strong incentive for MID/DEF to shoot on target
-    shot_on_target_team: float = 0.3           # Shared team bonus when firing a valid shot on target
-    shot_near_target_mult: float = 0.35        # Fraction of shot reward awarded for near-target shots hitting wall beside goal
-    shot_m_chain_max_dist: float = 420.0       # Maximum distance from goal center for chain multiplier scaling on shots
-    prime_shot_hesitation_pen: float = -0.025  # Per-RL-step penalty when aimed at goal within 320u and not shooting
-
-    # Keeper Save, Off-Target Catch, & Strip
-    keeper_save_ind: float = 5.0
-    keeper_save_team: float = 1.0
-    keeper_harmless_catch_ind: float = 0.5
-    keeper_harmless_catch_team: float = 0.1
-    keeper_strip_ind: float = 0.6
-    keeper_strip_team: float = 0.15
-    keeper_clear_forward_ind: float = 0.4   # Bonus when keeper kicks ball forward out of own box
-    keeper_kick_backward_pen: float = -1.5  # Penalty when keeper kicks ball toward own goal wall
-    keeper_clean_foot_recovery_bonus: float = 0.35 # Extra bonus when GK picks up a loose ball on foot (lunge_timer <= 0.0)
-    keeper_unnecessary_dive_pen: float = -0.25    # Mild penalty when GK triggers dive on a slow/non-threatening ball or when d_cpa <= 28.0u
-    keeper_long_pass_target_max_bonus: float = 1.80 # Max Gaussian trajectory bonus for GK kicking near an unpressed teammate
-    keeper_long_pass_sigma: float = 180.0          # Gaussian accuracy kernel width (in units)
-    keeper_long_pass_max_miss: float = 360.0       # Cutoff distance for Gaussian trajectory reward
-    keeper_wall_bypass_deep_bonus: float = 1.40    # Bonus when GK banks a ball off side wall into open space in opponent half (x_canon >= 700)
-    keeper_hold_urgency_start: float = 2.0         # Seconds before GK hold urgency penalty begins
-    keeper_hold_urgency_scale: float = 0.045       # Max per-step urgency penalty for GK holding ball up to 5.0s
-    keeper_dive_slow_ball_chase_mult: float = 0.30 # Scales down sweeper chase rewards while lunging at slow ball (<80u/s)
-    keeper_cooldown_walk_chase_mult: float = 1.25  # Boosts sweeper chase rewards when walking on cooldown to close gap
-    keeper_cooldown_stall_pen: float = 0.045       # Per-RL-step penalty when GK is on lunge cooldown and waiting instead of walking
-    keeper_box_shrink_pen_scale: float = 0.065     # Per-RL-step penalty scale when active box radius shrinks below nominal
-    keeper_shrunk_box_loss_pen: float = -1.50      # Discrete penalty when opponent claims loose ball inside shrunken box
-
-    # Pass & Role Link-Up Bonuses (Anti-Farming & Progressive)
-    completed_pass_passer_ind: float = 0.0      # Individual reward to passer on pass completion
-    completed_pass_receiver_ind: float = 0.2    # Receive touch bonus
-    completed_pass_team: float = 0.0            # Team reward on pass completion
-    def_breakout_pass_bonus: float = 0.75       # Defender forward breakout pass bonus
-    mid_link_receive_bonus: float = 0.5
-    mid_to_atk_pass_bonus: float = 0.60         # Midfielder to attacker pass bonus
-    pass_to_atk_bonus: float = 0.6
-    midfield_layoff_bonus: float = 0.30         # Midfield backward drops under press
-    goal_assist_ind: float = 4.0                # Individual reward to passer when receiver scores goal
-    goal_assist_window_sec: float = 4.0         # Maximum elapsed time (s) from completed pass to goal for assist
-    pass_target_aim_ind: float = 0.45       # Immediate bonus in _execute_kick when aiming toward open teammate
-    recycle_pass_bonus: float = 0.0         # Reward for recycling possession
-    open_clearance_ind: float = 0.25        # Immediate bonus in _execute_kick when kicking to open pitch corridor
-    blocked_kick_pen: float = -0.85         # Immediate penalty in _execute_kick when kicking into near opponent
-    keeper_wall_clear_bonus: float = 1.25   # Bonus for high-power GK side-wall ricochet clearances past pressed center
-    lead_pass_bonus: float = 1.50           # Bonus for completing pass to teammate running in forward stride (>=90u/s)
-
-    # Progressive Pass & Anti-Exploit Parameters
-    pass_progressive_dx_weight: float = 0.012   # Bonus per unit of canonical X or goal-dist gained (e.g., +200u dx = +2.4)
-    progressive_pass_scale: float = 0.012       # Alias matching pass_progressive_dx_weight
-    recycled_progression_discount: float = 0.15 # Multiplier on progressive dx re-treading territory in same spell
-    triangle_repeat_decay_base: float = 0.30    # Multiplier decay base for repeated triangle passes without fresh ground
-    final_third_prog_threat_mult: float = 1.35  # Boost for progressive passes delivered into d_dest_goal <= 380.0
-    pass_line_break_bonus: float = 0.40        # Bonus per bypassed defender X-coordinate
-    box_angle_pass_bonus: float = 1.15         # Bonus for final-third pass shifting goal angle >= 25 deg around semicircle
-    escape_press_pass_bonus: float = 0.50      # Bonus to passer when passing backward/sideways under pressure to open teammate
-    attacking_layoff_bonus: float = 1.15       # Bonus when attacker in final third lays ball back to oncoming midfielder or cutback
-    give_and_go_bonus: float = 0.70            # Bonus when receiver of return pass has advanced into space since initial pass
-    wall_pass_bonus: float = 0.65              # Bonus for completing an intentional bank pass off the side wall
-    scanned_pass_mult: float = 1.20            # Multiplier on progressive pass bonus when receiver is in passer's vision cone
-    pass_pairwise_decay_base: float = 0.25      # Multiplier decay: (0.25)^k for repeated pair exchanges
-    min_progressive_dx_threshold: float = 30.0  # Minimum canonical dx or goal-dist reduction to qualify as progressive
-
-    # Tiki-Taka Chain Parameters
-    pass_chain_multiplier_coeff: float = 0.30  # Multiplier scale: (1.0 + 0.30 * C_chain)
-    pass_chain_max_count: int = 10             # Cap at 10 passes (max multiplier 4.0x)
-
-    # Kinematic Lead-Pass Targeting
-    pass_lead_tau: float = 0.70                # Lookahead horizon in seconds: p_lead = p + tau * v
-
-    # Defensive Half Ball-Winning Multiplier for DEF
-    def_own_half_tackle_bonus: float = 0.75
-    def_own_half_intercept_bonus: float = 0.5
-
-    # Shot / Pass Intercepted by Opponent
+    goal_scorer_ind: float = 5.0
+    atk_goal_scorer_ind: float = 5.0
+    goal_assist_ind: float = 3.0
+    goal_assist_window_sec: float = 4.0
+    own_goal_ind: float = -5.0
+    atk_shot_on_target_ind: float = 1.0
+    other_shot_on_target_ind: float = 1.0
+    shot_on_target_team: float = 0.2
+    pass_threat_weight: float = 8.0
+    pass_space_weight: float = 0.80
+    lead_pass_bonus: float = 1.00
+    completed_pass_receiver_ind: float = 0.20
+    successful_tackle_tackler_ind: float = 1.2
+    successful_tackle_team: float = 0.25
+    successful_tackle_carrier_ind: float = -0.8
     intercepted_kicker_ind: float = -0.8
-    keeper_deep_turnover_pen: float = -2.0      # Dangerous GK turnover inside own defensive third (interpolates to -0.8 at midfield)
-    intercepted_team: float = -0.2
+    intercepted_team: float = -0.20
+    keeper_save_ind: float = 2.5
+    keeper_save_team: float = 0.5
 
-    # Tackle Outcomes
-    successful_tackle_tackler_ind: float = 1.5
-    successful_tackle_carrier_ind: float = -1.0
-    successful_tackle_team: float = 0.3
-    failed_tackle_in_range_ind: float = -0.10  # RNG fail when tackling an opponent carrier within range
-    failed_tackle_ind: float = -0.30           # Close miss when opponent carrier is within range..near_range
-    reckless_tackle_ind: float = -1.0          # Tackling with 0% chance (no opponent carrier within near_range)
-    reckless_tackle_spam_step_pen: float = -0.03  # Per-RL-step penalty for holding tackle trigger in empty space
-    failed_tackle_team: float = 0.0
+    # Tier 2: Strict Policy-Invariant PBRS Weights
+    team_advance_pbrs_weight: float = 5.0
+    carrier_advance_pbrs_weight: float = 2.0
+    support_potential_weight: float = 0.45
+    def_press_potential_weight: float = 0.50
+    def_cover_potential_weight: float = 0.40
+    teammate_sep_potential_weight: float = 0.25
+    keeper_bisect_potential_weight: float = 0.40
 
-    # Loose Ball Recovery
-    loose_ball_pickup_ind: float = 0.5
-    contested_ball_recovery_bonus: float = 0.40  # Bonus when securing a loose ball contested by nearby opponents (<=65u)
-    loose_ball_pickup_team: float = 0.15
-    first_touch_reception_bonus: float = 0.35  # Discrete bonus when cleanly receiving a pass in flight within 55u
-    keeper_box_recovery_ind: float = 1.2    # Bonus when GK picks up loose ball in own semicircle
-    keeper_sweeper_chase_scale: float = 0.028  # Velocity reward scale for sweeper-keeper actively charging loose ball in box
-    keeper_dive_save_attempt_ind: float = 0.60  # Bonus when GK triggers lunge towards shot-on-target
-    keeper_reckless_lunge_pen: float = -0.15    # Penalty when GK triggers lunge away from play
-
-    # Hold Violations (5s Field Hold & 5s Keeper Box Hold)
-    field_5s_violation_ind: float = -2.0
-    field_5s_violation_team: float = -0.5
-    field_3s_violation_ind: float = -2.0   # Backwards-compatible alias
-    field_3s_violation_team: float = -0.5  # Backwards-compatible alias
-    keeper_5s_violation_ind: float = -4.0
-    keeper_5s_violation_team: float = -1.5
-
-    # Dense Per-Step Shaping (at 15 Hz RL step rate)
-    possession_carrier_ind: float = 0.006
-    possession_team: float = 0.001
-    carrier_goal_advance_ind_scale: float = 0.005  # Carrier advance reward per unit gained
-    carrier_dribble_decay_start: float = 1.5       # Seconds of continuous carry before solo advance reward decays
-    unpressed_carry_advance_mult: float = 2.0      # Multiplier on carrier advance when forward corridor is unpressed
-    unpressed_carry_clear_dist: float = 140.0      # Euclidean clear distance ahead required to qualify as unpressed
-    ball_advance_team_scale: float = 0.004         # Team reward per unit closer to enemy goal center
-    team_advance_pbrs_weight: float = 6.50         # Team ball-advance potential-based reward shaping scale
-    hold_urgency_pen_scale: float = 0.035          # Escalating per-step penalty when field player holds ball > 3.2s
-
-    # Context-Dependent Tactical & Role Positioning
-    pocket_sticky_hysteresis_bonus: float = 25.0   # Score bonus for keeping the previous step's discrete candidate pocket
-    pocket_ema_alpha: float = 0.20                 # EMA smoothing factor: 0.80 * prev_pocket + 0.20 * new_candidate
-    teammate_min_spacing: float = 165.0            # Increased from 135.0 to spread off-ball players across 1400x840 pitch
-    teammate_box_cutback_spacing: float = 95.0     # Relaxed spacing when two attackers are in different angular sectors (>=40 deg) near box
-    teammate_defender_spacing: float = 120.0       # Relaxed spacing between center backs in own defensive half to allow central goal mouth zoning
-    carrier_min_spacing: float = 135.0             # Increased from 120.0
-    crowding_penalty_scale: float = 0.018          # Increased from 0.005 (applied asymmetrically with right-of-way exemptions)
-    teammate_approach_penalty_scale: float = 0.012 # Penalty per unit closed when approaching a nearby off-ball teammate (<155u)
-    carrier_approach_penalty_scale: float = 0.010  # Increased from 0.008
-    box_sector_crowding_pen: float = 0.020         # Penalty for non-carrier clogging the same angular sector (<35 deg) within 240u of enemy goal
-    gk_buffer_obstruction_pen: float = 0.015       # Penalty when actively driving toward enemy GK while enemy GK holds the ball
-    support_pocket_approach_scale: float = 0.010
-    open_support_bonus_scale: float = 0.010
-    unmask_lateral_scale: float = 0.015            # Reward for shadowed off-ball teammates moving laterally to unmask passing lanes
-    role_zone_anchor_scale: float = 0.005
-    loose_ball_chase_scale: float = 0.010
-    loose_ball_proximity_scale: float = 0.008
-    non_chaser_ball_repulsion_radius: float = 185.0
-    non_chaser_ball_repulsion_scale: float = 0.012
-    presser_approach_scale: float = 0.010
-    ball_heading_align_scale: float = 0.003
-    cover_approach_scale: float = 0.005
-    keeper_angle_track_scale: float = 0.010
-    keeper_anchor_approach_scale: float = 0.018
-    keeper_edge_camp_pen: float = 0.035
-    keeper_edge_camp_radius: float = 95.0  # Scaled to enlarged 195u semicircle to allow angle-narrowing bisector positioning
-    keeper_fetch_box_scale: float = 0.045
-    keeper_back_wall_face_pen: float = 0.035
-    jitter_reverse_pen: float = -0.008
-    pocket_deadzone_radius: float = 35.0           # Deadzone radius (u) around tactical pockets/anchors with 0 approach gradient
-    line_order_pen_scale: float = 0.010            # Soft penalty scale when outfield player breaches role line-ordering margin
+    # Tier 3: Physical Regularization
+    field_5s_violation_ind: float = -1.5
+    field_5s_violation_team: float = -0.3
+    keeper_5s_violation_ind: float = -1.5
+    keeper_5s_violation_team: float = -0.3
+    failed_tackle_ind: float = -0.15
+    reckless_tackle_ind: float = -0.15
 
 
 @dataclass(frozen=True)

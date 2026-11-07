@@ -205,3 +205,62 @@ def test_trainer_monotonic_match_id_and_every_gen_checkpoint(tmp_path: Path) -> 
     finally:
         trainer.close()
 
+
+def test_step_array_and_single_worker_replay_export(tmp_path: Path) -> None:
+    """Verify fast step_array IPC and that save_best_only writes only the winning worker replay to disk."""
+    rep_dir = tmp_path / "replays"
+    ckpt_dir = tmp_path / "ckpt"
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=4),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            save_dir=str(rep_dir),
+            enable_recording=True,
+            save_best_only=True,
+            interest_threshold=0.0,
+        ),
+    )
+
+    vec = make_vec_football_env(cfg, num_envs=2)
+    try:
+        obs_b, cen_b = vec.reset_array(
+            seeds=[11, 22],
+            options_list=[
+                {"generation": 1, "match_id": 1},
+                {"generation": 1, "match_id": 2},
+            ],
+        )
+        assert obs_b.shape == (2, 12, OBS_DIM)
+        assert cen_b.shape == (2, 12, 54)
+
+        act_arr = np.zeros((2, 12, ACTION_DIM), dtype=np.float32)
+        obs_next, cen_next, rew_next, done_next, summaries = vec.step_array(act_arr)
+        assert obs_next.shape == (2, 12, OBS_DIM)
+        assert cen_next.shape == (2, 12, 54)
+        assert rew_next.shape == (2, 12)
+        assert done_next.shape == (2,)
+        assert not np.any(done_next)
+        assert summaries == [None, None]
+    finally:
+        vec.close()
+
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg,
+        num_envs=2,
+        rollout_steps=4,
+        device="cpu",
+        checkpoint_dir=str(ckpt_dir),
+        seed=42,
+        save_best_only=True,
+    )
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        assert rollout["completed_episodes"] == 2
+        assert len(rollout["exported_replays"]) == 1
+        saved_files = [f for f in os.listdir(rep_dir) if f.endswith(".json")]
+        assert len(saved_files) == 1
+    finally:
+        trainer.close()
+
+

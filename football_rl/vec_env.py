@@ -32,11 +32,21 @@ def _worker(
                 next_obs, rewards, terminations, truncations, infos = env.step(actions)
                 env_done = (len(env.agents) == 0)
                 remote.send((next_obs, rewards, terminations, truncations, infos, env_done))
+            elif cmd == "step_array":
+                obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(data)
+                remote.send((obs_arr, central_arr, rew_arr, env_done, ep_summary))
             elif cmd == "reset":
                 options, seed = data
                 obs, info = env.reset(seed=seed, options=options)
                 remote.send((obs, info))
+            elif cmd == "reset_array":
+                options, seed = data
+                env.reset(seed=seed, options=options)
+                remote.send((env._get_observations_array(), env.get_centralized_state()))
+            elif cmd == "export_replay":
+                remote.send(env.export_deferred_replay())
             elif cmd == "set_generation":
+                env._deferred_replay = None
                 env.current_generation = int(data)
                 remote.send(True)
             elif cmd == "get_stats":
@@ -102,7 +112,7 @@ class SubprocVecFootballEnv:
         obs_list, info_list = [], []
         for idx in env_indices:
             res = self.remotes[idx].recv()
-            if isinstance(res, tuple) and len(res) == 2 and res[0] == "ERROR":
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
                 err_msg, tb = res[1]
                 raise RuntimeError(f"Error in SubprocVec worker {idx}:\n{tb}")
             obs, info = res
@@ -116,6 +126,96 @@ class SubprocVecFootballEnv:
             remote.send(("set_generation", generation))
         for remote in self.remotes:
             remote.recv()
+
+    def reset_array(
+        self,
+        seeds: Optional[List[Optional[int]]] = None,
+        options_list: Optional[List[Optional[Dict[str, Any]]]] = None,
+        env_indices: Optional[List[int]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Reset environments and return contiguous (K, 12, 76) obs and (K, 12, 54) central state arrays."""
+        if env_indices is None:
+            env_indices = list(range(self.num_envs))
+        if seeds is None:
+            seeds = [None] * len(env_indices)
+        if options_list is None:
+            options_list = [None] * len(env_indices)
+
+        for idx, seed, options in zip(env_indices, seeds, options_list):
+            self.remotes[idx].send(("reset_array", (options, seed)))
+
+        k = len(env_indices)
+        obs_batch = np.empty((k, 12, 76), dtype=np.float32)
+        central_batch = np.empty((k, 12, 54), dtype=np.float32)
+        for out_i, idx in enumerate(env_indices):
+            res = self.remotes[idx].recv()
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
+                err_msg, tb = res[1]
+                raise RuntimeError(f"Error in SubprocVec worker {idx}:\n{tb}")
+            obs_arr, central_arr = res
+            obs_batch[out_i] = obs_arr
+            central_batch[out_i] = central_arr
+        return obs_batch, central_batch
+
+    def step_array_async(self, actions_array: np.ndarray) -> None:
+        """Send (num_envs, 12, 4) action array to all workers without dictionary construction."""
+        act_np = np.asarray(actions_array, dtype=np.float32)
+        for remote, act in zip(self.remotes, act_np):
+            remote.send(("step_array", act))
+        self.waiting = True
+
+    def step_array_wait(
+        self,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[Optional[Dict[str, Any]]],
+    ]:
+        """Wait for all workers and return contiguous batch arrays for obs, central_state, rewards, and dones."""
+        obs_batch = np.empty((self.num_envs, 12, 76), dtype=np.float32)
+        central_batch = np.empty((self.num_envs, 12, 54), dtype=np.float32)
+        rew_batch = np.empty((self.num_envs, 12), dtype=np.float32)
+        done_batch = np.empty(self.num_envs, dtype=bool)
+        ep_summaries: List[Optional[Dict[str, Any]]] = [None] * self.num_envs
+
+        for idx, remote in enumerate(self.remotes):
+            res = remote.recv()
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
+                err_msg, tb = res[1]
+                raise RuntimeError(f"Error in SubprocVec worker {idx}:\n{tb}")
+            obs_arr, central_arr, rew_arr, env_done, ep_summary = res
+            obs_batch[idx] = obs_arr
+            central_batch[idx] = central_arr
+            rew_batch[idx] = rew_arr
+            done_batch[idx] = env_done
+            ep_summaries[idx] = ep_summary
+
+        self.waiting = False
+        return obs_batch, central_batch, rew_batch, done_batch, ep_summaries
+
+    def step_array(
+        self, actions_array: np.ndarray
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[Optional[Dict[str, Any]]],
+    ]:
+        """Execute a synchronous batched step using contiguous (num_envs, 12, 4) arrays."""
+        self.step_array_async(actions_array)
+        return self.step_array_wait()
+
+    def export_replay(self, env_idx: int) -> Optional[str]:
+        """Instruct worker `env_idx` to write its deferred replay trajectory to disk."""
+        self.remotes[env_idx].send(("export_replay", None))
+        res = self.remotes[env_idx].recv()
+        if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
+            err_msg, tb = res[1]
+            raise RuntimeError(f"Error in SubprocVec worker {env_idx}:\n{tb}")
+        return res
 
     def step_async(self, actions_by_env: List[Dict[str, np.ndarray]]) -> None:
         """Send action dictionaries to all workers without blocking."""
@@ -137,7 +237,7 @@ class SubprocVecFootballEnv:
         results = []
         for idx, remote in enumerate(self.remotes):
             res = remote.recv()
-            if isinstance(res, tuple) and len(res) == 2 and res[0] == "ERROR":
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
                 err_msg, tb = res[1]
                 raise RuntimeError(f"Error in SubprocVec worker {idx}:\n{tb}")
             results.append(res)
@@ -209,7 +309,73 @@ class DummyVecFootballEnv:
 
     def set_generation(self, generation: int) -> None:
         for env in self.envs:
+            env._deferred_replay = None
             env.current_generation = generation
+
+    def reset_array(
+        self,
+        seeds: Optional[List[Optional[int]]] = None,
+        options_list: Optional[List[Optional[Dict[str, Any]]]] = None,
+        env_indices: Optional[List[int]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if env_indices is None:
+            env_indices = list(range(self.num_envs))
+        if seeds is None:
+            seeds = [None] * len(env_indices)
+        if options_list is None:
+            options_list = [None] * len(env_indices)
+
+        k = len(env_indices)
+        obs_batch = np.empty((k, 12, 76), dtype=np.float32)
+        central_batch = np.empty((k, 12, 54), dtype=np.float32)
+        for out_i, (idx, seed, options) in enumerate(zip(env_indices, seeds, options_list)):
+            self.envs[idx].reset(seed=seed, options=options)
+            obs_batch[out_i] = self.envs[idx]._get_observations_array()
+            central_batch[out_i] = self.envs[idx].get_centralized_state()
+        return obs_batch, central_batch
+
+    def step_array_async(self, actions_array: np.ndarray) -> None:
+        self._pending_actions_array = np.asarray(actions_array, dtype=np.float32)
+
+    def step_array_wait(
+        self,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[Optional[Dict[str, Any]]],
+    ]:
+        obs_batch = np.empty((self.num_envs, 12, 76), dtype=np.float32)
+        central_batch = np.empty((self.num_envs, 12, 54), dtype=np.float32)
+        rew_batch = np.empty((self.num_envs, 12), dtype=np.float32)
+        done_batch = np.empty(self.num_envs, dtype=bool)
+        ep_summaries: List[Optional[Dict[str, Any]]] = [None] * self.num_envs
+
+        for idx, (env, act) in enumerate(zip(self.envs, self._pending_actions_array)):
+            obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(act)
+            obs_batch[idx] = obs_arr
+            central_batch[idx] = central_arr
+            rew_batch[idx] = rew_arr
+            done_batch[idx] = env_done
+            ep_summaries[idx] = ep_summary
+
+        return obs_batch, central_batch, rew_batch, done_batch, ep_summaries
+
+    def step_array(
+        self, actions_array: np.ndarray
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[Optional[Dict[str, Any]]],
+    ]:
+        self.step_array_async(actions_array)
+        return self.step_array_wait()
+
+    def export_replay(self, env_idx: int) -> Optional[str]:
+        return self.envs[env_idx].export_deferred_replay()
 
     def step_async(self, actions_by_env: List[Dict[str, np.ndarray]]) -> None:
         self._pending_actions = actions_by_env
