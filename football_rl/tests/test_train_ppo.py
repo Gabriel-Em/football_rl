@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
+import re
+from pathlib import Path
 import torch
 
 from football_rl.config import (
@@ -13,7 +16,12 @@ from football_rl.config import (
     DEFAULT_CONFIG,
     OBS_DIM,
 )
-from football_rl.train_ppo import ActorCritic, ParameterSharingPPOTrainer
+from football_rl.train_ppo import (
+    ActorCritic,
+    ParameterSharingPPOTrainer,
+    archive_batch,
+    select_archive_replays,
+)
 
 
 def test_ctde_ppo_rollout_and_update() -> None:
@@ -81,7 +89,7 @@ def test_adapted_weights_loader_zero_pads_legacy_critic() -> None:
 
 
 def test_per_role_advantage_normalization() -> None:
-    """Verify _normalize_advantages_per_role normalizes DEF, MID, and ATK advantages independently to unit variance."""
+    """Verify _normalize_advantages_per_role normalizes across the pooled team unit without intra-role zero-sum washing."""
     obs = torch.zeros((12, OBS_DIM), dtype=torch.float32)
     # 4 DEF [1,0,0], 4 MID [0,1,0], 4 ATK [0,0,1]
     obs[0:4, 13:16] = torch.tensor([1.0, 0.0, 0.0])
@@ -99,8 +107,75 @@ def test_per_role_advantage_normalization() -> None:
     )
 
     norm_adv = ParameterSharingPPOTrainer._normalize_advantages_per_role(obs, adv)
-    for sl in (slice(0, 4), slice(4, 8), slice(8, 12)):
-        role_slice = norm_adv[sl]
-        assert abs(float(role_slice.mean().item())) < 1e-6
-        assert abs(float(role_slice.std().item()) - 1.0) < 1e-5
+    assert abs(float(norm_adv.mean().item())) < 1e-6
+    assert abs(float(norm_adv.std().item()) - 1.0) < 1e-5
+    # Verify relative scale is preserved (ATK advantages remain larger than DEF advantages)
+    assert float(norm_adv[11].item()) > float(norm_adv[7].item()) > float(norm_adv[3].item())
+
+
+def test_select_archive_replays() -> None:
+    """Verify archive selection retains exactly 15 matches (first 5, middle 5, last 5)."""
+    # 1. Total matches <= 15: keep all
+    short_list = [f"match_{i:04d}_gen{i:04d}_score10_0.json" for i in range(1, 10)]
+    assert select_archive_replays(short_list) == short_list
+
+    # 2. Total matches > 15 (e.g. 50 generations)
+    files_50 = [f"match_{i:04d}_gen{i:04d}_score10_0.json" for i in range(1, 51)]
+    kept = select_archive_replays(files_50, seed=123)
+    assert len(kept) == 15
+
+    gens_kept = []
+    for f in kept:
+        m = re.search(r"gen(\d+)", f)
+        assert m is not None
+        gens_kept.append(int(m.group(1)))
+
+    # First 5 generations
+    assert gens_kept[:5] == [1, 2, 3, 4, 5]
+    # Last 5 generations
+    assert gens_kept[-5:] == [46, 47, 48, 49, 50]
+    # Middle 5 generations spread out
+    mid_gens = gens_kept[5:-5]
+    assert len(mid_gens) == 5
+    for g in mid_gens:
+        assert 6 <= g <= 45
+    # Strict monotonically increasing
+    assert mid_gens == sorted(mid_gens)
+    assert len(set(mid_gens)) == 5
+
+
+def test_archive_batch_keeps_fifteen_matches(tmp_path: Path) -> None:
+    """Verify archive_batch preserves only 15 matches and non-match files in archives."""
+    ckpt_dir = tmp_path / "checkpoints"
+    rep_dir = tmp_path / "replays"
+    arch_dir = tmp_path / "archives"
+    ckpt_dir.mkdir(parents=True)
+    rep_dir.mkdir(parents=True)
+
+    # Create dummy checkpoint
+    (ckpt_dir / "training_state.pt").write_text("state", encoding="utf-8")
+    (ckpt_dir / "training_history.json").write_text("{}", encoding="utf-8")
+
+    # Create 40 replay files and 1 summary markdown
+    (rep_dir / "matches_summary.md").write_text("# Summary", encoding="utf-8")
+    for i in range(1, 41):
+        (rep_dir / f"match_{i:04d}_gen{i:04d}_score5_0_20261107_120000.json").write_text(
+            f'{{"metadata": {{"match_id": {i}, "generation": {i}}}}}',
+            encoding="utf-8",
+        )
+
+    # Archive batch
+    dest = archive_batch("test_exp", str(ckpt_dir), str(rep_dir), str(arch_dir))
+    arch_replays = Path(dest) / "replays"
+
+    # Verify summary markdown preserved
+    assert (arch_replays / "matches_summary.md").exists()
+
+    # Verify exactly 15 JSON replays in archive
+    arch_json_files = list(arch_replays.glob("*.json"))
+    assert len(arch_json_files) == 15
+
+    # Verify active replays remain untouched (all 40 replays still in active replays)
+    assert len(list(rep_dir.glob("*.json"))) == 40
+
 

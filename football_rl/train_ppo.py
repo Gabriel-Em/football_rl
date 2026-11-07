@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
 import json
 import os
+import random
+import re
 import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -496,8 +499,9 @@ class ParameterSharingPPOTrainer:
             buf_rew[t] = rew_batch
             buf_done[t] = done_batch[:, None].astype(np.float32)
 
-            for env_i in range(N):
-                if done_batch[env_i]:
+            if bool(np.any(done_batch)):
+                done_env_indices = np.nonzero(done_batch)[0]
+                for env_i in done_env_indices:
                     completed_episodes += 1
                     ep_summary = ep_summaries[env_i] or {}
                     ep_interest = float(ep_summary.get("interest_score", 0.0))
@@ -606,23 +610,12 @@ class ParameterSharingPPOTrainer:
     def _normalize_advantages_per_role(
         obs: torch.Tensor, advantages: torch.Tensor
     ) -> torch.Tensor:
-        """Normalize advantages per outfield role (DEF, MID, ATK) when role one-hot masks are present."""
+        """Normalize advantages across the pooled team unit without intra-role zero-sum washing."""
         if advantages.numel() <= 1:
             return advantages
-        is_def = obs[:, 13] > 0.5
-        if bool(is_def.any()):
-            is_mid = (obs[:, 13] <= 0.5) & (obs[:, 14] > 0.5) & (obs[:, 15] <= 0.5)
-            is_atk = (obs[:, 13] <= 0.5) & (obs[:, 14] <= 0.5) & (obs[:, 15] > 0.5)
-            norm_adv = advantages.clone()
-            for mask in (is_def, is_mid, is_atk):
-                cnt = int(mask.sum().item())
-                if cnt > 1:
-                    r_adv = norm_adv[mask]
-                    norm_adv[mask] = (r_adv - r_adv.mean()) / (r_adv.std() + 1e-8)
-                elif cnt == 1:
-                    norm_adv[mask] = 0.0
-            return norm_adv
-        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        mean = advantages.mean()
+        std = advantages.std()
+        return (advantages - mean) / (std + 1e-8)
 
     def _ppo_update_role(
         self,
@@ -642,29 +635,45 @@ class ParameterSharingPPOTrainer:
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
 
+        # Normalize once across the full rollout batch for the team unit
         b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
 
         pg_losses: List[float] = []
         v_losses: List[float] = []
         entropy_losses: List[float] = []
 
-        b_inds = np.arange(batch_size)
+        device = b_obs.device
         for _ in range(self.cfg.ppo.update_epochs):
-            np.random.shuffle(b_inds)
+            if num_minibatches > 1:
+                b_inds = torch.randperm(batch_size, device=device)
+            else:
+                b_inds = None
+
             for start in range(0, batch_size, minibatch_size):
                 end = start + minibatch_size
-                mb_inds = b_inds[start:end]
+                if b_inds is not None:
+                    mb_inds = b_inds[start:end]
+                    mb_obs = b_obs[mb_inds]
+                    mb_actions = b_actions[mb_inds]
+                    mb_logprobs = b_logprobs[mb_inds]
+                    mb_advantages = b_advantages[mb_inds]
+                    mb_returns = b_returns[mb_inds]
+                    mb_values = b_values[mb_inds]
+                    cen_mb = b_central[mb_inds] if b_central is not None else None
+                else:
+                    mb_obs = b_obs
+                    mb_actions = b_actions
+                    mb_logprobs = b_logprobs
+                    mb_advantages = b_advantages
+                    mb_returns = b_returns
+                    mb_values = b_values
+                    cen_mb = b_central
 
-                cen_mb = b_central[mb_inds] if b_central is not None else None
                 _, newlogprob, entropy, newvalue = policy.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds], central_state=cen_mb
+                    mb_obs, mb_actions, central_state=cen_mb
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
+                logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
-
-                mb_advantages = self._normalize_advantages_per_role(
-                    b_obs[mb_inds], b_advantages[mb_inds]
-                )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -674,11 +683,11 @@ class ParameterSharingPPOTrainer:
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
-                v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                v_clipped = b_values[mb_inds] + torch.clamp(
-                    newvalue - b_values[mb_inds], -clip_coef, clip_coef
+                v_loss_unclipped = (newvalue - mb_returns) ** 2
+                v_clipped = mb_values + torch.clamp(
+                    newvalue - mb_values, -clip_coef, clip_coef
                 )
-                v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                v_loss_clipped = (v_clipped - mb_returns) ** 2
                 v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                 entropy_loss = entropy.mean()
@@ -688,7 +697,7 @@ class ParameterSharingPPOTrainer:
                     + v_loss * self.cfg.ppo.vf_coef
                 )
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), self.cfg.ppo.max_grad_norm)
                 optimizer.step()
@@ -1291,13 +1300,121 @@ def reset_active_batch(checkpoint_dir: str, replay_dir: str) -> None:
     os.makedirs(replay_dir, exist_ok=True)
 
 
+def select_archive_replays(
+    replay_files: List[str],
+    replay_dir: Optional[str] = None,
+    num_first: int = 5,
+    num_mid: int = 5,
+    num_last: int = 5,
+    seed: Optional[int] = None,
+) -> List[str]:
+    """Select up to (num_first + num_mid + num_last) match replay files across training generations.
+
+    Retains the first `num_first` generations, the last `num_last` generations, and `num_mid`
+    generations randomly spread out in-between, keeping at most one match replay per generation.
+    If the total number of match replay files is <= (num_first + num_mid + num_last), all files are kept.
+    """
+    total_target = num_first + num_mid + num_last
+    if len(replay_files) <= total_target:
+        return list(replay_files)
+
+    items = []
+    for f in replay_files:
+        full_path = os.path.join(replay_dir, f) if replay_dir else f
+        base = os.path.basename(f)
+        m = re.search(r"match_(\d+)_gen(\d+)(?:_score(\d+(?:_\d+)?))?", base)
+        if m:
+            mid = int(m.group(1))
+            gen = int(m.group(2))
+            try:
+                score = float(m.group(3).replace("_", ".")) if m.group(3) else 0.0
+            except (ValueError, TypeError):
+                score = 0.0
+        else:
+            m_gen = re.search(r"gen(\d+)", base)
+            m_mid = re.search(r"match_(\d+)", base)
+            m_score = re.search(r"score(\d+(?:_\d+)?)", base)
+            gen = int(m_gen.group(1)) if m_gen else None
+            mid = int(m_mid.group(1)) if m_mid else 0
+            try:
+                score = float(m_score.group(1).replace("_", ".")) if m_score else 0.0
+            except (ValueError, TypeError):
+                score = 0.0
+
+        if gen is None and os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8") as jf:
+                    data = json.load(jf)
+                    meta = data.get("metadata", {})
+                    gen = meta.get("generation", data.get("generation"))
+                    if mid == 0:
+                        mid = meta.get("match_id", data.get("match_id", 0))
+                    if score == 0.0:
+                        score = float(meta.get("interest_score", data.get("interest_score", 0.0)))
+            except Exception:
+                pass
+
+        if gen is None:
+            gen = mid if mid > 0 else 0
+
+        items.append({"file": f, "gen": gen, "mid": mid, "score": score})
+
+    gen_to_items = defaultdict(list)
+    for item in items:
+        gen_to_items[item["gen"]].append(item)
+
+    for gen in gen_to_items:
+        gen_to_items[gen].sort(key=lambda x: (x["score"], x["mid"]), reverse=True)
+
+    sorted_gens = sorted(gen_to_items.keys())
+    N = len(sorted_gens)
+
+    if N <= total_target:
+        chosen_files = [gen_to_items[g][0]["file"] for g in sorted_gens]
+        if len(chosen_files) < total_target:
+            remaining_items = []
+            for g in sorted_gens:
+                remaining_items.extend(gen_to_items[g][1:])
+            remaining_items.sort(key=lambda x: (x["score"], x["mid"]), reverse=True)
+            for item in remaining_items[: total_target - len(chosen_files)]:
+                chosen_files.append(item["file"])
+        return chosen_files
+
+    first_gens = sorted_gens[:num_first]
+    last_gens = sorted_gens[-num_last:]
+    in_between = sorted_gens[num_first:-num_last]
+    M = len(in_between)
+
+    rng = random.Random(seed) if seed is not None else random
+    mid_gens = []
+    if M <= num_mid:
+        mid_gens = list(in_between)
+    else:
+        for i in range(num_mid):
+            start = int(i * M / num_mid)
+            end = int((i + 1) * M / num_mid)
+            segment = in_between[start:end]
+            mid_gens.append(rng.choice(segment))
+    mid_gens.sort()
+
+    chosen_gens = first_gens + mid_gens + last_gens
+    return [gen_to_items[g][0]["file"] for g in chosen_gens]
+
+
 def archive_batch(
     name: str,
     checkpoint_dir: str = "checkpoints",
     replay_dir: str = "replays",
     archive_root: str = "archives",
+    num_first: int = 5,
+    num_mid: int = 5,
+    num_last: int = 5,
 ) -> str:
-    """Save the current active `checkpoints/` and `replays/` into `archives/<name>/`."""
+    """Save active `checkpoints/` and `replays/` into `archives/<name>/`.
+
+    When archiving, keeps the first 5 and last 5 generations as well as 5 randomly spread
+    out in-between generations, retaining a total of 15 match replays only.
+    """
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
     if not os.path.exists(state_path) and not os.path.exists(
         os.path.join(checkpoint_dir, "field_policy.pt")
@@ -1313,8 +1430,33 @@ def archive_batch(
 
     if os.path.exists(checkpoint_dir):
         shutil.copytree(checkpoint_dir, os.path.join(dest_dir, "checkpoints"))
+
     if os.path.exists(replay_dir):
-        shutil.copytree(replay_dir, os.path.join(dest_dir, "replays"))
+        dest_rep = os.path.join(dest_dir, "replays")
+        os.makedirs(dest_rep, exist_ok=True)
+
+        all_entries = os.listdir(replay_dir)
+        replay_files = []
+        for entry in all_entries:
+            src_path = os.path.join(replay_dir, entry)
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, os.path.join(dest_rep, entry), dirs_exist_ok=True)
+            elif entry.endswith(".json") and entry != "training_history.json":
+                replay_files.append(entry)
+            else:
+                shutil.copy2(src_path, os.path.join(dest_rep, entry))
+
+        kept_replays = select_archive_replays(
+            replay_files,
+            replay_dir=replay_dir,
+            num_first=num_first,
+            num_mid=num_mid,
+            num_last=num_last,
+        )
+        for rf in kept_replays:
+            src_file = os.path.join(replay_dir, rf)
+            if os.path.exists(src_file):
+                shutil.copy2(src_file, os.path.join(dest_rep, rf))
 
     return dest_dir
 
@@ -1498,7 +1640,7 @@ def main() -> None:
         type=str,
         default=None,
         metavar="BATCH_NAME",
-        help="Archive the active `checkpoints/` and `replays/` to `archives/<BATCH_NAME>/` and exit.",
+        help="Archive active `checkpoints/` and `replays/` to `archives/<BATCH_NAME>/` (retaining 15 matches across first 5, middle 5, and last 5 generations) and exit.",
     )
     parser.add_argument(
         "--load-archive",

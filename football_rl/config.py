@@ -74,15 +74,15 @@ class PhysicsConfig:
     player_max_turn_rate: float = 1.5 * math.pi  # 270 deg/sec in rad/sec
 
     # Dynamic Pass & Smother Parameters
-    kick_steer_max_deflection_deg: float = 75.0   # Maximum side-foot deflection angle (+/- 75 deg) for one-touch passing
+    kick_steer_max_deflection_deg: float = 35.0   # Clean side-foot deflection angle (+/- 35 deg) decoupled from body spin
     max_wall_pass_flight_time: float = 3.5        # Max flight time (s) for long GK/defender side-wall bank passes
     keeper_smother_cpa_radius: float = 30.0       # CPA threshold radius (u) for keeper dive speed clamping and smother saves
 
     # Ball Kinematics
     ball_radius: float = 10.0
-    ball_min_kick_speed: float = 130.0
+    ball_min_kick_speed: float = 160.0
     ball_max_launch_speed: float = 640.0  # Maximum launch speed
-    ball_kick_speed_span: float = 510.0   # 130.0 + power_norm * 510.0 -> 640.0
+    ball_kick_speed_span: float = 480.0   # 160.0 + power_norm * 480.0 -> 640.0
     def_max_kick_speed: float = 560.0
     mid_max_kick_speed: float = 600.0
     atk_max_kick_speed: float = 640.0
@@ -124,11 +124,13 @@ class MechanicsConfig:
     pickup_kick_grace: float = 0.08   # Minimum hold duration (s) after picking up ball before kick can trigger
     pickup_tackle_grace: float = 0.15 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
     pass_reception_tackle_grace: float = 0.10 # Shielding duration (s) after receiving a teammate pass outside goalmouth
-    kick_steer_max_deflection_deg: float = 75.0  # Side-foot pass/clearance angle modulation (+/- 75 deg)
+    kick_steer_max_deflection_deg: float = 35.0  # Side-foot pass/clearance angle modulation (+/- 35 deg)
     keeper_smother_cpa_radius: float = 30.0      # CPA threshold radius (u) for keeper dive speed clamping and smother saves
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
-    min_pass_distance: float = 38.0   # Minimum kick travel distance to count as a Completed Pass (allows short GK & CB distributions)
+    min_pass_distance: float = 85.0   # Minimum kick travel distance to count as a Completed Pass (blocks micro-pass scrums)
+    min_shot_speed: float = 240.0     # Minimum ball launch speed (u/s) required to qualify as a Shot on Target
+    turnover_reward_cooldown: float = 1.0  # Minimum interval (s) between rewarded turnover events
 
     # Special Action Trigger (action[3])
     special_trigger_threshold: float = 0.5
@@ -201,8 +203,8 @@ class MechanicsConfig:
     # Kickoff Protection & GK Possession Buffer
     kickoff_protection_time: float = 1.2    # Time (s) after kickoff during which carrier cannot be tackled
     kickoff_exclusion_radius: float = 130.0 # Radial buffer keeping opponents outside center spot at kickoff
-    gk_hold_opponent_buffer: float = 265.0  # Min distance opposing field players must keep from goal center while GK holds ball (keeper_box_radius + 70.0)
-    gk_hold_push_speed: float = 285.0       # Smooth radial pushback speed (u/s) when GK holds ball (no instant teleport)
+    gk_hold_opponent_buffer: float = 265.0  # Min distance opposing field players must keep from goal center while GK holds ball
+    gk_hold_push_speed: float = 185.0       # Smooth radial pushback speed (u/s) capped at player max speed (no wave surfing)
     tackle_whiff_max_ball_dist: float = 180.0  # Max distance to ball within which an out-of-range tackle triggers a physical whiff stun
 
 
@@ -226,47 +228,54 @@ class VisionConfig:
 
 @dataclass(frozen=True)
 class RewardConfig:
-    """Markovian 3-tier individual and team-shared reward weights."""
+    """Markovian 3-tier zero-sum adversarial and team-cooperative reward weights."""
 
-    # Tier 1: Objective Discrete Game Events
+    # Tier 1: Objective Discrete Game Events (Strictly Zero-Sum Adversarial Transitions)
     goal_team_shared: float = 10.0
     goal_concede_team_shared: float = -10.0
-    goal_scorer_ind: float = 5.0
-    atk_goal_scorer_ind: float = 5.0
-    goal_assist_ind: float = 3.0
+    goal_scorer_ind: float = 3.0
+    atk_goal_scorer_ind: float = 3.0
+    goal_assist_ind: float = 2.5
     goal_assist_window_sec: float = 4.0
-    own_goal_ind: float = -5.0
-    atk_shot_on_target_ind: float = 1.0
-    other_shot_on_target_ind: float = 1.0
-    shot_on_target_team: float = 0.2
-    pass_threat_weight: float = 8.0
-    pass_space_weight: float = 0.80
-    lead_pass_bonus: float = 1.00
-    completed_pass_receiver_ind: float = 0.20
-    successful_tackle_tackler_ind: float = 1.2
-    successful_tackle_team: float = 0.25
-    successful_tackle_carrier_ind: float = -0.8
-    intercepted_kicker_ind: float = -0.8
-    intercepted_team: float = -0.20
-    keeper_save_ind: float = 2.5
-    keeper_save_team: float = 0.5
+    own_goal_ind: float = -3.0
 
-    # Tier 2: Strict Policy-Invariant PBRS Weights
-    team_advance_pbrs_weight: float = 5.0
-    carrier_advance_pbrs_weight: float = 2.0
-    support_potential_weight: float = 0.45
-    def_press_potential_weight: float = 0.50
-    def_cover_potential_weight: float = 0.40
-    teammate_sep_potential_weight: float = 0.25
-    keeper_bisect_potential_weight: float = 0.40
+    # Shot on Target & Save (Zero-Sum Paired Accounting)
+    atk_shot_on_target_ind: float = 0.45
+    other_shot_on_target_ind: float = 0.45
+    shot_on_target_team: float = 0.15
+    keeper_save_ind: float = 1.20
+    keeper_save_team: float = 0.30
+
+    # Passing & Progression (Team-Cooperative + Anti-Oscillation)
+    pass_threat_weight: float = 6.0
+    pass_space_weight: float = 0.60
+    lead_pass_bonus: float = 0.80
+    completed_pass_receiver_ind: float = 0.15
+    completed_pass_team: float = 0.20
+
+    # Strictly Zero-Sum Turnover Events (Win Ind + 6*Win Team + Loss Ind + 6*Loss Team == 0.0)
+    successful_tackle_tackler_ind: float = 0.40
+    successful_tackle_team: float = 0.25
+    successful_tackle_carrier_ind: float = -0.40
+    intercepted_kicker_ind: float = -0.40
+    intercepted_team: float = -0.25
+
+    # Tier 2: Strict Policy-Invariant Non-Negative PBRS Weights (Phi in [0, Phi_max])
+    team_advance_pbrs_weight: float = 6.0
+    carrier_advance_pbrs_weight: float = 0.0  # Disabled: non-telescoping when ball is in flight
+    support_potential_weight: float = 0.85
+    def_press_potential_weight: float = 0.65
+    def_cover_potential_weight: float = 0.75
+    teammate_sep_potential_weight: float = 0.50
+    keeper_bisect_potential_weight: float = 0.60
 
     # Tier 3: Physical Regularization
     field_5s_violation_ind: float = -1.5
     field_5s_violation_team: float = -0.3
     keeper_5s_violation_ind: float = -1.5
     keeper_5s_violation_team: float = -0.3
-    failed_tackle_ind: float = -0.15
-    reckless_tackle_ind: float = -0.15
+    failed_tackle_ind: float = -0.20
+    reckless_tackle_ind: float = -0.20
 
 
 @dataclass(frozen=True)
