@@ -179,3 +179,33 @@ def test_archive_batch_keeps_fifteen_matches(tmp_path: Path) -> None:
     assert len(list(rep_dir.glob("*.json"))) == 40
 
 
+def test_archive_batch_default_timestamp_naming(tmp_path: Path) -> None:
+    """Verify archive_batch generates a timestamp-formatted folder name when name is omitted or empty."""
+    ckpt_dir = tmp_path / "checkpoints"
+    rep_dir = tmp_path / "replays"
+    arch_dir = tmp_path / "archives"
+    ckpt_dir.mkdir(parents=True)
+    rep_dir.mkdir(parents=True)
+
+    (ckpt_dir / "training_state.pt").write_text("state", encoding="utf-8")
+    (rep_dir / "matches_summary.md").write_text("# Summary", encoding="utf-8")
+    (rep_dir / "match_0001_gen0001_score1_0_20261107_120000.json").write_text(
+        '{"metadata": {"match_id": 1, "generation": 1}}',
+        encoding="utf-8",
+    )
+
+    # 1. Name is None
+    dest_default = archive_batch(None, str(ckpt_dir), str(rep_dir), str(arch_dir))
+    archive_name = Path(dest_default).name
+    assert re.match(r"^\d{8}_\d{6}$", archive_name) is not None
+    assert (Path(dest_default) / "checkpoints" / "training_state.pt").exists()
+    assert (Path(dest_default) / "replays" / "matches_summary.md").exists()
+
+    # 2. Name is empty or whitespace
+    dest_empty = archive_batch("   ", str(ckpt_dir), str(rep_dir), str(arch_dir))
+    archive_empty_name = Path(dest_empty).name
+    assert re.match(r"^\d{8}_\d{6}$", archive_empty_name) is not None
+    assert (Path(dest_empty) / "checkpoints" / "training_state.pt").exists()
+
+
+

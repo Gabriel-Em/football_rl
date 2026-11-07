@@ -1686,7 +1686,7 @@ def test_keeper_holonomic_lateral_and_intercept_dive_saves_fast_shot() -> None:
 
 
 def test_foul_restart_formation_opens_central_lane_and_forward_halfspace_runners() -> None:
-    """Verify keeper 5s violation drops the ball, applies 2.0s pickup cooldown, and nudges ball out of box without teleporting players."""
+    """Verify keeper 5s violation resets keeper to goal mouth, ejects ball to wide flank, and applies 1.5s pickup cooldown."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
@@ -1694,15 +1694,18 @@ def test_foul_restart_formation_opens_central_lane_and_forward_halfspace_runners
     env.ball_holder = gk_idx
     env.player_pos[gk_idx] = np.array([60.0, 420.0], dtype=np.float64)
     env.ball_pos = np.array([84.0, 420.0], dtype=np.float64)
-    pos_before = env.player_pos.copy()
 
     step_rewards = np.zeros(env.num_players, dtype=np.float64)
     env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
 
     assert env.ball_holder is None
     assert math.isclose(env.pickup_cooldown[gk_idx], 2.0, abs_tol=1e-5)
-    assert math.isclose(float(np.linalg.norm(env.ball_vel)), 160.0, abs_tol=1e-3)
-    np.testing.assert_allclose(env.player_pos, pos_before, atol=1e-6)
+    assert math.isclose(float(np.linalg.norm(env.ball_vel)), 120.0, abs_tol=1e-3)
+    assert env.player_pos[gk_idx, 0] == 40.0
+    assert env.player_pos[gk_idx, 1] == 420.0
+    assert env.ball_pos[0] == 250.0
+    assert env.ball_pos[1] in (140.0, 700.0)
+    assert (env.pickup_cooldown[env.player_team == 0] >= 1.5).all()
 
 
 def test_intermediate_teammate_pass_not_classified_as_shot_on_target() -> None:
@@ -2431,7 +2434,7 @@ def test_keeper_turnover_penalty_gradient() -> None:
 
 
 def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
-    """Verify 5.0s box loose timer, differentiated event naming, and post-save grace timer."""
+    """Verify GK hold violation event, suppression of obsolete unclaimed box ball foul, and post-save grace timer."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
@@ -2445,10 +2448,12 @@ def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
     env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
     assert any(e["type"] == "5s KEEPER HOLD FOUL!" for e in env._frame_events)
 
-    # 2. Verify loose ball in box emits '5s UNCLAIMED BOX BALL!'
+    # 2. Verify deprecated is_hold_violation=False is a no-op (no foul, no unclaimed event)
     env._frame_events.clear()
+    prev_violations = env.stats["keeper_5s_violations"]
     env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=False)
-    assert any(e["type"] == "5s UNCLAIMED BOX BALL!" for e in env._frame_events)
+    assert not any(e["type"] == "5s UNCLAIMED BOX BALL!" for e in env._frame_events)
+    assert env.stats["keeper_5s_violations"] == prev_violations
 
     # 3. Verify post-save grace pauses box_loose_ball_timer accumulation
     env.ball_holder = None
@@ -2519,6 +2524,53 @@ def test_dynamic_box_shrinks_only_after_ball_stopped_for_2s() -> None:
 
     assert env.box_loose_ball_timer[SIDE_LEFT] == 0.0
     assert env.active_box_radius[SIDE_LEFT] > shrunken_r
+
+
+def test_unclaimed_box_ball_organic_shrinkage_to_zero_no_foul() -> None:
+    """Verify dead ball in box contracts semicircle to 0.0u without foul/ejection, allowing outfield entry."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    nom_radius = env.cfg.physics.keeper_box_radius
+    assert nom_radius == 195.0
+    dt = env.cfg.physics.dt
+
+    # Dead ball inside Left box at (80, 420)
+    env.ball_holder = None
+    env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)
+    env.ball_vel = np.array([0.0, 0.0], dtype=np.float64)
+    env.box_loose_ball_timer = 0.0
+    env.post_save_box_grace_timer = 0.0
+
+    # Place opposing attacker at (100, 420) - inside nominal 195u semicircle
+    atk_idx = env.agent_to_idx["b_atk_1"]
+    env.player_pos[atk_idx] = np.array([100.0, 420.0], dtype=np.float64)
+    env.player_vel[atk_idx] = np.zeros(2, dtype=np.float64)
+
+    # Simulate 5.6s of dead ball (2.0s grace + 3.55s shrink at 55 u/s to reach 0.0u)
+    frames_5_6s = int(round(5.6 / dt))
+    for _ in range(frames_5_6s):
+        env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+
+    # Semicircle must have completely contracted to 0.0u
+    assert env.active_box_radius[SIDE_LEFT] == 0.0
+    # No foul, no keeper 5s violation, no synthetic ejection
+    assert env.stats["keeper_5s_violations"] == 0
+    assert not any("FOUL" in e.get("type", "") for e in env._frame_events)
+    # Ball is still at dead position (not teleported/ejected toward midfield)
+    assert math.isclose(env.ball_pos[0], 80.0, abs_tol=1e-3)
+    assert math.isclose(env.ball_pos[1], 420.0, abs_tol=1e-3)
+
+    # Boundary clamping should NOT push outfield attacker away when box is 0.0u
+    env.player_pos[atk_idx] = np.array([100.0, 420.0], dtype=np.float64)
+    env._clamp_players_to_boundaries(apply_dynamic_push=True)
+    assert math.isclose(env.player_pos[atk_idx, 0], 100.0, abs_tol=1e-3)
+
+    # When ball is kicked / moves (> 15 u/s), semicircle re-expands and timer resets
+    env.ball_vel = np.array([50.0, 0.0], dtype=np.float64)
+    env._physics_substep(np.zeros((env.num_players, 4), dtype=np.float32), np.zeros(env.num_players))
+    assert env.box_loose_ball_timer[SIDE_LEFT] == 0.0
+    assert env.active_box_radius[SIDE_LEFT] > 0.0
 
 
 def test_outfield_semicircle_contact_strips_inward_radial_velocity() -> None:
@@ -3427,3 +3479,308 @@ def test_symmetry_breaking_obs_and_ego_canonical_critic_invariance() -> None:
     for idx in range(12):
         np.testing.assert_allclose(central[idx, 0], obs_arr[idx, 0], atol=1e-5)
         np.testing.assert_allclose(central[idx, 1], obs_arr[idx, 1], atol=1e-5)
+
+
+def test_post_kick_pbrs_smooth_decay_and_carrier_baseline_continuity() -> None:
+    """Verify kicker potential decays smoothly over post-kick timer and carrier matches reception scale."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    a1 = env.agent_to_idx["a_atk_1"]
+    m1 = env.agent_to_idx["a_mid_1"]
+    w_press = env.cfg.rewards.def_press_potential_weight
+
+    # Carrier potential matches reception scale (w_press)
+    env.ball_holder = a1
+    env.ball_pos = env.player_pos[a1].copy()
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    assert math.isclose(env._phi_curr[a1], w_press, abs_tol=1e-5)
+
+    # Post-kick timer decays kicker potential smoothly
+    env.ball_holder = None
+    env.ball_kicked_in_flight = True
+    env.last_ball_team = TEAM_A
+    env.last_ball_holder = a1
+    env.post_kick_pbrs_timer[a1] = 0.50
+    # Place ball 20u from kicker (inside 45u deadzone)
+    env.ball_pos = env.player_pos[a1] + np.array([20.0, 0.0])
+
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_t50 = float(env._phi_curr[a1])
+    assert math.isclose(phi_t50, w_press, abs_tol=1e-5)
+
+    # At half timer (0.25s), potential is blended
+    env.post_kick_pbrs_timer[a1] = 0.25
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_t25 = float(env._phi_curr[a1])
+    assert 0.0 < phi_t25 < phi_t50
+
+    # Expired timer drops deadzone potential to zero
+    env.post_kick_pbrs_timer[a1] = 0.0
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_t00 = float(env._phi_curr[a1])
+    assert math.isclose(phi_t00, 0.0, abs_tol=1e-5)
+
+
+def test_circulation_floor_on_open_space_first_link() -> None:
+    """Verify first-pass circulation floor awards reward on open switches with zero threat delta."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    atk = env.agent_to_idx["a_atk_1"]
+    mid = env.agent_to_idx["a_mid_2"]
+
+    # Wide switch: atk at (700, 420) to mid at (700, 580) -> pass_dist = 160u, dy = 160u, d_phi_threat = 0
+    env.player_pos[atk] = np.array([700.0, 420.0], dtype=np.float64)
+    env.player_pos[mid] = np.array([700.0, 580.0], dtype=np.float64)
+
+    # Move defenders far away (open space)
+    for idx in range(6, 12):
+        env.player_pos[idx] = np.array([1250.0, 420.0], dtype=np.float64)
+
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[atk].copy()
+    env.ball_kick_start_pos = env.player_pos[atk].copy()
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = atk
+    env.last_ball_team = TEAM_A
+    env.team_pass_chain[TEAM_A] = 0
+    env.ball_pos = env.player_pos[mid].copy()
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    # Circulation floor (0.15) applied
+    team_bonus = getattr(env.cfg.rewards, "completed_pass_team", 0.0)
+    expected_passer = 0.60 * 0.15 + team_bonus
+    expected_receiver = 0.40 * 0.15 + env.cfg.rewards.completed_pass_receiver_ind + team_bonus
+    assert math.isclose(step_rewards[atk], expected_passer, abs_tol=1e-5)
+    assert math.isclose(step_rewards[mid], expected_receiver, abs_tol=1e-5)
+    assert env.stats["completed_passes"] == 1
+
+
+def test_in_flight_pass_expiration_on_slow_moving_ball() -> None:
+    """Verify in-flight pass status expires when ball speed drops below 25 u/s threshold."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    atk = env.agent_to_idx["a_atk_1"]
+    env.ball_holder = None
+    env.last_ball_holder = atk
+    env.last_ball_team = TEAM_A
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.2
+    env.is_wall_pass_in_flight = True
+
+    # Ball moving at 20 u/s (< 25 u/s minimum pass speed threshold)
+    env.ball_vel = np.array([20.0, 0.0], dtype=np.float64)
+
+    zero_acts = np.zeros((env.num_players, 4), dtype=np.float32)
+    env._physics_substep(zero_acts, None)
+
+    assert env.ball_kicked_in_flight is False
+    assert env.is_wall_pass_in_flight is False
+    assert env.ball_kick_orig_opp_dist == -1.0
+
+
+def test_through_ball_stride_bonus_physical_gating() -> None:
+    """Verify through ball stride bonus is physically gated on ball speed, distance, forward displacement, and threat."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    passer = env.agent_to_idx["a_mid_1"]
+    receiver = env.agent_to_idx["a_atk_1"]
+
+    for idx in range(6, 12):
+        env.player_pos[idx] = np.array([1250.0, 750.0], dtype=np.float64)
+
+    env.player_pos[passer] = np.array([500.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver] = np.array([720.0, 420.0], dtype=np.float64)
+    env.player_vel[receiver] = np.array([180.0, 0.0], dtype=np.float64)
+
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[passer].copy()
+    env.ball_kick_start_pos = env.player_pos[passer].copy()
+    env.ball_pos = env.player_pos[receiver].copy()
+    env.ball_vel = np.array([120.0, 0.0], dtype=np.float64)  # speed 120 >= 45
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.4
+    env.last_ball_holder = passer
+    env.last_ball_team = TEAM_A
+    env.team_pass_chain[TEAM_A] = 1
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    assert env.stats["through_balls"] == 1
+    assert any(ev["type"] == "THROUGH BALL!" for ev in env._frame_events)
+
+
+def test_zero_value_pass_event_and_stat_suppression() -> None:
+    """Verify non-qualifying zero-value passes do not inflate pass stats or emit event popups."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    passer = env.agent_to_idx["a_mid_1"]
+    receiver = env.agent_to_idx["a_atk_1"]
+
+    # Backward pass without pressure (600 -> 400, dy = 0)
+    env.player_pos[passer] = np.array([600.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver] = np.array([400.0, 420.0], dtype=np.float64)
+    for idx in range(6, 12):
+        env.player_pos[idx] = np.array([1300.0, 420.0], dtype=np.float64)
+
+    env.ball_holder = None
+    env.ball_kick_origin = env.player_pos[passer].copy()
+    env.ball_kick_start_pos = env.player_pos[passer].copy()
+    env.ball_pos = env.player_pos[receiver].copy()
+    env.ball_vel = np.array([-100.0, 0.0], dtype=np.float64)
+    env.ball_kicked_in_flight = True
+    env.ball_kick_flight_timer = 0.5
+    env.last_ball_holder = passer
+    env.last_ball_team = TEAM_A
+    env.team_pass_chain[TEAM_A] = 1  # Not first link
+    env._frame_events = []
+
+    prev_passes = env.stats["completed_passes"]
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_free_ball_pickup(step_rewards)
+
+    assert env.stats["completed_passes"] == prev_passes
+    assert not any(ev["type"] in ("PASS!", "WALL PASS!", "THROUGH BALL!") for ev in env._frame_events)
+
+
+def test_keeper_possession_pbrs_continuity_and_downfield_outlet_arc() -> None:
+    """Verify that a goalkeeper holding the ball targets the top clearance arc rather than the deep goal mouth."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    phys = env.cfg.physics
+
+    # GK at edge of box: (160, 420)
+    env.player_pos[gk_idx] = np.array([160.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([160.0, 420.0], dtype=np.float64)
+
+    # 1. Loose ball in box before pickup
+    env.ball_holder = None
+    step_rew_loose = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping(step_rew_loose, any_teleport=True)
+    loose_phi = float(env._phi_curr[gk_idx])
+
+    # 2. Picked up by keeper: targets clearance arc at x = keeper_box_radius - 25.0 = 170.0
+    env.ball_holder = gk_idx
+    step_rew_held = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping(step_rew_held, any_teleport=True)
+    held_phi = float(env._phi_curr[gk_idx])
+
+    # Pickup potential must remain high and continuous (no -0.25 cliff)
+    assert held_phi >= loose_phi - 0.05
+    assert held_phi > 0.55
+
+
+def test_keeper_kick_clamped_to_downfield_hemisphere() -> None:
+    """Verify that goalkeeper kick angles facing toward own goal are clamped into the downfield hemisphere."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    # Team A GK defending Left (X=0): facing backward into own goal (angle = pi)
+    gk_a = env.agent_to_idx["a_keeper"]
+    env.ball_holder = gk_a
+    env.player_pos[gk_a] = np.array([50.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_a] = math.pi
+    env._execute_kick(gk_a, kick_power=1.0)
+
+    # Kick direction dx must be clamped downfield (dx >= 0.25)
+    assert env.ball_vel[0] > 0.0
+    k_dir_x = float(env.ball_vel[0] / np.linalg.norm(env.ball_vel))
+    assert k_dir_x >= 0.25 - 1e-5
+
+    # Team B GK defending Right (X=1400): facing backward into own goal (angle = 0.0)
+    gk_b = env.agent_to_idx["b_keeper"]
+    env.ball_holder = gk_b
+    env.player_pos[gk_b] = np.array([1350.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_b] = 0.0
+    env._execute_kick(gk_b, kick_power=1.0)
+
+    # Kick direction dx must be clamped downfield (dx <= -0.25)
+    assert env.ball_vel[0] < 0.0
+    k_dir_x_b = float(env.ball_vel[0] / np.linalg.norm(env.ball_vel))
+    assert k_dir_x_b <= -0.25 + 1e-5
+
+
+def test_keeper_5s_hold_turnover_wide_flank_and_team_lockout() -> None:
+    """Verify that 5s GK violation resets keeper to goal mouth, ejects ball to wide flank, and locks out keeper's team."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    env.ball_holder = gk_idx
+    env.player_pos[gk_idx] = np.array([120.0, 500.0], dtype=np.float64)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
+
+    # GK reset to home goal mouth anchor
+    assert env.player_pos[gk_idx, 0] == 40.0
+    assert env.player_pos[gk_idx, 1] == 420.0
+    assert env.player_angle[gk_idx] == 0.0
+
+    # Ball ejected to wide flank outlet outside box (250u out, y=140 or 700)
+    assert env.ball_pos[0] == 250.0
+    assert env.ball_pos[1] in (140.0, 700.0)
+    assert env.ball_vel[0] > 0.0
+
+    # Offending team locked out from immediate pickup for 1.5s
+    team_mask = env.player_team == 0
+    assert (env.pickup_cooldown[team_mask] >= 1.5).all()
+    assert env.pickup_cooldown[gk_idx] >= 2.0
+
+
+def test_tackle_contact_clearance_reach_and_whiff_distance_gating() -> None:
+    """Verify surface contact clearance tackle calculation and whiff distance gating."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+
+    tackler_idx = env.agent_to_idx["a_atk_1"]
+    teammate_idx = env.agent_to_idx["a_mid_1"]
+    carrier_idx = env.agent_to_idx["b_atk_1"]
+
+    # 1. Whiff gating: tackle ignored when own team holds ball
+    env.ball_holder = teammate_idx
+    env.player_pos[tackler_idx] = np.array([500.0, 420.0], dtype=np.float64)
+    env.player_pos[teammate_idx] = np.array([540.0, 420.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[teammate_idx].copy()
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(tackler_idx, step_rewards)
+    assert env.stun_timer[tackler_idx] == 0.0
+    assert step_rewards[tackler_idx] == 0.0
+
+    # 2. Whiff gating: tackle ignored when dist_to_ball > 180.0u
+    env.ball_holder = carrier_idx
+    env.player_pos[carrier_idx] = np.array([900.0, 420.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[carrier_idx].copy()
+    env._attempt_tackle(tackler_idx, step_rewards)
+    assert env.stun_timer[tackler_idx] == 0.0
+    assert step_rewards[tackler_idx] == 0.0
+
+    # 3. Authentic contact clearance at bumper-to-bumper distance (dist = 40.0u)
+    env.player_pos[carrier_idx] = np.array([540.0, 420.0], dtype=np.float64)
+    env.ball_pos = env.player_pos[carrier_idx].copy()
+    env.player_angle[tackler_idx] = 0.0  # Facing carrier directly
+
+    from unittest.mock import MagicMock
+    mock_rng = MagicMock()
+    mock_rng.random.return_value = 0.0  # Force RNG to pass if p_success > 0
+    orig_rng = env.np_random
+    env.np_random = mock_rng
+
+    env._attempt_tackle(tackler_idx, step_rewards)
+    assert env.ball_holder == tackler_idx
+    assert env.stun_timer[carrier_idx] == env.cfg.mechanics.tackle_victim_stun_time
+
+    env.np_random = orig_rng
+
+

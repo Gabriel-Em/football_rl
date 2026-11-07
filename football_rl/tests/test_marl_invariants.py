@@ -12,8 +12,19 @@ import numpy as np
 import pytest
 import torch
 
-from football_rl.config import DEFAULT_CONFIG, TEAM_A, TEAM_B
-from football_rl.env import FootballParallelEnv
+from football_rl.config import (
+    DEFAULT_CONFIG,
+    EnvConfig,
+    ROLE_ATTACKER,
+    ROLE_DEFENDER,
+    ROLE_KEEPER,
+    ROLE_MIDFIELDER,
+    TEAM_A,
+    TEAM_B,
+    TEAM_LEFT,
+    TEAM_RIGHT,
+)
+from football_rl.env import FootballEnv, FootballParallelEnv
 from football_rl.train_ppo import ParameterSharingPPOTrainer
 
 
@@ -284,3 +295,144 @@ def test_replay_telemetry_thresholds_vectorization_and_correctness(tmp_path) -> 
     # Must fail with AssertionError due to low teammate spacing and clumping around ball
     with pytest.raises(AssertionError):
         assert_replay_telemetry_thresholds(str(clumped_file))
+
+
+def test_kickoff_pass_pbrs_continuity_and_circulation_bonus():
+    """Verify that kicking a pass does not trigger a -0.4675 PBRS cliff and open kickoff passes earn positive reward."""
+    env = FootballEnv(EnvConfig())
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+
+    # Striker (idx 4) holds ball at center (700, 420) facing Midfielder (idx 3) at (520, 580)
+    kicker_idx, receiver_idx = 4, 3
+    env.ball_holder = kicker_idx
+    env.last_ball_holder = kicker_idx
+    env.last_ball_team = TEAM_LEFT
+    env.player_pos[kicker_idx] = [700.0, 420.0]
+    env.player_pos[receiver_idx] = [520.0, 580.0]
+    angle_to_mid = math.atan2(580.0 - 420.0, 520.0 - 700.0)
+    env.player_angle[kicker_idx] = angle_to_mid
+
+    env.prev_potential = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping( np.zeros(env.num_players, dtype=np.float64))
+    phi_before_kick = float(env.prev_potential[kicker_idx])
+
+    # Execute pass kick
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(kicker_idx, kick_power=0.6, step_rewards=step_rewards)
+    pbrs_delta = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping(pbrs_delta)
+    phi_after_kick = float(env.prev_potential[kicker_idx])
+
+    # Kicker potential must remain continuous on the kick frame (no -0.4675 cliff)
+    assert abs(phi_after_kick - phi_before_kick) < 0.05, (
+        f"Kicker suffered PBRS cliff on kick frame: {phi_before_kick:.4f} -> {phi_after_kick:.4f}"
+    )
+
+
+def test_stopped_corner_ball_cannot_trigger_through_ball():
+    """Verify that a wall-bounced or stopped ball in the corner never triggers THROUGH BALL!"""
+    env = FootballEnv(EnvConfig())
+    env.reset(seed=42)
+
+    # Ball kicked off top wall in corner, then comes to a stop
+    env.last_ball_holder = 2
+    env.last_ball_team = TEAM_LEFT
+    env.ball_kicked_in_flight = True
+    env.is_wall_pass_in_flight = True
+    env.ball_kick_time = env.match_time - 0.5
+    env.ball_kick_start_pos = np.array([1295.0, 10.0], dtype=np.float64)
+    env.ball_pos = np.array([1324.7, 180.0], dtype=np.float64)
+    env.ball_vel = np.array([0.0, 0.0], dtype=np.float64)  # Stopped ball
+
+    # Run one physics substep to trigger stationary flight expiry
+    env._physics_substep(np.zeros((12, 4), dtype=np.float64), np.zeros(12, dtype=np.float64))
+    assert not env.ball_kicked_in_flight, "Stopped ball must expire ball_kicked_in_flight!"
+
+
+def test_gk_pickup_has_no_pbrs_cliff_and_cannot_kick_own_goal():
+    """Verify GK loose-ball pickup does not drop GK potential and GK kick cannot point into own goal."""
+    env = FootballEnv(EnvConfig())
+    env.reset(seed=42)
+
+    gk_idx = 0  # Left GK
+    env.player_pos[gk_idx] = [150.0, 260.0]
+    env.ball_pos = np.array([165.0, 260.0], dtype=np.float64)
+    env.ball_holder = None
+
+    dummy = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping(dummy)
+    phi_loose = float(env.prev_potential[gk_idx])
+
+    # GK claims the ball
+    env.ball_holder = gk_idx
+    pbrs_pickup = np.zeros(env.num_players, dtype=np.float64)
+    env._compute_potential_shaping(pbrs_pickup)
+    phi_held = float(env.prev_potential[gk_idx])
+
+    assert phi_held >= phi_loose - 0.05, (
+        f"GK punished by PBRS for picking up loose box ball: {phi_loose:.4f} -> {phi_held:.4f}"
+    )
+
+    # Point GK directly at own net (angle = pi) and force a kick
+    env.player_angle[gk_idx] = math.pi
+    env._execute_kick(gk_idx, kick_power=1.0, step_rewards=dummy)
+    assert env.ball_vel[0] > 0.0, f"Left GK kicked backward toward own goal: ball_vel={env.ball_vel}"
+
+
+def test_gk_5s_violation_prevents_teammate_recovery_and_protects_goal_mouth():
+    """Verify 5s GK violation locks out teammates and resets GK to goal mouth."""
+    env = FootballEnv(EnvConfig())
+    env.reset(seed=42)
+
+    gk_idx = 6  # Right GK
+    teammate_idx = 7  # Right Defender
+    env.player_pos[gk_idx] = [1378.0, 226.0]  # Stranded in corner
+    env.player_pos[teammate_idx] = [1204.0, 250.0]
+    env.ball_holder = gk_idx
+
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_keeper_5s_violation(gk_idx, rewards, is_hold_violation=True)
+
+    # 1. Offending team must have pickup cooldown >= 1.5s so teammate cannot grab the foul ball
+    assert env.pickup_cooldown[teammate_idx] >= 1.5
+    # 2. GK must be reset near goal center (y == 420.0), not stranded in the corner
+    assert abs(float(env.player_pos[gk_idx, 1]) - 420.0) < 1e-3
+
+
+def test_bumper_to_bumper_tackle_probability_and_whiff_distance_gate():
+    """Verify Attackers have non-zero tackle probability at rigid-body contact (dist=40u) and distant tackles are gated."""
+    env = FootballEnv(EnvConfig())
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+
+    # 1. Distant tackle (> 180u from ball) must be ignored without penalty
+    atk_idx = 4
+    carrier_idx = 8
+    env.ball_holder = carrier_idx
+    env.player_pos[carrier_idx] = [1000.0, 420.0]
+    env.ball_pos = np.array([1000.0, 420.0], dtype=np.float64)
+    env.player_pos[atk_idx] = [200.0, 420.0]  # 800u away
+
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._attempt_tackle(atk_idx, rewards)
+    assert rewards[atk_idx] == 0.0 and env.stats["failed_tackles"] == 0
+
+    # 2. Bumper-to-bumper contact (dist = 40.0u = 2 * player_radius) for Attacker
+    env.player_pos[atk_idx] = [960.0, 420.0]  # Exactly 40.0u from carrier at (1000, 420)
+    env.player_angle[atk_idx] = 0.0
+    successes = 0
+    for s in range(100):
+        env.ball_holder = carrier_idx
+        env.pickup_tackle_grace_timer = 0.0
+        env.tackle_cooldown[atk_idx] = 0.0
+        env.stun_timer[atk_idx] = 0.0
+        env.player_pos[atk_idx] = [960.0, 420.0]
+        env.player_pos[carrier_idx] = [1000.0, 420.0]
+        env.ball_pos = np.array([1000.0, 420.0], dtype=np.float64)
+        env._attempt_tackle(atk_idx, np.zeros(12, dtype=np.float64))
+        if env.ball_holder == atk_idx:
+            successes += 1
+    assert successes >= 25, f"Attacker tackle rate at 40u contact should be ~43%, got {successes}%"
+

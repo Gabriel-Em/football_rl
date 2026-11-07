@@ -1402,7 +1402,7 @@ def select_archive_replays(
 
 
 def archive_batch(
-    name: str,
+    name: Optional[str] = None,
     checkpoint_dir: str = "checkpoints",
     replay_dir: str = "replays",
     archive_root: str = "archives",
@@ -1414,7 +1414,14 @@ def archive_batch(
 
     When archiving, keeps the first 5 and last 5 generations as well as 5 randomly spread
     out in-between generations, retaining a total of 15 match replays only.
+    If `name` is omitted or empty, automatically generates a timestamp-based name
+    formatted as `%Y%m%d_%H%M%S`.
     """
+    if not name or not name.strip():
+        name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        name = name.strip()
+
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
     if not os.path.exists(state_path) and not os.path.exists(
         os.path.join(checkpoint_dir, "field_policy.pt")
@@ -1638,9 +1645,11 @@ def main() -> None:
     parser.add_argument(
         "--archive",
         type=str,
+        nargs="?",
+        const="",
         default=None,
         metavar="BATCH_NAME",
-        help="Archive active `checkpoints/` and `replays/` to `archives/<BATCH_NAME>/` (retaining 15 matches across first 5, middle 5, and last 5 generations) and exit.",
+        help="Archive active `checkpoints/` and `replays/` to `archives/<BATCH_NAME>/` (defaults to a timestamp-based name if omitted) and exit.",
     )
     parser.add_argument(
         "--load-archive",
@@ -1686,8 +1695,9 @@ def main() -> None:
                 )
         return
 
-    if args.archive:
-        dest = archive_batch(args.archive, ckpt_dir, rep_dir)
+    if args.archive is not None:
+        archive_name = args.archive.strip() if args.archive.strip() else None
+        dest = archive_batch(archive_name, ckpt_dir, rep_dir)
         print(f"Archived active training batch (checkpoints + replays) to: {dest}")
         return
 

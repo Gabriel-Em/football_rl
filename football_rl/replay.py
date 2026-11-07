@@ -1052,7 +1052,7 @@ class ReplayViewer:
             trans_events = [
                 ev
                 for ev in events
-                if ev.get("type") in ("GOAL!", "OWN GOAL!", "5s KEEPER FOUL!", "5s KEEPER HOLD FOUL!", "5s UNCLAIMED BOX BALL!", "HALFTIME!", "FULLTIME!")
+                if ev.get("type") in ("GOAL!", "OWN GOAL!", "HALFTIME!", "FULLTIME!")
             ]
 
             # Trigger Full-Time cinematic at match conclusion on final frame if not already present
@@ -1270,11 +1270,11 @@ class ReplayViewer:
                 goal_net_x = 0.0 if own_side == 0 else self.field_w
             elif ev_type in ("5s KEEPER FOUL!", "5s KEEPER HOLD FOUL!"):
                 title_str = "5s KEEPER HOLD VIOLATION  —  TURNOVER FREE KICK!"
-                sub_str = "Goalkeeper held ball > 5.0s  |  Awarded to attacking team"
+                sub_str = "LIVE FLANK TURNOVER — Keeper reset to goal line, ball awarded wide"
                 accent_color = EVENT_COLORS.get("5s KEEPER HOLD FOUL!", (255, 75, 150))
             elif ev_type == "5s UNCLAIMED BOX BALL!":
                 title_str = "5s UNCLAIMED BOX BALL  —  ATTACKING OVERLOAD FREE KICK!"
-                sub_str = "Loose ball unclaimed in keeper arc > 5.0s  |  Turnover restart"
+                sub_str = "LIVE FLANK TURNOVER — Keeper reset to goal line, ball awarded wide"
                 accent_color = EVENT_COLORS.get("5s UNCLAIMED BOX BALL!", (255, 110, 180))
             elif ev_type == "HALFTIME!":
                 title_str = "HALF-TIME  —  SWITCHING SIDES"

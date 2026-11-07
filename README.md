@@ -148,7 +148,7 @@ Inspect generation count, cumulative matches, total steps, and Top 10 most excit
 | `--shared-teams` | `False` | Force Blue and Red to share the same policy network (mirror self-play). |
 | `--seed` | `42` | Random seed. |
 | `--status` | `False` | Display current training status, match count, and leaderboard, then exit. |
-| `--archive <NAME>` | `None` | Save active checkpoints and replays to `archives/<NAME>/` and exit. |
+| `--archive [NAME]` | `None` | Save active checkpoints and replays to `archives/<NAME>/` (or timestamped name if omitted) and exit. |
 | `--load-archive <NAME>` | `None` | Restore an experiment archive to active workspace and exit. |
 | `--list-archives` | `False` | List all saved experiment archives in `archives/` and exit. |
 

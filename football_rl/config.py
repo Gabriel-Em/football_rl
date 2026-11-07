@@ -15,6 +15,8 @@ TEAM_B: int = 1
 
 SIDE_LEFT: int = 0   # Defends Left goal (0.0, 420.0), attacks Right goal (1400.0, 420.0)
 SIDE_RIGHT: int = 1  # Defends Right goal (1400.0, 420.0), attacks Left goal (0.0, 420.0)
+TEAM_LEFT: int = SIDE_LEFT
+TEAM_RIGHT: int = SIDE_RIGHT
 
 TEAM_A_AGENTS: Tuple[str, ...] = (
     "a_keeper",
@@ -39,6 +41,9 @@ ROLE_FIELD: int = 1  # Kept as alias/base for general field-player checks (role 
 ROLE_DEF: int = 1
 ROLE_MID: int = 2
 ROLE_ATK: int = 3
+ROLE_DEFENDER: int = ROLE_DEF
+ROLE_MIDFIELDER: int = ROLE_MID
+ROLE_ATTACKER: int = ROLE_ATK
 
 
 # ==============================================================================
@@ -75,8 +80,6 @@ class PhysicsConfig:
 
     # Dynamic Pass & Smother Parameters
     kick_steer_max_deflection_deg: float = 35.0   # Clean side-foot deflection angle (+/- 35 deg) decoupled from body spin
-    max_wall_pass_flight_time: float = 3.5        # Max flight time (s) for long GK/defender side-wall bank passes
-    keeper_smother_cpa_radius: float = 30.0       # CPA threshold radius (u) for keeper dive speed clamping and smother saves
 
     # Ball Kinematics
     ball_radius: float = 10.0
@@ -125,7 +128,6 @@ class MechanicsConfig:
     pickup_tackle_grace: float = 0.15 # Shielding duration (s) after recovering a free loose ball during which carrier cannot be tackled
     pass_reception_tackle_grace: float = 0.10 # Shielding duration (s) after receiving a teammate pass outside goalmouth
     kick_steer_max_deflection_deg: float = 35.0  # Side-foot pass/clearance angle modulation (+/- 35 deg)
-    keeper_smother_cpa_radius: float = 30.0      # CPA threshold radius (u) for keeper dive speed clamping and smother saves
     contested_ball_distance: float = 65.0  # Max opponent distance (u) at recovery for a loose ball pickup to be classified as contested
     kick_trigger_threshold: float = 0.35  # action[2] must exceed 0.35 to intentionally kick
     min_pass_distance: float = 85.0   # Minimum kick travel distance to count as a Completed Pass (blocks micro-pass scrums)
@@ -173,8 +175,6 @@ class MechanicsConfig:
     keeper_lunge_cooldown: float = 1.8
     keeper_strip_stun_duration: float = 0.20
     keeper_strip_self_kick_cooldown: float = 2.0  # 0.0 reward and no save stat if keeper kicked in last 2.0s
-    keeper_clear_corridor_length: float = 380.0   # Forward corridor distance (u) to check for blocking opponents (reaches past gk_hold_opponent_buffer=265.0)
-    keeper_clear_corridor_half_width: float = 45.0 # Corridor half-width (u) around GK kick trajectory
 
     # Hold Rules & Violation Penalties
     field_max_hold_time: float = 5.0
@@ -248,8 +248,11 @@ class RewardConfig:
 
     # Passing & Progression (Team-Cooperative + Anti-Oscillation)
     pass_threat_weight: float = 6.0
+    pass_threat_coeff: float = 6.0
     pass_space_weight: float = 0.60
+    pass_press_escape_coeff: float = 0.60
     lead_pass_bonus: float = 0.80
+    through_ball_stride_bonus: float = 0.80
     completed_pass_receiver_ind: float = 0.15
     completed_pass_team: float = 0.20
 
@@ -262,11 +265,9 @@ class RewardConfig:
 
     # Tier 2: Strict Policy-Invariant Non-Negative PBRS Weights (Phi in [0, Phi_max])
     team_advance_pbrs_weight: float = 6.0
-    carrier_advance_pbrs_weight: float = 0.0  # Disabled: non-telescoping when ball is in flight
     support_potential_weight: float = 0.85
     def_press_potential_weight: float = 0.65
     def_cover_potential_weight: float = 0.75
-    teammate_sep_potential_weight: float = 0.50
     keeper_bisect_potential_weight: float = 0.60
 
     # Tier 3: Physical Regularization
@@ -275,7 +276,6 @@ class RewardConfig:
     keeper_5s_violation_ind: float = -1.5
     keeper_5s_violation_team: float = -0.3
     failed_tackle_ind: float = -0.20
-    reckless_tackle_ind: float = -0.20
 
 
 @dataclass(frozen=True)
@@ -306,50 +306,6 @@ class FormationConfig:
             "mid_1": (960.0, 220.0),
             "mid_2": (960.0, 620.0),
             "atk_1": (910.0, 420.0),  # Outside center circle (210u from center spot)
-        }
-    )
-
-    # 2. Foul Restart Formation (Open 3-2 Attacking Overload & Zonal Block)
-    # Canonical coordinates where the Attacking Team attacks toward +X (1400.0, 420.0)
-    foul_attacking_canonical: Dict[str, Tuple[float, float]] = field(
-        default_factory=lambda: {
-            "keeper": (40.0, 420.0),
-            "def_1": (540.0, 260.0),
-            "def_2": (540.0, 580.0),
-            "mid_1": (965.0, 235.0),
-            "mid_2": (965.0, 605.0),
-            "atk_1": (820.0, 420.0),
-        }
-    )
-    foul_defending_canonical: Dict[str, Tuple[float, float]] = field(
-        default_factory=lambda: {
-            "keeper": (1360.0, 420.0),
-            "def_1": (1115.0, 315.0),
-            "def_2": (1115.0, 525.0),
-            "mid_1": (1030.0, 130.0),
-            "mid_2": (1030.0, 710.0),
-            "atk_1": (640.0, 420.0),
-        }
-    )
-    # Backward-compatible mappings:
-    foul_penalized_left: Dict[str, Tuple[float, float]] = field(
-        default_factory=lambda: {
-            "keeper": (40.0, 420.0),
-            "def_1": (285.0, 525.0),
-            "def_2": (285.0, 315.0),
-            "mid_1": (370.0, 710.0),
-            "mid_2": (370.0, 130.0),
-            "atk_1": (760.0, 420.0),
-        }
-    )
-    foul_attacking_right: Dict[str, Tuple[float, float]] = field(
-        default_factory=lambda: {
-            "keeper": (1360.0, 420.0),
-            "def_1": (860.0, 580.0),
-            "def_2": (860.0, 260.0),
-            "mid_1": (435.0, 605.0),
-            "mid_2": (435.0, 235.0),
-            "atk_1": (580.0, 420.0),
         }
     )
 
