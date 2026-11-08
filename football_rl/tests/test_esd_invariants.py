@@ -37,15 +37,15 @@ def test_closed_loop_pbrs_zero_gain_invariant() -> None:
         env.player_vel[i] = np.zeros(2, dtype=np.float64)
     env.ball_holder = None
 
-    gamma = env.cfg.ppo.gamma
+    gamma = 1.0  # Undiscounted potential difference for zero stationary leak
     rew_w = env.cfg.rewards.team_advance_pbrs_weight
     # Define a closed spatial trajectory for the ball: s0 -> s1 -> s2 -> s3 -> s0
     waypoints = [
-        np.array([500.0, 400.0], dtype=np.float64),
-        np.array([700.0, 400.0], dtype=np.float64),
+        np.array([700.0, 420.0], dtype=np.float64),
         np.array([900.0, 500.0], dtype=np.float64),
         np.array([600.0, 300.0], dtype=np.float64),
         np.array([500.0, 400.0], dtype=np.float64),
+        np.array([700.0, 420.0], dtype=np.float64),
     ]
 
     total_discounted_pbrs_team_a = 0.0
@@ -333,7 +333,7 @@ def test_pbrs_strict_non_negativity_and_cross_turnover_telescoping() -> None:
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
-    gamma = env.cfg.ppo.gamma
+    gamma = 1.0  # Undiscounted potential difference for zero stationary leak
     states = [
         (np.array([450.0, 380.0], dtype=np.float64), 1),
         (np.array([700.0, 420.0], dtype=np.float64), None),
@@ -390,7 +390,14 @@ def test_multiplicative_spacing_gate_and_one_to_one_defensive_marking() -> None:
     env.player_pos[4] = np.array([700.0, 185.0], dtype=np.float64)
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
     phi_clumped = float(env.prev_tactical_potential[3])
-    assert phi_clumped == 0.0, f"Expected 0.0 potential when clumped at 30u, got {phi_clumped}"
+    assert phi_clumped < phi_spread, f"Expected reduced potential when clumped, got {phi_clumped} vs {phi_spread}"
+    assert phi_clumped > 0.0, f"Expected non-zero potential to avoid gradient death, got {phi_clumped}"
+
+    # Moving apart increases potential (positive separation gradient)
+    env.player_pos[4] = np.array([700.0, 215.0], dtype=np.float64)  # 60u separation
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_separating = float(env.prev_tactical_potential[3])
+    assert phi_separating > phi_clumped, f"Expected increasing potential when separating, got {phi_separating} vs {phi_clumped}"
 
 
 def test_zero_sum_adversarial_turnover_and_scrum_cooldown_invariants() -> None:

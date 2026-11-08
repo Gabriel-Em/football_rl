@@ -281,7 +281,7 @@ class FootballParallelEnv(ParallelEnv):
         self.last_shot_team_reward: float = 0.0
         self.last_pass_pair: List[Optional[Tuple[int, int]]] = [None, None]
         self.pair_pass_count: List[int] = [0, 0]
-        self.spell_max_threat: np.ndarray = np.zeros(2, dtype=np.float64)
+        self.spell_max_threat: np.ndarray = np.full(2, -1.0, dtype=np.float64)
 
         # Preallocated buffers and constants for high-performance observation and critic computation
         self._inv_2_165_sq: float = 1.0 / (2.0 * 165.0 * 165.0)
@@ -289,6 +289,7 @@ class FootballParallelEnv(ParallelEnv):
         self._inv_2_260_sq: float = 1.0 / (2.0 * 260.0 * 260.0)
         self._inv_2_280_sq: float = 1.0 / (2.0 * 280.0 * 280.0)
         self._inv_2_95_sq: float = 1.0 / (2.0 * 95.0 * 95.0)
+        self._inv_lambda_chase: float = 1.0 / 220.0
         self._phi_curr: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
 
         self._critic_feat_a: np.ndarray = np.empty((self.num_players, 4), dtype=np.float32)
@@ -426,6 +427,17 @@ class FootballParallelEnv(ParallelEnv):
         self.current_generation: int = 0
         self.current_match_id: int = 0
 
+        # Telemetry & Critic recording buffers
+        self.last_v_preds: Optional[np.ndarray] = None
+        self.last_rew_breakdown: Optional[List[Dict[str, Any]]] = None
+        self.last_grad_phi: Optional[List[List[float]]] = None
+        self.last_role_states: List[str] = [
+            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
+            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
+        ]
+        self.last_role_targets: List[List[float]] = [[0.0, 0.0] for _ in range(self.num_players)]
+        self.last_actions: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(self.num_players)]
+
     @property
     def phys_cfg(self) -> PhysicsConfig:
         return self.cfg.physics
@@ -503,7 +515,7 @@ class FootballParallelEnv(ParallelEnv):
         team_id: int,
         ref_world_pos: Optional[np.ndarray] = None,
     ) -> float:
-        """Compute bounded territorial ball threat potential in [0.0, 1.0] for `team_id`."""
+        """Compute strictly anti-symmetric territorial ball threat potential in [-0.5, +0.5] for `team_id`."""
         if ref_world_pos is None:
             ref_world_pos = (
                 self.player_pos[self.ball_holder]
@@ -511,10 +523,21 @@ class FootballParallelEnv(ParallelEnv):
                 else self.ball_pos
             )
         c_ref = self._to_canonical_pos(ref_world_pos, team_id)
-        d_goal = math.hypot(1400.0 - float(c_ref[0]), 420.0 - float(c_ref[1]))
-        linear_term = _fast_clip(1.0 - (d_goal / self.max_pitch_diag), 0.0, 1.0)
-        gauss_term = math.exp(-(d_goal * d_goal) / (2.0 * 380.0 * 380.0))
-        return _fast_clip(0.65 * linear_term + 0.35 * gauss_term, 0.0, 1.0)
+        cx, cy = float(c_ref[0]), float(c_ref[1])
+
+        # Distance to opponent goal (1400, 420)
+        d_att = math.hypot(1400.0 - cx, 420.0 - cy)
+        lin_att = _fast_clip(1.0 - (d_att / self.max_pitch_diag), 0.0, 1.0)
+        gauss_att = math.exp(-(d_att * d_att) / (2.0 * 380.0 * 380.0))
+        phi_att = 0.65 * lin_att + 0.35 * gauss_att
+
+        # Distance to own goal (0, 420)
+        d_def = math.hypot(cx, 420.0 - cy)
+        lin_def = _fast_clip(1.0 - (d_def / self.max_pitch_diag), 0.0, 1.0)
+        gauss_def = math.exp(-(d_def * d_def) / (2.0 * 380.0 * 380.0))
+        phi_def = 0.65 * lin_def + 0.35 * gauss_def
+
+        return 0.5 * (phi_att - phi_def)
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """Convenience alias for _get_observations()."""
@@ -659,10 +682,20 @@ class FootballParallelEnv(ParallelEnv):
             "field_3s_violations": 0,  # alias for backwards compatibility
             "keeper_5s_violations": 0,
             "possession_frames": [0, 0],
+            "stationary_ball_frames": 0,
         }
 
         self.replay_frames = []
         self._frame_events = []
+        self.last_v_preds = None
+        self.last_rew_breakdown = None
+        self.last_grad_phi = None
+        self.last_role_states = [
+            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
+            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
+        ]
+        self.last_role_targets = [[0.0, 0.0] for _ in range(self.num_players)]
+        self.last_actions = [[0.0, 0.0, 0.0, 0.0] for _ in range(self.num_players)]
         self.last_keeper_kick_time.fill(-999.0)
         self.shot_on_target_cd.fill(0.0)
         self.last_step_rewards.fill(0.0)
@@ -713,10 +746,15 @@ class FootballParallelEnv(ParallelEnv):
         }
         return observations, infos
 
-    def _step_core(self, act_array: np.ndarray) -> Tuple[np.ndarray, bool, bool]:
+    def _step_core(
+        self, act_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, bool, bool]:
         """Execute physics sub-steps, PBRS, and end-of-episode bookkeeping for a (12, 4) action array."""
         # Store raw steering input for instantaneous kick deflection
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
+        self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
+        if v_preds is not None:
+            self.last_v_preds = np.asarray(v_preds, dtype=np.float32)
 
         step_rewards = np.zeros(self.num_players, dtype=np.float64)
         phi_ball_start_a = self._compute_ball_potential(TEAM_A)
@@ -746,23 +784,30 @@ class FootballParallelEnv(ParallelEnv):
 
         self.rl_step_count += 1
 
+        r_sparse = step_rewards.copy()
+
         # Tier 2: Strict Policy-Invariant PBRS (Ball Threat & Off-Ball Positioning)
         phi_ball_end_a = self._compute_ball_potential(TEAM_A)
         phi_ball_end_b = self._compute_ball_potential(TEAM_B)
         self.prev_ball_potential[0] = phi_ball_end_a
         self.prev_ball_potential[1] = phi_ball_end_b
+        r_ball_adv = np.zeros(self.num_players, dtype=np.float64)
         if not any_teleport:
-            gamma = self.cfg.ppo.gamma
             rew = self.cfg.rewards
             w_adv = rew.team_advance_pbrs_weight
-            adv_a = w_adv * (gamma * phi_ball_end_a - phi_ball_start_a)
+            adv_a = w_adv * (phi_ball_end_a - phi_ball_start_a)
+            adv_b = w_adv * (phi_ball_end_b - phi_ball_start_b)
+
             if abs(adv_a) > 1e-12:
                 step_rewards[:6] += adv_a
-            adv_b = w_adv * (gamma * phi_ball_end_b - phi_ball_start_b)
+                r_ball_adv[:6] = adv_a
             if abs(adv_b) > 1e-12:
                 step_rewards[6:] += adv_b
+                r_ball_adv[6:] = adv_b
 
-        self._compute_potential_shaping(step_rewards, any_teleport)
+        self._compute_potential_shaping(
+            step_rewards, any_teleport, r_sparse=r_sparse, r_ball_adv=r_ball_adv
+        )
 
         # Update reward tracking arrays for visual feedback & replay recording
         self.last_step_rewards = step_rewards.astype(np.float32)
@@ -770,10 +815,23 @@ class FootballParallelEnv(ParallelEnv):
         if self.cfg.replay.enable_recording and len(self.replay_frames) > 0:
             p_rews = [round(float(r), 4) for r in self.last_step_rewards]
             c_rews = [round(float(r), 2) for r in self.cum_player_rewards]
+            v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
             start_back = max(0, len(self.replay_frames) - self.cfg.physics.frame_skip)
             for f_idx in range(start_back, len(self.replay_frames)):
                 self.replay_frames[f_idx]["player_rewards"] = p_rews
                 self.replay_frames[f_idx]["cum_rewards"] = c_rews
+                if v_preds_data is not None:
+                    self.replay_frames[f_idx]["v_pred"] = v_preds_data
+                if self.last_rew_breakdown is not None:
+                    self.replay_frames[f_idx]["rew_breakdown"] = self.last_rew_breakdown
+                if self.last_grad_phi is not None:
+                    self.replay_frames[f_idx]["grad_phi"] = self.last_grad_phi
+                if self.last_role_states is not None:
+                    self.replay_frames[f_idx]["role_state"] = list(self.last_role_states)
+                if self.last_role_targets is not None:
+                    self.replay_frames[f_idx]["role_targets"] = self.last_role_targets
+                if self.last_actions is not None:
+                    self.replay_frames[f_idx]["actions"] = self.last_actions
 
         # Episode termination / truncation at t = 180.0s (2,700 RL steps)
         is_truncated = self.rl_step_count >= self.cfg.physics.max_rl_steps
@@ -803,11 +861,11 @@ class FootballParallelEnv(ParallelEnv):
         return step_rewards, is_terminated, is_truncated
 
     def step_array(
-        self, actions_array: np.ndarray
+        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Optional[Dict[str, Any]]]:
         """Execute one RL step using a (12, 4) action array and return contiguous NumPy arrays."""
         act_array = np.clip(np.asarray(actions_array, dtype=np.float64), -1.0, 1.0)
-        step_rewards, is_terminated, is_truncated = self._step_core(act_array)
+        step_rewards, is_terminated, is_truncated = self._step_core(act_array, v_preds=v_preds)
 
         obs_arr = self._get_observations_array()
         central_arr = self.get_centralized_state()
@@ -983,11 +1041,16 @@ class FootballParallelEnv(ParallelEnv):
                 and self.ball_hold_timer >= mech.field_max_hold_time - 1e-9
             ):
                 self._handle_field_5s_violation(self.ball_holder, step_rewards)
+                return True
             elif (
                 holder_role == ROLE_KEEPER
                 and self.ball_hold_timer >= mech.keeper_max_hold_time - 1e-9
             ):
                 self._handle_keeper_5s_violation(self.ball_holder, step_rewards, is_hold_violation=True)
+                return True
+        else:
+            if math.hypot(float(self.ball_vel[0]), float(self.ball_vel[1])) < 1.0:
+                self.stats["stationary_ball_frames"] += 1
 
         # ----------------------------------------------------------------------
         # 2. Process Player Actions (Steering, Throttle, Kick, Special)
@@ -1464,6 +1527,11 @@ class FootballParallelEnv(ParallelEnv):
         if holder is not None and int(self.player_team[holder]) == tackler_team:
             return
 
+        # Fix 4.2: If ball is loose (holder is None), tackling is a harmless no-op.
+        # Tackles apply strictly against an active opponent ball carrier.
+        if holder is None:
+            return
+
         # Gate tackle execution with tackle_whiff_max_ball_dist (180u)
         max_ball_dist = getattr(mech, "tackle_whiff_max_ball_dist", getattr(rew, "tackle_whiff_max_ball_dist", 180.0))
         dist_to_ball = math.hypot(
@@ -1597,6 +1665,15 @@ class FootballParallelEnv(ParallelEnv):
 
         dist_to_ball = float(np.linalg.norm(self.player_pos[keeper_idx] - self.ball_pos))
         if dist_to_ball <= mech.pickup_distance:
+            d_ball = self.ball_pos - self.player_pos[keeper_idx]
+            d_norm = max(1e-6, dist_to_ball)
+            u_ball_x = float(d_ball[0]) / d_norm
+            u_ball_y = float(d_ball[1]) / d_norm
+            gk_ang = float(self.player_angle[keeper_idx])
+            cos_phi = math.cos(gk_ang) * u_ball_x + math.sin(gk_ang) * u_ball_y
+            if cos_phi < -0.15:
+                return
+
             now_t = self.physics_frame_count * self.cfg.physics.dt
             recently_kicked_by_gk = (now_t - self.last_keeper_kick_time[opp_team]) < mech.keeper_strip_self_kick_cooldown
 
@@ -1652,12 +1729,20 @@ class FootballParallelEnv(ParallelEnv):
         rew = self.cfg.rewards
         phys = self.cfg.physics
 
-        dists = np.hypot(
-            self.player_pos[:, 0] - self.ball_pos[0],
-            self.player_pos[:, 1] - self.ball_pos[1],
-        )
+        dx_b = self.ball_pos[0] - self.player_pos[:, 0]
+        dy_b = self.ball_pos[1] - self.player_pos[:, 1]
+        dists = np.hypot(dx_b, dy_b)
+        inv_dists = 1.0 / np.maximum(dists, 1e-6)
+        u_bx = dx_b * inv_dists
+        u_by = dy_b * inv_dists
+        cos_phi = np.cos(self.player_angle) * u_bx + np.sin(self.player_angle) * u_by
+
+        gk_mask = self.player_role == ROLE_KEEPER
+        facing_eligible = ~gk_mask | (cos_phi >= -0.15)
+
         eligible = np.where(
             (dists <= mech.pickup_distance)
+            & facing_eligible
             & (self.pickup_cooldown <= 0.0)
             & (self.stun_timer <= 0.0)
             & (self.ghost_timer <= 0.0)
@@ -1717,7 +1802,11 @@ class FootballParallelEnv(ParallelEnv):
                     # 1. Territorial Threat Gain above spell high-water mark (prevents backward-forward pass pumping)
                     phi_orig = self._compute_ball_potential(new_team, self.ball_kick_origin)
                     phi_dest = self._compute_ball_potential(new_team, self.ball_pos)
-                    high_water = max(float(phi_orig), float(self.spell_max_threat[new_team]))
+                    high_water = max(
+                        float(phi_orig),
+                        float(self._compute_ball_potential(new_team, self.player_pos[kicker_idx])),
+                        float(self.spell_max_threat[new_team]),
+                    )
                     d_phi_threat = max(0.0, float(phi_dest) - high_water)
                     self.spell_max_threat[new_team] = max(high_water, float(phi_dest))
 
@@ -1855,6 +1944,7 @@ class FootballParallelEnv(ParallelEnv):
                 my_side = int(self.team_side[new_team])
                 is_real_save = (
                     new_role == ROLE_KEEPER
+                    and cos_phi[new_holder] >= -0.15
                     and (
                         self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, my_side)
                         or (
@@ -2149,7 +2239,7 @@ class FootballParallelEnv(ParallelEnv):
                     yi = float(pos[i, 1])
 
     def _clamp_players_to_boundaries(self, apply_dynamic_push: bool = True) -> None:
-        """Enforce field walls and semi-circle barriers (Keepers inside own box, Field outside both)."""
+        """Enforce field walls and semi-circle barriers with smooth tangential sliding and corner trap resolution."""
         phys = self.cfg.physics
         r_player = phys.player_radius
         box_r = phys.keeper_box_radius
@@ -2158,6 +2248,7 @@ class FootballParallelEnv(ParallelEnv):
             np.array(phys.right_goal_center, dtype=np.float64),
         )
 
+        # 1. Keepers clamped inside own box
         for k_idx in (0, 6):
             my_side = int(self.team_side[self.player_team[k_idx]])
             own_goal = goal_centers[my_side]
@@ -2166,30 +2257,127 @@ class FootballParallelEnv(ParallelEnv):
             if dist > box_r:
                 self.player_pos[k_idx] = own_goal + (delta / dist) * box_r
 
+        # 2. Outfield players outside keeper semicircle envelopes and inside field walls
+        # Smooth continuous boundary envelope: resolves the wall-semicircle intersection
+        # and projects velocity tangentially around the box to eliminate zero-velocity fixed points.
+        eff_box_left = float(self.active_box_radius[0])
+        eff_box_right = float(self.active_box_radius[1])
+
         for field_slice in (slice(1, 6), slice(7, 12)):
-            for side_i, g_center in enumerate(goal_centers):
-                eff_box_r = float(self.active_box_radius[side_i])
-                if eff_box_r <= 1e-3:
-                    continue
-                delta = self.player_pos[field_slice] - g_center
-                dist = np.hypot(delta[:, 0], delta[:, 1])
-                inside = dist <= eff_box_r
-                if not np.any(inside):
-                    continue
-                safe_dist = np.maximum(dist, 1e-6)
-                push_dir = delta / safe_dist[:, None]
-                too_close = dist < 1e-6
-                if np.any(too_close):
-                    push_dir[too_close, 0] = 1.0 if g_center[0] == 0.0 else -1.0
-                    push_dir[too_close, 1] = 0.0
-                new_pos = g_center + push_dir * (eff_box_r + 1e-3)
-                if apply_dynamic_push:
-                    rad_v = np.sum(self.player_vel[field_slice] * push_dir, axis=1)
-                    neg_rad_v = np.where(inside & (rad_v < 0.0), rad_v, 0.0)
-                    self.player_vel[field_slice] -= neg_rad_v[:, None] * push_dir
-                self.player_pos[field_slice] = np.where(
-                    inside[:, None], new_pos, self.player_pos[field_slice]
-                )
+            for p_idx in range(field_slice.start, field_slice.stop):
+                px = float(self.player_pos[p_idx, 0])
+                py = float(self.player_pos[p_idx, 1])
+                vx = float(self.player_vel[p_idx, 0])
+                vy = float(self.player_vel[p_idx, 1])
+
+                # Left goalmouth boundary envelope
+                dy_l = py - 420.0
+                if abs(dy_l) < eff_box_left and eff_box_left > 1e-3:
+                    dx_arc_l = math.sqrt(eff_box_left * eff_box_left - dy_l * dy_l)
+                else:
+                    dx_arc_l = 0.0
+                x_min = max(r_player, dx_arc_l + 1e-3 if dx_arc_l > 0.0 else r_player)
+
+                if px < x_min:
+                    px = x_min
+
+                dist_l = math.hypot(px, dy_l)
+                if abs(dy_l) < eff_box_left and dist_l <= eff_box_left + 1e-3 and eff_box_left > 1e-3:
+                    dist_safe = max(1e-6, dist_l)
+                    nx_l = px / dist_safe
+                    ny_l = dy_l / dist_safe
+
+                    if apply_dynamic_push:
+                        # Tangent vector along arc directed into the field (tx > 0) toward goalmouth
+                        s_ny = 1.0 if ny_l >= 0.0 else -1.0
+                        tx_l = abs(ny_l)
+                        ty_l = -nx_l * s_ny
+
+                        # Corner vertex near the wall (px <= r_player + 0.5)
+                        if px <= r_player + 0.5:
+                            pushes_away = (dy_l < 0.0 and vy < 0.0) or (dy_l > 0.0 and vy > 0.0)
+                            if pushes_away:
+                                vx = 0.0
+                            else:
+                                spd = math.hypot(vx, vy)
+                                vt_l = max(spd * tx_l, vx * tx_l + vy * ty_l)
+                                vx = vt_l * tx_l
+                                vy = vt_l * ty_l
+                        else:
+                            vn_l = vx * nx_l + vy * ny_l
+                            if vn_l < 0.0:
+                                vx -= vn_l * nx_l
+                                vy -= vn_l * ny_l
+                            if vx < 0.0 and px <= r_player + 2.0:
+                                vt_l = max(0.0, vx * tx_l + vy * ty_l)
+                                vx = vt_l * tx_l
+                                vy = vt_l * ty_l
+                elif px <= r_player:
+                    px = r_player
+                    if apply_dynamic_push and vx < 0.0:
+                        vx = 0.0
+
+                # Right goalmouth boundary envelope
+                dy_r = py - 420.0
+                if abs(dy_r) < eff_box_right and eff_box_right > 1e-3:
+                    dx_arc_r = math.sqrt(eff_box_right * eff_box_right - dy_r * dy_r)
+                else:
+                    dx_arc_r = 0.0
+                x_max = min(phys.field_width - r_player, phys.field_width - (dx_arc_r + 1e-3 if dx_arc_r > 0.0 else 0.0))
+
+                if px > x_max:
+                    px = x_max
+
+                dist_r = math.hypot(phys.field_width - px, dy_r)
+                if abs(dy_r) < eff_box_right and dist_r <= eff_box_right + 1e-3 and eff_box_right > 1e-3:
+                    dist_safe = max(1e-6, dist_r)
+                    nx_r = (px - phys.field_width) / dist_safe
+                    ny_r = dy_r / dist_safe
+
+                    if apply_dynamic_push:
+                        # Tangent vector along arc directed into the field (tx < 0) toward goalmouth
+                        s_ny = 1.0 if ny_r >= 0.0 else -1.0
+                        tx_r = -abs(ny_r)
+                        ty_r = nx_r * s_ny
+
+                        # Corner vertex near the wall (px >= field_width - r_player - 0.5)
+                        if px >= phys.field_width - r_player - 0.5:
+                            pushes_away = (dy_r < 0.0 and vy < 0.0) or (dy_r > 0.0 and vy > 0.0)
+                            if pushes_away:
+                                vx = 0.0
+                            else:
+                                spd = math.hypot(vx, vy)
+                                vt_r = max(spd * abs(tx_r), vx * tx_r + vy * ty_r)
+                                vx = vt_r * tx_r
+                                vy = vt_r * ty_r
+                        else:
+                            vn_r = vx * nx_r + vy * ny_r
+                            if vn_r < 0.0:
+                                vx -= vn_r * nx_r
+                                vy -= vn_r * ny_r
+                            if vx > 0.0 and px >= phys.field_width - r_player - 2.0:
+                                vt_r = max(0.0, vx * tx_r + vy * ty_r)
+                                vx = vt_r * tx_r
+                                vy = vt_r * ty_r
+                elif px >= phys.field_width - r_player:
+                    px = phys.field_width - r_player
+                    if apply_dynamic_push and vx > 0.0:
+                        vx = 0.0
+
+                # Top & bottom field walls with normal dissipation
+                if py < r_player:
+                    py = r_player
+                    if apply_dynamic_push and vy < 0.0:
+                        vy = 0.0
+                elif py > phys.field_height - r_player:
+                    py = phys.field_height - r_player
+                    if apply_dynamic_push and vy > 0.0:
+                        vy = 0.0
+
+                self.player_pos[p_idx, 0] = px
+                self.player_pos[p_idx, 1] = py
+                self.player_vel[p_idx, 0] = vx
+                self.player_vel[p_idx, 1] = vy
 
         # Kickoff Exclusion Circle: Smoothly or firmly keep opposing players outside center spot (r = 130.0)
         if self.kickoff_protection_timer > 0.0 and self.ball_holder is not None:
@@ -2264,6 +2452,18 @@ class FootballParallelEnv(ParallelEnv):
             phys.field_height - r_player,
             out=self.player_pos[:, 1],
         )
+
+        hit_left = self.player_pos[:, 0] <= r_player
+        self.player_vel[hit_left & (self.player_vel[:, 0] < 0.0), 0] = 0.0
+
+        hit_right = self.player_pos[:, 0] >= phys.field_width - r_player
+        self.player_vel[hit_right & (self.player_vel[:, 0] > 0.0), 0] = 0.0
+
+        hit_top = self.player_pos[:, 1] <= r_player
+        self.player_vel[hit_top & (self.player_vel[:, 1] < 0.0), 1] = 0.0
+
+        hit_bottom = self.player_pos[:, 1] >= phys.field_height - r_player
+        self.player_vel[hit_bottom & (self.player_vel[:, 1] > 0.0), 1] = 0.0
 
     def _check_goal_scored(self) -> Optional[int]:
         """Check if the ball crossed X <= 0 or X >= 1400 within Y in [340.0, 500.0]."""
@@ -2461,7 +2661,7 @@ class FootballParallelEnv(ParallelEnv):
         self.last_kick_time.fill(-999.0)
         self.last_shot_sot_reward = 0.0
         self.last_shot_team_reward = 0.0
-        self.spell_max_threat.fill(0.0)
+        self.spell_max_threat.fill(-1.0)
         self._reset_pass_chains()
 
     def _reset_pass_chains(self, team: Optional[int] = None) -> None:
@@ -2473,7 +2673,7 @@ class FootballParallelEnv(ParallelEnv):
             self.last_completed_pass_time.fill(-999.0)
             self.last_pass_pair = [None, None]
             self.pair_pass_count = [0, 0]
-            self.spell_max_threat.fill(0.0)
+            self.spell_max_threat.fill(-1.0)
         else:
             self.team_pass_chain[team] = 0
             self.last_completed_pass_passer[team] = None
@@ -2481,7 +2681,7 @@ class FootballParallelEnv(ParallelEnv):
             self.last_completed_pass_time[team] = -999.0
             self.last_pass_pair[team] = None
             self.pair_pass_count[team] = 0
-            self.spell_max_threat[team] = 0.0
+            self.spell_max_threat[team] = -1.0
 
     def _CanonicalToWorld(
         self, pos: Tuple[float, float], angle: float, side: int
@@ -2815,6 +3015,8 @@ class FootballParallelEnv(ParallelEnv):
         self,
         step_rewards: np.ndarray,
         any_teleport: bool = False,
+        r_sparse: Optional[np.ndarray] = None,
+        r_ball_adv: Optional[np.ndarray] = None,
     ) -> None:
         """Evaluate strictly non-negative [0, Phi_max] Markovian potentials and apply exact PBRS."""
         rew = self.cfg.rewards
@@ -2827,6 +3029,15 @@ class FootballParallelEnv(ParallelEnv):
 
         phi_curr = self._phi_curr
         phi_curr.fill(0.0)
+
+        record_telemetry = bool(self.cfg.replay.enable_recording)
+        if record_telemetry:
+            phi_role = [0.0] * self.num_players
+            phi_crowd = [0.0] * self.num_players
+            grad_phi = [[0.0, 0.0, 0.0] for _ in range(self.num_players)]
+            role_states = ["COVR"] * self.num_players
+            role_targets = [[0.0, 0.0] for _ in range(self.num_players)]
+            crowd_rep_grads = [[0.0, 0.0] for _ in range(self.num_players)]
 
         dx_b = pos[:, 0] - bx
         dy_b = pos[:, 1] - by
@@ -2853,6 +3064,7 @@ class FootballParallelEnv(ParallelEnv):
         inv_2_260_sq = self._inv_2_260_sq
         inv_2_280_sq = self._inv_2_280_sq
         inv_2_95_sq = self._inv_2_95_sq
+        inv_lambda_chase = self._inv_lambda_chase
 
         inv_115 = 1.0 / 115.0
         inv_75 = 1.0 / 75.0
@@ -2874,7 +3086,7 @@ class FootballParallelEnv(ParallelEnv):
                 holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id
             )
 
-            # 1. Strictly Non-Negative Multiplicative Spacing Gate psi_sep(i) in [0.0, 1.0]
+            # 1. Additive Teammate Crowding Penalty (Fix 3: prevents gradient death from multiplicative 0.0)
             p0_x, p0_y = float(pos[f_start, 0]), float(pos[f_start, 1])
             p1_x, p1_y = float(pos[f_start + 1, 0]), float(pos[f_start + 1, 1])
             p2_x, p2_y = float(pos[f_start + 2, 0]), float(pos[f_start + 2, 1])
@@ -2886,67 +3098,44 @@ class FootballParallelEnv(ParallelEnv):
             ref_x = 0.65 * bx + 0.35 * centroid_x
             ref_y = 0.50 * by + 0.50 * centroid_y
 
-            d01 = math.hypot(p0_x - p1_x, p0_y - p1_y)
-            d02 = math.hypot(p0_x - p2_x, p0_y - p2_y)
-            d03 = math.hypot(p0_x - p3_x, p0_y - p3_y)
-            d04 = math.hypot(p0_x - p4_x, p0_y - p4_y)
-            d12 = math.hypot(p1_x - p2_x, p1_y - p2_y)
-            d13 = math.hypot(p1_x - p3_x, p1_y - p3_y)
-            d14 = math.hypot(p1_x - p4_x, p1_y - p4_y)
-            d23 = math.hypot(p2_x - p3_x, p2_y - p3_y)
-            d24 = math.hypot(p2_x - p4_x, p2_y - p4_y)
-            d34 = math.hypot(p3_x - p4_x, p3_y - p4_y)
-
-            h_loc = (holder - f_start) if (holder is not None and f_start <= holder < f_start + 5) else -1
-            off0 = 75.0 if h_loc == 0 else 65.0
-            off1 = 75.0 if h_loc == 1 else 65.0
-            off2 = 75.0 if h_loc == 2 else 65.0
-            off3 = 75.0 if h_loc == 3 else 65.0
-            off4 = 75.0 if h_loc == 4 else 65.0
-
-            g01 = _fast_clip((d01 - off1) * inv_115, 0.0, 1.0)
-            g02 = _fast_clip((d02 - off2) * inv_115, 0.0, 1.0)
-            g03 = _fast_clip((d03 - off3) * inv_115, 0.0, 1.0)
-            g04 = _fast_clip((d04 - off4) * inv_115, 0.0, 1.0)
-            psi_sep_0 = (g01 * g01) * (g02 * g02) * (g03 * g03) * (g04 * g04)
-
-            g10 = _fast_clip((d01 - off0) * inv_115, 0.0, 1.0)
-            g12 = _fast_clip((d12 - off2) * inv_115, 0.0, 1.0)
-            g13 = _fast_clip((d13 - off3) * inv_115, 0.0, 1.0)
-            g14 = _fast_clip((d14 - off4) * inv_115, 0.0, 1.0)
-            psi_sep_1 = (g10 * g10) * (g12 * g12) * (g13 * g13) * (g14 * g14)
-
-            g20 = _fast_clip((d02 - off0) * inv_115, 0.0, 1.0)
-            g21 = _fast_clip((d12 - off1) * inv_115, 0.0, 1.0)
-            g23 = _fast_clip((d23 - off3) * inv_115, 0.0, 1.0)
-            g24 = _fast_clip((d24 - off4) * inv_115, 0.0, 1.0)
-            psi_sep_2 = (g20 * g20) * (g21 * g21) * (g23 * g23) * (g24 * g24)
-
-            g30 = _fast_clip((d03 - off0) * inv_115, 0.0, 1.0)
-            g31 = _fast_clip((d13 - off1) * inv_115, 0.0, 1.0)
-            g32 = _fast_clip((d23 - off2) * inv_115, 0.0, 1.0)
-            g34 = _fast_clip((d34 - off4) * inv_115, 0.0, 1.0)
-            psi_sep_3 = (g30 * g30) * (g31 * g31) * (g32 * g32) * (g34 * g34)
-
-            g40 = _fast_clip((d04 - off0) * inv_115, 0.0, 1.0)
-            g41 = _fast_clip((d14 - off1) * inv_115, 0.0, 1.0)
-            g42 = _fast_clip((d24 - off2) * inv_115, 0.0, 1.0)
-            g43 = _fast_clip((d34 - off3) * inv_115, 0.0, 1.0)
-            psi_sep_4 = (g40 * g40) * (g41 * g41) * (g42 * g42) * (g43 * g43)
-
-            psi_seps = (psi_sep_0, psi_sep_1, psi_sep_2, psi_sep_3, psi_sep_4)
+            tf_positions = ((p0_x, p0_y), (p1_x, p1_y), (p2_x, p2_y), (p3_x, p3_y), (p4_x, p4_y))
+            r_crowd = rew.teammate_crowd_radius
+            w_crowd = rew.teammate_crowd_weight
+            inv_r_crowd = 1.0 / max(1e-6, r_crowd)
+            crowd_penalties = [0.0, 0.0, 0.0, 0.0, 0.0]
+            for loc_i in range(5):
+                px_i, py_i = tf_positions[loc_i]
+                c_pen = 0.0
+                rep_x = 0.0
+                rep_y = 0.0
+                for loc_j in range(5):
+                    if loc_i == loc_j:
+                        continue
+                    if self.stun_timer[f_start + loc_j] > 0.0 or self.is_ghost[f_start + loc_j]:
+                        continue
+                    px_j, py_j = tf_positions[loc_j]
+                    d_ij = math.hypot(px_i - px_j, py_i - py_j)
+                    if d_ij < r_crowd:
+                        viol = (r_crowd - d_ij) * inv_r_crowd
+                        c_pen += viol * viol
+                        if record_telemetry and d_ij > 1e-4:
+                            coeff = 2.0 * w_crowd * viol * inv_r_crowd / d_ij
+                            rep_x += coeff * (px_i - px_j)
+                            rep_y += coeff * (py_i - py_j)
+                crowd_penalties[loc_i] = w_crowd * c_pen
+                if record_telemetry:
+                    crowd_rep_grads[f_start + loc_i] = [rep_x, rep_y]
+                    phi_crowd[f_start + loc_i] = -float(w_crowd * c_pen)
 
             if in_possession:
                 pass_chaser = -1
                 if holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id:
-                    last_h = self.last_ball_holder
                     min_c_dist = 1e9
                     for cand in range(f_start, f_start + 5):
-                        if cand != last_h:
-                            d_c = float(ball_dists[cand])
-                            if d_c < min_c_dist:
-                                min_c_dist = d_c
-                                pass_chaser = cand
+                        d_c = float(ball_dists[cand])
+                        if d_c < min_c_dist:
+                            min_c_dist = d_c
+                            pass_chaser = cand
 
                 # Opponent outfield positions
                 op0_x, op0_y = float(pos[o_start, 0]), float(pos[o_start, 1])
@@ -2955,16 +3144,29 @@ class FootballParallelEnv(ParallelEnv):
                 op3_x, op3_y = float(pos[o_start + 3, 0]), float(pos[o_start + 3, 1])
                 op4_x, op4_y = float(pos[o_start + 4, 0]), float(pos[o_start + 4, 1])
 
-                tf_positions = ((p0_x, p0_y), (p1_x, p1_y), (p2_x, p2_y), (p3_x, p3_y), (p4_x, p4_y))
-
                 for loc_i, (px, py) in enumerate(tf_positions):
                     i = f_start + loc_i
                     if i == holder:
                         phi_curr[i] = carrier_baseline
+                        if record_telemetry:
+                            phi_role[i] = carrier_baseline
+                            role_states[i] = "BALL"
+                            role_targets[i] = [round(bx, 1), round(by, 1)]
+                            grad_phi[i] = [round(sign_x, 3), 0.0, 0.02]
                         continue
                     if i == pass_chaser:
                         d_ib = float(ball_dists[i])
-                        phi_curr[i] = w_press * math.exp(-(d_ib * d_ib) * inv_2_260_sq)
+                        d_eff = max(0.0, d_ib - 28.0)
+                        val = w_press * math.exp(-d_eff * inv_lambda_chase)
+                        phi_curr[i] = val
+                        if record_telemetry:
+                            phi_role[i] = val
+                            role_states[i] = "CHSE"
+                            role_targets[i] = [round(bx, 1), round(by, 1)]
+                            d_safe = max(1e-4, d_ib)
+                            dir_b = [(bx - px) / d_safe, (by - py) / d_safe]
+                            mag = val * inv_lambda_chase
+                            grad_phi[i] = [round(dir_b[0], 3), round(dir_b[1], 3), round(mag, 4)]
                         continue
 
                     # Relative Tactical Depth & Flank Channel Target
@@ -3024,40 +3226,81 @@ class FootballParallelEnv(ParallelEnv):
                         * psi_ring
                         * psi_lane
                         * psi_channel
-                        * psi_seps[loc_i]
                     )
+                    ring_pot_unpen = ring_pot
+                    ring_pot = ring_pot - crowd_penalties[loc_i]
                     if self.post_kick_pbrs_timer[i] > 0.0:
                         alpha_kick = float(self.post_kick_pbrs_timer[i]) / 0.50
                         phi_curr[i] = max(ring_pot, alpha_kick * carrier_baseline + (1.0 - alpha_kick) * ring_pot)
                     else:
                         phi_curr[i] = ring_pot
+
+                    if record_telemetry:
+                        phi_role[i] = ring_pot_unpen
+                        role_states[i] = "COVR"
+                        role_targets[i] = [round(target_x, 1), round(target_y, 1)]
+                        dx = target_x - px
+                        dy = target_y - py
+                        d_t = math.hypot(dx, dy)
+                        pull_mag = ring_pot_unpen * 2.0 * inv_2_240_sq * d_t
+                        ux_pull = (dx / d_t) if d_t > 1e-4 else 0.0
+                        uy_pull = (dy / d_t) if d_t > 1e-4 else 0.0
+                        rx, ry = crowd_rep_grads[i]
+                        gx = ux_pull * pull_mag + rx
+                        gy = uy_pull * pull_mag + ry
+                        g_mag = math.hypot(gx, gy)
+                        if g_mag > 1e-6:
+                            grad_phi[i] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
+                        else:
+                            grad_phi[i] = [0.0, 0.0, 0.0]
             else:
-                # Out-of-Possession: 1 Presser + 4 Cover Defenders
-                b_d0 = float(ball_dists[f_start])
-                b_d1 = float(ball_dists[f_start + 1])
-                b_d2 = float(ball_dists[f_start + 2])
-                b_d3 = float(ball_dists[f_start + 3])
-                b_d4 = float(ball_dists[f_start + 4])
+                # Out-of-Possession: Dynamic Loose-Ball Pursuit & Cover Defense (Fix 4.1)
+                # Filter active (non-stunned, non-ghost) players for primary presser selection
+                presser_scores = []
+                for loc_i in range(5):
+                    i = f_start + loc_i
+                    d_b = float(ball_dists[i])
+                    is_dis = (self.stun_timer[i] > 0.0) or self.is_ghost[i]
+                    presser_scores.append((d_b + (10000.0 if is_dis else 0.0), d_b, loc_i, i))
+                presser_scores.sort(key=lambda item: item[0])
 
-                loc_presser = 0
-                min_bd = b_d0
-                if b_d1 < min_bd:
-                    min_bd = b_d1
-                    loc_presser = 1
-                if b_d2 < min_bd:
-                    min_bd = b_d2
-                    loc_presser = 2
-                if b_d3 < min_bd:
-                    min_bd = b_d3
-                    loc_presser = 3
-                if b_d4 < min_bd:
-                    min_bd = b_d4
-                    loc_presser = 4
+                loc_presser = presser_scores[0][2]
+                presser = presser_scores[0][3]
+                d_eff = max(0.0, presser_scores[0][1] - 28.0)
+                phi_press = w_press * math.exp(-d_eff * inv_lambda_chase)
+                phi_curr[presser] = phi_press
+                if record_telemetry:
+                    phi_role[presser] = phi_press
+                    role_states[presser] = "1stP"
+                    role_targets[presser] = [round(bx, 1), round(by, 1)]
+                    px, py = tf_positions[loc_presser]
+                    d_b = max(1e-4, presser_scores[0][1])
+                    gx = (bx - px) / d_b * (phi_press * inv_lambda_chase)
+                    gy = (by - py) / d_b * (phi_press * inv_lambda_chase)
+                    g_mag = math.hypot(gx, gy)
+                    if g_mag > 1e-6:
+                        grad_phi[presser] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
+                    else:
+                        grad_phi[presser] = [0.0, 0.0, 0.0]
 
-                presser = f_start + loc_presser
-                phi_curr[presser] = w_press * math.exp(-(min_bd * min_bd) * inv_2_280_sq)
+                # Fix 4.1: If ball is loose (holder is None), allow 2nd closest active player
+                # to pursue/recover the loose ball without cover-anchor freeze
+                sec_presser_loc = -1
+                sec_presser_pot = 0.0
+                if holder is None and len(presser_scores) > 1:
+                    sec_loc = presser_scores[1][2]
+                    sec_i = presser_scores[1][3]
+                    sec_dist = presser_scores[1][1]
+                    if not ((self.stun_timer[sec_i] > 0.0) or self.is_ghost[sec_i]):
+                        sec_presser_loc = sec_loc
+                        d_eff_sec = max(0.0, sec_dist - 28.0)
+                        sec_presser_pot = (
+                            rew.loose_ball_secondary_press_blend
+                            * w_press
+                            * math.exp(-d_eff_sec * inv_lambda_chase)
+                        )
 
-                tf_all_pos = ((p0_x, p0_y), (p1_x, p1_y), (p2_x, p2_y), (p3_x, p3_y), (p4_x, p4_y))
+                tf_all_pos = tf_positions
                 cover_defs = []
                 cov_locs = []
                 for loc_i in range(5):
@@ -3111,12 +3354,37 @@ class FootballParallelEnv(ParallelEnv):
                     d_chan_sq = dx_chan * dx_chan + dy_chan * dy_chan
                     psi_chan = 0.40 + 0.60 * math.exp(-d_chan_sq * inv_2_280_sq)
 
-                    phi_curr[i] = (
-                        w_cover
-                        * psi_cov
-                        * psi_chan
-                        * psi_seps[loc_i]
-                    )
+                    base_cover = w_cover * psi_cov * psi_chan
+                    if loc_i == sec_presser_loc:
+                        base_role = max(base_cover, sec_presser_pot)
+                        if record_telemetry:
+                            role_states[i] = "2ndP"
+                            role_targets[i] = [round(bx, 1), round(by, 1)]
+                    else:
+                        base_role = base_cover
+                        if record_telemetry:
+                            role_states[i] = "COVR"
+                            role_targets[i] = [round(anchor_x, 1), round(anchor_y, 1)]
+
+                    phi_curr[i] = base_role - crowd_penalties[loc_i]
+
+                    if record_telemetry:
+                        phi_role[i] = base_role
+                        tgt_x, tgt_y = role_targets[i]
+                        dx = tgt_x - px
+                        dy = tgt_y - py
+                        d_t = math.hypot(dx, dy)
+                        pull_mag = base_role * 2.0 * inv_2_280_sq * d_t
+                        ux_pull = (dx / d_t) if d_t > 1e-4 else 0.0
+                        uy_pull = (dy / d_t) if d_t > 1e-4 else 0.0
+                        rx, ry = crowd_rep_grads[i]
+                        gx = ux_pull * pull_mag + rx
+                        gy = uy_pull * pull_mag + ry
+                        g_mag = math.hypot(gx, gy)
+                        if g_mag > 1e-6:
+                            grad_phi[i] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
+                        else:
+                            grad_phi[i] = [0.0, 0.0, 0.0]
 
             # Goalkeeper strictly non-negative bisector & loose-box-ball claim potential
             ray_x = bx - own_gx
@@ -3132,9 +3400,9 @@ class FootballParallelEnv(ParallelEnv):
                 goal_y_max_bound,
             )
             if is_left:
-                bis_x = _fast_clip(bis_x, 20.0, 95.0)
+                bis_x = _fast_clip(bis_x, 38.0, 95.0)
             else:
-                bis_x = _fast_clip(bis_x, phys.field_width - 95.0, phys.field_width - 20.0)
+                bis_x = _fast_clip(bis_x, phys.field_width - 95.0, phys.field_width - 38.0)
 
             gk_x = float(pos[keeper_idx, 0])
             gk_y = float(pos[keeper_idx, 1])
@@ -3148,17 +3416,76 @@ class FootballParallelEnv(ParallelEnv):
                 )
                 clear_y = float(np.clip(gk_y, own_gy - 110.0, own_gy + 110.0))
                 d_target_gk = math.hypot(gk_x - clear_x, gk_y - clear_y) * 0.5
+                psi_face = 1.0
+                tgt_gk_x, tgt_gk_y = clear_x, clear_y
             elif holder is None and ray_norm <= box_loose_thresh:
                 d_target_gk = float(ball_dists[keeper_idx])
+                u_gk_x = math.cos(float(self.player_angle[keeper_idx]))
+                u_gk_y = math.sin(float(self.player_angle[keeper_idx]))
+                d_bx = bx - gk_x
+                d_by = by - gk_y
+                inv_db = 1.0 / max(1e-6, math.hypot(d_bx, d_by))
+                cos_phi = u_gk_x * (d_bx * inv_db) + u_gk_y * (d_by * inv_db)
+                psi_face = _fast_clip(1.0 + cos_phi, 0.0, 1.0)
+                tgt_gk_x, tgt_gk_y = bx, by
             else:
                 d_target_gk = math.hypot(gk_x - bis_x, gk_y - bis_y)
+                u_gk_x = math.cos(float(self.player_angle[keeper_idx]))
+                u_gk_y = math.sin(float(self.player_angle[keeper_idx]))
+                d_bx = bx - gk_x
+                d_by = by - gk_y
+                inv_db = 1.0 / max(1e-6, math.hypot(d_bx, d_by))
+                cos_phi = u_gk_x * (d_bx * inv_db) + u_gk_y * (d_by * inv_db)
+                psi_face = _fast_clip(1.0 + cos_phi, 0.0, 1.0)
+                tgt_gk_x, tgt_gk_y = bis_x, bis_y
 
-            phi_curr[keeper_idx] = w_bisect * math.exp(
-                -(d_target_gk * d_target_gk) * inv_2_95_sq
+            phi_curr[keeper_idx] = (
+                w_bisect
+                * math.exp(-(d_target_gk * d_target_gk) * inv_2_95_sq)
+                * psi_face
             )
 
+            if record_telemetry:
+                role_states[keeper_idx] = "GK"
+                role_targets[keeper_idx] = [round(tgt_gk_x, 1), round(tgt_gk_y, 1)]
+                phi_role[keeper_idx] = phi_curr[keeper_idx]
+                phi_crowd[keeper_idx] = 0.0
+                dx = tgt_gk_x - gk_x
+                dy = tgt_gk_y - gk_y
+                d_gk = math.hypot(dx, dy)
+                g_mag = phi_curr[keeper_idx] * 2.0 * inv_2_95_sq * d_gk
+                if d_gk > 1e-4 and g_mag > 1e-6:
+                    grad_phi[keeper_idx] = [round(dx / d_gk, 3), round(dy / d_gk, 3), round(g_mag, 4)]
+                else:
+                    grad_phi[keeper_idx] = [0.0, 0.0, 0.0]
+
+        if record_telemetry:
+            for i in range(self.num_players):
+                if self.stun_timer[i] > 0.0:
+                    role_states[i] = "STUN"
+                elif self.lunge_timer[i] > 0.0:
+                    role_states[i] = "LNGE"
+
+            pot_delta = (phi_curr - self.prev_tactical_potential) if not any_teleport else np.zeros_like(phi_curr)
+            r_adv = r_ball_adv if r_ball_adv is not None else np.zeros(self.num_players)
+            r_sp = r_sparse if r_sparse is not None else np.zeros(self.num_players)
+            rew_breakdown = []
+            for i in range(self.num_players):
+                rew_breakdown.append({
+                    "r_ball_adv": round(float(r_adv[i]), 4),
+                    "r_pot_i": round(float(pot_delta[i]), 4),
+                    "phi_role": round(float(phi_role[i]), 4),
+                    "phi_crowd": round(float(phi_crowd[i]), 4),
+                    "r_sparse": round(float(r_sp[i]), 4),
+                    "grad_phi_xy": grad_phi[i],
+                })
+            self.last_rew_breakdown = rew_breakdown
+            self.last_grad_phi = grad_phi
+            self.last_role_states = role_states
+            self.last_role_targets = role_targets
+
         if not any_teleport:
-            step_rewards += gamma * phi_curr - self.prev_tactical_potential
+            step_rewards += phi_curr - self.prev_tactical_potential
         self.prev_tactical_potential[:] = phi_curr
 
     def _emit_event(
@@ -3225,7 +3552,14 @@ class FootballParallelEnv(ParallelEnv):
             round(100.0 * self.stats["possession_frames"][0] / total_poss, 1),
             round(100.0 * self.stats["possession_frames"][1] / total_poss, 1),
         ]
+        total_frames = max(1, self.physics_frame_count)
+        true_poss_pct = [
+            round(100.0 * self.stats["possession_frames"][0] / total_frames, 1),
+            round(100.0 * self.stats["possession_frames"][1] / total_frames, 1),
+            round(100.0 * max(0, total_frames - sum(self.stats["possession_frames"])) / total_frames, 1),
+        ]
 
+        v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
         self.replay_frames.append(
             {
                 "frame": self.physics_frame_count,
@@ -3237,9 +3571,17 @@ class FootballParallelEnv(ParallelEnv):
                 "ball": ball_frame,
                 "player_rewards": [round(float(r), 4) for r in self.last_step_rewards],
                 "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
+                "v_pred": v_preds_data,
+                "rew_breakdown": self.last_rew_breakdown,
+                "grad_phi": self.last_grad_phi,
+                "role_state": (list(self.last_role_states) if self.last_role_states is not None else None),
+                "role_targets": self.last_role_targets,
+                "actions": self.last_actions,
                 "stats": {
                     "score": list(self.stats["score"]),
                     "possession_pct": poss_pct,
+                    "true_possession_pct": true_poss_pct,
+                    "stationary_ball_frames": int(self.stats.get("stationary_ball_frames", 0)),
                     "passes": list(self.stats["team_passes"]),
                     "tackles": list(self.stats["team_tackles"]),
                     "saves": list(self.stats["team_saves"]),

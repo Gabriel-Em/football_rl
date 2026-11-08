@@ -112,7 +112,7 @@ class PhysicsConfig:
     throttle_deadzone: float = 0.10         # |throttle_raw| <= 0.10 -> speed = 0.0 (stand still)
     backpedal_threshold: float = -0.10      # throttle_raw in [-0.10, +0.10] -> speed = 0.0; backpedal if < -0.10
     field_backpedal_mult: float = 0.65      # throttle_raw = -1.0 -> -0.65 * role_max_speed
-    keeper_backpedal_mult: float = 0.75     # throttle_raw = -1.0 -> -0.75 * keeper_max_speed
+    keeper_backpedal_mult: float = 1.0      # throttle_raw = -1.0 -> -1.0 * keeper_max_speed (full drop-back speed)
     player_accel_rate: float = 10.5         # Exponential velocity smoothing rate (1/s) for fluid accel/decel
 
 
@@ -269,6 +269,9 @@ class RewardConfig:
     def_press_potential_weight: float = 0.65
     def_cover_potential_weight: float = 0.75
     keeper_bisect_potential_weight: float = 0.60
+    teammate_crowd_weight: float = 0.35
+    teammate_crowd_radius: float = 110.0
+    loose_ball_secondary_press_blend: float = 0.75
 
     # Tier 3: Physical Regularization
     field_5s_violation_ind: float = -1.5

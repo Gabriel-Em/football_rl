@@ -10,6 +10,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import pygame
 
 from football_rl.config import DEFAULT_CONFIG, ReplayConfig
@@ -84,6 +85,57 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
 }
 
 
+def _get_critic_color(v: float) -> Tuple[int, int, int]:
+    """Return a diverging color: Red/Magenta for V < 0, Grey for V ≈ 0, Cyan/Green for V > 0."""
+    if v > 0.05:
+        t = min(1.0, (v - 0.05) / 1.5)
+        r = int(150 + t * (45 - 150))
+        g = int(160 + t * (240 - 160))
+        b = int(175 + t * (160 - 175))
+        return (r, g, b)
+    elif v < -0.05:
+        t = min(1.0, (-v - 0.05) / 1.5)
+        r = int(150 + t * (255 - 150))
+        g = int(160 + t * (60 - 160))
+        b = int(175 + t * (100 - 175))
+        return (r, g, b)
+    else:
+        return (150, 160, 175)
+
+
+def _draw_dashed_line(
+    surf: pygame.Surface,
+    p1: Tuple[int, int],
+    p2: Tuple[int, int],
+    color: Tuple[int, ...],
+    dash_len: float = 6.0,
+    space_len: float = 4.0,
+    width: int = 1,
+) -> None:
+    """Draw a straight dashed line between two pixel coordinates."""
+    x1, y1 = p1
+    x2, y2 = p2
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = math.hypot(dx, dy)
+    if dist < 1e-4:
+        return
+    ux = dx / dist
+    uy = dy / dist
+    step = dash_len + space_len
+    num_steps = int(dist // step)
+    for i in range(num_steps + 1):
+        s_dist = i * step
+        e_dist = min(dist, s_dist + dash_len)
+        if s_dist >= dist:
+            break
+        sx = int(round(x1 + ux * s_dist))
+        sy = int(round(y1 + uy * s_dist))
+        ex = int(round(x1 + ux * e_dist))
+        ey = int(round(y1 + uy * e_dist))
+        pygame.draw.line(surf, color, (sx, sy), (ex, ey), width)
+
+
 @dataclass
 class FloatingPopup:
     """Rising and fading floating text spawned at world event coordinates."""
@@ -110,6 +162,8 @@ class ReplayViewer:
         show_wall_tracers: Optional[bool] = None,
         show_radar: Optional[bool] = None,
         auto_focus_carrier: Optional[bool] = None,
+        show_critic: bool = False,
+        show_gradient: bool = False,
     ) -> None:
         self.data = replay_data
         self.meta = replay_data["metadata"]
@@ -178,6 +232,8 @@ class ReplayViewer:
         self.show_vision_cones: bool = show_vision_cones
         self.selected_cone_players: Set[int] = set()
         self.show_reward_hud: bool = show_reward_hud
+        self.show_critic: bool = show_critic
+        self.show_gradient: bool = show_gradient
         self.running: bool = True
         self.headless: bool = headless
 
@@ -256,6 +312,61 @@ class ReplayViewer:
         self.font_popup = pygame.font.SysFont("dejavusans", 16, bold=True)
 
         self._ingest_frame_events(0)
+        self._init_possession_ribbon()
+
+    def _init_possession_ribbon(self) -> None:
+        """Precompute 4px color-coded possession & dead-ball stall ribbon along timeline."""
+        bar_w = max(1, self.disp_field_w)
+        self.possession_ribbon_surface = pygame.Surface((bar_w, 4))
+        self.possession_ribbon_surface.fill((45, 55, 70))
+
+        if self.num_frames == 0:
+            return
+
+        num_f = self.num_frames
+        states = [2] * num_f
+        stat_streak = 0
+        team_size = max(1, len(self.frames[0].get("players", [])) // 2)
+
+        for f_idx in range(num_f):
+            frame = self.frames[f_idx]
+            players = frame.get("players", [])
+            holder_team = -1
+            for p_idx, p in enumerate(players):
+                if len(p) > 3 and (p[3] & 1):
+                    holder_team = 0 if p_idx < team_size else 1
+                    break
+
+            if holder_team != -1:
+                stat_streak = 0
+                states[f_idx] = 0 if holder_team == 0 else 1
+            else:
+                ball = frame.get("ball", [0, 0, -1, 0, 0])
+                vx = float(ball[3]) if len(ball) > 3 else 0.0
+                vy = float(ball[4]) if len(ball) > 4 else 0.0
+                if math.hypot(vx, vy) < 1.0:
+                    stat_streak += 1
+                else:
+                    stat_streak = 0
+                if stat_streak >= 15:
+                    start_stall = max(0, f_idx - stat_streak + 1)
+                    for k in range(start_stall, f_idx + 1):
+                        states[k] = 3
+                else:
+                    states[f_idx] = 2
+
+        color_map = {
+            0: COLOR_TEAM_A,
+            1: COLOR_TEAM_B,
+            2: (45, 55, 70),
+            3: (255, 195, 20),
+        }
+
+        for px in range(bar_w):
+            f_idx = min(num_f - 1, int((px / float(bar_w)) * num_f))
+            st = states[f_idx]
+            col = color_map.get(st, (45, 55, 70))
+            pygame.draw.line(self.possession_ribbon_surface, col, (px, 0), (px, 3))
 
     def world_to_screen(self, wx: float, wy: float) -> Tuple[int, int]:
         """Convert pitch coordinates to window pixel coordinates."""
@@ -288,16 +399,9 @@ class ReplayViewer:
                         self.selected_cone_players.clear()
                         self.show_vision_cones = False
                 elif event.key == pygame.K_c:
-                    if not self.auto_focus_carrier:
-                        # Toggle between All cones, Selected cone, or OFF
-                        if self.selected_cone_players:
-                            self.selected_cone_players.clear()
-                            self.show_vision_cones = False
-                            self.inspect_player_idx = None
-                        else:
-                            self.selected_cone_players.add(0)
-                            self.show_vision_cones = True
-                            self.inspect_player_idx = 0
+                    self.show_critic = not self.show_critic
+                elif event.key == pygame.K_g:
+                    self.show_gradient = not self.show_gradient
                 elif event.key == pygame.K_TAB:
                     if not self.auto_focus_carrier:
                         # Cycle through individual players for cone isolation (0..11 -> OFF -> 0)
@@ -384,6 +488,10 @@ class ReplayViewer:
                         self.show_radar = not self.show_radar
                     elif clicked_chip == "H:HALO":
                         self.show_pocket_halos = not getattr(self, "show_pocket_halos", True)
+                    elif clicked_chip == "C:CRIT":
+                        self.show_critic = not self.show_critic
+                    elif clicked_chip == "G:GRAD":
+                        self.show_gradient = not self.show_gradient
                 # 1. Left Click on Scrubber Bar -> Seek
                 elif event.button == 1 and bar_x <= mx <= bar_x + bar_w and bar_y - 10 <= my <= bar_y + 26:
                     ratio = (mx - bar_x) / float(bar_w)
@@ -561,6 +669,8 @@ class ReplayViewer:
         # 2b. Peripheral Radar 32-Ray 360 Fan (Toggleable via 'I' or Click)
         if self.show_radar or (self.inspect_player_idx is not None and self.show_radar):
             self._draw_peripheral_radar(frame)
+        if self.show_radar:
+            self._draw_role_tethers(frame)
 
         # 2c. Passing Lanes & Unpressed Lead Targets (Toggleable via 'P')
         if self.show_pass_lanes:
@@ -571,6 +681,10 @@ class ReplayViewer:
 
         # 4. Players (with role insignias, reward glows, lunge trails, ghost rings, stun icons, pocket halos)
         self._draw_players(frame)
+
+        # 4b. Potential Gradient Compass (Toggleable via 'G')
+        if self.show_gradient:
+            self._draw_gradient_compass(frame)
 
         # 5. Ball
         self._draw_ball(frame)
@@ -859,6 +973,17 @@ class ReplayViewer:
                 cum_col = (110, 245, 130) if cum_rew >= 0 else (255, 120, 120)
                 rew_lbl = self.font_small.render(f"{cum_rew:+.1f}", True, cum_col)
                 self.screen.blit(rew_lbl, (sx - rew_lbl.get_width() // 2, sy + r + 8))
+
+            # 2b. Critic Value Overlay & Indicator Arc ([C] Critic:ON)
+            if self.show_critic:
+                v_preds = self.frames[self.current_frame_idx].get("v_pred")
+                if v_preds and idx < len(v_preds) and v_preds[idx] is not None:
+                    v_val = float(v_preds[idx])
+                    v_col = _get_critic_color(v_val)
+                    pygame.draw.circle(self.screen, v_col, (sx, sy), r + 5, width=2)
+                    v_lbl = self.font_small.render(f"V:{v_val:+.1f}", True, v_col)
+                    v_y = sy + r + (18 if self.show_reward_hud else 8)
+                    self.screen.blit(v_lbl, (sx - v_lbl.get_width() // 2, v_y))
 
             # 3. Possession Halo
             if flags & FLAG_HAS_BALL:
@@ -1398,11 +1523,25 @@ class ReplayViewer:
         cx = self.margin_x + self.disp_field_w // 2
         score_text = f"{score[0]}   -   {score[1]}"
         score_surf = self.font_score.render(score_text, True, COLOR_TEXT_MAIN)
-        self.screen.blit(score_surf, (cx - score_surf.get_width() // 2, 8))
+        self.screen.blit(score_surf, (cx - score_surf.get_width() // 2, 4))
 
         timer_str = f"{mins:02d}:{secs:04.1f}  |  {half_str}"
         timer_surf = self.font_hud.render(timer_str, True, COLOR_KEEPER_GOLD)
-        self.screen.blit(timer_surf, (cx - timer_surf.get_width() // 2, 46))
+        self.screen.blit(timer_surf, (cx - timer_surf.get_width() // 2, 36))
+
+        # True Possession Center Sub-Header
+        true_poss = stats.get("true_possession_pct")
+        if true_poss and len(true_poss) >= 3:
+            red_p, blue_p, loose_p = float(true_poss[0]), float(true_poss[1]), float(true_poss[2])
+        else:
+            red_p = float(poss[0]) if len(poss) > 0 else 50.0
+            blue_p = float(poss[1]) if len(poss) > 1 else 50.0
+            loose_p = max(0.0, 100.0 - red_p - blue_p)
+        stat_frames = int(stats.get("stationary_ball_frames", 0))
+        stall_sec = stat_frames / float(max(1, self.physics_hz))
+        poss_sub_str = f"Poss: Red {red_p:.0f}% | Blue {blue_p:.0f}% | Loose {loose_p:.0f}% (Stall: {stall_sec:.1f}s)"
+        poss_sub_surf = self.font_small.render(poss_sub_str, True, (215, 225, 240))
+        self.screen.blit(poss_sub_surf, (cx - poss_sub_surf.get_width() // 2, 54))
 
         # Team A Left Panel
         side_a_tag = "LEFT GOAL" if team_side[0] == 0 else "RIGHT GOAL"
@@ -1462,13 +1601,15 @@ class ReplayViewer:
             f"[P] Pass:{'ON' if self.show_pass_lanes else 'OFF'}   "
             f"[W] Walls:{'ON' if self.show_wall_tracers else 'OFF'}   "
             f"[I] Radar:{'ON' if self.show_radar else 'OFF'}   "
+            f"[C] Critic:{'ON' if self.show_critic else 'OFF'}   "
+            f"[G] Grad:{'ON' if self.show_gradient else 'OFF'}   "
             f"[T] Telemetry:{'ON' if self.show_telemetry else 'OFF'}   "
             f"[E] Rew:{'ON' if self.show_reward_hud else 'OFF'}"
         )
         status_str = left_part + speed_part + right_part
         ctrl_surf = self.font_small.render(status_str, True, COLOR_TEXT_MUTED)
         ctrl_x = cx - ctrl_surf.get_width() // 2
-        ctrl_y = 70
+        ctrl_y = 74
         self.screen.blit(ctrl_surf, (ctrl_x, ctrl_y))
 
     def _draw_scrubber_bar(self, frame: Dict[str, Any]) -> None:
@@ -1477,6 +1618,10 @@ class ReplayViewer:
         bar_w = self.disp_field_w
         bar_y = self.hud_height + self.disp_field_h + 16
         bar_h = 10
+
+        # 4px color-coded possession & dead-ball stall ribbon along timeline track
+        if hasattr(self, "possession_ribbon_surface") and self.possession_ribbon_surface is not None:
+            self.screen.blit(self.possession_ribbon_surface, (bar_x, bar_y - 6))
 
         pygame.draw.rect(
             self.screen,
@@ -1560,17 +1705,23 @@ class ReplayViewer:
         self.screen.blit(frame_lbl, (bar_x, bar_y + 14))
 
         # Bottom Bar Legend (right)
-        legend_x = bar_x + bar_w - 335
+        legend_x = bar_x + bar_w - 390
         legend_y = bar_y + 14
 
+        # Stall icon for Dead-Ball Stall
+        pygame.draw.rect(self.screen, (255, 195, 20), pygame.Rect(legend_x + 2, legend_y + 4, 8, 4), border_radius=1)
+        stall_leg_surf = self.font_small.render("Stall", True, COLOR_TEXT_MUTED)
+        self.screen.blit(stall_leg_surf, (legend_x + 13, legend_y))
+
         # Circle icon for Goal
-        pygame.draw.circle(self.screen, COLOR_LINE, (legend_x + 4, legend_y + 6), 4)
-        pygame.draw.circle(self.screen, COLOR_KEEPER_GOLD, (legend_x + 4, legend_y + 6), 4, width=1)
+        g_leg_x = legend_x + 55
+        pygame.draw.circle(self.screen, COLOR_LINE, (g_leg_x + 4, legend_y + 6), 4)
+        pygame.draw.circle(self.screen, COLOR_KEEPER_GOLD, (g_leg_x + 4, legend_y + 6), 4, width=1)
         goal_leg_surf = self.font_small.render("Goal", True, COLOR_TEXT_MUTED)
-        self.screen.blit(goal_leg_surf, (legend_x + 11, legend_y))
+        self.screen.blit(goal_leg_surf, (g_leg_x + 11, legend_y))
 
         # Diamond icon for Save
-        d_leg_x = legend_x + 65
+        d_leg_x = g_leg_x + 65
         d_pts = [
             (d_leg_x + 4, legend_y + 2),
             (d_leg_x + 8, legend_y + 6),
@@ -1582,7 +1733,7 @@ class ReplayViewer:
         self.screen.blit(save_leg_surf, (d_leg_x + 11, legend_y))
 
         # Triangle icon for +5 Event
-        t_leg_x = legend_x + 130
+        t_leg_x = d_leg_x + 65
         t_pts = [
             (t_leg_x + 4, legend_y + 2),
             (t_leg_x + 8, legend_y + 10),
@@ -1593,7 +1744,7 @@ class ReplayViewer:
         self.screen.blit(plus5_leg_surf, (t_leg_x + 11, legend_y))
 
         # Card icon for Foul
-        f_leg_x = legend_x + 220
+        f_leg_x = t_leg_x + 85
         card_leg_rect = pygame.Rect(f_leg_x + 2, legend_y + 1, 6, 10)
         pygame.draw.rect(self.screen, (255, 80, 80), card_leg_rect, border_radius=1)
         pygame.draw.rect(self.screen, (255, 170, 40), card_leg_rect, width=1, border_radius=1)
@@ -1930,6 +2081,99 @@ class ReplayViewer:
 
         self.screen.blit(self.radar_surface, (self.margin_x, self.hud_height))
 
+    def _draw_role_tethers(self, frame: Dict[str, Any]) -> None:
+        """Render tactical tethers for COVR (to anchor), 1stP (gold to ball), and 2ndP (silver to ball)."""
+        role_states = frame.get("role_state")
+        role_targets = frame.get("role_targets")
+        players = frame.get("players", [])
+        num_players = len(players)
+        if num_players == 0:
+            return
+
+        team_size = max(1, num_players // 2)
+        ball = frame.get("ball", [700.0, 420.0])
+        bx, by = float(ball[0]), float(ball[1])
+        ball_scr = self.world_to_screen(bx, by)
+
+        for idx, p in enumerate(players):
+            px, py = float(p[0]), float(p[1])
+            p_scr = self.world_to_screen(px, py)
+            is_team_a = idx < team_size
+            team_col = COLOR_TEAM_A if is_team_a else COLOR_TEAM_B
+
+            r_state = role_states[idx] if (role_states and idx < len(role_states)) else "COVR"
+
+            if r_state == "COVR" and role_targets and idx < len(role_targets):
+                tgt = role_targets[idx]
+                if tgt and (tgt[0] != 0.0 or tgt[1] != 0.0):
+                    tx, ty = float(tgt[0]), float(tgt[1])
+                    tgt_scr = self.world_to_screen(tx, ty)
+                    # Anchor dot
+                    pygame.draw.circle(self.screen, team_col, tgt_scr, 4)
+                    pygame.draw.circle(self.screen, (240, 245, 255), tgt_scr, 4, width=1)
+                    # Subtle dashed tether
+                    tether_col = (
+                        team_col[0] // 2 + 50,
+                        team_col[1] // 2 + 50,
+                        team_col[2] // 2 + 50,
+                    )
+                    _draw_dashed_line(self.screen, p_scr, tgt_scr, tether_col, dash_len=5.0, space_len=4.0, width=1)
+            elif r_state == "1stP":
+                # Gold dashed tether toward ball
+                _draw_dashed_line(self.screen, p_scr, ball_scr, (255, 215, 60), dash_len=6.0, space_len=3.0, width=2)
+            elif r_state == "2ndP":
+                # Silver dashed tether toward ball
+                _draw_dashed_line(self.screen, p_scr, ball_scr, (195, 205, 220), dash_len=5.0, space_len=4.0, width=1)
+            elif r_state == "CHSE":
+                # Cyan dashed tether toward ball
+                _draw_dashed_line(self.screen, p_scr, ball_scr, (80, 225, 255), dash_len=5.0, space_len=4.0, width=1)
+
+    def _draw_gradient_compass(self, frame: Dict[str, Any]) -> None:
+        """Render gold potential gradient arrows and warning red crosses for flat zones."""
+        grad_phi = frame.get("grad_phi")
+        if grad_phi is None:
+            rb = frame.get("rew_breakdown")
+            if rb:
+                grad_phi = [b.get("grad_phi_xy", [0.0, 0.0, 0.0]) for b in rb]
+        if not grad_phi:
+            return
+
+        players = frame.get("players", [])
+        gold_color = (255, 215, 0)
+        warn_red = (255, 65, 80)
+
+        for idx, p in enumerate(players):
+            if idx >= len(grad_phi):
+                break
+            g = grad_phi[idx]
+            if not g or len(g) < 3:
+                continue
+            ux, uy, mag = float(g[0]), float(g[1]), float(g[2])
+            px, py = float(p[0]), float(p[1])
+            sx, sy = self.world_to_screen(px, py)
+
+            if mag < 1e-4:
+                # Flat-gradient zone warning: tiny red ×
+                pygame.draw.line(self.screen, warn_red, (sx - 3, sy - 3), (sx + 3, sy + 3), width=2)
+                pygame.draw.line(self.screen, warn_red, (sx - 3, sy + 3), (sx + 3, sy - 3), width=2)
+            else:
+                # Gold arrow indicating potential gradient direction and strength
+                arrow_len = min(36.0, 14.0 + min(1.0, mag * 25.0) * 20.0)
+                tx = int(round(sx + ux * arrow_len))
+                ty = int(round(sy + uy * arrow_len))
+                pygame.draw.line(self.screen, gold_color, (sx, sy), (tx, ty), width=2)
+                ang = math.atan2(uy, ux)
+                b1 = (
+                    int(round(tx - math.cos(ang + 0.55) * 6)),
+                    int(round(ty - math.sin(ang + 0.55) * 6)),
+                )
+                b2 = (
+                    int(round(tx - math.cos(ang - 0.55) * 6)),
+                    int(round(ty - math.sin(ang - 0.55) * 6)),
+                )
+                pygame.draw.line(self.screen, gold_color, (tx, ty), b1, width=2)
+                pygame.draw.line(self.screen, gold_color, (tx, ty), b2, width=2)
+
     def _draw_telemetry_panel(self, frame: Dict[str, Any]) -> None:
         """Render modern broadcast telemetry table to the right of the pitch."""
         self.telemetry_row_rects.clear()
@@ -2000,8 +2244,49 @@ class ReplayViewer:
             width=2,
         )
 
+        # Critic V(s) Team Meter
+        critic_y = gauge_y + 30
+        v_preds = frame.get("v_pred")
+        num_players_fr = len(frame.get("players", []))
+        t_size = max(1, num_players_fr // 2) if num_players_fr > 0 else 6
+        if v_preds and len(v_preds) >= num_players_fr and any(v is not None and v != 0.0 for v in v_preds):
+            va_vals = [float(v) for v in v_preds[:t_size] if v is not None]
+            vb_vals = [float(v) for v in v_preds[t_size:num_players_fr] if v is not None]
+            mean_v_a = float(sum(va_vals) / len(va_vals)) if va_vals else 0.0
+            mean_v_b = float(sum(vb_vals) / len(vb_vals)) if vb_vals else 0.0
+        else:
+            mean_v_a = 0.0
+            mean_v_b = 0.0
+
+        lbl_va = self.font_small.render(f"RED V: {mean_v_a:+.2f}", True, COLOR_TEAM_A)
+        lbl_vb = self.font_small.render(f"BLUE V: {mean_v_b:+.2f}", True, COLOR_TEAM_B)
+        lbl_vc = self.font_small.render("CRITIC V(s)", True, (160, 175, 195))
+        self.screen.blit(lbl_va, (panel_x + 12, critic_y))
+        self.screen.blit(lbl_vc, (center_x - lbl_vc.get_width() // 2, critic_y))
+        self.screen.blit(lbl_vb, (panel_x + panel_w - lbl_vb.get_width() - 12, critic_y))
+
+        c_bar_rect = pygame.Rect(panel_x + 12, critic_y + 16, panel_w - 24, 8)
+        pygame.draw.rect(self.screen, (32, 40, 52), c_bar_rect, border_radius=4)
+        v_diff = mean_v_a - mean_v_b
+        v_tilt = max(-1.0, min(1.0, v_diff / 2.0))
+        if v_tilt > 0:
+            fill_w = int(abs(v_tilt) * half_w)
+            fill_rect = pygame.Rect(center_x - fill_w, critic_y + 16, fill_w, 8)
+            pygame.draw.rect(self.screen, COLOR_TEAM_A, fill_rect, border_radius=3)
+        elif v_tilt < 0:
+            fill_w = int(abs(v_tilt) * half_w)
+            fill_rect = pygame.Rect(center_x, critic_y + 16, fill_w, 8)
+            pygame.draw.rect(self.screen, COLOR_TEAM_B, fill_rect, border_radius=3)
+        pygame.draw.line(
+            self.screen,
+            (255, 255, 255),
+            (center_x, critic_y + 14),
+            (center_x, critic_y + 26),
+            width=2,
+        )
+
         # 4. Toggle Buttons / Chips
-        chips_y = gauge_y + 34
+        chips_y = critic_y + 30
         chips = [
             ("F:BALL", self.auto_focus_carrier),
             ("P:PASS", self.show_pass_lanes),
@@ -2009,6 +2294,8 @@ class ReplayViewer:
             ("V:CONE", self.show_vision_cones),
             ("I:RADAR", self.show_radar),
             ("H:HALO", getattr(self, "show_pocket_halos", True)),
+            ("C:CRIT", self.show_critic),
+            ("G:GRAD", self.show_gradient),
         ]
         cx = panel_x + 12
         cy = chips_y
@@ -2081,9 +2368,12 @@ class ReplayViewer:
             if self.inspect_player_idx is not None
             else self.hovered_player_idx
         )
+        if focus_idx is None and num_players > 0:
+            focus_idx = 0
         if focus_idx is not None and focus_idx < num_players:
+            card_h = 136
             self._draw_focus_player_card(
-                panel_x + 10, panel_y + panel_h - 76, panel_w - 20, focus_idx
+                panel_x + 10, panel_y + panel_h - card_h - 8, panel_w - 20, focus_idx
             )
 
     def _draw_telemetry_row(
@@ -2145,22 +2435,40 @@ class ReplayViewer:
         threat_txt = self.font_small.render(threat_str, True, (185, 200, 220))
         self.screen.blit(threat_txt, (rx + 160, ry + 4))
 
-        # Status Icon (Ball holder, lunge, stun, ghost)
+        # Status Icon (Ball holder, lunge, stun, ghost, tactical roles)
+        role_states = self.frames[self.current_frame_idx].get("role_state", [])
+        tactical_role = role_states[idx] if (role_states and idx < len(role_states)) else None
+
         status_str = "—"
         status_col = (130, 145, 165)
         flags = phys["flags"]
-        if flags & FLAG_HAS_BALL:
-            status_str = "●BALL"
-            status_col = COLOR_KEEPER_GOLD
-        elif flags & FLAG_IS_LUNGING:
-            status_str = "⚡DIVE" if "GK" in role_str else "⚡LNGE"
-            status_col = (80, 240, 220)
-        elif flags & FLAG_IS_STUNNED:
+        if flags & FLAG_IS_STUNNED or tactical_role == "STUN":
             status_str = "💫STUN"
             status_col = COLOR_STUN_ALERT
+        elif flags & FLAG_IS_LUNGING or tactical_role == "LNGE":
+            status_str = "⚡DIVE" if "GK" in role_str else "⚡LNGE"
+            status_col = (80, 240, 220)
         elif flags & FLAG_IS_GHOST:
             status_str = "🛡️GHST"
             status_col = COLOR_GHOST_RING
+        elif flags & FLAG_HAS_BALL or tactical_role == "BALL":
+            status_str = "●BALL"
+            status_col = COLOR_KEEPER_GOLD
+        elif tactical_role == "1stP":
+            status_str = "⚡1stP"
+            status_col = (255, 205, 50)
+        elif tactical_role == "2ndP":
+            status_str = "🔹2ndP"
+            status_col = (195, 210, 230)
+        elif tactical_role == "CHSE":
+            status_str = "🎯CHSE"
+            status_col = (80, 225, 255)
+        elif tactical_role == "COVR":
+            status_str = "⚓COVR"
+            status_col = (130, 160, 200)
+        elif tactical_role == "GK":
+            status_str = "🧤GK"
+            status_col = (245, 185, 75)
 
         sts_txt = self.font_small.render(status_str, True, status_col)
         self.screen.blit(sts_txt, (rx + 224, ry + 4))
@@ -2168,8 +2476,9 @@ class ReplayViewer:
         return ry + row_h
 
     def _draw_focus_player_card(self, cx: int, cy: int, cw: int, idx: int) -> None:
-        """Render a mini-dossier card for the active/selected player."""
-        card_rect = pygame.Rect(cx, cy, cw, 68)
+        """Render an expanded mini-dossier card for the active/selected player."""
+        card_h = 136
+        card_rect = pygame.Rect(cx, cy, cw, card_h)
         pygame.draw.rect(self.screen, (16, 22, 30), card_rect, border_radius=6)
         pygame.draw.rect(self.screen, (60, 80, 110), card_rect, width=1, border_radius=6)
 
@@ -2177,24 +2486,88 @@ class ReplayViewer:
         phys = self._get_player_physics(self.current_frame_idx, idx)
         team_size = max(1, len(self.frames[0]["players"]) // 2) if self.frames else 6
         role_accent = self._get_player_role_accent(idx, team_size)
+        curr_fr = self.frames[self.current_frame_idx]
 
-        hdr_txt = self.font_small.render(f"FOCUSED: {label.upper()}", True, role_accent)
+        role_states = curr_fr.get("role_state", [])
+        state_tag = f"  [{role_states[idx]}]" if (role_states and idx < len(role_states) and role_states[idx]) else ""
+        hdr_txt = self.font_small.render(f"FOCUSED: {label.upper()}{state_tag}", True, role_accent)
         self.screen.blit(hdr_txt, (cx + 8, cy + 6))
 
         px, py = phys["pos"]
         deg = int(math.degrees(phys["angle"]) % 360)
-        line1 = f"Pos: ({px:.0f}, {py:.0f})  Dir: {deg}°  Ball: {phys['d_ball']:.0f}u"
+        line1 = f"Pos: ({px:.0f}, {py:.0f})  Dir: {deg}°  Ball: {phys['d_ball']:.0f}u  Spd: {phys['speed']:.0f}"
         t1 = self.font_small.render(line1, True, (190, 205, 225))
         self.screen.blit(t1, (cx + 8, cy + 24))
 
-        p_rews = self.frames[self.current_frame_idx].get("player_rewards", [])
-        c_rews = self.frames[self.current_frame_idx].get("cum_rewards", [])
+        # Critic V(s) & TD-Surprise ΔV
+        v_preds = curr_fr.get("v_pred", [])
+        v_curr = float(v_preds[idx]) if (v_preds and idx < len(v_preds) and v_preds[idx] is not None) else 0.0
+        if self.current_frame_idx > 0:
+            prev_fr = self.frames[self.current_frame_idx - 1]
+            prev_v = prev_fr.get("v_pred", [])
+            v_prev = float(prev_v[idx]) if (prev_v and idx < len(prev_v) and prev_v[idx] is not None) else v_curr
+            delta_v = v_curr - v_prev
+        else:
+            delta_v = 0.0
+
+        p_rews = curr_fr.get("player_rewards", [])
+        c_rews = curr_fr.get("cum_rewards", [])
         step_r = float(p_rews[idx]) if idx < len(p_rews) else 0.0
         cum_r = float(c_rews[idx]) if idx < len(c_rews) else 0.0
         r_col = (100, 245, 130) if cum_r >= 0 else (255, 110, 110)
-        line2 = f"Rew Step: {step_r:+.2f}  Cum: {cum_r:+.1f}  Spd: {phys['speed']:.0f}"
+
+        line2 = f"V(s): {v_curr:+.2f} | ΔV: {delta_v:+.2f} | StepR: {step_r:+.2f} (Cum: {cum_r:+.1f})"
         t2 = self.font_small.render(line2, True, r_col)
         self.screen.blit(t2, (cx + 8, cy + 44))
+
+        # Reward breakdown
+        rew_bd = curr_fr.get("rew_breakdown", [])
+        bd_item = rew_bd[idx] if (rew_bd and idx < len(rew_bd) and isinstance(rew_bd[idx], dict)) else {}
+        r_adv = float(bd_item.get("r_ball_adv", 0.0))
+        r_pos = float(bd_item.get("r_pot_i", 0.0))
+        r_spars = float(bd_item.get("r_sparse", 0.0))
+        phi_r = float(bd_item.get("phi_role", 0.0))
+        phi_c = float(bd_item.get("phi_crowd", 0.0))
+        phi_tot = phi_r - phi_c
+
+        line3 = f"Adv: {r_adv:+.3f} | Pos: {r_pos:+.3f} | Spars: {r_spars:+.2f}"
+        t3 = self.font_small.render(line3, True, (215, 230, 245))
+        self.screen.blit(t3, (cx + 8, cy + 64))
+
+        line4 = f"Φ_i: {phi_tot:.2f} (Role: {phi_r:.2f}, Crowd: {-phi_c:.2f})"
+        t4 = self.font_small.render(line4, True, (180, 205, 235))
+        self.screen.blit(t4, (cx + 8, cy + 82))
+
+        # Action readout
+        actions = curr_fr.get("actions", [])
+        act_item = actions[idx] if (actions and idx < len(actions) and len(actions[idx]) >= 4) else [0.0, 0.0, 0.0, 0.0]
+        throt = float(act_item[0])
+        steer = float(act_item[1])
+        kick = float(act_item[2])
+        tkl = float(act_item[3])
+
+        act_x = cx + 8
+        act_y = cy + 102
+        lbl_act = self.font_small.render("Act: ", True, (160, 175, 195))
+        self.screen.blit(lbl_act, (act_x, act_y))
+        act_x += lbl_act.get_width()
+
+        lbl_dir = self.font_small.render(f"Dir({throt:+.2f}, {steer:+.2f}) | ", True, (220, 230, 245))
+        self.screen.blit(lbl_dir, (act_x, act_y))
+        act_x += lbl_dir.get_width()
+
+        kick_col = (255, 220, 70) if kick > 0.35 else (160, 175, 195)
+        lbl_kick = self.font_small.render(f"Kick: {kick:.2f}", True, kick_col)
+        self.screen.blit(lbl_kick, (act_x, act_y))
+        act_x += lbl_kick.get_width()
+
+        lbl_sep = self.font_small.render(" | ", True, (160, 175, 195))
+        self.screen.blit(lbl_sep, (act_x, act_y))
+        act_x += lbl_sep.get_width()
+
+        tkl_col = (80, 240, 220) if tkl > 0.50 else (160, 175, 195)
+        lbl_tkl = self.font_small.render(f"Tkl: {tkl:.2f}", True, tkl_col)
+        self.screen.blit(lbl_tkl, (act_x, act_y))
 
     def _find_player_at_telemetry_pos(self, mx: int, my: int) -> Optional[int]:
         """Detect if mouse click is on a player row in the telemetry table."""
@@ -2454,6 +2827,18 @@ def main() -> None:
         default=False,
         help="Automatically follow and focus active ball carrier (toggled in-viewer with 'F').",
     )
+    parser.add_argument(
+        "--critic",
+        action="store_true",
+        default=False,
+        help="Enable Critic value prediction overlay on startup (toggled in-viewer with 'C').",
+    )
+    parser.add_argument(
+        "--grad",
+        action="store_true",
+        default=False,
+        help="Enable potential gradient compass overlay on startup (toggled in-viewer with 'G').",
+    )
     args = parser.parse_args()
 
     if args.list or args.range is not None or args.top is not None:
@@ -2495,6 +2880,8 @@ def main() -> None:
         show_wall_tracers=not args.no_walls,
         show_radar=args.show_radar,
         auto_focus_carrier=True if args.auto_ball else None,
+        show_critic=args.critic,
+        show_gradient=args.grad,
     )
     viewer.run(max_frames=args.headless_frames)
 

@@ -494,7 +494,7 @@ class ParameterSharingPPOTrainer:
 
             act_clipped = np.clip(actions, -1.0, 1.0)
             obs_batch, central_batch, rew_batch, done_batch, ep_summaries = (
-                self.vec_env.step_array(act_clipped)
+                self.vec_env.step_array(act_clipped, values)
             )
             buf_rew[t] = rew_batch
             buf_done[t] = done_batch[:, None].astype(np.float32)
@@ -517,6 +517,16 @@ class ParameterSharingPPOTrainer:
                         round(100.0 * fstats.get("possession_frames", [1, 1])[0] / total_poss, 1),
                         round(100.0 * fstats.get("possession_frames", [1, 1])[1] / total_poss, 1),
                     ]
+                    total_match_frames = max(1, int(ep_summary.get("total_frames", 10800)))
+                    poss_a = int(fstats.get("possession_frames", [0, 0])[0])
+                    poss_b = int(fstats.get("possession_frames", [0, 0])[1])
+                    stat_frames = int(fstats.get("stationary_ball_frames", 0))
+                    loose_frames = max(0, total_match_frames - poss_a - poss_b)
+                    true_poss_pct = [
+                        round(100.0 * poss_a / total_match_frames, 1),
+                        round(100.0 * poss_b / total_match_frames, 1),
+                        round(100.0 * loose_frames / total_match_frames, 1),
+                    ]
                     match_record = {
                         "match_id": int(ep_summary.get("match_id", self.next_match_id)),
                         "generation": int(active_generation),
@@ -524,6 +534,8 @@ class ParameterSharingPPOTrainer:
                         "goals": int(fstats.get("goals", 0)),
                         "interest_score": round(ep_interest, 2),
                         "possession_pct": poss_pct,
+                        "true_possession_pct": true_poss_pct,
+                        "stationary_ball_frames": stat_frames,
                         "shots": list(fstats.get("shots", [0, 0])),
                         "team_passes": list(fstats.get("team_passes", [0, 0])),
                         "completed_passes": int(fstats.get("completed_passes", 0)),

@@ -29,11 +29,11 @@ from football_rl.train_ppo import ParameterSharingPPOTrainer
 
 
 def test_pbrs_strict_non_negativity_and_cross_turnover_telescoping() -> None:
-    """Assert all potentials Phi(s) >= 0 and closed state-space loops with turnovers telescope to <= 0."""
+    """Assert uncrowded potentials Phi(s) >= 0 and closed state-space loops with turnovers telescope to 0."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
-    gamma = env.cfg.ppo.gamma
+    gamma = 1.0  # Undiscounted potential difference for zero stationary leak
     # Define a closed trajectory of (ball_pos, ball_holder) states that crosses a possession turnover
     states = [
         (np.array([450.0, 380.0], dtype=np.float64), 1),    # Team A def_1 holds ball
@@ -89,11 +89,18 @@ def test_multiplicative_spacing_gate_and_one_to_one_defensive_marking() -> None:
     phi_spread = float(env.prev_tactical_potential[3])
     assert phi_spread > 0.10
 
-    # Now clump a_mid_2 (idx=4) within 40u of a_mid_1 (idx=3)
+    # Now clump a_mid_2 (idx=4) within 30u of a_mid_1 (idx=3)
     env.player_pos[4] = np.array([700.0, 185.0], dtype=np.float64)
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
     phi_clumped = float(env.prev_tactical_potential[3])
-    assert phi_clumped == 0.0, f"Expected 0.0 potential when clumped at 30u, got {phi_clumped}"
+    assert phi_clumped < phi_spread, f"Expected reduced potential when clumped, got {phi_clumped} vs {phi_spread}"
+    assert phi_clumped > 0.0, f"Expected non-zero potential to avoid gradient death, got {phi_clumped}"
+
+    # Moving apart increases potential (positive separation gradient)
+    env.player_pos[4] = np.array([700.0, 215.0], dtype=np.float64)  # 60u separation
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    phi_separating = float(env.prev_tactical_potential[3])
+    assert phi_separating > phi_clumped, f"Expected increasing potential when separating, got {phi_separating} vs {phi_clumped}"
 
 
 def test_zero_sum_adversarial_turnover_and_scrum_cooldown_invariants() -> None:

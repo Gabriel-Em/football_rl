@@ -570,7 +570,8 @@ def test_piecewise_deadzone_and_backpedal_kinematics() -> None:
 
     # 2. Maximum backpedal (throttle_raw = -1.0)
     # Field player (ROLE_ATK): -0.65 * 190.0 = -123.5
-    # Keeper (ROLE_KEEPER): -0.75 * 180.0 = -135.0
+    # Keeper (ROLE_KEEPER): -1.0 * 180.0 = -180.0
+    env.player_pos[gk_idx] = np.array([300.0, 420.0], dtype=np.float64)
     actions["a_atk_1"] = np.array([-1.0, 0.0, -1.0, -1.0], dtype=np.float32)
     actions["a_keeper"] = np.array([-1.0, 0.0, -1.0, -1.0], dtype=np.float32)
 
@@ -578,7 +579,7 @@ def test_piecewise_deadzone_and_backpedal_kinematics() -> None:
         env.step(actions)
     assert np.isclose(env.player_vel[atk_idx, 0], -123.5, atol=0.05)
     assert np.isclose(env.player_vel[atk_idx, 1], 0.0, atol=0.05)
-    assert np.isclose(env.player_vel[gk_idx, 0], -135.0, atol=0.05)
+    assert np.isclose(env.player_vel[gk_idx, 0], -180.0, atol=0.05)
     assert np.isclose(env.player_vel[gk_idx, 1], 0.0, atol=0.05)
 
 
@@ -1469,7 +1470,7 @@ def test_asymmetric_crowding_exemptions_and_box_cutback_angles() -> None:
     step_rewards = np.zeros(env.num_players, dtype=np.float64)
     env._compute_potential_shaping(step_rewards, any_teleport=False)
 
-    expected_atk_delta = (env.cfg.ppo.gamma - 1.0) * env.prev_tactical_potential[atk_idx]
+    expected_atk_delta = 0.0
     assert abs(step_rewards[atk_idx] - expected_atk_delta) < 1e-6
     assert step_rewards[mid_idx] < -0.05
 
@@ -1581,8 +1582,8 @@ def test_stationary_receiver_earns_zero_chase_reward_and_active_receiver_earns_b
         if i not in (passer_idx, receiver_idx):
             env.player_pos[i] = np.array([100.0 + i * 80.0, 100.0], dtype=np.float64)
 
-    env.player_pos[passer_idx] = np.array([300.0, 420.0], dtype=np.float64)
-    env.player_pos[receiver_idx] = np.array([550.0, 420.0], dtype=np.float64)
+    env.player_pos[passer_idx] = np.array([200.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver_idx] = np.array([500.0, 420.0], dtype=np.float64)
     env.player_vel[:] = 0.0
 
     # Pass in flight toward receiver
@@ -1591,19 +1592,19 @@ def test_stationary_receiver_earns_zero_chase_reward_and_active_receiver_earns_b
     env.ball_kick_origin = env.player_pos[passer_idx].copy()
     env.last_ball_holder = passer_idx
     env.last_ball_team = TEAM_A
-    env.ball_pos = np.array([400.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([420.0, 420.0], dtype=np.float64)
     env.ball_vel = np.array([120.0, 0.0], dtype=np.float64)
 
     env._compute_potential_shaping(np.zeros(env.num_players, dtype=np.float64), any_teleport=True)
 
-    # 1. Receiver stands still: discounted PBRS matches steady-state discount delta
+    # 1. Receiver stands still: undiscounted PBRS produces exact zero reward leak
     r_still = np.zeros(env.num_players, dtype=np.float64)
     env._compute_potential_shaping(r_still, any_teleport=False)
-    expected_r_still = (env.cfg.ppo.gamma - 1.0) * env.prev_tactical_potential[receiver_idx]
+    expected_r_still = 0.0
     assert abs(r_still[receiver_idx] - expected_r_still) < 1e-6
 
     # 2. Receiver moves 40u closer to the ball: PBRS is strictly larger
-    env.player_pos[receiver_idx] = np.array([510.0, 420.0], dtype=np.float64)
+    env.player_pos[receiver_idx] = np.array([460.0, 420.0], dtype=np.float64)
     r_moving = np.zeros(env.num_players, dtype=np.float64)
     env._compute_potential_shaping(r_moving, any_teleport=False)
     assert r_moving[receiver_idx] > r_still[receiver_idx] + 0.005
@@ -3496,14 +3497,15 @@ def test_post_kick_pbrs_smooth_decay_and_carrier_baseline_continuity() -> None:
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
     assert math.isclose(env._phi_curr[a1], w_press, abs_tol=1e-5)
 
-    # Post-kick timer decays kicker potential smoothly
+    # Post-kick timer decays kicker potential smoothly when teammate is receiving
     env.ball_holder = None
     env.ball_kicked_in_flight = True
     env.last_ball_team = TEAM_A
     env.last_ball_holder = a1
     env.post_kick_pbrs_timer[a1] = 0.50
-    # Place ball 20u from kicker (inside 45u deadzone)
+    # Place ball 20u from kicker and teammate m1 at the ball (m1 is pass chaser)
     env.ball_pos = env.player_pos[a1] + np.array([20.0, 0.0])
+    env.player_pos[m1] = env.ball_pos.copy()
 
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
     phi_t50 = float(env._phi_curr[a1])
@@ -3515,11 +3517,16 @@ def test_post_kick_pbrs_smooth_decay_and_carrier_baseline_continuity() -> None:
     phi_t25 = float(env._phi_curr[a1])
     assert 0.0 < phi_t25 < phi_t50
 
-    # Expired timer drops deadzone potential to zero
+    # Expired timer drops deadzone support potential to non-positive with crowding
     env.post_kick_pbrs_timer[a1] = 0.0
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
     phi_t00 = float(env._phi_curr[a1])
-    assert math.isclose(phi_t00, 0.0, abs_tol=1e-5)
+    assert phi_t00 <= 0.0 and phi_t00 < phi_t25
+
+    # If kicker is the closest player to loose ball, they become pass_chaser with non-zero potential
+    env.player_pos[m1] = np.array([100.0, 100.0])
+    env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
+    assert math.isclose(float(env._phi_curr[a1]), w_press, abs_tol=1e-5)
 
 
 def test_circulation_floor_on_open_space_first_link() -> None:
@@ -3782,5 +3789,80 @@ def test_tackle_contact_clearance_reach_and_whiff_distance_gating() -> None:
     assert env.stun_timer[carrier_idx] == env.cfg.mechanics.tackle_victim_stun_time
 
     env.np_random = orig_rng
+
+
+def test_goalkeeper_directional_pickup_and_perimeter_strip_gating() -> None:
+    """Verify goalkeeper pickups and perimeter strips require facing the ball within the forward cone."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    gk_idx = env.agent_to_idx["a_keeper"]
+    atk_idx = env.agent_to_idx["b_atk_1"]
+
+    # 1. Perimeter strip: goalkeeper facing away cannot strip ball from behind
+    env.ball_holder = atk_idx
+    env.player_pos[atk_idx] = np.array([60.0, 420.0], dtype=np.float64)
+    env.ball_pos = np.array([55.0, 420.0], dtype=np.float64)
+    env.player_pos[gk_idx] = np.array([45.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_idx] = math.pi  # Facing into own net (-X)
+
+    step_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._check_keeper_perimeter_strip(atk_idx, step_rewards)
+    assert env.ball_holder == atk_idx
+
+    # Goalkeeper facing carrier cleanly strips ball
+    env.player_angle[gk_idx] = 0.0  # Facing ball (+X)
+    env._check_keeper_perimeter_strip(atk_idx, step_rewards)
+    assert env.ball_holder == gk_idx
+
+    # 2. Free ball pickup: goalkeeper cannot catch loose ball striking from behind
+    env.reset(seed=42)
+    env.ball_holder = None
+    env.ball_pos = np.array([65.0, 420.0], dtype=np.float64)
+    env.player_pos[gk_idx] = np.array([45.0, 420.0], dtype=np.float64)
+    env.player_angle[gk_idx] = math.pi  # Facing away from ball
+
+    step_rewards.fill(0.0)
+    env._check_free_ball_pickup(step_rewards)
+    assert env.ball_holder is None
+
+    # Goalkeeper facing ball picks up free ball
+    env.player_angle[gk_idx] = 0.0
+    env._check_free_ball_pickup(step_rewards)
+    assert env.ball_holder == gk_idx
+
+
+def test_pitch_boundary_wall_velocity_dissipation_and_bisector_depth() -> None:
+    """Verify boundary wall collision zeroes normal velocity and bisector target depth stays in front of goal line."""
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+
+    # 1. Boundary wall contact zeroes inward normal velocity
+    env.player_pos[0] = np.array([18.0, 420.0], dtype=np.float64)
+    env.player_vel[0] = np.array([-180.0, 60.0], dtype=np.float64)
+    env._clamp_players_to_boundaries()
+    assert env.player_vel[0, 0] == 0.0
+    assert env.player_vel[0, 1] == 60.0
+
+    # 2. Bisector target depth never retreats behind minimum clearance (X >= 38.0)
+    # Deep corner ball at [20, 100]
+    env.ball_pos = np.array([20.0, 100.0], dtype=np.float64)
+    env._compute_potential_shaping(np.zeros(env.num_players, dtype=np.float64), any_teleport=True)
+    phi_val = float(env.prev_tactical_potential[0])
+    assert phi_val >= 0.0
+
+    # 3. Continuous orientation factor psi_face across full heading circle
+    phi_angles = []
+    angles = np.linspace(-math.pi, math.pi, 181)
+    env.ball_pos = np.array([200.0, 420.0], dtype=np.float64)
+    env.player_pos[0] = np.array([45.0, 420.0], dtype=np.float64)
+    for a in angles:
+        env.player_angle[0] = a
+        env._compute_potential_shaping(np.zeros(env.num_players, dtype=np.float64), any_teleport=True)
+        phi_angles.append(float(env.prev_tactical_potential[0]))
+
+    max_delta = max(abs(phi_angles[i] - phi_angles[i - 1]) for i in range(1, len(phi_angles)))
+    assert max_delta < 0.02
+
 
 

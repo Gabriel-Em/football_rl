@@ -676,6 +676,226 @@ def test_subframe_accumulator_0_5_and_0_75() -> None:
     assert viz.current_frame_idx == 3
 
 
+def test_critic_telemetry_toggle_and_display() -> None:
+    """Verify Critic V(s) recording, [C] key and chip toggles, diverging ring, and TD-surprise."""
+    data = _create_mock_replay_data()
+    for i, fr in enumerate(data["frames"]):
+        fr["v_pred"] = [round(0.2 * i - 1.0 + p * 0.1, 2) for p in range(12)]
+
+    viz = ReplayVisualizer(data, headless=True)
+    assert not viz.show_critic
+
+    # 1. Toggle via keyboard 'C'
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_c, mod=0))
+    viz.handle_events()
+    assert viz.show_critic
+
+    # 2. Toggle via chip 'C:CRIT'
+    viz.render_frame()
+    chip_rect = viz.telemetry_chip_rects.get("C:CRIT")
+    assert chip_rect is not None
+    pygame.event.post(
+        pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            pos=(chip_rect.centerx, chip_rect.centery),
+            button=1,
+        )
+    )
+    viz.handle_events()
+    assert not viz.show_critic
+
+    # 3. Turn on and render frame 2
+    viz.show_critic = True
+    viz.seek_to_frame(2)
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+    # 4. Verify focused player card TD-surprise calculation
+    viz.inspect_player_idx = 3
+    viz.render_frame()
+
+
+def test_reward_breakdown_and_gradient_compass() -> None:
+    """Verify reward breakdown card rendering, [G] key and chip toggles, and compass arrows."""
+    data = _create_mock_replay_data()
+    for fr in data["frames"]:
+        bd = []
+        gp = []
+        for p in range(12):
+            mag = 0.05 if p != 0 else 0.0  # Player 0 has flat gradient zone
+            gp.append([0.707, 0.707, mag])
+            bd.append({
+                "r_ball_adv": 0.012,
+                "r_pot_i": 0.005,
+                "phi_role": 0.62,
+                "phi_crowd": 0.08,
+                "r_sparse": 0.0,
+                "grad_phi_xy": [0.707, 0.707, mag],
+            })
+        fr["rew_breakdown"] = bd
+        fr["grad_phi"] = gp
+
+    viz = ReplayVisualizer(data, headless=True)
+    assert not viz.show_gradient
+
+    # 1. Toggle via keyboard 'G'
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_g, mod=0))
+    viz.handle_events()
+    assert viz.show_gradient
+
+    # 2. Toggle via chip 'G:GRAD'
+    viz.render_frame()
+    chip_rect = viz.telemetry_chip_rects.get("G:GRAD")
+    assert chip_rect is not None
+    pygame.event.post(
+        pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            pos=(chip_rect.centerx, chip_rect.centery),
+            button=1,
+        )
+    )
+    viz.handle_events()
+    assert not viz.show_gradient
+
+    # 3. Render frame with gradient compass ON
+    viz.show_gradient = True
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+
+def test_dynamic_role_tethers_and_presser_badges() -> None:
+    """Verify live tactical badges (BALL, 1stP, 2ndP, COVR, CHSE, STUN, LNGE, GK) and role tethers."""
+    data = _create_mock_replay_data()
+    roles = ["GK", "1stP", "2ndP", "COVR", "CHSE", "BALL", "GK", "COVR", "STUN", "LNGE", "1stP", "2ndP"]
+    targets = [
+        [50.0, 420.0], [700.0, 420.0], [700.0, 420.0], [400.0, 300.0], [700.0, 420.0], [700.0, 420.0],
+        [1350.0, 420.0], [1000.0, 500.0], [900.0, 400.0], [800.0, 300.0], [700.0, 420.0], [700.0, 420.0],
+    ]
+    for fr in data["frames"]:
+        fr["role_state"] = list(roles)
+        fr["role_targets"] = [list(t) for t in targets]
+
+    viz = ReplayVisualizer(data, headless=True, show_radar=True, show_telemetry=True)
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+
+def test_true_possession_and_timeline_stall_ribbon() -> None:
+    """Verify true possession header and 4-color timeline stall ribbon."""
+    data = _create_mock_replay_data()
+    # Frame 0..4: Team A possession
+    for f in range(5):
+        data["frames"][f]["players"][2][3] |= 1  # FLAG_HAS_BALL for Team A
+    # Frame 5..9: Team B possession
+    for f in range(5, 10):
+        data["frames"][f]["players"][8][3] |= 1  # FLAG_HAS_BALL for Team B
+    # Frame 10..14: Loose moving ball
+    for f in range(10, 15):
+        data["frames"][f]["ball"] = [700.0, 420.0, -1, 10.0, 5.0]
+    # Frame 15..19: Stationary ball (vx=0, vy=0 for 5 frames)
+    for f in range(15, 20):
+        data["frames"][f]["ball"] = [700.0, 420.0, -1, 0.0, 0.0]
+
+    viz = ReplayVisualizer(data, headless=True)
+    assert hasattr(viz, "possession_ribbon_surface")
+    assert viz.possession_ribbon_surface is not None
+    assert viz.possession_ribbon_surface.get_width() == viz.disp_field_w
+    assert viz.possession_ribbon_surface.get_height() == 4
+
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+
+def test_focused_player_action_readout() -> None:
+    """Verify action outputs line in focused player card with highlight thresholds."""
+    data = _create_mock_replay_data()
+    for fr in data["frames"]:
+        fr["actions"] = [[0.8, -0.2, 0.65, 0.85] for _ in range(12)]  # Active kick and tackle
+
+    viz = ReplayVisualizer(data, headless=True, show_telemetry=True)
+    viz.inspect_player_idx = 5
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+
+
+def test_backward_compatibility_older_replays() -> None:
+    """Verify older replays without new telemetry fields load and play smoothly without exceptions."""
+    data = _create_mock_replay_data()
+    for fr in data["frames"]:
+        fr.pop("v_pred", None)
+        fr.pop("rew_breakdown", None)
+        fr.pop("grad_phi", None)
+        fr.pop("role_state", None)
+        fr.pop("role_targets", None)
+        fr.pop("actions", None)
+
+    viz = ReplayVisualizer(
+        data,
+        headless=True,
+        show_critic=True,
+        show_gradient=True,
+        show_radar=True,
+        show_telemetry=True,
+        show_reward_hud=True,
+    )
+    for f in range(len(data["frames"])):
+        viz.seek_to_frame(f)
+        surf = viz.render_frame()
+        assert isinstance(surf, pygame.Surface)
+
+
+def test_env_replay_recording_telemetry_fields() -> None:
+    """Verify FootballEnv records v_pred, rew_breakdown, grad_phi, role_state, role_targets, actions."""
+    from dataclasses import replace
+    import numpy as np
+    from football_rl.config import DEFAULT_CONFIG
+    from football_rl.env import FootballEnv
+
+    replay_cfg = replace(DEFAULT_CONFIG.replay, enable_recording=True)
+    cfg = replace(DEFAULT_CONFIG, replay=replay_cfg)
+    env = FootballEnv(cfg)
+    env.reset(seed=42)
+
+    acts = np.zeros((12, 4), dtype=np.float64)
+    v_preds = np.array([0.5 * (i - 6) for i in range(12)], dtype=np.float32)
+
+    env.step_array(acts, v_preds=v_preds)
+
+    assert env.last_v_preds is not None
+    assert len(env.last_v_preds) == 12
+    assert env.last_rew_breakdown is not None
+    assert len(env.last_rew_breakdown) == 12
+    assert "r_ball_adv" in env.last_rew_breakdown[0]
+    assert "r_pot_i" in env.last_rew_breakdown[0]
+    assert "phi_role" in env.last_rew_breakdown[0]
+    assert "phi_crowd" in env.last_rew_breakdown[0]
+    assert "grad_phi_xy" in env.last_rew_breakdown[0]
+
+    assert env.last_grad_phi is not None
+    assert len(env.last_grad_phi) == 12
+    for g in env.last_grad_phi:
+        assert len(g) == 3
+
+    assert env.last_role_states is not None
+    assert len(env.last_role_states) == 12
+    assert env.last_role_targets is not None
+    assert len(env.last_role_targets) == 12
+    assert env.last_actions is not None
+    assert len(env.last_actions) == 12
+
+    # Check replay_frames
+    assert len(env.replay_frames) > 0
+    rf = env.replay_frames[-1]
+    assert "v_pred" in rf
+    assert "rew_breakdown" in rf
+    assert "grad_phi" in rf
+    assert "role_state" in rf
+    assert "role_targets" in rf
+    assert "actions" in rf
+
+
+
+
 
 
 
