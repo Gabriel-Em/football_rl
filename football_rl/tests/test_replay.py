@@ -213,6 +213,79 @@ def test_cinematic_timeline_event_indexing() -> None:
     assert isinstance(surf_hrew, pygame.Surface)
 
 
+def _halftime_replay(goal_frames: List[int], halftime_frame: int, n_frames: int = 30,
+                     cinematics: bool = True, with_halftime_event: bool = True) -> Dict[str, Any]:
+    """Mock replay with goals at given raw frames and a half switch at ``halftime_frame``."""
+    data = _create_mock_replay_data()
+    base = data["frames"][0]
+    frames: List[Dict[str, Any]] = []
+    for f in range(n_frames):
+        fr = dict(base)
+        fr["frame"] = f
+        fr["time"] = f / 60.0
+        fr["events"] = []
+        fr["half"] = 2 if f >= halftime_frame else 1
+        if f in goal_frames:
+            fr["events"].append({"type": "GOAL!", "x": 1400.0, "y": 420.0, "team": 0,
+                                 "agent": "a_atk_1", "reward": 10.0})
+        if with_halftime_event and f == halftime_frame:
+            fr["events"].append({"type": "HALFTIME!", "x": 700.0, "y": 420.0, "team": 1,
+                                 "agent": "referee", "reward": 0.0})
+        frames.append(fr)
+    data["frames"] = frames
+    data["metadata"]["disable_cinematics"] = not cinematics
+    return data
+
+
+def test_halftime_tick_follows_halftime_cinematic_not_midpoint() -> None:
+    """1 goal in half 1 and 3 in half 2: the tick sits at the HALFTIME cinematic start."""
+    data = _halftime_replay(goal_frames=[5, 18, 22, 26], halftime_frame=15)
+    viz = ReplayVisualizer(data, headless=True)
+
+    # Each goal inserts 90 freeze + 120 walk + 60 hold = 270 frames; one goal precedes half-time.
+    assert viz.halftime_frame_idx == 15 + 270
+    assert viz.frames[viz.halftime_frame_idx]["cinematic"]["event_type"] == "HALFTIME!"
+    assert viz.num_frames == 30 + 4 * 270 + 240  # plus the half-time cinematic (60 + 120 + 60)
+    assert viz.halftime_frame_idx != viz.num_frames // 2
+
+
+def test_halftime_tick_pixel_is_drawn_at_marker_position() -> None:
+    """The scrubber bar draws its half-time line at the marker, not at 50 %."""
+    data = _halftime_replay(goal_frames=[5, 18, 22, 26], halftime_frame=15)
+    viz = ReplayVisualizer(data, headless=True)
+    viz.seek_to_frame(viz.num_frames - 1)
+    surf = viz.render_frame()
+    bar_x, bar_w = viz.margin_x, viz.disp_field_w
+    bar_y = viz.hud_height + viz.disp_field_h + 16
+    ht_x = bar_x + int((viz.halftime_frame_idx / float(viz.num_frames - 1)) * bar_w)
+    mid_x = bar_x + bar_w // 2
+    probe_y = bar_y - 3
+    assert tuple(surf.get_at((ht_x, probe_y)))[:3] == (235, 240, 245)
+    assert ht_x != mid_x
+    assert tuple(surf.get_at((mid_x, probe_y)))[:3] != (235, 240, 245)
+
+
+def test_halftime_index_falls_back_to_half_two_then_none() -> None:
+    """Without cinematics or a HALFTIME event the first half-2 frame is used; no half-2 gives None."""
+    data = _halftime_replay([], halftime_frame=12, cinematics=False, with_halftime_event=False)
+    viz = ReplayVisualizer(data, headless=True)
+    assert viz.halftime_frame_idx == 12
+
+    data = _halftime_replay([], halftime_frame=10_000, cinematics=False, with_halftime_event=False)
+    viz = ReplayVisualizer(data, headless=True)
+    assert viz.halftime_frame_idx is None
+    assert isinstance(viz.render_frame(), pygame.Surface)
+
+
+def test_halftime_index_uses_event_when_goal_cinematic_shadows_it() -> None:
+    """A goal on the half-time frame owns the cinematic; the tick uses the HALFTIME event frame."""
+    data = _halftime_replay(goal_frames=[15], halftime_frame=15)
+    viz = ReplayVisualizer(data, headless=True)
+    idx = viz.halftime_frame_idx
+    assert idx == 15
+    assert any(ev.get("type") == "HALFTIME!" for ev in viz.frames[idx]["events"])
+
+
 def test_slowmo_playback_speed_and_accumulator() -> None:
     """Verify 0.25x slow-mo advances exactly 1 frame every 4 ticks and key toggles work."""
     data = _create_mock_replay_data()

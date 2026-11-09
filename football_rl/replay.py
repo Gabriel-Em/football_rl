@@ -250,10 +250,20 @@ class ReplayViewer:
         self.save_frames: List[Tuple[int, int, bool]] = []
         self.high_reward_frames: List[Tuple[int, int, str, float]] = []
         self.foul_frames: List[Tuple[int, int, str]] = []
+        self.halftime_frame_idx: Optional[int] = None
+        ht_cinematic_idx: Optional[int] = None
+        ht_event_idx: Optional[int] = None
+        second_half_idx: Optional[int] = None
 
         for idx, fr in enumerate(self.frames):
+            if ht_cinematic_idx is None and fr.get("cinematic", {}).get("event_type") == "HALFTIME!":
+                ht_cinematic_idx = idx
+            if second_half_idx is None and fr.get("half") == 2:
+                second_half_idx = idx
             for ev in fr.get("events", []):
                 ev_t = str(ev.get("type", ""))
+                if ev_t == "HALFTIME!" and ht_event_idx is None:
+                    ht_event_idx = idx
                 team = int(ev.get("team", -1))
                 rew = ev.get("reward")
                 rew_val = float(rew) if rew is not None else 0.0
@@ -266,6 +276,11 @@ class ReplayViewer:
                     self.foul_frames.append((idx, team, ev_t))
                 elif rew_val >= 5.0:
                     self.high_reward_frames.append((idx, team, ev_t, rew_val))
+
+        for candidate in (ht_cinematic_idx, ht_event_idx, second_half_idx):
+            if candidate is not None:
+                self.halftime_frame_idx = candidate
+                break
 
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -1639,11 +1654,12 @@ class ReplayViewer:
             border_radius=5,
         )
 
-        # Halftime marker at 50%
-        ht_x = bar_x + bar_w // 2
-        pygame.draw.line(
-            self.screen, COLOR_LINE, (ht_x, bar_y - 4), (ht_x, bar_y + bar_h + 4), width=2
-        )
+        # Halftime marker at the first frame of the second half
+        if self.halftime_frame_idx is not None:
+            ht_x = bar_x + int((self.halftime_frame_idx / float(max(1, self.num_frames - 1))) * bar_w)
+            pygame.draw.line(
+                self.screen, COLOR_LINE, (ht_x, bar_y - 4), (ht_x, bar_y + bar_h + 4), width=2
+            )
 
         # 1. High-reward (+5 or up) other event markers along timeline (triangle shaped: ▲)
         for h_frame, h_team, h_label, h_rew in self.high_reward_frames:
