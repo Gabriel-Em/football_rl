@@ -27,8 +27,12 @@ venv/
 ENV/
 env/
 
-# Pytest / coverage cache
+# Pytest / coverage / linter / profiler caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.prof
+*.lprof
 .coverage
 .coverage.*
 htmlcov/
@@ -49,8 +53,11 @@ Thumbs.db
 replays/
 matches_summary.md
 
-# Model Checkpoints & Training Dumps
+# Model Checkpoints & Training Dumps (also stray weights saved outside checkpoints/)
 checkpoints/
+*.pt
+*.pth
+*.log
 
 # Experiment Archives
 archives/
@@ -59,3 +66,6 @@ archives/
 context/
 AGENTS.md
 
+# Local agent-tool settings (per-machine)
+.claude/settings.local.json
+.gemini/
