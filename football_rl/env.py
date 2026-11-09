@@ -1723,17 +1723,8 @@ class FootballParallelEnv(ParallelEnv):
         if not np.any(dists <= mech.pickup_distance):
             return
 
-        inv_dists = 1.0 / np.maximum(dists, 1e-6)
-        u_bx = dx_b * inv_dists
-        u_by = dy_b * inv_dists
-        cos_phi = np.cos(self.player_angle) * u_bx + np.sin(self.player_angle) * u_by
-
-        gk_mask = self.player_role == ROLE_KEEPER
-        facing_eligible = ~gk_mask | (cos_phi >= -0.15)
-
         eligible = np.where(
             (dists <= mech.pickup_distance)
-            & facing_eligible
             & (self.pickup_cooldown <= 0.0)
             & (self.stun_timer <= 0.0)
             & (self.ghost_timer <= 0.0)
@@ -1933,9 +1924,17 @@ class FootballParallelEnv(ParallelEnv):
                 self._reset_pass_chains(kicker_team)
                 self.spell_max_threat[new_team] = self._compute_ball_potential(new_team, self.ball_pos)
                 my_side = int(self.team_side[new_team])
+                keeper_facing_ball = False
+                if new_role == ROLE_KEEPER:
+                    inv_d = 1.0 / max(float(dists[new_holder]), 1e-6)
+                    gk_ang = float(self.player_angle[new_holder])
+                    keeper_facing_ball = (
+                        math.cos(gk_ang) * (float(dx_b[new_holder]) * inv_d)
+                        + math.sin(gk_ang) * (float(dy_b[new_holder]) * inv_d)
+                    ) >= -0.15
                 is_real_save = (
                     new_role == ROLE_KEEPER
-                    and cos_phi[new_holder] >= -0.15
+                    and keeper_facing_ball
                     and (
                         self._is_ball_heading_into_goal(self.ball_pos, self.ball_vel, my_side)
                         or (

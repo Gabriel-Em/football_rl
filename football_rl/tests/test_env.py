@@ -3833,7 +3833,7 @@ def test_goalkeeper_directional_pickup_and_perimeter_strip_gating() -> None:
     env._check_keeper_perimeter_strip(atk_idx, step_rewards)
     assert env.ball_holder == gk_idx
 
-    # 2. Free ball pickup: goalkeeper cannot catch loose ball striking from behind
+    # 2. Free ball pickup: a keeper touching a loose ball collects it regardless of facing
     env.reset(seed=42)
     env.ball_holder = None
     env.ball_pos = np.array([65.0, 420.0], dtype=np.float64)
@@ -3842,12 +3842,42 @@ def test_goalkeeper_directional_pickup_and_perimeter_strip_gating() -> None:
 
     step_rewards.fill(0.0)
     env._check_free_ball_pickup(step_rewards)
-    assert env.ball_holder is None
+    assert env.ball_holder == gk_idx
 
     # Goalkeeper facing ball picks up free ball
+    env.ball_holder = None
+    env.player_angle[gk_idx] = 0.0
     env.player_angle[gk_idx] = 0.0
     env._check_free_ball_pickup(step_rewards)
     assert env.ball_holder == gk_idx
+
+
+def _oop_env(seed: int = 0) -> FootballParallelEnv:
+    """Loose-ball environment with every player parked far from the ball and from each other."""
+    env = FootballParallelEnv(config=EnvConfig())
+    env.reset(seed=seed)
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.last_ball_team = None
+    env.stun_timer[:] = 0.0
+    env.ghost_timer[:] = 0.0
+    env.is_ghost[:] = False
+    env.team_side[:] = [0, 1]
+    for k in range(12):
+        env.player_pos[k] = [100.0 + 100.0 * k, 780.0]
+    return env
+
+
+def test_keeper_collects_loose_ball_while_facing_away() -> None:
+    """A keeper touching a loose ball collects it regardless of its heading."""
+    env = _oop_env()
+    env.player_pos[0] = [60.0, 420.0]
+    env.player_angle[0] = math.pi  # facing own goal line, ball behind the back
+    env.ball_pos[:] = [80.0, 420.0]
+    env.ball_vel[:] = 0.0
+    env.pickup_cooldown[:] = 0.0
+    env._check_free_ball_pickup(np.zeros(12))
+    assert env.ball_holder == 0
 
 
 def test_pitch_boundary_wall_velocity_dissipation_and_bisector_depth() -> None:
