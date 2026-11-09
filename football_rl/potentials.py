@@ -10,12 +10,16 @@ defending. Role potentials, before the teammate-crowding penalty, are:
 
 * ball carrier: the carrier baseline (`def_press_potential_weight`);
 * pass chaser (nearest outfielder of the passing team to a ball in flight) and primary presser:
-  a Gaussian-in-distance pull toward the ball;
+  a Gaussian-in-distance pull toward the ball. The presser of a defending team is the outfielder
+  with the lowest cost, the distance to the ball plus `RewardConfig.press_trail_weight` times how
+  far the player stands upfield of the ball (measured from the team's own goal line);
 * possessing-team supporters: a support ring around the ball, shaded by passing-lane openness and
   by the distance to a tactical channel target;
 * defenders: a cover term from the distance to the assigned opponent's goal-side marking point and
   to a tactical anchor, with the second-closest defender blending in a ball pull when the ball is
-  loose;
+  loose. Marks are assigned to defenders by minimising the total distance weighted by how close each
+  opponent stands to the defended goal. When the keeper is nearer to a loose ball inside its box than
+  the cost of every outfielder, no outfielder presses and all five cover the five opposing outfielders;
 * keepers: a Gaussian in the distance to a goal-line bisector target (or the ball, or the front
   outlet arc when holding it) scaled by how squarely the keeper faces the ball.
 
@@ -24,13 +28,17 @@ potential can be negative.
 
 The field is evaluated with scalar arithmetic over Python floats taken from the state arrays. With
 five players per team the arrays are too small for NumPy dispatch to pay for itself: element-wise
-array code measures several times slower than these loops. Pairwise distances use `math.hypot` /
-`math.dist`, which are correctly rounded and agree with each other bit for bit; the player-to-ball
-distances use `np.hypot`, which differs from them in the last bit for a small share of inputs.
+array code measures several times slower than these loops. The marking assignment is the one NumPy
+step; it reads fixed-size scratch arrays that every call overwrites before use, so a result never
+depends on earlier calls, but evaluations must not run concurrently in one process. Pairwise
+distances use `math.hypot` / `math.dist`, which are correctly rounded and agree with each other bit
+for bit; the player-to-ball distances use `np.hypot`, which differs from them in the last bit for a
+small share of inputs.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 from math import dist, exp
 from typing import NamedTuple
@@ -65,8 +73,9 @@ class PotentialState(NamedTuple):
         post_kick_timer: Seconds left of the post-kick shaping window per player, shape (12,).
         depth_bias: Tactical depth per player (-1 defensive, 0 middle, +1 attacking), shape (12,).
         flank_bias: Tactical lateral position per player (-1, 0, +1), shape (12,).
-        active_box_radius: Current keeper-box radius per team, shape (2,). Carried with the state for
-            consumers; the evaluation uses `PhysicsConfig.keeper_box_radius`.
+        active_box_radius: Current keeper-box radius per pitch side (indexed by the `team_side` value),
+            shape (2,). A keeper claims a loose ball only inside its team's current radius; the keeper's
+            own potential uses `PhysicsConfig.keeper_box_radius`.
     """
 
     pos: np.ndarray
@@ -122,10 +131,62 @@ _DISABLED_RANK_PENALTY = 10000.0
 
 _ROLE_TEMPLATE = [ROLE_GK, *([ROLE_COVER] * 5), ROLE_GK, *([ROLE_COVER] * 5)]
 
-# Candidate (defender, mark) pair indices (defender * 4 + mark) with the presser's row removed.
-_COVER_PAIRS = tuple(
-    tuple(loc * 4 + m for loc in range(5) if loc != presser for m in range(4)) for presser in range(5)
-)
+# Distance charged per unit of danger weight to a mark left without a coverer (the distance the potential
+# assigns to a defender that has no mark).
+_UNCOVERED_MARK_DIST = 300.0
+
+# Every ordered choice of k distinct cover points out of m, as rows of point indices, for 1 <= k <= m <= 5.
+_PERMS = {
+    (m, k): np.array(list(itertools.permutations(range(m), k)), dtype=np.intp).reshape(-1, k)
+    for m in range(1, 6)
+    for k in range(1, m + 1)
+}
+_ROWS = tuple(np.arange(k)[None, :] for k in range(6))
+
+# Scratch inputs of `assign_cover`: coverer positions, cover points and danger weights, filled per call.
+_COVER_XY = np.zeros((5, 2))
+_COVER_PTS = np.zeros((5, 2))
+_COVER_WEIGHT = np.zeros(5)
+
+
+def assign_cover(cover_xy: np.ndarray, cov_pts: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Assign K coverers to K distinct cover points out of M (0 <= K <= M <= 5).
+
+    Returns `perm`, shape (K,), such that coverer `c` marks cover point `perm[c]`. The assignment minimises
+
+        sum_c weights[perm[c]] * |cover_xy[c] - cov_pts[perm[c]]|
+        + _UNCOVERED_MARK_DIST * sum_{m not in perm} weights[m]
+
+    so that when K < M the points left uncovered are the least dangerous ones; for K == M the second term
+    is constant and the objective is the plain weighted distance sum. Ties resolve to the first permutation
+    in `itertools.permutations` order.
+
+    Raises:
+        ValueError: on K > M, M > 5, a shape mismatch, or a non-finite cost.
+    """
+    k = cover_xy.shape[0]
+    m = cov_pts.shape[0]
+    if (
+        cover_xy.ndim != 2
+        or cov_pts.ndim != 2
+        or cover_xy.shape[1] != 2
+        or cov_pts.shape[1] != 2
+        or weights.shape != (m,)
+        or k > m
+        or m > 5
+    ):
+        raise ValueError(f"assign_cover: invalid shapes cover={cover_xy.shape} pts={cov_pts.shape} w={weights.shape}")
+    if k == 0:
+        return np.zeros(0, dtype=np.intp)
+    d = np.hypot(cover_xy[:, None, 0] - cov_pts[None, :, 0], cover_xy[:, None, 1] - cov_pts[None, :, 1])
+    # Charging each uncovered mark `weights[m] * _UNCOVERED_MARK_DIST` is the same as subtracting that distance
+    # from every entry: the sum over a permutation then differs from the full objective by a constant.
+    cost = (d - _UNCOVERED_MARK_DIST) * weights[None, :]
+    if not np.isfinite(cost).all():
+        raise ValueError("assign_cover: non-finite cost")
+    perms = _PERMS[(m, k)]
+    totals = cost[_ROWS[k], perms].sum(axis=1)
+    return perms[int(np.argmin(totals))]
 
 
 def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsConfig) -> PotentialResult:
@@ -141,6 +202,7 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
     depth = state.depth_bias.tolist()
     flank = state.flank_bias.tolist()
     kick = state.post_kick_timer.tolist()
+    box_radius = state.active_box_radius.tolist()
 
     holder_team = -1 if holder < 0 else (0 if holder < 6 else 1)
     flight_team = int(state.last_ball_team) if (holder < 0 and state.ball_in_flight) else -1
@@ -186,8 +248,8 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
             defending.append(team)
     for team in defending:
         _cover_defence(
-            team, side[team] == SIDE_LEFT, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled, crowd,
-            phi, phi_role, role, target, cover_mark,
+            team, side[team] == SIDE_LEFT, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled,
+            box_radius[side[team]], crowd, phi, phi_role, role, target, cover_mark,
         )
 
     for team in (0, 1):
@@ -309,10 +371,10 @@ def _press_pull(w_press, d_ball):
 
 
 def _cover_defence(
-    team, is_left, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled, crowd,
+    team, is_left, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled, box_radius, crowd,
     phi, phi_role, role, target, cover_mark,
 ):
-    """Primary/secondary presser, greedy nearest-pair marking assignment, and cover potentials."""
+    """Presser selection, keeper claim of a loose ball, optimal marking assignment, and cover potentials."""
     f0 = 1 + 6 * team
     o0 = 7 - 6 * team
     sign = 1.0 if is_left else -1.0
@@ -320,53 +382,71 @@ def _cover_defence(
     w_press = rew.def_press_potential_weight
     ref_x, ref_y = _reference_point(f0, bx, by, pos)
 
-    # Presser: nearest enabled outfielder (disabled players rank behind every enabled one).
-    ranking = [ball_dist[g] + (_DISABLED_RANK_PENALTY if disabled[g] else 0.0) for g in range(f0, f0 + 5)]
-    order = sorted(range(5), key=ranking.__getitem__)
-    presser = order[0]
+    # Presser: lowest-cost outfielder, the distance to the ball plus a penalty for standing upfield of it
+    # (disabled players rank behind every enabled one; ties go to the nearer, then the lower index).
+    trail_weight = rew.press_trail_weight
+    ball_depth = (bx - own_gx) * sign
+    scores = []
+    for loc in range(5):
+        g = f0 + loc
+        trail = (pos[g][0] - own_gx) * sign - ball_depth
+        cost = ball_dist[g] + trail_weight * (trail if trail > 0.0 else 0.0)
+        scores.append((cost + (_DISABLED_RANK_PENALTY if disabled[g] else 0.0), ball_dist[g], loc))
+    scores.sort()
+
+    # A keeper that is enabled and nearer to a loose ball inside its box than the best press cost claims the
+    # ball: no outfielder presses and all five mark.
+    keeper = 6 * team
+    keeper_claims = (
+        holder < 0
+        and not disabled[keeper]
+        and math.hypot(bx - own_gx, by - _GOAL_CENTER_Y) <= box_radius
+        and ball_dist[keeper] < scores[0][0]
+    )
+    presser = -1 if keeper_claims else scores[0][2]
     second = -1
     second_pot = 0.0
-    if holder < 0 and not disabled[f0 + order[1]]:
-        second = order[1]
+    if holder < 0 and not keeper_claims and not disabled[f0 + scores[1][2]]:
+        second = scores[1][2]
         second_pot = rew.loose_ball_secondary_press_blend * w_press * exp(
             -max(0.0, ball_dist[f0 + second] - _PICKUP_REACH) * _INV_LAMBDA_CHASE
         )
 
-    # Opponents to mark: every outfield opponent except the carrier, or, when the ball is loose,
-    # except the one nearest the ball.
+    # Opponents to mark: every outfield opponent except the carrier, or, when the ball is loose, except the one
+    # nearest the ball (unless the keeper claims the ball, which leaves all five to be marked).
     if o0 <= holder < o0 + 5:
         marks = [o for o in range(o0, o0 + 5) if o != holder]
     else:
-        marks = sorted(range(o0, o0 + 5), key=ball_dist.__getitem__)[1:]
-    points = []
-    for o in marks:
-        ox, oy = pos[o]
-        points.append((ox + 0.35 * (own_gx - ox), oy + 0.35 * (_GOAL_CENTER_Y - oy)))
+        marks = sorted(range(o0, o0 + 5), key=ball_dist.__getitem__)
+        if not keeper_claims:
+            marks = marks[1:]
+    cover_locs = [loc for loc in range(5) if loc != presser]
+    n_cover = len(cover_locs)
+    n_mark = len(marks)
+    assert n_cover <= n_mark
 
-    # Greedy assignment: repeatedly take the closest unassigned (defender, mark) pair.
-    gaps = [0.0] * 20
-    for loc in range(5):
-        if loc != presser:
-            mate = pos[f0 + loc]
-            row = loc * 4
-            for m in range(4):
-                gaps[row + m] = dist(mate, points[m])
+    # Marking points sit between each opponent and the defended goal; each is weighted by how close its
+    # opponent stands to that goal (2 on the goal line, 1 on the far one).
+    points = []
+    for j, o in enumerate(marks):
+        ox, oy = pos[o]
+        point_x = ox + 0.35 * (own_gx - ox)
+        point_y = oy + 0.35 * (_GOAL_CENTER_Y - oy)
+        points.append((point_x, point_y))
+        _COVER_PTS[j, 0] = point_x
+        _COVER_PTS[j, 1] = point_y
+        advance = (ox - own_gx) * sign / phys.field_width
+        _COVER_WEIGHT[j] = 2.0 - (0.0 if advance < 0.0 else (1.0 if advance > 1.0 else advance))
+    for c, loc in enumerate(cover_locs):
+        mate = pos[f0 + loc]
+        _COVER_XY[c, 0] = mate[0]
+        _COVER_XY[c, 1] = mate[1]
+    assignment = assign_cover(_COVER_XY[:n_cover], _COVER_PTS[:n_mark], _COVER_WEIGHT[:n_mark]).tolist()
     assigned_gap = [300.0] * 5
-    used_defenders = 0
-    used_marks = 0
-    remaining = 4
-    for pair in sorted(_COVER_PAIRS[presser], key=gaps.__getitem__):
-        defender = pair >> 2
-        m = pair & 3
-        if (used_defenders >> defender) & 1 or (used_marks >> m) & 1:
-            continue
-        used_defenders |= 1 << defender
-        used_marks |= 1 << m
-        assigned_gap[defender] = gaps[pair]
-        cover_mark[f0 + defender] = marks[m]
-        remaining -= 1
-        if remaining == 0:
-            break
+    for c, loc in enumerate(cover_locs):
+        m = assignment[c]
+        assigned_gap[loc] = dist(pos[f0 + loc], points[m])
+        cover_mark[f0 + loc] = marks[m]
 
     w_cover = rew.def_cover_potential_weight
     for loc in range(5):

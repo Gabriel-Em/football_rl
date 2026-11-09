@@ -4168,10 +4168,6 @@ def test_step_array_clips_infinite_actions_to_finite_state(bad) -> None:
         assert np.isfinite(arr).all()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="np.clip does not clip NaN; NaN actions propagate into positions, observations and rewards",
-)
 def test_step_array_rejects_or_clips_nan_actions() -> None:
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
@@ -4266,7 +4262,7 @@ def test_field_hold_foul_charges_violator_and_team_while_only_5s_stat_is_kept() 
     assert rewards[violator] < -1.5
 
 
-GOLDEN_ROLLOUT_DIGEST = "a0e3c934d19f7f40cd8cba0ba0f1c5f26cd381934d38ebf97d0ffd1db1f0f2e7"
+GOLDEN_ROLLOUT_DIGEST = "e726782a53270dbbc008e1912e551635033b95a6583dc78c7c946adaf7b339ae"
 
 
 def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False) -> str:
@@ -4302,8 +4298,8 @@ def test_rollout_digest_is_seed_sensitive_and_repeatable():
     assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
 
 
-GOLDEN_REPLAY_DIGEST = "4630bf92c66483c59e2728baed93bab98911d77a3874789e1d8e883c4c3f5f82"
-GOLDEN_FULL_MATCH_REPLAY_DIGEST = "89964bf213162456ee32ddec0f2cba54d114b4953769c4766b7a865cafa44ddd"
+GOLDEN_REPLAY_DIGEST = "40687227c7c551d52215b14eb69f22944188ffaa59462b31b8245680c315e707"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST = "5143452ad8e31c690373e916bf9cd1efa6f77f49f2917bde10417e9e53136d7c"
 
 
 def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bool = False) -> str:

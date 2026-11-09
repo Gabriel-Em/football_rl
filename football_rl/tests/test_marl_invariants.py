@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import glob
+import itertools
 import json
 import math
 import os
@@ -24,6 +26,7 @@ from football_rl.config import (
     TEAM_LEFT,
     TEAM_RIGHT,
 )
+from football_rl import potentials
 from football_rl.env import FootballEnv, FootballParallelEnv
 from football_rl.train_ppo import ParameterSharingPPOTrainer
 
@@ -443,3 +446,181 @@ def test_bumper_to_bumper_tackle_probability_and_whiff_distance_gate():
             successes += 1
     assert successes >= 25, f"Attacker tackle rate at 40u contact should be ~43%, got {successes}%"
 
+
+
+def _oop_env(seed: int = 0) -> FootballParallelEnv:
+    """Loose-ball environment with every player parked far from the ball and from each other."""
+    env = FootballParallelEnv(config=EnvConfig())
+    env.reset(seed=seed)
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.last_ball_team = None
+    env.stun_timer[:] = 0.0
+    env.ghost_timer[:] = 0.0
+    env.is_ghost[:] = False
+    env.team_side[:] = [0, 1]
+    for k in range(12):
+        env.player_pos[k] = [100.0 + 100.0 * k, 780.0]
+    return env
+
+
+def _labels(env: FootballParallelEnv) -> List[str]:
+    """Role labels per player after one potential evaluation of the current state."""
+    env._compute_potential_shaping(np.zeros(12), any_teleport=False)
+    return list(env.last_role_states)
+
+
+def test_goal_side_player_presses_instead_of_trailing_chaser() -> None:
+    """A goal-side player slightly farther from a loose ball presses ahead of a nearer player behind the play."""
+    env = _oop_env()
+    env.ball_pos[:] = [500.0, 420.0]
+    env.player_pos[5] = [560.0, 420.0]  # striker: 60u away, 60u upfield of the ball -> cost 120
+    env.player_pos[1] = [430.0, 420.0]  # defender: 70u away, goal-side -> cost 70
+    lab = _labels(env)
+    assert lab[1] == "1stP" and lab[5] != "1stP"
+
+
+def test_zero_press_trail_weight_selects_the_nearest_player() -> None:
+    """With no trailing penalty the nearest outfielder presses regardless of which side of the ball it stands."""
+    cfg = dataclasses.replace(
+        DEFAULT_CONFIG, rewards=dataclasses.replace(DEFAULT_CONFIG.rewards, press_trail_weight=0.0)
+    )
+    env = _oop_env()
+    env.cfg = cfg
+    env.ball_pos[:] = [500.0, 420.0]
+    env.player_pos[5] = [560.0, 420.0]
+    env.player_pos[1] = [430.0, 420.0]
+    assert _labels(env)[5] == "1stP"
+
+
+def test_presser_selection_mirrors_for_team_b_and_after_side_switch() -> None:
+    """Goal-side selection measures upfield from each team's own goal line, for either side of the pitch."""
+    env = _oop_env()
+    env.ball_pos[:] = [900.0, 420.0]  # team B defends the right goal: canonical ball x = 500
+    env.player_pos[11] = [840.0, 420.0]  # striker trails by 60 (canonical 560)
+    env.player_pos[7] = [970.0, 420.0]  # defender goal-side, 70u away
+    assert _labels(env)[7] == "1stP"
+
+    env.team_side[:] = [1, 0]  # after half-time team A defends the right goal
+    for k in range(12):
+        env.player_pos[k] = [100.0 + 100.0 * k, 780.0]
+    env.ball_pos[:] = [900.0, 420.0]
+    env.player_pos[5] = [840.0, 420.0]
+    env.player_pos[1] = [970.0, 420.0]
+    assert _labels(env)[1] == "1stP"
+
+
+def test_presser_tie_resolves_to_lowest_index_and_disabled_players_are_excluded() -> None:
+    """Exactly equal presser costs go to the lower player index; a stunned player is never selected over an enabled one."""
+    env = _oop_env()
+    env.ball_pos[:] = [500.0, 420.0]
+    env.player_pos[3] = [440.0, 420.0]
+    env.player_pos[4] = [500.0, 360.0]  # both 60u away, goal-side or level
+    assert _labels(env)[3] == "1stP"
+    env.stun_timer[3] = 0.5
+    assert _labels(env)[4] == "1stP"
+
+
+def test_keeper_claims_loose_ball_in_own_box_and_outfield_does_not_chase() -> None:
+    """A keeper nearer to a loose ball inside its box than every outfielder's press cost takes the ball; outfielders cover."""
+    env = _oop_env()
+    env.ball_pos[:] = [180.0, 420.0]  # inside team A's keeper box
+    env.player_pos[0] = [150.0, 420.0]  # keeper 30u away
+    env.player_pos[1] = [205.0, 420.0]  # defender just outside the box: 25u away, 25u upfield -> cost 50
+    lab = _labels(env)
+    assert lab[0] == "GK"
+    assert all(lab[i] == "COVR" for i in range(1, 6))
+    env.player_pos[0] = [60.0, 420.0]  # keeper 120u away, beyond the defender's cost
+    assert _labels(env)[1] == "1stP"
+
+
+def test_assign_cover_optimal_beats_greedy_hand_solved() -> None:
+    """Total distance 4 of the optimal pairing beats the 6 of repeatedly taking the closest pair."""
+    cov = np.array([[0.0, 0.0], [3.0, 0.0]])
+    pts = np.array([[2.0, 0.0], [5.0, 0.0]])
+    assert potentials.assign_cover(cov, pts, np.ones(2)).tolist() == [0, 1]
+
+
+def test_assign_cover_danger_weight_flips_assignment() -> None:
+    """A heavily weighted cover point is served by the coverer that makes the weighted total smallest."""
+    cov = np.array([[0.0, 0.0], [0.0, 10.0]])
+    pts = np.array([[5.0, 0.0], [5.0, 4.0]])
+    # |c0-m0| = 5, |c1-m1| = hypot(5, 6) = 7.8102, |c1-m0| = hypot(5, 10) = 11.1803, |c0-m1| = hypot(5, 4) = 6.4031
+    # unweighted: [0, 1] -> 12.810 and [1, 0] -> 17.583
+    assert potentials.assign_cover(cov, pts, np.ones(2)).tolist() == [0, 1]
+    # weights (1, 5): [0, 1] -> 5 + 39.051 = 44.051 and [1, 0] -> 11.180 + 32.016 = 43.196
+    assert potentials.assign_cover(cov, pts, np.array([1.0, 5.0])).tolist() == [1, 0]
+
+
+def test_assign_cover_ties_pick_lexicographically_first_permutation() -> None:
+    """Two coverers at one point with mirrored cover points tie exactly; the first permutation wins."""
+    cov = np.array([[0.0, 0.0], [0.0, 0.0]])
+    pts = np.array([[1.0, 0.0], [-1.0, 0.0]])
+    assert potentials.assign_cover(cov, pts, np.ones(2)).tolist() == [0, 1]
+
+
+def test_assign_cover_sizes_zero_one_five_and_permutation_property() -> None:
+    """Empty and single problems are trivial; random 5x5 problems return a permutation no other permutation beats."""
+    assert potentials.assign_cover(np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0)).tolist() == []
+    assert potentials.assign_cover(np.zeros((1, 2)), np.ones((1, 2)), np.ones(1)).tolist() == [0]
+    rng = np.random.default_rng(3)
+    for _ in range(50):
+        c = rng.uniform(0, 1400, (5, 2))
+        p = rng.uniform(0, 1400, (5, 2))
+        w = rng.uniform(1, 2, 5)
+        perm = potentials.assign_cover(c, p, w)
+        assert sorted(perm.tolist()) == [0, 1, 2, 3, 4]
+
+        def total(q):
+            return sum(w[q[i]] * math.hypot(*(c[i] - p[q[i]])) for i in range(5))
+
+        assert total(perm) <= min(total(q) for q in itertools.permutations(range(5))) + 1e-9
+
+
+def test_assign_cover_rectangular_assignment() -> None:
+    """With fewer coverers than cover points the least dangerous marks are the ones left uncovered."""
+    # K=3 coverers, M=4 cover points, all on the x axis so distances are |dx|.
+    c = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+    p = np.array([[1.0, 0.0], [11.0, 0.0], [30.0, 0.0], [19.0, 0.0]])
+    # distance matrix rows c0..c2, columns m0..m3:
+    #   c0: 1 11 30 19 | c1: 9 1 20 9 | c2: 19 9 10 1
+    # equal weights: every choice leaves one mark uncovered at equal cost -> minimum distance sum
+    #   [0, 1, 3] -> 1 + 1 + 1 = 3 (m2 uncovered)
+    perm = potentials.assign_cover(c, p, np.ones(4))
+    assert perm.tolist() == [0, 1, 3] and perm.shape == (3,)
+    # m2 dangerous (w=2): objective = sum w*d + 300 * sum over uncovered w
+    #   [0, 1, 3]: 3 + 300*2 = 603 ; [0, 1, 2]: 1 + 1 + 2*10 + 300*1 = 322 ; [0, 3, 2]: 1 + 9 + 20 + 300 = 330
+    #   [0, 2, 3]: 1 + 2*20 + 1 + 300 = 342 -> optimum [0, 1, 2]
+    assert potentials.assign_cover(c, p, np.array([1.0, 1.0, 2.0, 1.0])).tolist() == [0, 1, 2]
+    # property sweep: every K <= M <= 5 is one-to-one, in range and optimal against an independent brute force
+    rng = np.random.default_rng(7)
+    for _ in range(100):
+        m = int(rng.integers(1, 6))
+        k = int(rng.integers(0, m + 1))
+        cc = rng.uniform(0, 1400, (k, 2))
+        pp = rng.uniform(0, 1400, (m, 2))
+        w = rng.uniform(1, 2, m)
+        q = potentials.assign_cover(cc, pp, w).tolist()
+        assert len(q) == k and len(set(q)) == k and all(0 <= j < m for j in q)
+
+        def total(r):
+            return (
+                sum(w[r[i]] * math.hypot(*(cc[i] - pp[r[i]])) for i in range(k))
+                + 300.0 * sum(w[j] for j in range(m) if j not in r)
+            )
+
+        assert total(q) <= min(total(r) for r in itertools.permutations(range(m), k)) + 1e-6
+
+
+def test_assign_cover_invalid_inputs_raise() -> None:
+    """More coverers than points, mismatched or oversized shapes and non-finite values are rejected."""
+    with pytest.raises(ValueError):  # K > M
+        potentials.assign_cover(np.zeros((4, 2)), np.zeros((3, 2)), np.ones(3))
+    with pytest.raises(ValueError):  # weights length != M
+        potentials.assign_cover(np.zeros((2, 2)), np.zeros((3, 2)), np.ones(2))
+    with pytest.raises(ValueError):  # M > 5
+        potentials.assign_cover(np.zeros((2, 2)), np.zeros((6, 2)), np.ones(6))
+    with pytest.raises(ValueError):  # NaN coordinate
+        potentials.assign_cover(np.zeros((1, 2)), np.full((1, 2), np.nan), np.ones(1))
+    with pytest.raises(ValueError):  # Inf weight
+        potentials.assign_cover(np.zeros((1, 2)), np.ones((1, 2)), np.array([np.inf]))

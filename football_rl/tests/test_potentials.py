@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
@@ -483,3 +484,161 @@ def test_keeper_bisector_stays_at_least_38_units_off_the_goal_line():
     res = evaluate(make_state(ball=np.array([20.0, 800.0])))
     assert res.target[0][0] == pytest.approx(38.0, abs=1e-12)
     assert res.target[0][1] == pytest.approx(504.8825, abs=1e-4)
+
+
+def test_covers_take_the_danger_weighted_optimal_assignment():
+    pos = make_state().pos.copy()
+    pos[1:5] = [[50.0, 130.0], [580.0, 680.0], [210.0, 370.0], [180.0, 180.0]]
+    pos[5] = [858.0, 420.0]  # presser, 30 u goal-side of the ball
+    pos[7:12] = [[1150.0, 530.0], [370.0, 210.0], [860.0, 690.0], [1290.0, 220.0], [900.0, 420.0]]
+    state = make_state(pos=pos, holder=11, ball=np.array([888.0, 420.0]))
+    res = evaluate(state)
+    assert res.role_code[5] == ROLE_PRESS
+    # Cover points of marks 7, 8, 9, 10: (747.5, 491.5), (240.5, 283.5), (559.0, 595.5), (838.5, 290.0);
+    # danger weights 2 - x / 1400: 1.1786, 1.7357, 1.3857, 1.0786. Weighted distance totals:
+    #   marks [10, 9, 7, 8] -> 1845.99 (optimum); closest-pair-first [10, 9, 8, 7] -> 1910.61;
+    #   unweighted optimum [8, 9, 7, 10] -> 1914.84.
+    assert res.cover_mark[1:5].tolist() == [10, 9, 7, 8]
+    # The point-reflected position with the teams swapped (team B defends the right goal) pairs the mirrored players.
+    assert evaluate(mirrored(state)).cover_mark[7:11].tolist() == [4, 3, 1, 2]
+
+
+def test_presser_potential_depends_on_the_distance_to_the_ball_not_on_the_selection_cost():
+    pos = make_state().pos.copy()
+    pos[5] = [560.0, 420.0]  # 60 u from the ball and 60 u upfield of it; every teammate is 225 u or more away
+    res = evaluate(make_state(pos=pos, ball=np.array([500.0, 420.0])))
+    assert res.role_code[5] == ROLE_PRESS
+    # 0.65 * exp(-(60 - 28) / 220); a pull evaluated at the 120 u selection cost would be 0.4279
+    assert res.phi[5] == pytest.approx(0.5620, abs=5e-5)
+
+
+def test_keeper_claim_leaves_five_covers_marking_every_opponent_outfielder():
+    res = evaluate(make_state(ball=np.array([120.0, 380.0])))  # 89 u from the keeper, 313 u press cost for the nearest defender
+    assert res.role_code[:6].tolist() == [ROLE_GK] + [ROLE_COVER] * 5
+    assert sorted(res.cover_mark[1:6].tolist()) == [7, 8, 9, 10, 11]
+    assert np.count_nonzero(res.role_code[7:12] == ROLE_PRESS) == 1
+
+
+def test_keeper_claim_is_withheld_when_the_keeper_is_disabled():
+    disabled = np.zeros(12, dtype=bool)
+    disabled[0] = True
+    res = evaluate(make_state(ball=np.array([120.0, 380.0]), disabled=disabled, stunned=disabled))
+    assert np.count_nonzero(res.role_code[1:6] == ROLE_PRESS) == 1
+
+
+def test_keeper_claim_needs_the_ball_inside_the_current_box_of_the_defended_side():
+    # Team A defends the right goal; the ball is 126.5 u from the goal centre and the keeper 80.6 u from the ball.
+    pos = make_state().pos.copy()
+    pos[0] = [1350.0, 420.0]
+    sides = np.array([SIDE_RIGHT, SIDE_LEFT], dtype=np.int32)
+    ball = np.array([1280.0, 380.0])
+    claimed = evaluate(make_state(pos=pos, ball=ball, team_side=sides, active_box_radius=np.array([100.0, 195.0])))
+    assert np.count_nonzero(claimed.role_code[1:6] == ROLE_PRESS) == 0
+    assert claimed.role_code[1:6].tolist() == [ROLE_COVER] * 5
+    shrunk = evaluate(make_state(pos=pos, ball=ball, team_side=sides, active_box_radius=np.array([195.0, 100.0])))
+    assert np.count_nonzero(shrunk.role_code[1:6] == ROLE_PRESS) == 1
+
+
+@pytest.mark.parametrize("radius, keeper_claims", [(195.0, True), (194.999, False)])
+def test_keeper_claim_boundary_is_the_box_radius_inclusive(radius, keeper_claims):
+    pos = make_state().pos.copy()
+    pos[0] = [150.0, 420.0]
+    state = make_state(pos=pos, ball=np.array([195.0, 420.0]), active_box_radius=np.array([radius, 195.0]))
+    codes = evaluate(state).role_code[1:6].tolist()
+    assert (codes == [ROLE_COVER] * 5) is keeper_claims
+
+
+def test_keeper_claim_requires_a_strictly_lower_cost_than_the_best_outfielder():
+    pos = make_state().pos.copy()
+    pos[0] = [50.0, 420.0]  # keeper exactly 100 u from the ball
+    pos[1] = [150.0, 520.0]  # defender exactly 100 u from the ball, level with it: press cost 100
+    res = evaluate(make_state(pos=pos, ball=np.array([150.0, 420.0])))
+    assert res.role_code[1] == ROLE_PRESS
+    pos[1] = [150.0, 519.0]  # 99 u: still the cheaper press
+    assert evaluate(make_state(pos=pos, ball=np.array([150.0, 420.0]))).role_code[1] == ROLE_PRESS
+    pos[1] = [150.0, 521.0]  # 101 u: the keeper's cost is lower
+    assert evaluate(make_state(pos=pos, ball=np.array([150.0, 420.0]))).role_code[1] == ROLE_COVER
+
+
+def _defending_teams(res):
+    """Teams whose outfielders carry marks, with the outfielder indices of each."""
+    return [
+        (team, 1 + 6 * team)
+        for team in (0, 1)
+        if (res.cover_mark[1 + 6 * team:6 + 6 * team] >= 0).any()
+    ]
+
+
+def test_cover_marks_are_one_to_one_and_minimise_the_danger_weighted_distance():
+    rng = np.random.default_rng(31)
+    checked = 0
+    for _ in range(300):
+        state = random_state(rng)
+        res = evaluate(state)
+        for team, f0 in _defending_teams(res):
+            own_gx = 0.0 if state.team_side[team] == SIDE_LEFT else W
+            sign = 1.0 if state.team_side[team] == SIDE_LEFT else -1.0
+            coverers = [g for g in range(f0, f0 + 5) if res.cover_mark[g] >= 0]
+            marks = [int(res.cover_mark[g]) for g in coverers]
+            opponents = range(7 - 6 * team, 12 - 6 * team)
+            assert len(set(marks)) == len(marks) and set(marks) <= set(opponents)
+            assert len(coverers) in (4, 5)
+            pts = {m: (state.pos[m][0] + 0.35 * (own_gx - state.pos[m][0]), state.pos[m][1] + 0.35 * (420.0 - state.pos[m][1])) for m in marks}
+            wts = {m: 2.0 - min(max((state.pos[m][0] - own_gx) * sign / W, 0.0), 1.0) for m in marks}
+
+            def total(order):
+                return sum(wts[m] * math.dist(state.pos[g], pts[m]) for g, m in zip(coverers, order))
+
+            assert total(marks) <= min(total(order) for order in itertools.permutations(marks)) + 1e-9
+            checked += 1
+    assert checked >= 200
+
+
+def _claim_biased_state(rng, team):
+    """Random state with a loose ball inside `team`'s box, its keeper (enabled) close to the ball and often a close outfielder."""
+    state = random_state(rng)
+    own_gx = 0.0 if state.team_side[team] == SIDE_LEFT else W
+    sign = 1.0 if state.team_side[team] == SIDE_LEFT else -1.0
+    ball = np.array([own_gx + sign * rng.uniform(10.0, 150.0), 420.0 + rng.uniform(-100.0, 100.0)])
+    pos = state.pos.copy()
+    pos[6 * team] = ball + rng.uniform(-60.0, 60.0, 2)
+    if rng.random() < 0.6:  # an outfielder of the same team close enough to contest the claim
+        pos[1 + 6 * team + int(rng.integers(5))] = ball + rng.uniform(-90.0, 90.0, 2)
+    disabled = state.disabled.copy()
+    disabled[6 * team] = False
+    return state._replace(
+        pos=pos, ball=ball, holder=-1, ball_in_flight=False, last_ball_team=-1,
+        disabled=disabled, stunned=state.stunned & disabled,
+    )
+
+
+def test_presser_labels_follow_possession_and_the_keeper_claim():
+    rng = np.random.default_rng(32)
+    claimed = pressed_in_box = 0
+    for i in range(600):
+        state = random_state(rng) if i % 3 == 0 else _claim_biased_state(rng, i % 2)
+        res = evaluate(state)
+        ball_dist = np.hypot(*(state.pos - state.ball).T)
+        for team, f0 in _defending_teams(res):
+            codes = res.role_code[f0:f0 + 5].tolist()
+            n_press, n_second = codes.count(ROLE_PRESS), codes.count(ROLE_SECOND_PRESS)
+            assert n_press <= 1 and n_second <= 1
+            if n_second:
+                assert state.holder < 0
+            side = int(state.team_side[team])
+            own_gx = 0.0 if side == SIDE_LEFT else W
+            in_box = math.hypot(*(state.ball - np.array([own_gx, 420.0]))) <= state.active_box_radius[side]
+            keeper = 6 * team
+            keeper_closest = ball_dist[keeper] < ball_dist[f0:f0 + 5].min()
+            if n_press == 0:
+                # Only a keeper claim leaves a defending team without a presser, and then no outfielder runs at the ball.
+                assert n_second == 0 and state.holder < 0 and in_box and not state.disabled[keeper]
+                assert (res.cover_mark[f0:f0 + 5] >= 0).all() and codes == [ROLE_COVER] * 5
+                claimed += 1
+            else:
+                assert n_press == 1
+                if state.holder < 0 and in_box and not state.disabled[keeper]:
+                    # A keeper strictly nearer than every outfielder always wins: press cost never undercuts distance.
+                    assert not keeper_closest
+                    pressed_in_box += 1
+    assert claimed >= 30 and pressed_in_box >= 30

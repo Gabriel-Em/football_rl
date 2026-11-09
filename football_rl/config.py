@@ -248,6 +248,7 @@ class RewardConfig:
     teammate_crowd_weight: float = 0.35
     teammate_crowd_radius: float = 110.0
     loose_ball_secondary_press_blend: float = 0.75
+    press_trail_weight: float = 1.0  # presser cost = ball distance + this * how far the player stands upfield of the ball
 
     # Tier 3: Physical Regularization
     field_5s_violation_ind: float = -1.5
