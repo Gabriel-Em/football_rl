@@ -1,0 +1,4034 @@
+{
+  "deltas": null,
+  "errors": [],
+  "eval": {
+    "checkpoint_dir": "/home/gabri/work/football_rl/archives/20261109_215405/checkpoints",
+    "checkpoint_generation": 1652,
+    "football_rl": "/tmp/fr_preB/football_rl",
+    "matches": 32,
+    "seed": 1234
+  },
+  "eval_guards": {
+    "ball_hold_rate": {
+      "mean": 0.19012707156744746,
+      "n": 32,
+      "se": 0.0034227873208188737
+    },
+    "gk_dist_goal_line": {
+      "mean": 81.98132236019813,
+      "n": 32,
+      "se": 1.480968565307727
+    },
+    "gk_dives_per_match": {
+      "mean": 73.5,
+      "n": 32,
+      "se": 1.2771250475567277
+    },
+    "gk_facing_blocked_frames_per_match": {
+      "mean": 0.40625,
+      "n": 32,
+      "se": 0.1949947011273433
+    },
+    "gk_near_miss_frames_per_match": {
+      "mean": 38.78125,
+      "n": 32,
+      "se": 5.770254364711121
+    },
+    "gk_pickups_per_match": {
+      "mean": 5.75,
+      "n": 32,
+      "se": 0.4163977626911479
+    },
+    "gk_wall_pinned_rate": {
+      "mean": 0.11165488149245441,
+      "n": 32,
+      "se": 0.004268193594860505
+    },
+    "longest_hold_spell_s": {
+      "mean": 1.7369791666666667,
+      "n": 32,
+      "se": 0.13284464875502128
+    },
+    "loose_share": {
+      "mean": 0.8098729284325525,
+      "n": 32,
+      "se": 0.0034227873208188746
+    },
+    "mean_cluster_size": {
+      "mean": 1.1603121238774188,
+      "n": 32,
+      "se": 0.02681756142938918
+    },
+    "presser_trailing_avoidable_rate": {
+      "mean": 0.03389740920560936,
+      "n": 32,
+      "se": 0.0018122745621934695
+    },
+    "presser_trailing_rate": {
+      "mean": 0.295569007688342,
+      "n": 32,
+      "se": 0.004898951014755416
+    },
+    "role_inversion_rate": {
+      "mean": 0.2626811174891214,
+      "n": 32,
+      "se": 0.009637111076838161
+    }
+  },
+  "generated_at": "2026-11-09T23:56:29",
+  "guards": {
+    "ball_hold_rate": 0.19012707156744746,
+    "gk_dist_goal_line": 81.98132236019813,
+    "gk_dives_per_match": 73.5,
+    "gk_facing_blocked_frames_per_match": 0.40625,
+    "gk_near_miss_frames_per_match": 38.78125,
+    "gk_pickups_per_match": 5.75,
+    "gk_wall_pinned_rate": 0.1116548814924544,
+    "interest_last_bucket": 59.16593137254902,
+    "longest_hold_spell_s": 1.7369791666666667,
+    "loose_share": 0.8098729284325525,
+    "mean_cluster_size": 1.1603121238774188,
+    "ms_per_step": null,
+    "presser_trailing_avoidable_rate": 0.03389740920560936,
+    "presser_trailing_rate": 0.295569007688342,
+    "role_inversion_rate": 0.2626811174891214
+  },
+  "history": {
+    "buckets": [
+      {
+        "gen_end": 100,
+        "gen_start": 1,
+        "goals": 1.94625,
+        "interest_max": 83.12,
+        "interest_mean": 22.670862500000002,
+        "interest_median": 20.62,
+        "loose_pct": 83.67375,
+        "n": 800,
+        "passes": 2.4125,
+        "saves": 0.43625,
+        "shots": 2.07,
+        "stationary_frames": 5306.36,
+        "tackles": 2.07375
+      },
+      {
+        "gen_end": 200,
+        "gen_start": 101,
+        "goals": 3.5125,
+        "interest_max": 125.38,
+        "interest_mean": 45.2067375,
+        "interest_median": 43.12,
+        "loose_pct": 76.451375,
+        "n": 800,
+        "passes": 3.21,
+        "saves": 1.05875,
+        "shots": 4.25,
+        "stationary_frames": 2701.8725,
+        "tackles": 6.43625
+      },
+      {
+        "gen_end": 300,
+        "gen_start": 201,
+        "goals": 3.50625,
+        "interest_max": 107.81,
+        "interest_mean": 52.16762500000001,
+        "interest_median": 51.25,
+        "loose_pct": 78.65925,
+        "n": 800,
+        "passes": 4.085,
+        "saves": 1.25125,
+        "shots": 4.37,
+        "stationary_frames": 2363.10375,
+        "tackles": 8.10875
+      },
+      {
+        "gen_end": 400,
+        "gen_start": 301,
+        "goals": 3.685,
+        "interest_max": 106.88,
+        "interest_mean": 52.1438625,
+        "interest_median": 50.62,
+        "loose_pct": 79.369375,
+        "n": 800,
+        "passes": 4.16125,
+        "saves": 1.4025,
+        "shots": 4.78875,
+        "stationary_frames": 2276.3275,
+        "tackles": 6.86375
+      },
+      {
+        "gen_end": 500,
+        "gen_start": 401,
+        "goals": 3.48125,
+        "interest_max": 117.5,
+        "interest_mean": 52.823137499999994,
+        "interest_median": 51.25,
+        "loose_pct": 79.64325000000001,
+        "n": 800,
+        "passes": 4.11125,
+        "saves": 1.52375,
+        "shots": 4.81,
+        "stationary_frames": 2259.18625,
+        "tackles": 7.5925
+      },
+      {
+        "gen_end": 600,
+        "gen_start": 501,
+        "goals": 3.6425,
+        "interest_max": 120.31,
+        "interest_mean": 56.436362499999994,
+        "interest_median": 55.68,
+        "loose_pct": 81.181875,
+        "n": 800,
+        "passes": 4.93125,
+        "saves": 1.73875,
+        "shots": 5.42875,
+        "stationary_frames": 2152.18875,
+        "tackles": 6.7625
+      },
+      {
+        "gen_end": 700,
+        "gen_start": 601,
+        "goals": 4.035,
+        "interest_max": 113.75,
+        "interest_mean": 58.57151250000001,
+        "interest_median": 58.12,
+        "loose_pct": 81.21000000000001,
+        "n": 800,
+        "passes": 5.08125,
+        "saves": 1.84625,
+        "shots": 6.425,
+        "stationary_frames": 2138.3975,
+        "tackles": 5.8775
+      },
+      {
+        "gen_end": 800,
+        "gen_start": 701,
+        "goals": 4.27,
+        "interest_max": 127.5,
+        "interest_mean": 61.7673875,
+        "interest_median": 60.62,
+        "loose_pct": 80.028875,
+        "n": 800,
+        "passes": 5.3975,
+        "saves": 2.07625,
+        "shots": 6.99625,
+        "stationary_frames": 2070.9175,
+        "tackles": 6.46375
+      },
+      {
+        "gen_end": 900,
+        "gen_start": 801,
+        "goals": 4.0825,
+        "interest_max": 132.5,
+        "interest_mean": 62.945874999999994,
+        "interest_median": 61.88,
+        "loose_pct": 80.1795,
+        "n": 800,
+        "passes": 5.64125,
+        "saves": 2.2025,
+        "shots": 6.94625,
+        "stationary_frames": 2005.86875,
+        "tackles": 6.2075
+      },
+      {
+        "gen_end": 1000,
+        "gen_start": 901,
+        "goals": 3.99625,
+        "interest_max": 128.12,
+        "interest_mean": 61.4673875,
+        "interest_median": 59.5,
+        "loose_pct": 80.515625,
+        "n": 800,
+        "passes": 5.89625,
+        "saves": 2.16,
+        "shots": 6.8075,
+        "stationary_frames": 1972.57125,
+        "tackles": 5.5225
+      },
+      {
+        "gen_end": 1100,
+        "gen_start": 1001,
+        "goals": 3.88125,
+        "interest_max": 110.94,
+        "interest_mean": 61.261025,
+        "interest_median": 59.38,
+        "loose_pct": 81.461375,
+        "n": 800,
+        "passes": 6.3925,
+        "saves": 2.27,
+        "shots": 6.77375,
+        "stationary_frames": 1943.885,
+        "tackles": 4.66125
+      },
+      {
+        "gen_end": 1200,
+        "gen_start": 1101,
+        "goals": 3.74125,
+        "interest_max": 118.75,
+        "interest_mean": 61.162749999999996,
+        "interest_median": 60.31,
+        "loose_pct": 79.771875,
+        "n": 800,
+        "passes": 6.4075,
+        "saves": 2.3425,
+        "shots": 6.9475,
+        "stationary_frames": 1893.17375,
+        "tackles": 4.57375
+      },
+      {
+        "gen_end": 1300,
+        "gen_start": 1201,
+        "goals": 3.7725,
+        "interest_max": 123.12,
+        "interest_mean": 59.7733,
+        "interest_median": 58.12,
+        "loose_pct": 79.120625,
+        "n": 800,
+        "passes": 6.1375,
+        "saves": 2.1875,
+        "shots": 6.72875,
+        "stationary_frames": 1785.7475,
+        "tackles": 4.56875
+      },
+      {
+        "gen_end": 1400,
+        "gen_start": 1301,
+        "goals": 3.7625,
+        "interest_max": 122.19,
+        "interest_mean": 61.9890625,
+        "interest_median": 61.07,
+        "loose_pct": 78.801875,
+        "n": 800,
+        "passes": 6.39125,
+        "saves": 2.2925,
+        "shots": 7.0575,
+        "stationary_frames": 1814.8475,
+        "tackles": 4.98875
+      },
+      {
+        "gen_end": 1500,
+        "gen_start": 1401,
+        "goals": 3.815,
+        "interest_max": 134.06,
+        "interest_mean": 62.06785,
+        "interest_median": 61.815,
+        "loose_pct": 79.12025,
+        "n": 800,
+        "passes": 6.44,
+        "saves": 2.11,
+        "shots": 7.03625,
+        "stationary_frames": 1866.57125,
+        "tackles": 4.98375
+      },
+      {
+        "gen_end": 1600,
+        "gen_start": 1501,
+        "goals": 3.58625,
+        "interest_max": 126.25,
+        "interest_mean": 62.9711125,
+        "interest_median": 61.25,
+        "loose_pct": 80.396,
+        "n": 800,
+        "passes": 7.325,
+        "saves": 2.1175,
+        "shots": 7.1225,
+        "stationary_frames": 1842.13,
+        "tackles": 5.0425
+      },
+      {
+        "gen_end": 1651,
+        "gen_start": 1601,
+        "goals": 3.5073529411764706,
+        "interest_max": 113.12,
+        "interest_mean": 59.16593137254902,
+        "interest_median": 58.06,
+        "loose_pct": 80.63504901960783,
+        "n": 408,
+        "passes": 7.0,
+        "saves": 2.0441176470588234,
+        "shots": 6.950980392156863,
+        "stationary_frames": 1840.6936274509803,
+        "tackles": 4.318627450980392
+      }
+    ],
+    "last_generations": [
+      {
+        "gen_end": 1642,
+        "gen_start": 1642,
+        "goals": 3.375,
+        "interest_max": 90.62,
+        "interest_mean": 60.72875,
+        "interest_median": 53.79,
+        "loose_pct": 81.3375,
+        "n": 8,
+        "passes": 7.375,
+        "saves": 2.625,
+        "shots": 6.5,
+        "stationary_frames": 1778.25,
+        "tackles": 2.5
+      },
+      {
+        "gen_end": 1643,
+        "gen_start": 1643,
+        "goals": 3.25,
+        "interest_max": 76.62,
+        "interest_mean": 56.2175,
+        "interest_median": 58.94,
+        "loose_pct": 81.0,
+        "n": 8,
+        "passes": 6.25,
+        "saves": 1.875,
+        "shots": 6.0,
+        "stationary_frames": 1864.5,
+        "tackles": 4.875
+      },
+      {
+        "gen_end": 1644,
+        "gen_start": 1644,
+        "goals": 2.375,
+        "interest_max": 74.0,
+        "interest_mean": 52.98375,
+        "interest_median": 52.56,
+        "loose_pct": 80.4125,
+        "n": 8,
+        "passes": 6.25,
+        "saves": 2.375,
+        "shots": 5.125,
+        "stationary_frames": 1844.375,
+        "tackles": 4.125
+      },
+      {
+        "gen_end": 1645,
+        "gen_start": 1645,
+        "goals": 3.625,
+        "interest_max": 86.88,
+        "interest_mean": 53.9525,
+        "interest_median": 49.685,
+        "loose_pct": 80.5,
+        "n": 8,
+        "passes": 6.125,
+        "saves": 1.125,
+        "shots": 6.625,
+        "stationary_frames": 1929.5,
+        "tackles": 4.375
+      },
+      {
+        "gen_end": 1646,
+        "gen_start": 1646,
+        "goals": 3.125,
+        "interest_max": 70.62,
+        "interest_mean": 61.87875,
+        "interest_median": 63.75,
+        "loose_pct": 79.6875,
+        "n": 8,
+        "passes": 6.75,
+        "saves": 2.125,
+        "shots": 6.5,
+        "stationary_frames": 1672.0,
+        "tackles": 4.875
+      },
+      {
+        "gen_end": 1647,
+        "gen_start": 1647,
+        "goals": 3.625,
+        "interest_max": 77.5,
+        "interest_mean": 55.61625,
+        "interest_median": 53.815,
+        "loose_pct": 80.85,
+        "n": 8,
+        "passes": 6.0,
+        "saves": 1.875,
+        "shots": 5.875,
+        "stationary_frames": 1900.375,
+        "tackles": 4.375
+      },
+      {
+        "gen_end": 1648,
+        "gen_start": 1648,
+        "goals": 3.625,
+        "interest_max": 81.88,
+        "interest_mean": 56.735,
+        "interest_median": 56.69,
+        "loose_pct": 80.35,
+        "n": 8,
+        "passes": 5.5,
+        "saves": 1.125,
+        "shots": 6.5,
+        "stationary_frames": 1874.125,
+        "tackles": 4.625
+      },
+      {
+        "gen_end": 1649,
+        "gen_start": 1649,
+        "goals": 2.125,
+        "interest_max": 69.38,
+        "interest_mean": 52.04875,
+        "interest_median": 51.19,
+        "loose_pct": 79.075,
+        "n": 8,
+        "passes": 5.25,
+        "saves": 2.375,
+        "shots": 6.375,
+        "stationary_frames": 1782.5,
+        "tackles": 4.25
+      },
+      {
+        "gen_end": 1650,
+        "gen_start": 1650,
+        "goals": 3.875,
+        "interest_max": 104.38,
+        "interest_mean": 57.402499999999996,
+        "interest_median": 43.81,
+        "loose_pct": 81.8,
+        "n": 8,
+        "passes": 8.375,
+        "saves": 1.5,
+        "shots": 5.75,
+        "stationary_frames": 1856.875,
+        "tackles": 3.625
+      },
+      {
+        "gen_end": 1651,
+        "gen_start": 1651,
+        "goals": 3.375,
+        "interest_max": 76.88,
+        "interest_mean": 57.09625,
+        "interest_median": 52.375,
+        "loose_pct": 81.05000000000001,
+        "n": 8,
+        "passes": 5.625,
+        "saves": 1.375,
+        "shots": 6.5,
+        "stationary_frames": 1878.625,
+        "tackles": 4.5
+      }
+    ]
+  },
+  "inputs": {
+    "bucket": 100,
+    "eval_checkpoint": "archives/20261109_215405/checkpoints",
+    "eval_code_root": "/tmp/fr_preB",
+    "eval_matches": 32,
+    "eval_seed": 1234,
+    "history": null,
+    "last": 8,
+    "last_gens": 10,
+    "out_dir": "/home/gabri/work/football_rl/context/metrics",
+    "perf_steps": 300,
+    "replays_dir": "/home/gabri/work/football_rl/replays",
+    "save_baseline": "context/metrics/baseline_unbiased.json",
+    "save_baseline_unbiased": false,
+    "seed": 0,
+    "skip_perf": false,
+    "source_dir": "/home/gabri/work/football_rl/football_rl"
+  },
+  "orphans": {
+    "attributes_read_only_in_tests": [
+      "FootballParallelEnv._phi_curr"
+    ],
+    "config_fields_read_only_in_tests": [
+      "PhysicsConfig.goal_width"
+    ],
+    "duplicate_value_groups": [
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "min_pass_distance",
+          "min_wall_pass_distance",
+          "tackle_radius_def"
+        ],
+        "similarity": 0.75,
+        "value": 85.0
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "field_lunge_duration",
+          "lunge_duration"
+        ],
+        "similarity": 0.6667,
+        "value": 0.25
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "keeper_lunge_cooldown",
+          "lunge_cooldown"
+        ],
+        "similarity": 0.6667,
+        "value": 1.8
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "field_violation_pickup_cooldown",
+          "field_violation_tackle_cooldown",
+          "ghost_duration",
+          "max_pass_flight_time"
+        ],
+        "similarity": 0.6,
+        "value": 3.0
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "box_timer_obs_norm",
+          "field_max_hold_time",
+          "keeper_max_hold_time"
+        ],
+        "similarity": 0.6,
+        "value": 5.0
+      },
+      {
+        "class": "PhysicsConfig",
+        "fields": [
+          "atk_max_kick_speed",
+          "ball_max_launch_speed",
+          "keeper_max_kick_speed"
+        ],
+        "similarity": 0.6,
+        "value": 640.0
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "field_5s_violation_ind",
+          "keeper_5s_violation_ind"
+        ],
+        "similarity": 0.6,
+        "value": -1.5
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "box_shrink_grace_time",
+          "keeper_foul_pickup_cooldown",
+          "keeper_strip_self_kick_cooldown",
+          "pinned_ball_max_time",
+          "post_save_box_grace_time"
+        ],
+        "similarity": 0.5,
+        "value": 2.0
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "tackle_fail_cooldown",
+          "tackle_miss_stun_time"
+        ],
+        "similarity": 0.1667,
+        "value": 0.8
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "intercepted_kicker_ind",
+          "successful_tackle_carrier_ind"
+        ],
+        "similarity": 0.1667,
+        "value": -0.4
+      },
+      {
+        "class": "MechanicsConfig",
+        "fields": [
+          "contested_ball_distance",
+          "tackle_radius_atk"
+        ],
+        "similarity": 0.0,
+        "value": 65.0
+      },
+      {
+        "class": "PPOHyperparams",
+        "fields": [
+          "max_grad_norm",
+          "vf_coef"
+        ],
+        "similarity": 0.0,
+        "value": 0.5
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "completed_pass_receiver_ind",
+          "shot_on_target_team"
+        ],
+        "similarity": 0.0,
+        "value": 0.15
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "keeper_bisect_potential_weight",
+          "pass_press_escape_coeff"
+        ],
+        "similarity": 0.0,
+        "value": 0.6
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "def_cover_potential_weight",
+          "loose_ball_secondary_press_blend"
+        ],
+        "similarity": 0.0,
+        "value": 0.75
+      },
+      {
+        "class": "RewardConfig",
+        "fields": [
+          "pass_threat_coeff",
+          "team_advance_pbrs_weight"
+        ],
+        "similarity": 0.0,
+        "value": 6.0
+      }
+    ],
+    "files_scanned": 16,
+    "source_dir": "/home/gabri/work/football_rl/football_rl",
+    "unread_config_fields": [],
+    "unused_class_aliases": [],
+    "write_only_attributes": [
+      "FootballParallelEnv.action_spaces",
+      "FootballParallelEnv.observation_spaces",
+      "FootballParallelEnv.render_mode"
+    ]
+  },
+  "perf": null,
+  "replays": {
+    "matches": [
+      {
+        "ball_hold_rate": 0.19451902601610963,
+        "cluster_frame_rate": 0.00833256179983335,
+        "cluster_frames": 90,
+        "depth_mean": [
+          327.29506990093506,
+          205.9699916674382
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          583.4358561275163,
+          762.4053802677997
+        ],
+        "gk_dist_goal_center_mean": [
+          117.51980524697966,
+          115.8839354582713
+        ],
+        "gk_dist_goal_line_mean": [
+          61.697143782983055,
+          97.02567540042588
+        ],
+        "gk_dives": [
+          47,
+          36
+        ],
+        "gk_facing_blocked_frames": [
+          3,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.6866666666666668,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          29,
+          12
+        ],
+        "gk_pickups": [
+          5,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.2377557633552449,
+          0.07665956855846681
+        ],
+        "inversion_rate": [
+          0.28043699657439125,
+          0.34561614665308765
+        ],
+        "inversion_rate_oop": [
+          0.29267306720565944,
+          0.336456381428274
+        ],
+        "longest_hold_spell_s": 1.9833333333333334,
+        "loose_share": 0.8054809739838904,
+        "match_id": 13209,
+        "mean_cluster_size": 1.1552634015368948,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6399407462272012,
+          0.7203036755855939
+        ],
+        "passes": [
+          5,
+          6
+        ],
+        "possession_share": [
+          0.08388112211832238,
+          0.11063790389778724
+        ],
+        "presser_share": [
+          {
+            "D1": 0.21236872812135357,
+            "D2": 0.24329054842473746,
+            "GK": 0.0,
+            "M1": 0.17561260210035007,
+            "M2": 0.19253208868144692,
+            "ST": 0.176196032672112
+          },
+          {
+            "D1": 0.16799874627801284,
+            "D2": 0.27080394922425954,
+            "GK": 0.0,
+            "M1": 0.10405892493339602,
+            "M2": 0.1441780285221752,
+            "ST": 0.3129603510421564
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.05177946324387398,
+          0.04544742203416392
+        ],
+        "presser_trailing_rate": [
+          0.22695449241540255,
+          0.35872120357310766
+        ],
+        "width_mean": [
+          298.281328580687,
+          227.12058327932598
+        ]
+      },
+      {
+        "ball_hold_rate": 0.1963707064160726,
+        "cluster_frame_rate": 0.04768077029904638,
+        "cluster_frames": 515,
+        "depth_mean": [
+          337.58231460049996,
+          202.5737866864179
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          634.7818179298096,
+          715.2264384743464
+        ],
+        "gk_dist_goal_center_mean": [
+          117.43100521600465,
+          104.75815300531721
+        ],
+        "gk_dist_goal_line_mean": [
+          91.21053328395519,
+          89.04312285899454
+        ],
+        "gk_dives": [
+          38,
+          30
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.08333333333333333,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          48,
+          11
+        ],
+        "gk_pickups": [
+          1,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.1571150819368577,
+          0.06277196555874456
+        ],
+        "inversion_rate": [
+          0.18914915285621703,
+          0.3123784834737524
+        ],
+        "inversion_rate_oop": [
+          0.19554584243937975,
+          0.3255672609400324
+        ],
+        "longest_hold_spell_s": 1.25,
+        "loose_share": 0.8036292935839274,
+        "match_id": 13210,
+        "mean_cluster_size": 1.5013424682899732,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.8659383390426812,
+          0.8471437829830571
+        ],
+        "passes": [
+          1,
+          3
+        ],
+        "possession_share": [
+          0.1103601518377928,
+          0.08601055457827979
+        ],
+        "presser_share": [
+          {
+            "D1": 0.21104651162790697,
+            "D2": 0.3319767441860465,
+            "GK": 0.0,
+            "M1": 0.23197674418604652,
+            "M2": 0.12209302325581395,
+            "ST": 0.10290697674418604
+          },
+          {
+            "D1": 0.17833650051162112,
+            "D2": 0.17833650051162112,
+            "GK": 0.0,
+            "M1": 0.19061540710422453,
+            "M2": 0.1689811431077328,
+            "ST": 0.28373044876480047
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04534883720930233,
+          0.01695658529454758
+        ],
+        "presser_trailing_rate": [
+          0.1994186046511628,
+          0.3597427276713931
+        ],
+        "width_mean": [
+          262.9777141005462,
+          244.85727062309044
+        ]
+      },
+      {
+        "ball_hold_rate": 0.21377650217572447,
+        "cluster_frame_rate": 0.03388575131932228,
+        "cluster_frames": 366,
+        "depth_mean": [
+          374.5795315248588,
+          219.43107490047217
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          778.7783393829944,
+          603.9409856374689
+        ],
+        "gk_dist_goal_center_mean": [
+          109.63003529060498,
+          85.15538603409377
+        ],
+        "gk_dist_goal_line_mean": [
+          76.76724747708546,
+          49.280403666327196
+        ],
+        "gk_dives": [
+          30,
+          36
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          3
+        ],
+        "gk_hold_mean_s": [
+          0.21666666666666667,
+          0.14444444444444443
+        ],
+        "gk_near_miss_frames": [
+          6,
+          27
+        ],
+        "gk_pickups": [
+          1,
+          6
+        ],
+        "gk_wall_pinned_rate": [
+          0.13230256457735395,
+          0.14628275159707435
+        ],
+        "inversion_rate": [
+          0.26756781779464867,
+          0.1383205258772336
+        ],
+        "inversion_rate_oop": [
+          0.2660439891533595,
+          0.14417309340188517
+        ],
+        "longest_hold_spell_s": 1.3333333333333333,
+        "loose_share": 0.7862234978242755,
+        "match_id": 13211,
+        "mean_cluster_size": 1.4186649384316268,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6751226738264976,
+          0.9449125081011017
+        ],
+        "passes": [
+          3,
+          1
+        ],
+        "possession_share": [
+          0.07814091287843718,
+          0.13563558929728728
+        ],
+        "presser_share": [
+          {
+            "D1": 0.1396614268440145,
+            "D2": 0.20556227327690446,
+            "GK": 0.0,
+            "M1": 0.17714631197097944,
+            "M2": 0.22430471584038694,
+            "ST": 0.25332527206771466
+          },
+          {
+            "D1": 0.27250124316260566,
+            "D2": 0.220122658710426,
+            "GK": 0.0,
+            "M1": 0.09945300845350571,
+            "M2": 0.18100447538538042,
+            "ST": 0.22691861428808222
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04035671100362757,
+          0.04276479363500746
+        ],
+        "presser_trailing_rate": [
+          0.16021765417170497,
+          0.32952096800928227
+        ],
+        "width_mean": [
+          250.4996685492084,
+          257.6587936302194
+        ]
+      },
+      {
+        "ball_hold_rate": 0.17535413387649293,
+        "cluster_frame_rate": 0.016850291639662993,
+        "cluster_frames": 182,
+        "depth_mean": [
+          322.0146430886029,
+          230.90732709934267
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          613.7483865355663,
+          744.6063665845502
+        ],
+        "gk_dist_goal_center_mean": [
+          109.63178262105062,
+          111.11200617170404
+        ],
+        "gk_dist_goal_line_mean": [
+          73.27117674289417,
+          88.97111841496158
+        ],
+        "gk_dives": [
+          50,
+          32
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.6722222222222223,
+          0.07777777777777778
+        ],
+        "gk_near_miss_frames": [
+          21,
+          6
+        ],
+        "gk_pickups": [
+          3,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.1467456716970651,
+          0.048791778539024167
+        ],
+        "inversion_rate": [
+          0.09508378853809832,
+          0.25951300805480976
+        ],
+        "inversion_rate_oop": [
+          0.10174944701387492,
+          0.255480434337226
+        ],
+        "longest_hold_spell_s": 1.6833333333333333,
+        "loose_share": 0.8246458661235071,
+        "match_id": 13212,
+        "mean_cluster_size": 1.1541523932969169,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5793907971484121,
+          0.7552078511248959
+        ],
+        "passes": [
+          2,
+          5
+        ],
+        "possession_share": [
+          0.07915933709841681,
+          0.0961947967780761
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20825958702064898,
+            "D2": 0.18230088495575222,
+            "GK": 0.0,
+            "M1": 0.17168141592920355,
+            "M2": 0.1687315634218289,
+            "ST": 0.26902654867256637
+          },
+          {
+            "D1": 0.17118402282453637,
+            "D2": 0.2523379299413536,
+            "GK": 0.0,
+            "M1": 0.19400855920114124,
+            "M2": 0.19908067839594232,
+            "ST": 0.18338880963702647
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.06784660766961652,
+          0.05072119194801078
+        ],
+        "presser_trailing_rate": [
+          0.28067846607669616,
+          0.27896655571405926
+        ],
+        "width_mean": [
+          285.22612258124246,
+          209.03756504027402
+        ]
+      },
+      {
+        "ball_hold_rate": 0.18350152763632996,
+        "cluster_frame_rate": 0.04203314507915934,
+        "cluster_frames": 454,
+        "depth_mean": [
+          315.3951726691973,
+          227.70100175909639
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          651.9602334281833,
+          682.2215439802633
+        ],
+        "gk_dist_goal_center_mean": [
+          120.18535274293579,
+          120.31791672902911
+        ],
+        "gk_dist_goal_line_mean": [
+          75.03939727802981,
+          103.22927228960282
+        ],
+        "gk_dives": [
+          36,
+          29
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.15416666666666667,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          7,
+          17
+        ],
+        "gk_pickups": [
+          4,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.1687806684566244,
+          0.027682621979446348
+        ],
+        "inversion_rate": [
+          0.273400611054532,
+          0.34978242755300437
+        ],
+        "inversion_rate_oop": [
+          0.2794523347297435,
+          0.3683514695413404
+        ],
+        "longest_hold_spell_s": 1.0833333333333333,
+        "loose_share": 0.81649847236367,
+        "match_id": 13213,
+        "mean_cluster_size": 1.315248588093695,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.7480788815850384,
+          0.7565040274048699
+        ],
+        "passes": [
+          4,
+          5
+        ],
+        "possession_share": [
+          0.0938801962781224,
+          0.08962133135820757
+        ],
+        "presser_share": [
+          {
+            "D1": 0.1293833131801693,
+            "D2": 0.17533252720677148,
+            "GK": 0.0,
+            "M1": 0.16686819830713423,
+            "M2": 0.2370012091898428,
+            "ST": 0.2914147521160822
+          },
+          {
+            "D1": 0.22825930717263188,
+            "D2": 0.21618513727181257,
+            "GK": 0.0,
+            "M1": 0.16213885295385944,
+            "M2": 0.24550812131665947,
+            "ST": 0.14790858128503664
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04005441354292624,
+          0.02630444156964209
+        ],
+        "presser_trailing_rate": [
+          0.2623941958887545,
+          0.37113698433232717
+        ],
+        "width_mean": [
+          284.10093695028235,
+          230.4899935191186
+        ]
+      },
+      {
+        "ball_hold_rate": 0.21914637533561707,
+        "cluster_frame_rate": 0.01712804369965744,
+        "cluster_frames": 185,
+        "depth_mean": [
+          363.67338487177113,
+          242.30131561892415
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          654.5257420168034,
+          727.3761517162047
+        ],
+        "gk_dist_goal_center_mean": [
+          102.20916247829349,
+          115.17270343495714
+        ],
+        "gk_dist_goal_line_mean": [
+          59.37628089991667,
+          89.18379964818072
+        ],
+        "gk_dives": [
+          40,
+          38
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.5625,
+          0.1
+        ],
+        "gk_near_miss_frames": [
+          10,
+          4
+        ],
+        "gk_pickups": [
+          4,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.22636792889547264,
+          0.03703360799925933
+        ],
+        "inversion_rate": [
+          0.21257290991574854,
+          0.3912600685121748
+        ],
+        "inversion_rate_oop": [
+          0.2092776954035162,
+          0.40161339732461965
+        ],
+        "longest_hold_spell_s": 2.3833333333333333,
+        "loose_share": 0.7808536246643829,
+        "match_id": 13214,
+        "mean_cluster_size": 1.0553652439588928,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5851310063882974,
+          0.6016109619479678
+        ],
+        "passes": [
+          5,
+          6
+        ],
+        "possession_share": [
+          0.12582168317748357,
+          0.09332469215813351
+        ],
+        "presser_share": [
+          {
+            "D1": 0.1340533672172808,
+            "D2": 0.18170266836086404,
+            "GK": 0.0,
+            "M1": 0.35578144853875476,
+            "M2": 0.13214739517153748,
+            "ST": 0.1963151207115629
+          },
+          {
+            "D1": 0.2789767043018436,
+            "D2": 0.23438616549949978,
+            "GK": 0.0,
+            "M1": 0.13605831070458768,
+            "M2": 0.2252393883092754,
+            "ST": 0.1253394311847935
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.037007623888182975,
+          0.035586680005716735
+        ],
+        "presser_trailing_rate": [
+          0.19536213468869124,
+          0.36529941403458627
+        ],
+        "width_mean": [
+          335.1216544764374,
+          242.35070641607263
+        ]
+      },
+      {
+        "ball_hold_rate": 0.23479307471530414,
+        "cluster_frame_rate": 0.042681233219146374,
+        "cluster_frames": 461,
+        "depth_mean": [
+          350.6998592722896,
+          230.86951671141566
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          573.8973530176679,
+          777.956834282154
+        ],
+        "gk_dist_goal_center_mean": [
+          113.8646065442971,
+          98.15429630324137
+        ],
+        "gk_dist_goal_line_mean": [
+          69.55758355707805,
+          74.3597028052958
+        ],
+        "gk_dives": [
+          47,
+          39
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.774074074074074,
+          0.09166666666666666
+        ],
+        "gk_near_miss_frames": [
+          35,
+          18
+        ],
+        "gk_pickups": [
+          9,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.1868345523562633,
+          0.04619942597907601
+        ],
+        "inversion_rate": [
+          0.29210258309415793,
+          0.43588556615128227
+        ],
+        "inversion_rate_oop": [
+          0.31519496035625066,
+          0.43868546505730804
+        ],
+        "longest_hold_spell_s": 2.45,
+        "loose_share": 0.7652069252846959,
+        "match_id": 13215,
+        "mean_cluster_size": 1.4425516155911489,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.8726969725025461,
+          0.7598370521248032
+        ],
+        "passes": [
+          0,
+          2
+        ],
+        "possession_share": [
+          0.14757892787704843,
+          0.08721414683825572
+        ],
+        "presser_share": [
+          {
+            "D1": 0.28824273072060685,
+            "D2": 0.18647281921618206,
+            "GK": 0.0,
+            "M1": 0.20164348925410872,
+            "M2": 0.16687737041719342,
+            "ST": 0.15676359039190899
+          },
+          {
+            "D1": 0.11741323956581562,
+            "D2": 0.14676654945726952,
+            "GK": 0.0,
+            "M1": 0.2861947714416756,
+            "M2": 0.154104876930133,
+            "ST": 0.29552056260510623
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.034450063211125155,
+          0.02201498241859043
+        ],
+        "presser_trailing_rate": [
+          0.2002212389380531,
+          0.30148295367680783
+        ],
+        "width_mean": [
+          300.29198500138875,
+          250.29212202573837
+        ]
+      },
+      {
+        "ball_hold_rate": 0.21738727895565224,
+        "cluster_frame_rate": 0.05156929913896861,
+        "cluster_frames": 557,
+        "depth_mean": [
+          340.2605805018054,
+          210.2833700583279
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          599.0155620909048,
+          759.961510451107
+        ],
+        "gk_dist_goal_center_mean": [
+          127.195547380664,
+          119.91202014194299
+        ],
+        "gk_dist_goal_line_mean": [
+          85.77088973243217,
+          98.27498750115728
+        ],
+        "gk_dives": [
+          45,
+          32
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.19444444444444445,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          17,
+          53
+        ],
+        "gk_pickups": [
+          3,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.1642440514767151,
+          0.037774280159244514
+        ],
+        "inversion_rate": [
+          0.17174335709656513,
+          0.27080825849458384
+        ],
+        "inversion_rate_oop": [
+          0.16802800466744458,
+          0.2804518164241376
+        ],
+        "longest_hold_spell_s": 1.6833333333333333,
+        "loose_share": 0.7826127210443478,
+        "match_id": 13216,
+        "mean_cluster_size": 1.578557540968429,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.8252013702434959,
+          0.9796315156004074
+        ],
+        "passes": [
+          0,
+          3
+        ],
+        "possession_share": [
+          0.1272104434774558,
+          0.09017683547819647
+        ],
+        "presser_share": [
+          {
+            "D1": 0.18293431553100062,
+            "D2": 0.23388581952117865,
+            "GK": 0.0,
+            "M1": 0.15653775322283608,
+            "M2": 0.2608962553713935,
+            "ST": 0.16574585635359115
+          },
+          {
+            "D1": 0.20751750750321565,
+            "D2": 0.18236387023009862,
+            "GK": 0.0,
+            "M1": 0.17664713448620836,
+            "M2": 0.18750893239959981,
+            "ST": 0.24596255538087752
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.029005524861878452,
+          0.016864370444476202
+        ],
+        "presser_trailing_rate": [
+          0.29066912216083485,
+          0.328855223667286
+        ],
+        "width_mean": [
+          271.3511360059254,
+          237.2787445606888
+        ]
+      },
+      {
+        "ball_hold_rate": 0.16794741227664106,
+        "cluster_frame_rate": 0.017405795759651885,
+        "cluster_frames": 188,
+        "depth_mean": [
+          386.08323303397833,
+          212.55699472271087
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          764.1197633856756,
+          562.6090328396747
+        ],
+        "gk_dist_goal_center_mean": [
+          118.34274113530232,
+          107.64678163061862
+        ],
+        "gk_dist_goal_line_mean": [
+          92.98104990278678,
+          83.69275344875474
+        ],
+        "gk_dives": [
+          38,
+          33
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.2916666666666667,
+          0.14444444444444443
+        ],
+        "gk_near_miss_frames": [
+          9,
+          13
+        ],
+        "gk_pickups": [
+          2,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.10619387093787612,
+          0.03194148689936117
+        ],
+        "inversion_rate": [
+          0.2739561151745209,
+          0.2176650310156467
+        ],
+        "inversion_rate_oop": [
+          0.28421052631578947,
+          0.2340532902704885
+        ],
+        "longest_hold_spell_s": 1.3333333333333333,
+        "loose_share": 0.832052587723359,
+        "match_id": 13217,
+        "mean_cluster_size": 1.106193870937876,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.614294972687714,
+          0.7071567447458569
+        ],
+        "passes": [
+          5,
+          4
+        ],
+        "possession_share": [
+          0.0852698824182946,
+          0.08267752985834645
+        ],
+        "presser_share": [
+          {
+            "D1": 0.3870220162224797,
+            "D2": 0.13557358053302435,
+            "GK": 0.0,
+            "M1": 0.17091541135573582,
+            "M2": 0.11529548088064889,
+            "ST": 0.19119351100811124
+          },
+          {
+            "D1": 0.17537148742092099,
+            "D2": 0.29718993673679567,
+            "GK": 0.0,
+            "M1": 0.08768574371046049,
+            "M2": 0.22068559658672943,
+            "ST": 0.21906723554509341
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.026506373117033605,
+          0.018390466382227452
+        ],
+        "presser_trailing_rate": [
+          0.2701332560834299,
+          0.47653376489627775
+        ],
+        "width_mean": [
+          247.36577539116746,
+          247.71750393482088
+        ]
+      },
+      {
+        "ball_hold_rate": 0.21831311915563373,
+        "cluster_frame_rate": 0.025645773539487084,
+        "cluster_frames": 277,
+        "depth_mean": [
+          361.4439477826127,
+          214.86618924173686
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          616.2609737074266,
+          725.1392481352195
+        ],
+        "gk_dist_goal_center_mean": [
+          126.35795643931696,
+          124.58685097152245
+        ],
+        "gk_dist_goal_line_mean": [
+          81.41156189241737,
+          101.07914637533561
+        ],
+        "gk_dives": [
+          46,
+          33
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.5733333333333334,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          6,
+          13
+        ],
+        "gk_pickups": [
+          5,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.1743357096565133,
+          0.01703545967965929
+        ],
+        "inversion_rate": [
+          0.1963707064160726,
+          0.33441348023331174
+        ],
+        "inversion_rate_oop": [
+          0.21246872393661384,
+          0.3426232905097389
+        ],
+        "longest_hold_spell_s": 1.8,
+        "loose_share": 0.7816868808443662,
+        "match_id": 13218,
+        "mean_cluster_size": 1.256457735394871,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5643921859087122,
+          0.8561244329228775
+        ],
+        "passes": [
+          3,
+          2
+        ],
+        "possession_share": [
+          0.11193408017776132,
+          0.10637903897787242
+        ],
+        "presser_share": [
+          {
+            "D1": 0.150093808630394,
+            "D2": 0.1438398999374609,
+            "GK": 0.0,
+            "M1": 0.27267041901188244,
+            "M2": 0.30268918073796125,
+            "ST": 0.13070669168230145
+          },
+          {
+            "D1": 0.17735686612139476,
+            "D2": 0.21581288563638973,
+            "GK": 0.0,
+            "M1": 0.12455158559334194,
+            "M2": 0.2600086095566078,
+            "ST": 0.22227005309226575
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.053314571607254536,
+          0.03917348256564787
+        ],
+        "presser_trailing_rate": [
+          0.2298311444652908,
+          0.3442387717032573
+        ],
+        "width_mean": [
+          321.60483844088515,
+          257.09788908434405
+        ]
+      },
+      {
+        "ball_hold_rate": 0.17368762151652625,
+        "cluster_frame_rate": 0.01046199425979076,
+        "cluster_frames": 113,
+        "depth_mean": [
+          430.5019414868994,
+          237.00703545967968
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          680.9547844022245,
+          651.9506207148964
+        ],
+        "gk_dist_goal_center_mean": [
+          110.66378305176966,
+          121.10184986715133
+        ],
+        "gk_dist_goal_line_mean": [
+          86.30754096842885,
+          93.3901009165818
+        ],
+        "gk_dives": [
+          37,
+          35
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.5875,
+          0.09166666666666666
+        ],
+        "gk_near_miss_frames": [
+          19,
+          8
+        ],
+        "gk_pickups": [
+          4,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.12924729191741505,
+          0.045551337839088976
+        ],
+        "inversion_rate": [
+          0.2820109249143598,
+          0.3226553096935469
+        ],
+        "inversion_rate_oop": [
+          0.302276390008058,
+          0.33741579914268216
+        ],
+        "longest_hold_spell_s": 2.066666666666667,
+        "loose_share": 0.8263123784834737,
+        "match_id": 13219,
+        "mean_cluster_size": 1.0048143690399036,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5166188315896676,
+          0.6411443384871771
+        ],
+        "passes": [
+          4,
+          4
+        ],
+        "possession_share": [
+          0.08082584945838349,
+          0.09286177205814276
+        ],
+        "presser_share": [
+          {
+            "D1": 0.18523316062176165,
+            "D2": 0.2655440414507772,
+            "GK": 0.0,
+            "M1": 0.20077720207253885,
+            "M2": 0.12305699481865284,
+            "ST": 0.22538860103626943
+          },
+          {
+            "D1": 0.13171680886094897,
+            "D2": 0.18919323454572667,
+            "GK": 0.0,
+            "M1": 0.20236491543182158,
+            "M2": 0.2957641071695854,
+            "ST": 0.18096093399191737
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04064119170984456,
+          0.016015566531956293
+        ],
+        "presser_trailing_rate": [
+          0.23769430051813473,
+          0.38497230953450085
+        ],
+        "width_mean": [
+          317.12531802610863,
+          252.68220257383578
+        ]
+      },
+      {
+        "ball_hold_rate": 0.16581797981668364,
+        "cluster_frame_rate": 0.007591889639848162,
+        "cluster_frames": 82,
+        "depth_mean": [
+          412.13157855754093,
+          240.20844829182485
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          684.8176542167448,
+          696.1171463821272
+        ],
+        "gk_dist_goal_center_mean": [
+          118.37840504187656,
+          113.70597836768788
+        ],
+        "gk_dist_goal_line_mean": [
+          63.32390704564392,
+          81.1547162299787
+        ],
+        "gk_dives": [
+          39,
+          37
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.3166666666666667,
+          0.11666666666666667
+        ],
+        "gk_near_miss_frames": [
+          12,
+          6
+        ],
+        "gk_pickups": [
+          1,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.26293861679474123,
+          0.05842051661883159
+        ],
+        "inversion_rate": [
+          0.17942783075641144,
+          0.3493195074530136
+        ],
+        "inversion_rate_oop": [
+          0.17917289486796215,
+          0.36456628477905073
+        ],
+        "longest_hold_spell_s": 1.3166666666666667,
+        "loose_share": 0.8341820201833163,
+        "match_id": 13220,
+        "mean_cluster_size": 1.0452735857790945,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5340246273493195,
+          0.6774372743264513
+        ],
+        "passes": [
+          3,
+          2
+        ],
+        "possession_share": [
+          0.0709193593185816,
+          0.09489862049810202
+        ],
+        "presser_share": [
+          {
+            "D1": 0.15397631133671744,
+            "D2": 0.20530174844895657,
+            "GK": 0.0,
+            "M1": 0.22560631697687536,
+            "M2": 0.17822899041173154,
+            "ST": 0.23688663282571912
+          },
+          {
+            "D1": 0.12762992893966837,
+            "D2": 0.25247317820816495,
+            "GK": 0.0,
+            "M1": 0.1883795457712136,
+            "M2": 0.26919325623519574,
+            "ST": 0.16232409084575727
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.0559785673998872,
+          0.03330082207050299
+        ],
+        "presser_trailing_rate": [
+          0.27749576988155666,
+          0.35474432214017
+        ],
+        "width_mean": [
+          281.08714285714285,
+          206.0106582723822
+        ]
+      },
+      {
+        "ball_hold_rate": 0.19377835385612444,
+        "cluster_frame_rate": 0.029997222479400055,
+        "cluster_frames": 324,
+        "depth_mean": [
+          360.6069845384687,
+          218.1932145171743
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          608.4905418966066,
+          725.1605995215012
+        ],
+        "gk_dist_goal_center_mean": [
+          114.35411720264698,
+          97.71685458682661
+        ],
+        "gk_dist_goal_line_mean": [
+          83.87539672252568,
+          78.96849273215443
+        ],
+        "gk_dives": [
+          40,
+          26
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.11666666666666667,
+          0.1611111111111111
+        ],
+        "gk_near_miss_frames": [
+          8,
+          14
+        ],
+        "gk_pickups": [
+          1,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.1730395333765392,
+          0.03953337653920933
+        ],
+        "inversion_rate": [
+          0.2072956207758541,
+          0.11137857605777243
+        ],
+        "inversion_rate_oop": [
+          0.2139689578713969,
+          0.109523312819443
+        ],
+        "longest_hold_spell_s": 1.1,
+        "loose_share": 0.8062216461438756,
+        "match_id": 13221,
+        "mean_cluster_size": 1.103694102397926,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5825386538283492,
+          0.7039163040459216
+        ],
+        "passes": [
+          2,
+          7
+        ],
+        "possession_share": [
+          0.08138135357837237,
+          0.11239700027775205
+        ],
+        "presser_share": [
+          {
+            "D1": 0.23025516403402188,
+            "D2": 0.20534629404617255,
+            "GK": 0.0,
+            "M1": 0.20291616038882138,
+            "M2": 0.12636695018226002,
+            "ST": 0.23511543134872417
+          },
+          {
+            "D1": 0.11970389037643724,
+            "D2": 0.18081587651598677,
+            "GK": 0.0,
+            "M1": 0.06804221137186958,
+            "M2": 0.3654118758859663,
+            "ST": 0.2660261458497401
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.025972053462940462,
+          0.04457394865333123
+        ],
+        "presser_trailing_rate": [
+          0.25136695018226,
+          0.3219404630650496
+        ],
+        "width_mean": [
+          281.38408295528194,
+          227.48911397092866
+        ]
+      },
+      {
+        "ball_hold_rate": 0.1850754559762985,
+        "cluster_frame_rate": 0.006666049439866679,
+        "cluster_frames": 72,
+        "depth_mean": [
+          408.85919266734567,
+          216.0142847884455
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          764.0953494506969,
+          619.7962241122249
+        ],
+        "gk_dist_goal_center_mean": [
+          106.63457992869903,
+          98.26304395964809
+        ],
+        "gk_dist_goal_line_mean": [
+          67.56392463660772,
+          69.93802518285344
+        ],
+        "gk_dives": [
+          30,
+          34
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.9416666666666667,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          173,
+          4
+        ],
+        "gk_pickups": [
+          2,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.13017313211739653,
+          0.08202944171835941
+        ],
+        "inversion_rate": [
+          0.2807147486343857,
+          0.23044162577539118
+        ],
+        "inversion_rate_oop": [
+          0.27711693548387095,
+          0.24723742641743263
+        ],
+        "longest_hold_spell_s": 1.8,
+        "loose_share": 0.8149245440237015,
+        "match_id": 13222,
+        "mean_cluster_size": 1.0685121747986297,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5296731784094065,
+          0.709101009165818
+        ],
+        "passes": [
+          0,
+          3
+        ],
+        "possession_share": [
+          0.08156652161836866,
+          0.10350893435792982
+        ],
+        "presser_share": [
+          {
+            "D1": 0.14476190476190476,
+            "D2": 0.11873015873015873,
+            "GK": 0.0,
+            "M1": 0.2692063492063492,
+            "M2": 0.2546031746031746,
+            "ST": 0.2126984126984127
+          },
+          {
+            "D1": 0.18409811216756236,
+            "D2": 0.18961003169353727,
+            "GK": 0.0,
+            "M1": 0.28386385558770844,
+            "M2": 0.19677552707730467,
+            "ST": 0.1456524734738873
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.03857142857142857,
+          0.05002066969822241
+        ],
+        "presser_trailing_rate": [
+          0.1607936507936508,
+          0.40374810527766297
+        ],
+        "width_mean": [
+          284.6267382649755,
+          248.9352032219239
+        ]
+      },
+      {
+        "ball_hold_rate": 0.20266641977594668,
+        "cluster_frame_rate": 0.009536154059809277,
+        "cluster_frames": 103,
+        "depth_mean": [
+          422.54416442921945,
+          244.67679474122767
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          751.7307871349955,
+          615.5230148737627
+        ],
+        "gk_dist_goal_center_mean": [
+          107.74427212726698,
+          103.36422440633321
+        ],
+        "gk_dist_goal_line_mean": [
+          65.86275437459494,
+          68.72760392556246
+        ],
+        "gk_dives": [
+          41,
+          30
+        ],
+        "gk_facing_blocked_frames": [
+          4,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.45,
+          0.09166666666666666
+        ],
+        "gk_near_miss_frames": [
+          46,
+          26
+        ],
+        "gk_pickups": [
+          4,
+          6
+        ],
+        "gk_wall_pinned_rate": [
+          0.17368762151652625,
+          0.07925192111841496
+        ],
+        "inversion_rate": [
+          0.4501435052309971,
+          0.29034348671419313
+        ],
+        "inversion_rate_oop": [
+          0.47600208224882873,
+          0.30138662316476345
+        ],
+        "longest_hold_spell_s": 3.6166666666666667,
+        "loose_share": 0.7973335802240533,
+        "match_id": 13223,
+        "mean_cluster_size": 1.0840662901583187,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5608739931487825,
+          0.696046662346079
+        ],
+        "passes": [
+          4,
+          2
+        ],
+        "possession_share": [
+          0.11073048791778539,
+          0.09193593185816128
+        ],
+        "presser_share": [
+          {
+            "D1": 0.24030037546933666,
+            "D2": 0.2002503128911139,
+            "GK": 0.0,
+            "M1": 0.2546933667083855,
+            "M2": 0.0951188986232791,
+            "ST": 0.20963704630788485
+          },
+          {
+            "D1": 0.17633961704022563,
+            "D2": 0.3609915392607986,
+            "GK": 0.0,
+            "M1": 0.12765325812676265,
+            "M2": 0.11755974469348375,
+            "ST": 0.2174558408787294
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.03770337922403004,
+          0.03443669289001039
+        ],
+        "presser_trailing_rate": [
+          0.13642052565707133,
+          0.3734599970313196
+        ],
+        "width_mean": [
+          285.9581659105638,
+          227.70207388204796
+        ]
+      },
+      {
+        "ball_hold_rate": 0.20794370891584113,
+        "cluster_frame_rate": 0.02036848439959263,
+        "cluster_frames": 220,
+        "depth_mean": [
+          353.16156374409775,
+          229.31434867141934
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          678.4840288098226,
+          672.4412150239262
+        ],
+        "gk_dist_goal_center_mean": [
+          110.25552171443186,
+          122.22425477462392
+        ],
+        "gk_dist_goal_line_mean": [
+          74.65958337191002,
+          99.14797240996204
+        ],
+        "gk_dives": [
+          29,
+          26
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          2.155555555555556,
+          0.1
+        ],
+        "gk_near_miss_frames": [
+          26,
+          15
+        ],
+        "gk_pickups": [
+          3,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.14433848717711323,
+          0.036663271919266736
+        ],
+        "inversion_rate": [
+          0.18137209517637257,
+          0.31608184427367836
+        ],
+        "inversion_rate_oop": [
+          0.19707491582491582,
+          0.32358911896061715
+        ],
+        "longest_hold_spell_s": 4.033333333333333,
+        "loose_share": 0.7920562910841589,
+        "match_id": 13224,
+        "mean_cluster_size": 1.197203962596056,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.7404869919451903,
+          0.661605406906768
+        ],
+        "passes": [
+          2,
+          5
+        ],
+        "possession_share": [
+          0.12008147393759837,
+          0.08786223497824276
+        ],
+        "presser_share": [
+          {
+            "D1": 0.26128266033254155,
+            "D2": 0.16211401425178149,
+            "GK": 0.0,
+            "M1": 0.22209026128266032,
+            "M2": 0.16270783847980996,
+            "ST": 0.19180522565320665
+          },
+          {
+            "D1": 0.16398576512455515,
+            "D2": 0.18619217081850534,
+            "GK": 0.0,
+            "M1": 0.141779359430605,
+            "M2": 0.31544483985765126,
+            "ST": 0.19259786476868326
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.03859857482185273,
+          0.04412811387900356
+        ],
+        "presser_trailing_rate": [
+          0.20160332541567696,
+          0.3881850533807829
+        ],
+        "width_mean": [
+          287.03981483196003,
+          229.17666790112025
+        ]
+      },
+      {
+        "ball_hold_rate": 0.1900749930561985,
+        "cluster_frame_rate": 0.019164892139616703,
+        "cluster_frames": 207,
+        "depth_mean": [
+          422.56792889547273,
+          227.49721136931765
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          710.6028132545684,
+          644.1713388362696
+        ],
+        "gk_dist_goal_center_mean": [
+          105.06770334935858,
+          124.90516556373912
+        ],
+        "gk_dist_goal_line_mean": [
+          63.1202712711786,
+          96.22590778631609
+        ],
+        "gk_dives": [
+          39,
+          35
+        ],
+        "gk_facing_blocked_frames": [
+          3,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.4833333333333334,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          16,
+          70
+        ],
+        "gk_pickups": [
+          2,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.17942783075641144,
+          0.03749652809925007
+        ],
+        "inversion_rate": [
+          0.23784834737524305,
+          0.3280251828534395
+        ],
+        "inversion_rate_oop": [
+          0.2545380379359576,
+          0.34527352971364056
+        ],
+        "longest_hold_spell_s": 2.816666666666667,
+        "loose_share": 0.8099250069438015,
+        "match_id": 13225,
+        "mean_cluster_size": 1.1739653735765208,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5669845384686603,
+          0.77650217572447
+        ],
+        "passes": [
+          2,
+          4
+        ],
+        "possession_share": [
+          0.09212109989815757,
+          0.09795389315804093
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20658849804578447,
+            "D2": 0.16638749302065886,
+            "GK": 0.0,
+            "M1": 0.2573981016192071,
+            "M2": 0.17308766052484645,
+            "ST": 0.19653824678950307
+          },
+          {
+            "D1": 0.17765310892940628,
+            "D2": 0.3540595293750974,
+            "GK": 0.0,
+            "M1": 0.1676796010596852,
+            "M2": 0.20944366526414213,
+            "ST": 0.091164095371669
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.028754885538805137,
+          0.016518622409225494
+        ],
+        "presser_trailing_rate": [
+          0.2285036292573981,
+          0.3945769050958392
+        ],
+        "width_mean": [
+          254.13611702620125,
+          220.7992287751134
+        ]
+      },
+      {
+        "ball_hold_rate": 0.20090732339598186,
+        "cluster_frame_rate": 0.02638644569947227,
+        "cluster_frames": 285,
+        "depth_mean": [
+          322.67891861864643,
+          212.88928802888623
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          731.6785423975646,
+          606.781086570882
+        ],
+        "gk_dist_goal_center_mean": [
+          114.54706581215201,
+          117.38116769430499
+        ],
+        "gk_dist_goal_line_mean": [
+          78.8399611147116,
+          86.31788630682344
+        ],
+        "gk_dives": [
+          37,
+          35
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.48333333333333334,
+          0.11666666666666667
+        ],
+        "gk_near_miss_frames": [
+          10,
+          8
+        ],
+        "gk_pickups": [
+          2,
+          5
+        ],
+        "gk_wall_pinned_rate": [
+          0.1435052309971299,
+          0.09156559577816868
+        ],
+        "inversion_rate": [
+          0.2856217016942876,
+          0.2072956207758541
+        ],
+        "inversion_rate_oop": [
+          0.2972916882847359,
+          0.20816743236345073
+        ],
+        "longest_hold_spell_s": 1.0,
+        "loose_share": 0.7990926766040182,
+        "match_id": 13226,
+        "mean_cluster_size": 1.2185908712156281,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6753078418664938,
+          0.7369687991852606
+        ],
+        "passes": [
+          1,
+          3
+        ],
+        "possession_share": [
+          0.10776779927784465,
+          0.09313952411813721
+        ],
+        "presser_share": [
+          {
+            "D1": 0.09959231217239371,
+            "D2": 0.24694234129295284,
+            "GK": 0.0,
+            "M1": 0.20617355853232383,
+            "M2": 0.20559114735002912,
+            "ST": 0.2417006406523005
+          },
+          {
+            "D1": 0.14661943631603266,
+            "D2": 0.21500077006006468,
+            "GK": 0.0,
+            "M1": 0.25196365316494684,
+            "M2": 0.1712613583859541,
+            "ST": 0.2151547820730017
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.035235876528829355,
+          0.021253657785307255
+        ],
+        "presser_trailing_rate": [
+          0.19117647058823528,
+          0.390112428769444
+        ],
+        "width_mean": [
+          284.73707434496805,
+          258.3122997870568
+        ]
+      },
+      {
+        "ball_hold_rate": 0.20886954911582262,
+        "cluster_frame_rate": 0.01712804369965744,
+        "cluster_frames": 185,
+        "depth_mean": [
+          350.50550689750946,
+          235.03712804369965
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          638.3686298739883,
+          686.9852510727259
+        ],
+        "gk_dist_goal_center_mean": [
+          130.00468400017755,
+          128.97827280016054
+        ],
+        "gk_dist_goal_line_mean": [
+          90.9401194333858,
+          104.34146097583559
+        ],
+        "gk_dives": [
+          43,
+          34
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.6916666666666667,
+          0.37083333333333335
+        ],
+        "gk_near_miss_frames": [
+          20,
+          16
+        ],
+        "gk_pickups": [
+          4,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.13211739653735766,
+          0.04212572909915749
+        ],
+        "inversion_rate": [
+          0.15813350615683733,
+          0.3036755855939265
+        ],
+        "inversion_rate_oop": [
+          0.16823590274185204,
+          0.31701270529903935
+        ],
+        "longest_hold_spell_s": 1.9833333333333334,
+        "loose_share": 0.7911304508841774,
+        "match_id": 13227,
+        "mean_cluster_size": 1.1507267845569855,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6259605592074808,
+          0.6786408665864272
+        ],
+        "passes": [
+          1,
+          2
+        ],
+        "possession_share": [
+          0.10517544671789648,
+          0.10369410239792612
+        ],
+        "presser_share": [
+          {
+            "D1": 0.18765432098765433,
+            "D2": 0.1845679012345679,
+            "GK": 0.0,
+            "M1": 0.20864197530864198,
+            "M2": 0.16790123456790124,
+            "ST": 0.25123456790123455
+          },
+          {
+            "D1": 0.27592345349354697,
+            "D2": 0.08366711170449488,
+            "GK": 0.0,
+            "M1": 0.2622756267616081,
+            "M2": 0.23972704346536122,
+            "ST": 0.13840676457498888
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04583333333333333,
+          0.015427978044800474
+        ],
+        "presser_trailing_rate": [
+          0.20540123456790124,
+          0.31315828512090194
+        ],
+        "width_mean": [
+          255.10227571521156,
+          232.17694102397923
+        ]
+      },
+      {
+        "ball_hold_rate": 0.19100083325617997,
+        "cluster_frame_rate": 0.02092398851958152,
+        "cluster_frames": 226,
+        "depth_mean": [
+          424.4196916952134,
+          227.3641292472919
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          708.9221990780146,
+          624.970434172576
+        ],
+        "gk_dist_goal_center_mean": [
+          117.69883946911706,
+          126.85336746328201
+        ],
+        "gk_dist_goal_line_mean": [
+          76.92872604388484,
+          102.40004258864919
+        ],
+        "gk_dives": [
+          43,
+          33
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.1,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          0,
+          6
+        ],
+        "gk_pickups": [
+          3,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.2377557633552449,
+          0.05416165169891677
+        ],
+        "inversion_rate": [
+          0.29858346449402834,
+          0.23294139431534117
+        ],
+        "inversion_rate_oop": [
+          0.2987631792376318,
+          0.24258397932816536
+        ],
+        "longest_hold_spell_s": 0.8,
+        "loose_share": 0.80899916674382,
+        "match_id": 13228,
+        "mean_cluster_size": 1.1709101009165819,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5991111934080178,
+          0.7565966114248681
+        ],
+        "passes": [
+          7,
+          4
+        ],
+        "possession_share": [
+          0.08675122673826498,
+          0.10424960651791501
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20911854103343466,
+            "D2": 0.23768996960486322,
+            "GK": 0.0,
+            "M1": 0.19148936170212766,
+            "M2": 0.1519756838905775,
+            "ST": 0.20972644376899696
+          },
+          {
+            "D1": 0.0969051953507912,
+            "D2": 0.19269009942585072,
+            "GK": 0.0,
+            "M1": 0.15796106987816833,
+            "M2": 0.29463660551743454,
+            "ST": 0.2578070298277552
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.05531914893617021,
+          0.0390701582411427
+        ],
+        "presser_trailing_rate": [
+          0.19133738601823708,
+          0.46758157120851424
+        ],
+        "width_mean": [
+          273.5166456809555,
+          227.77430978613094
+        ]
+      },
+      {
+        "ball_hold_rate": 0.15183779279696324,
+        "cluster_frame_rate": 0.004629200999907416,
+        "cluster_frames": 50,
+        "depth_mean": [
+          412.32879455605956,
+          220.3114572724748
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          788.4220046443821,
+          581.0179707135394
+        ],
+        "gk_dist_goal_center_mean": [
+          107.79375735262761,
+          113.03177210671355
+        ],
+        "gk_dist_goal_line_mean": [
+          76.07694565318027,
+          72.2002518285344
+        ],
+        "gk_dives": [
+          39,
+          42
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.3,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          9,
+          9
+        ],
+        "gk_pickups": [
+          1,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.18979724099620404,
+          0.07934450513841311
+        ],
+        "inversion_rate": [
+          0.2534950467549301,
+          0.23266364225534672
+        ],
+        "inversion_rate_oop": [
+          0.26384364820846906,
+          0.24819448682738277
+        ],
+        "longest_hold_spell_s": 1.7,
+        "loose_share": 0.8481622072030368,
+        "match_id": 13229,
+        "mean_cluster_size": 0.9629663920007406,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.4897694657902046,
+          0.6349412091473011
+        ],
+        "passes": [
+          2,
+          5
+        ],
+        "possession_share": [
+          0.062031293398759374,
+          0.08980649939820387
+        ],
+        "presser_share": [
+          {
+            "D1": 0.17502986857825567,
+            "D2": 0.17144563918757466,
+            "GK": 0.0,
+            "M1": 0.16248506571087215,
+            "M2": 0.34408602150537637,
+            "ST": 0.14695340501792115
+          },
+          {
+            "D1": 0.1654558932542624,
+            "D2": 0.26745737583395107,
+            "GK": 0.0,
+            "M1": 0.10259451445515197,
+            "M2": 0.2627131208302446,
+            "ST": 0.20177909562638993
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.02120669056152927,
+          0.040770941438102296
+        ],
+        "presser_trailing_rate": [
+          0.1832437275985663,
+          0.4161601186063751
+        ],
+        "width_mean": [
+          254.06061198037222,
+          214.52983057124337
+        ]
+      },
+      {
+        "ball_hold_rate": 0.16924358855661512,
+        "cluster_frame_rate": 0.03249699101935006,
+        "cluster_frames": 351,
+        "depth_mean": [
+          395.40623738542723,
+          205.34353670956392
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          605.0126039088477,
+          759.4169716410994
+        ],
+        "gk_dist_goal_center_mean": [
+          112.22966615874465,
+          111.35269455838443
+        ],
+        "gk_dist_goal_line_mean": [
+          76.4351597074345,
+          92.50835107860382
+        ],
+        "gk_dives": [
+          41,
+          37
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.46111111111111114,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          23,
+          3
+        ],
+        "gk_pickups": [
+          3,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.10721229515785576,
+          0.034441255439311175
+        ],
+        "inversion_rate": [
+          0.16081844273678364,
+          0.42736783631145264
+        ],
+        "inversion_rate_oop": [
+          0.16742172556126045,
+          0.4380652372726349
+        ],
+        "longest_hold_spell_s": 1.1166666666666667,
+        "loose_share": 0.8307564114433849,
+        "match_id": 13230,
+        "mean_cluster_size": 1.0585131006388298,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.534950467549301,
+          0.6796592908064069
+        ],
+        "passes": [
+          3,
+          0
+        ],
+        "possession_share": [
+          0.08036292935839275,
+          0.08888065919822238
+        ],
+        "presser_share": [
+          {
+            "D1": 0.16166666666666665,
+            "D2": 0.27,
+            "GK": 0.0,
+            "M1": 0.10444444444444445,
+            "M2": 0.1811111111111111,
+            "ST": 0.2827777777777778
+          },
+          {
+            "D1": 0.2307353588727433,
+            "D2": 0.3246734184646998,
+            "GK": 0.0,
+            "M1": 0.11096433289299867,
+            "M2": 0.1649787171583737,
+            "ST": 0.1686481726111845
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.06944444444444445,
+          0.02906208718626156
+        ],
+        "presser_trailing_rate": [
+          0.2361111111111111,
+          0.3999706443563775
+        ],
+        "width_mean": [
+          314.2846254976391,
+          228.5014183871864
+        ]
+      },
+      {
+        "ball_hold_rate": 0.18535320803629293,
+        "cluster_frame_rate": 0.007499305619850014,
+        "cluster_frames": 81,
+        "depth_mean": [
+          402.5437709471345,
+          247.17182297935375
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          654.1065366359151,
+          679.2549957103965
+        ],
+        "gk_dist_goal_center_mean": [
+          117.6515146433589,
+          115.68552810292475
+        ],
+        "gk_dist_goal_line_mean": [
+          76.60368576983612,
+          94.7890852698824
+        ],
+        "gk_dives": [
+          38,
+          31
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.1111111111111112,
+          0.0875
+        ],
+        "gk_near_miss_frames": [
+          11,
+          18
+        ],
+        "gk_pickups": [
+          3,
+          4
+        ],
+        "gk_wall_pinned_rate": [
+          0.1603555226367929,
+          0.07008610313859828
+        ],
+        "inversion_rate": [
+          0.20109249143597815,
+          0.24266271641514675
+        ],
+        "inversion_rate_oop": [
+          0.2139761074109314,
+          0.24070604476876048
+        ],
+        "longest_hold_spell_s": 2.0833333333333335,
+        "loose_share": 0.814646791963707,
+        "match_id": 13231,
+        "mean_cluster_size": 1.0162947875196742,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6166095731876678,
+          0.553096935468938
+        ],
+        "passes": [
+          1,
+          3
+        ],
+        "possession_share": [
+          0.12424775483751505,
+          0.061105453198777894
+        ],
+        "presser_share": [
+          {
+            "D1": 0.16839378238341968,
+            "D2": 0.21178756476683938,
+            "GK": 0.0,
+            "M1": 0.2551813471502591,
+            "M2": 0.14702072538860103,
+            "ST": 0.21761658031088082
+          },
+          {
+            "D1": 0.16551334557265923,
+            "D2": 0.3496681259709081,
+            "GK": 0.0,
+            "M1": 0.11975709645530293,
+            "M2": 0.20844513486795652,
+            "ST": 0.1566162971331733
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.016677461139896373,
+          0.020194887727722072
+        ],
+        "presser_trailing_rate": [
+          0.26360103626943004,
+          0.3202937438214941
+        ],
+        "width_mean": [
+          218.31250902694197,
+          219.9493111748912
+        ]
+      },
+      {
+        "ball_hold_rate": 0.21090639755578186,
+        "cluster_frame_rate": 0.025738357559485232,
+        "cluster_frames": 278,
+        "depth_mean": [
+          325.058217757615,
+          230.88802240533283
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          594.470968450289,
+          771.6521781903926
+        ],
+        "gk_dist_goal_center_mean": [
+          109.5122547760398,
+          121.80816094846725
+        ],
+        "gk_dist_goal_line_mean": [
+          64.54610776779928,
+          96.14288862142394
+        ],
+        "gk_dives": [
+          46,
+          33
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.1555555555555554,
+          0.5700000000000001
+        ],
+        "gk_near_miss_frames": [
+          18,
+          32
+        ],
+        "gk_pickups": [
+          3,
+          5
+        ],
+        "gk_wall_pinned_rate": [
+          0.1954448662160911,
+          0.039996296639200075
+        ],
+        "inversion_rate": [
+          0.01323951485973521,
+          0.23118229793537634
+        ],
+        "inversion_rate_oop": [
+          0.013050233039875712,
+          0.2355983038576895
+        ],
+        "longest_hold_spell_s": 2.5166666666666666,
+        "loose_share": 0.7890936024442181,
+        "match_id": 13232,
+        "mean_cluster_size": 1.1056383668178873,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6030923062679382,
+          0.6682714563466345
+        ],
+        "passes": [
+          6,
+          3
+        ],
+        "possession_share": [
+          0.10610128691787797,
+          0.1048051106379039
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20727745289148797,
+            "D2": 0.12410656270305392,
+            "GK": 0.0,
+            "M1": 0.294996751137102,
+            "M2": 0.21832358674463936,
+            "ST": 0.1552956465237167
+          },
+          {
+            "D1": 0.1925862803579037,
+            "D2": 0.3448373810538276,
+            "GK": 0.0,
+            "M1": 0.16077261752591962,
+            "M2": 0.12384604459593808,
+            "ST": 0.17795767646641103
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04824561403508772,
+          0.019315438147990343
+        ],
+        "presser_trailing_rate": [
+          0.2475633528265107,
+          0.30592245419684705
+        ],
+        "width_mean": [
+          308.8453374687529,
+          239.27330154615316
+        ]
+      },
+      {
+        "ball_hold_rate": 0.18137209517637257,
+        "cluster_frame_rate": 0.004814369039903713,
+        "cluster_frames": 52,
+        "depth_mean": [
+          420.03663179335246,
+          240.16916026293862
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          718.2630731839098,
+          598.4812996160504
+        ],
+        "gk_dist_goal_center_mean": [
+          114.17236222341923,
+          120.06283436729882
+        ],
+        "gk_dist_goal_line_mean": [
+          82.35190074993055,
+          101.229365799463
+        ],
+        "gk_dives": [
+          40,
+          29
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.08333333333333333,
+          0.7083333333333334
+        ],
+        "gk_near_miss_frames": [
+          0,
+          3
+        ],
+        "gk_pickups": [
+          1,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.14017220627719656,
+          0.043236737339135266
+        ],
+        "inversion_rate": [
+          0.2910841588741783,
+          0.2400703638551986
+        ],
+        "inversion_rate_oop": [
+          0.29509685230024213,
+          0.25886342616380636
+        ],
+        "longest_hold_spell_s": 1.2,
+        "loose_share": 0.8186279048236275,
+        "match_id": 13233,
+        "mean_cluster_size": 0.9491713730210166,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.48986204981020276,
+          0.6095731876678085
+        ],
+        "passes": [
+          4,
+          3
+        ],
+        "possession_share": [
+          0.08230719377835385,
+          0.0990649013980187
+        ],
+        "presser_share": [
+          {
+            "D1": 0.16676923076923078,
+            "D2": 0.2276923076923077,
+            "GK": 0.0,
+            "M1": 0.23815384615384616,
+            "M2": 0.2006153846153846,
+            "ST": 0.16676923076923078
+          },
+          {
+            "D1": 0.1539166284928997,
+            "D2": 0.23515040464193007,
+            "GK": 0.0,
+            "M1": 0.1606352114826691,
+            "M2": 0.23453962437013284,
+            "ST": 0.2157581310123683
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.02476923076923077,
+          0.019697663765460376
+        ],
+        "presser_trailing_rate": [
+          0.20692307692307693,
+          0.3585280195449687
+        ],
+        "width_mean": [
+          265.80202666419774,
+          243.09546893806132
+        ]
+      },
+      {
+        "ball_hold_rate": 0.16600314785667994,
+        "cluster_frame_rate": 0.014443107119711137,
+        "cluster_frames": 156,
+        "depth_mean": [
+          348.4761540598093,
+          253.4560873993149
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          638.5971850674855,
+          697.4605950026078
+        ],
+        "gk_dist_goal_center_mean": [
+          114.67073974877705,
+          117.5659740484036
+        ],
+        "gk_dist_goal_line_mean": [
+          78.39331821127674,
+          90.9208304786594
+        ],
+        "gk_dives": [
+          49,
+          29
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.18333333333333332,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          25,
+          0
+        ],
+        "gk_pickups": [
+          4,
+          1
+        ],
+        "gk_wall_pinned_rate": [
+          0.17794648643644106,
+          0.023238589019535228
+        ],
+        "inversion_rate": [
+          0.2368299231552634,
+          0.35320803629293585
+        ],
+        "inversion_rate_oop": [
+          0.24904522613065327,
+          0.3690029414747946
+        ],
+        "longest_hold_spell_s": 0.9333333333333333,
+        "loose_share": 0.8339968521433201,
+        "match_id": 13234,
+        "mean_cluster_size": 1.0920285158781595,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6132765484677345,
+          0.6364225534672715
+        ],
+        "passes": [
+          5,
+          4
+        ],
+        "possession_share": [
+          0.07878900101842422,
+          0.08721414683825572
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20478036175710596,
+            "D2": 0.18863049095607234,
+            "GK": 0.0,
+            "M1": 0.24806201550387597,
+            "M2": 0.10465116279069768,
+            "ST": 0.25387596899224807
+          },
+          {
+            "D1": 0.11732088136582519,
+            "D2": 0.3116883116883117,
+            "GK": 0.0,
+            "M1": 0.15642784182110026,
+            "M2": 0.26557711950970375,
+            "ST": 0.1489858456150591
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.02616279069767442,
+          0.010944112067707573
+        ],
+        "presser_trailing_rate": [
+          0.22577519379844962,
+          0.3899022325988618
+        ],
+        "width_mean": [
+          272.61109434311635,
+          235.0362133135821
+        ]
+      },
+      {
+        "ball_hold_rate": 0.17424312563651514,
+        "cluster_frame_rate": 0.02481251735950375,
+        "cluster_frames": 268,
+        "depth_mean": [
+          364.6822507175262,
+          232.5260420331451
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          703.9286972217014,
+          653.1284376896222
+        ],
+        "gk_dist_goal_center_mean": [
+          114.64187939152866,
+          100.59309815543864
+        ],
+        "gk_dist_goal_line_mean": [
+          79.35558466808628,
+          81.26263123784834
+        ],
+        "gk_dives": [
+          47,
+          41
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.225,
+          0.11
+        ],
+        "gk_near_miss_frames": [
+          9,
+          15
+        ],
+        "gk_pickups": [
+          2,
+          5
+        ],
+        "gk_wall_pinned_rate": [
+          0.11045273585779095,
+          0.08351078603832979
+        ],
+        "inversion_rate": [
+          0.28802888621423944,
+          0.2239607443755208
+        ],
+        "inversion_rate_oop": [
+          0.2992715920915713,
+          0.22799208704253215
+        ],
+        "longest_hold_spell_s": 1.1166666666666667,
+        "loose_share": 0.8257568743634849,
+        "match_id": 13235,
+        "mean_cluster_size": 1.1146190167577077,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6383668178872327,
+          0.6563281177668734
+        ],
+        "passes": [
+          5,
+          5
+        ],
+        "possession_share": [
+          0.11026756781779465,
+          0.06397555781872048
+        ],
+        "presser_share": [
+          {
+            "D1": 0.22440220723482526,
+            "D2": 0.2023298589822195,
+            "GK": 0.0,
+            "M1": 0.15941140404659718,
+            "M2": 0.2176578786020846,
+            "ST": 0.19619865113427346
+          },
+          {
+            "D1": 0.28814291888776833,
+            "D2": 0.3117706382365653,
+            "GK": 0.0,
+            "M1": 0.14291888776833309,
+            "M2": 0.13254574268837344,
+            "ST": 0.12462181241895981
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.03832004904966278,
+          0.03299236421264948
+        ],
+        "presser_trailing_rate": [
+          0.27590435315757206,
+          0.3766027949863132
+        ],
+        "width_mean": [
+          257.1677733543191,
+          264.2548041847977
+        ]
+      },
+      {
+        "ball_hold_rate": 0.18951948893620962,
+        "cluster_frame_rate": 0.010369410239792612,
+        "cluster_frames": 112,
+        "depth_mean": [
+          383.4587001203592,
+          242.28856124432923
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          659.9609361376856,
+          692.794161926732
+        ],
+        "gk_dist_goal_center_mean": [
+          111.63786951343349,
+          116.82223300606809
+        ],
+        "gk_dist_goal_line_mean": [
+          53.946500324044074,
+          94.30133691324879
+        ],
+        "gk_dives": [
+          37,
+          37
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.3,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          8,
+          6
+        ],
+        "gk_pickups": [
+          2,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.2726599388945468,
+          0.025553189519488935
+        ],
+        "inversion_rate": [
+          0.16331821127673363,
+          0.2583094157948338
+        ],
+        "inversion_rate_oop": [
+          0.16785117056856189,
+          0.26184039251026336
+        ],
+        "longest_hold_spell_s": 1.8666666666666667,
+        "loose_share": 0.8104805110637904,
+        "match_id": 13236,
+        "mean_cluster_size": 1.111100823997778,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6114248680677715,
+          0.6634570873067308
+        ],
+        "passes": [
+          2,
+          3
+        ],
+        "possession_share": [
+          0.11415609665771688,
+          0.07536339227849273
+        ],
+        "presser_share": [
+          {
+            "D1": 0.226890756302521,
+            "D2": 0.1570782159017453,
+            "GK": 0.0,
+            "M1": 0.28054298642533937,
+            "M2": 0.12087912087912088,
+            "ST": 0.21460892049127342
+          },
+          {
+            "D1": 0.16296893908834206,
+            "D2": 0.18878580072609924,
+            "GK": 0.0,
+            "M1": 0.1263950517681861,
+            "M2": 0.33346779615436334,
+            "ST": 0.18838241226300928
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.03296703296703297,
+          0.022320828290977545
+        ],
+        "presser_trailing_rate": [
+          0.1910148674854557,
+          0.3469140782573618
+        ],
+        "width_mean": [
+          269.49979261179516,
+          227.2420174057958
+        ]
+      },
+      {
+        "ball_hold_rate": 0.17544671789649108,
+        "cluster_frame_rate": 0.026664197759466716,
+        "cluster_frames": 288,
+        "depth_mean": [
+          343.56091010091654,
+          245.85155541153597
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          669.131218871356,
+          701.1565611307988
+        ],
+        "gk_dist_goal_center_mean": [
+          123.5137306387407,
+          111.63686936642564
+        ],
+        "gk_dist_goal_line_mean": [
+          82.31379872234054,
+          85.37957596518841
+        ],
+        "gk_dives": [
+          46,
+          28
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.37,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          23,
+          9
+        ],
+        "gk_pickups": [
+          5,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.1571150819368577,
+          0.046662346079066754
+        ],
+        "inversion_rate": [
+          0.3697805758726044,
+          0.26256828071474864
+        ],
+        "inversion_rate_oop": [
+          0.3796211891015902,
+          0.27425259304453936
+        ],
+        "longest_hold_spell_s": 1.3666666666666667,
+        "loose_share": 0.824553282103509,
+        "match_id": 13237,
+        "mean_cluster_size": 1.1456346634570873,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.698453846866031,
+          0.6389223220072215
+        ],
+        "passes": [
+          3,
+          4
+        ],
+        "possession_share": [
+          0.08591797055828164,
+          0.08952874733820942
+        ],
+        "presser_share": [
+          {
+            "D1": 0.2503242542153048,
+            "D2": 0.23605706874189364,
+            "GK": 0.0,
+            "M1": 0.22243839169909208,
+            "M2": 0.18482490272373542,
+            "ST": 0.10635538261997406
+          },
+          {
+            "D1": 0.1197954711468225,
+            "D2": 0.4084733382030679,
+            "GK": 0.0,
+            "M1": 0.1618699780861943,
+            "M2": 0.15485756026296568,
+            "ST": 0.1550036523009496
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.04328793774319066,
+          0.019138056975894813
+        ],
+        "presser_trailing_rate": [
+          0.244325551232166,
+          0.4048210372534697
+        ],
+        "width_mean": [
+          283.8841922044255,
+          232.6885992037774
+        ]
+      },
+      {
+        "ball_hold_rate": 0.18350152763632996,
+        "cluster_frame_rate": 0.02138690861957226,
+        "cluster_frames": 231,
+        "depth_mean": [
+          393.05997592815476,
+          221.62805480973984
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          733.4559856902249,
+          595.1736365413751
+        ],
+        "gk_dist_goal_center_mean": [
+          116.7594455802685,
+          125.33780868802592
+        ],
+        "gk_dist_goal_line_mean": [
+          82.2953245069901,
+          103.51857605777244
+        ],
+        "gk_dives": [
+          35,
+          28
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.11666666666666667,
+          0.15
+        ],
+        "gk_near_miss_frames": [
+          7,
+          24
+        ],
+        "gk_pickups": [
+          2,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.13498750115730024,
+          0.053143227478937134
+        ],
+        "inversion_rate": [
+          0.36181835015276365,
+          0.3232108138135358
+        ],
+        "inversion_rate_oop": [
+          0.36915472071181415,
+          0.3397159389794845
+        ],
+        "longest_hold_spell_s": 0.9333333333333333,
+        "loose_share": 0.81649847236367,
+        "match_id": 13238,
+        "mean_cluster_size": 1.2570132395148597,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.5306916026293862,
+          0.8967688177020646
+        ],
+        "passes": [
+          3,
+          7
+        ],
+        "possession_share": [
+          0.06351263771872975,
+          0.11998888991760022
+        ],
+        "presser_share": [
+          {
+            "D1": 0.20011179429849077,
+            "D2": 0.19005030743432086,
+            "GK": 0.0,
+            "M1": 0.11514812744550028,
+            "M2": 0.3074343208496367,
+            "ST": 0.18725544997205143
+          },
+          {
+            "D1": 0.2211433046202036,
+            "D2": 0.18292873923257635,
+            "GK": 0.0,
+            "M1": 0.24494909945184026,
+            "M2": 0.1823022709475333,
+            "ST": 0.16867658574784652
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.048071548351034096,
+          0.03711824588880188
+        ],
+        "presser_trailing_rate": [
+          0.16294019005030744,
+          0.41456538762725137
+        ],
+        "width_mean": [
+          321.0439635218961,
+          276.1211841496158
+        ]
+      },
+      {
+        "ball_hold_rate": 0.1879455605962411,
+        "cluster_frame_rate": 0.02314600499953708,
+        "cluster_frames": 250,
+        "depth_mean": [
+          373.8560346264235,
+          223.7920433293214
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          747.909898559976,
+          606.3351387373883
+        ],
+        "gk_dist_goal_center_mean": [
+          102.6216437558177,
+          108.40380087280265
+        ],
+        "gk_dist_goal_line_mean": [
+          65.55343486714193,
+          86.67397370613833
+        ],
+        "gk_dives": [
+          38,
+          28
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          0.15,
+          0.08333333333333333
+        ],
+        "gk_near_miss_frames": [
+          25,
+          19
+        ],
+        "gk_pickups": [
+          1,
+          3
+        ],
+        "gk_wall_pinned_rate": [
+          0.14822701601703547,
+          0.04194056105916119
+        ],
+        "inversion_rate": [
+          0.39996296639200074,
+          0.1327654846773447
+        ],
+        "inversion_rate_oop": [
+          0.3978774321090417,
+          0.13201485794598936
+        ],
+        "longest_hold_spell_s": 1.3833333333333333,
+        "loose_share": 0.8120544394037589,
+        "match_id": 13239,
+        "mean_cluster_size": 1.132302564577354,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.6264234793074716,
+          0.6580872141468382
+        ],
+        "passes": [
+          4,
+          3
+        ],
+        "possession_share": [
+          0.1101749837977965,
+          0.07777057679844458
+        ],
+        "presser_share": [
+          {
+            "D1": 0.1696774193548387,
+            "D2": 0.23935483870967741,
+            "GK": 0.0,
+            "M1": 0.21096774193548387,
+            "M2": 0.15483870967741936,
+            "ST": 0.22516129032258064
+          },
+          {
+            "D1": 0.13316405698970235,
+            "D2": 0.16645507123712794,
+            "GK": 0.0,
+            "M1": 0.181125687685146,
+            "M2": 0.31654676258992803,
+            "ST": 0.20270842149809565
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.014032258064516129,
+          0.029482296515728593
+        ],
+        "presser_trailing_rate": [
+          0.2103225806451613,
+          0.343207786711807
+        ],
+        "width_mean": [
+          279.80915285621705,
+          237.41549486158686
+        ]
+      },
+      {
+        "ball_hold_rate": 0.16776224423664476,
+        "cluster_frame_rate": 0.017220627719655587,
+        "cluster_frames": 186,
+        "depth_mean": [
+          421.59974169058415,
+          211.7961105453199
+        ],
+        "generation": 1653,
+        "gk_dist_ball_mean": [
+          676.7341949838875,
+          696.705024011548
+        ],
+        "gk_dist_goal_center_mean": [
+          116.81451149552439,
+          124.59796787812927
+        ],
+        "gk_dist_goal_line_mean": [
+          63.879369502823806,
+          92.86939264882882
+        ],
+        "gk_dives": [
+          42,
+          33
+        ],
+        "gk_facing_blocked_frames": [
+          0,
+          0
+        ],
+        "gk_hold_mean_s": [
+          1.8,
+          0.09166666666666666
+        ],
+        "gk_near_miss_frames": [
+          9,
+          71
+        ],
+        "gk_pickups": [
+          2,
+          2
+        ],
+        "gk_wall_pinned_rate": [
+          0.2566429034348671,
+          0.04786593833904268
+        ],
+        "inversion_rate": [
+          0.24516248495509674,
+          0.3376539209332469
+        ],
+        "inversion_rate_oop": [
+          0.2618662896384569,
+          0.3469862459546926
+        ],
+        "longest_hold_spell_s": 1.85,
+        "loose_share": 0.8322377557633552,
+        "match_id": 13240,
+        "mean_cluster_size": 0.983149708360337,
+        "n_frames": 10801,
+        "near_ball_mean": [
+          0.547449310249051,
+          0.5918896398481622
+        ],
+        "passes": [
+          2,
+          4
+        ],
+        "possession_share": [
+          0.08323303397833534,
+          0.08452921025830941
+        ],
+        "presser_share": [
+          {
+            "D1": 0.2503052503052503,
+            "D2": 0.18253968253968253,
+            "GK": 0.0,
+            "M1": 0.14590964590964592,
+            "M2": 0.32722832722832723,
+            "ST": 0.09401709401709402
+          },
+          {
+            "D1": 0.15743681811904434,
+            "D2": 0.26681397597016987,
+            "GK": 0.0,
+            "M1": 0.1392072918105234,
+            "M2": 0.2574230078718409,
+            "ST": 0.1791189062284215
+          }
+        ],
+        "presser_trailing_avoidable_rate": [
+          0.023656898656898656,
+          0.024306035078027897
+        ],
+        "presser_trailing_rate": [
+          0.25931013431013433,
+          0.4278414583621047
+        ],
+        "width_mean": [
+          316.3163160818443,
+          236.00763262660865
+        ]
+      }
+    ],
+    "n_matches": 32,
+    "summary": {
+      "ball_hold_rate": 0.19012707156744746,
+      "cluster_frame_rate": 0.02139558837144709,
+      "cluster_frames": 231.09375,
+      "depth_mean": [
+        374.0960196393852,
+        226.9026533133506
+      ],
+      "gk_dist_ball_mean": [
+        675.5832081716699,
+        676.1849185800385
+      ],
+      "gk_dist_goal_center_mean": [
+        114.36676068972582,
+        113.87790535823558
+      ],
+      "gk_dist_goal_line_mean": [
+        75.00800562447921,
+        88.95463909591705
+      ],
+      "gk_dives": [
+        40.40625,
+        33.09375
+      ],
+      "gk_facing_blocked_frames": [
+        0.3125,
+        0.09375
+      ],
+      "gk_hold_mean_s": [
+        0.6809866898148149,
+        0.1403472222222222
+      ],
+      "gk_near_miss_frames": [
+        21.40625,
+        17.375
+      ],
+      "gk_pickups": [
+        2.875,
+        2.875
+      ],
+      "gk_wall_pinned_rate": [
+        0.17056001759096379,
+        0.052749745393945
+      ],
+      "inversion_rate": [
+        0.24369271363762612,
+        0.2816695213406166
+      ],
+      "inversion_rate_oop": [
+        0.25209880508122845,
+        0.2905451458458096
+      ],
+      "longest_hold_spell_s": 1.7369791666666667,
+      "loose_share": 0.8098729284325525,
+      "mean_cluster_size": 1.1603121238774188,
+      "n_frames": 10801.0,
+      "n_matches": 32,
+      "near_ball_mean": [
+        0.6219418340894362,
+        0.7141815572632164
+      ],
+      "passes": [
+        2.9375,
+        3.65625
+      ],
+      "possession_share": [
+        0.09630184705119896,
+        0.0938252245162485
+      ],
+      "presser_share": [
+        {
+          "D1": 0.19898306558340012,
+          "D2": 0.20043389306894727,
+          "GK": 0.0,
+          "M1": 0.2111740067261569,
+          "M2": 0.1896836908917641,
+          "ST": 0.1997253437297316
+        },
+        {
+          "D1": 0.17761471369468596,
+          "D2": 0.2430531783152184,
+          "GK": 0.0,
+          "M1": 0.16315603144906737,
+          "M2": 0.22183627424717717,
+          "ST": 0.19433980229385114
+        }
+      ],
+      "presser_trailing_avoidable_rate": [
+        0.03859751829256691,
+        0.029197300118651806
+      ],
+      "presser_trailing_rate": [
+        0.22202214774462764,
+        0.36911586763205634
+      ],
+      "width_mean": [
+        281.97412285320803,
+        237.15859836473476
+      ]
+    }
+  }
+}

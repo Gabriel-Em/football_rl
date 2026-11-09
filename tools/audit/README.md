@@ -1,5 +1,7 @@
 # Audit tools (read-only; run from repo root with `.venv/bin/python`)
-- `tools/audit/run_all.py [--last 8] [--save-baseline] [--skip-perf]` → `context/metrics/latest.{md,json}` + guard deltas vs `baseline.json`.
+- `tools/audit/run_all.py [--last 8] [--save-baseline [PATH]] [--skip-perf]` → `context/metrics/latest.{md,json}` + guard deltas vs `baseline.json`.
+- `tools/audit/eval_matches.py --checkpoint-dir DIR [--code-root PATH] [--matches 32] [--seed 1234] [--out JSON] [--keep-replays DIR]` → N fresh, unselected matches from a checkpoint (never writes checkpoints/replays) with per-match metrics and guard mean/se/n.
+- `run_all.py --eval-checkpoint DIR [--eval-code-root PATH] [--eval-matches 32] [--save-baseline-unbiased]` → replay guards from fresh matches, compared with `baseline_unbiased.json`. Prefer this over `./replays` whenever training used `--save-best-only`.
 - `tools/audit/training_progress.py --bucket 100 --last-gens 15` → per-bucket interest/goals/passes/shots/tackles/saves/loose%/stationary.
 - `tools/audit/replay_metrics.py --last 8` (or `--match ID`, `--gen G`, paths) → possession, width/depth, clustering, inversion, GK stats.
 - `tools/audit/frame_inspect.py --match 13204 --frames 760 5531 [--viewer]` → full per-player state; `--viewer` = viewer frame counter.

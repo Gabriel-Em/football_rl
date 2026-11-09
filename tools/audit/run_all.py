@@ -6,22 +6,33 @@ Guard metrics (compared before/after every change):
   rate, longest hold spell, loose_share, interest_last_bucket, ms_per_step when available).
 
 Usage:
-  python tools/audit/run_all.py [--last 8] [--save-baseline] [--skip-perf] [--perf-steps 300]
+  python tools/audit/run_all.py [--last 8] [--save-baseline [PATH]] [--skip-perf] [--perf-steps 300]
          [--out-dir context/metrics] [--replays-dir replays] [--history PATH] [--source-dir football_rl]
+         [--eval-checkpoint DIR [--eval-code-root PATH] [--eval-matches 32] [--eval-seed 1234]
+          [--save-baseline-unbiased]]
+
+Replay guards normally come from the newest `--last` training replays, which are selection-biased when
+training used `--save-best-only`. With `--eval-checkpoint` they come from fresh, unselected matches played
+by `eval_matches.py` (optionally under another source tree via `--eval-code-root`) and are compared with
+`baseline_unbiased.json` instead of `baseline.json`. In that mode the perf profile is skipped when
+`--eval-code-root` is given (it would time the current code, not the evaluated one) and the training
+history is read from the evaluated checkpoint directory unless `--history` is passed.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.audit import orphan_scan, perf_profile, replay_metrics, training_progress  # noqa: E402
+from tools.audit import eval_matches, orphan_scan, perf_profile, replay_metrics, training_progress  # noqa: E402
 from tools.audit._common import REPO_ROOT, fmt, load_json, safe_mean, write_json  # noqa: E402
 
 __all__ = ["guard_metrics", "compute_deltas", "run", "main"]
@@ -29,20 +40,8 @@ __all__ = ["guard_metrics", "compute_deltas", "run", "main"]
 GUARD_ORDER = (
     "ball_hold_rate", "gk_dist_goal_line", "gk_pickups_per_match", "role_inversion_rate", "mean_cluster_size",
     "gk_wall_pinned_rate", "gk_near_miss_frames_per_match", "gk_facing_blocked_frames_per_match", "gk_dives_per_match",
-    "presser_trailing_rate", "longest_hold_spell_s", "loose_share", "interest_last_bucket", "ms_per_step",
+    "presser_trailing_rate", "presser_trailing_avoidable_rate", "longest_hold_spell_s", "loose_share", "interest_last_bucket", "ms_per_step",
 )
-
-
-def _pair_mean(v: Any) -> Optional[float]:
-    if not isinstance(v, list):
-        return None
-    return safe_mean([x for x in v if x is not None]) if any(x is not None for x in v) else None
-
-
-def _pair_sum(v: Any) -> Optional[float]:
-    if not isinstance(v, list) or not any(x is not None for x in v):
-        return None
-    return float(sum(x for x in v if x is not None))
 
 
 def guard_metrics(report: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -51,18 +50,7 @@ def guard_metrics(report: Dict[str, Any]) -> Dict[str, Optional[float]]:
     buckets = hist.get("buckets") or []
     perf = report.get("perf") or {}
     return {
-        "ball_hold_rate": s.get("ball_hold_rate"),
-        "gk_dist_goal_line": _pair_mean(s.get("gk_dist_goal_line_mean")),
-        "gk_pickups_per_match": _pair_sum(s.get("gk_pickups")),
-        "role_inversion_rate": _pair_mean(s.get("inversion_rate")),
-        "mean_cluster_size": s.get("mean_cluster_size"),
-        "gk_wall_pinned_rate": _pair_mean(s.get("gk_wall_pinned_rate")),
-        "gk_near_miss_frames_per_match": _pair_sum(s.get("gk_near_miss_frames")),
-        "gk_facing_blocked_frames_per_match": _pair_sum(s.get("gk_facing_blocked_frames")),
-        "gk_dives_per_match": _pair_sum(s.get("gk_dives")),
-        "presser_trailing_rate": _pair_mean(s.get("presser_trailing_rate")),
-        "longest_hold_spell_s": s.get("longest_hold_spell_s"),
-        "loose_share": s.get("loose_share"),
+        **replay_metrics.replay_guards(s),
         "interest_last_bucket": buckets[-1]["interest_mean"] if buckets else None,
         "ms_per_step": perf.get("total_ms_per_step"),
     }
@@ -77,6 +65,22 @@ def compute_deltas(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, D
     return out
 
 
+def _run_eval_subprocess(checkpoint_dir: str, matches: int, code_root: Optional[str], seed: int) -> Dict[str, Any]:
+    """Run `eval_matches.py` in a fresh interpreter (so `--code-root` can take effect) and return its JSON."""
+    with tempfile.TemporaryDirectory(prefix="run_all_eval_") as td:
+        out = Path(td) / "eval.json"
+        cmd = [sys.executable, str(Path(eval_matches.__file__).resolve()),
+               "--checkpoint-dir", str(Path(checkpoint_dir).resolve()),
+               "--matches", str(matches), "--seed", str(seed), "--out", str(out)]
+        if code_root:
+            cmd += ["--code-root", str(Path(code_root).resolve())]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-15:])
+            raise RuntimeError(f"eval_matches exited with {proc.returncode}:\n{tail}")
+        return load_json(out)
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     errors: List[str] = []
     report: Dict[str, Any] = {
@@ -86,7 +90,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "orphans": None, "perf": None, "guards": {}, "deltas": None, "errors": errors,
     }
 
-    hist_path = Path(args.history)
+    eval_mode = bool(args.eval_checkpoint)
+    if args.history:
+        hist_path = Path(args.history)
+    elif eval_mode:
+        hist_path = Path(args.eval_checkpoint) / "training_history.json"
+    else:
+        hist_path = REPO_ROOT / "checkpoints" / "training_history.json"
     if hist_path.is_file():
         hist = load_json(hist_path)
         report["history"] = {
@@ -96,14 +106,23 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         errors.append(f"history not found: {hist_path}")
 
-    paths = replay_metrics.select_replays(args.replays_dir, last=args.last)
-    if not paths:
-        errors.append(f"no replays found in {args.replays_dir}")
-    per_match = []
-    for p in paths:
-        m = replay_metrics.compute_match_metrics(load_json(p))
-        m["path"] = str(p)
-        per_match.append(m)
+    per_match: List[Dict[str, Any]] = []
+    if eval_mode:
+        try:
+            ev = _run_eval_subprocess(args.eval_checkpoint, args.eval_matches, args.eval_code_root, args.eval_seed)
+            per_match = list(ev["per_match"])
+            report["eval"] = ev.get("meta")
+            report["eval_guards"] = ev.get("guards")
+        except Exception as exc:  # noqa: BLE001 - reported in the report, never fatal
+            errors.append(f"eval failed: {exc}")
+    else:
+        paths = replay_metrics.select_replays(args.replays_dir, last=args.last)
+        if not paths:
+            errors.append(f"no replays found in {args.replays_dir}")
+        for p in paths:
+            m = replay_metrics.compute_match_metrics(load_json(p))
+            m["path"] = str(p)
+            per_match.append(m)
     report["replays"] = {"n_matches": len(per_match), "summary": replay_metrics.summarize(per_match),
                          "matches": per_match}
 
@@ -112,19 +131,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     except FileNotFoundError as exc:
         errors.append(str(exc))
 
-    if not args.skip_perf:
+    if not args.skip_perf and not (eval_mode and args.eval_code_root):
         report["perf"] = perf_profile.profile_env(steps=args.perf_steps, seed=args.seed, record=True)
 
     report["guards"] = guard_metrics(report)
     out_dir = Path(args.out_dir)
-    base_path = out_dir / "baseline.json"
+    base_path = out_dir / ("baseline_unbiased.json" if eval_mode else "baseline.json")
     if base_path.is_file():
         base = load_json(base_path)
         report["deltas"] = compute_deltas(base.get("guards") or {}, report["guards"])
         report["baseline_generated_at"] = base.get("generated_at")
     write_json(out_dir / "latest.json", report)
-    if args.save_baseline:
-        write_json(base_path, report)
+    save_targets: List[Path] = []
+    if isinstance(args.save_baseline, str):
+        save_targets.append(Path(args.save_baseline))
+    elif args.save_baseline:
+        save_targets.append(base_path)
+    if args.save_baseline_unbiased:
+        save_targets.append(out_dir / "baseline_unbiased.json")
+    for target in save_targets:
+        write_json(target, report)
     (out_dir / "latest.md").write_text(render_markdown(report), encoding="utf-8")
     return report
 
@@ -138,6 +164,10 @@ def render_markdown(r: Dict[str, Any]) -> str:
         L.append(f"| {k} | {fmt(d.get('before'))} | {fmt(r['guards'].get(k))} | {fmt(d.get('delta'))} |")
     if r.get("baseline_generated_at"):
         L.append(f"\nBaseline from {r['baseline_generated_at']}.")
+    ev = r.get("eval")
+    if ev:
+        L.append(f"\nReplay guards from {ev.get('matches')} fresh unselected matches (seed {ev.get('seed')}, "
+                 f"checkpoint gen {ev.get('checkpoint_generation')}, code {ev.get('football_rl')}).")
     hist = r.get("history")
     if hist and hist["buckets"]:
         L += ["", "## Training progress (last buckets)", "",
@@ -179,7 +209,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "context" / "metrics"))
     ap.add_argument("--replays-dir", default=str(REPO_ROOT / "replays"))
-    ap.add_argument("--history", default=str(REPO_ROOT / "checkpoints" / "training_history.json"))
+    ap.add_argument("--history", default=None,
+                    help="training_history.json (default: checkpoints/, or the --eval-checkpoint directory)")
     ap.add_argument("--source-dir", default=str(REPO_ROOT / "football_rl"))
     ap.add_argument("--last", type=int, default=8, help="newest N replays to analyse")
     ap.add_argument("--bucket", type=int, default=100)
@@ -187,8 +218,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--skip-perf", action="store_true")
     ap.add_argument("--perf-steps", type=int, default=300)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--save-baseline", action="store_true", help="also store this run as baseline.json")
+    ap.add_argument("--save-baseline", nargs="?", const=True, default=None, metavar="PATH",
+                    help="also store this run as a baseline: PATH if given, else baseline.json "
+                         "(baseline_unbiased.json with --eval-checkpoint)")
+    ap.add_argument("--save-baseline-unbiased", action="store_true",
+                    help="with --eval-checkpoint: also store this run as baseline_unbiased.json")
+    ap.add_argument("--eval-checkpoint", default=None, metavar="DIR",
+                    help="take replay guards from fresh unselected matches played from this checkpoint directory")
+    ap.add_argument("--eval-code-root", default=None, metavar="PATH",
+                    help="evaluate under the football_rl package found in PATH instead of this repository")
+    ap.add_argument("--eval-matches", type=int, default=eval_matches.DEFAULT_MATCHES,
+                    help="fresh matches to play with --eval-checkpoint (multiple of 8)")
+    ap.add_argument("--eval-seed", type=int, default=eval_matches.DEFAULT_SEED)
     args = ap.parse_args(argv)
+    if (args.eval_code_root or args.save_baseline_unbiased) and not args.eval_checkpoint:
+        ap.error("--eval-code-root and --save-baseline-unbiased require --eval-checkpoint")
     report = run(args)
     md = (Path(args.out_dir) / "latest.md").read_text(encoding="utf-8").splitlines()
     print("\n".join(md[:16]))

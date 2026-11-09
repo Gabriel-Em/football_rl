@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,6 +23,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.audit._common import (  # noqa: E402
+    FLAG_GHOST,
+    FLAG_STUN,
     PLAYERS_PER_TEAM,
     REPO_ROOT,
     SLOT_NAMES,
@@ -35,9 +37,17 @@ from tools.audit._common import (  # noqa: E402
     write_json,
 )
 
-__all__ = ["compute_match_metrics", "summarize", "select_replays", "main"]
+__all__ = ["compute_match_metrics", "summarize", "replay_guards", "REPLAY_GUARD_KEYS", "select_replays", "main"]
 
 PASS_EVENT_TYPES = ("PASS!", "THROUGH BALL!", "WALL PASS!")
+
+# Guard metrics derived purely from replays (the remaining run_all guards come from history / perf).
+REPLAY_GUARD_KEYS = (
+    "ball_hold_rate", "gk_dist_goal_line", "gk_pickups_per_match", "role_inversion_rate", "mean_cluster_size",
+    "gk_wall_pinned_rate", "gk_near_miss_frames_per_match", "gk_facing_blocked_frames_per_match",
+    "gk_dives_per_match", "presser_trailing_rate", "presser_trailing_avoidable_rate", "longest_hold_spell_s",
+    "loose_share",
+)
 
 
 def _empty_metrics(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,6 +76,7 @@ def _empty_metrics(meta: Dict[str, Any]) -> Dict[str, Any]:
         "gk_near_miss_frames": [0, 0],
         "presser_share": [{}, {}],
         "presser_trailing_rate": [None, None],
+        "presser_trailing_avoidable_rate": [None, None],
         "gk_facing_blocked_frames": [0, 0],
         "gk_dives": [0, 0],
         "longest_hold_spell_s": None,
@@ -101,12 +112,18 @@ def _presser_share(frames: List[Dict[str, Any]], team: int) -> Dict[str, float]:
     return {SLOT_NAMES[k]: float(counts[k]) / total for k in range(PLAYERS_PER_TEAM)}
 
 
-def _presser_trailing(frames: List[Dict[str, Any]], cx_team: np.ndarray, ball_cx: np.ndarray, team: int,
-                      margin: float) -> Optional[float]:
-    """Fraction of frames with a `1stP` presser whose canonical x exceeds the ball's by more than `margin`."""
+def _presser_trailing(frames: List[Dict[str, Any]], cx_team: np.ndarray, ball_cx: np.ndarray,
+                      flags: np.ndarray, team: int, margin: float) -> Tuple[Optional[float], Optional[float]]:
+    """Presser-trailing rates over frames with a `1stP` presser (None when there are none).
+
+    Trailing: the presser's canonical x exceeds the ball's by more than `margin`.
+    Avoidable trailing: additionally, another outfielder of the team who is neither stunned nor ghosted
+    stands at canonical x <= ball x + `margin`, i.e. a goal-side player could have been the presser.
+    """
     base = team * PLAYERS_PER_TEAM
     n_press = 0
     n_trail = 0
+    n_avoid = 0
     for f_i, fr in enumerate(frames):
         rs = fr.get("role_state")
         if not rs:
@@ -116,8 +133,15 @@ def _presser_trailing(frames: List[Dict[str, Any]], cx_team: np.ndarray, ball_cx
                 n_press += 1
                 if cx_team[f_i, base + k] - ball_cx[f_i] > margin:
                     n_trail += 1
+                    # The trailing presser itself is upfield of ball + margin, so it never qualifies as cover.
+                    mates_cx = cx_team[f_i, base + 1:base + PLAYERS_PER_TEAM]
+                    active = (flags[f_i, base + 1:base + PLAYERS_PER_TEAM] & (FLAG_STUN | FLAG_GHOST)) == 0
+                    if bool((active & (mates_cx <= ball_cx[f_i] + margin)).any()):
+                        n_avoid += 1
                 break
-    return (n_trail / n_press) if n_press else None
+    if not n_press:
+        return None, None
+    return n_trail / n_press, n_avoid / n_press
 
 
 def _longest_spell_frames(holder: np.ndarray, max_gap: int) -> int:
@@ -218,7 +242,9 @@ def compute_match_metrics(
 
         out["presser_share"][t] = _presser_share(ra.frames, t)
         ball_cx = (ra.ball[:, 0] - gx) * np.where(ra.team_side[:, t] == 0, 1.0, -1.0)
-        out["presser_trailing_rate"][t] = _presser_trailing(ra.frames, cx, ball_cx, t, trail_margin)
+        (out["presser_trailing_rate"][t],
+         out["presser_trailing_avoidable_rate"][t]) = _presser_trailing(ra.frames, cx, ball_cx, ra.flags, t,
+                                                                         trail_margin)
 
         dxg = ra.ball[:, 0] - gk_x
         dyg = ra.ball[:, 1] - gk_y
@@ -253,6 +279,38 @@ def summarize(per_match: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def _pair_mean(v: Any) -> Optional[float]:
+    if not isinstance(v, list):
+        return None
+    return safe_mean([x for x in v if x is not None]) if any(x is not None for x in v) else None
+
+
+def _pair_sum(v: Any) -> Optional[float]:
+    if not isinstance(v, list) or not any(x is not None for x in v):
+        return None
+    return float(sum(x for x in v if x is not None))
+
+
+def replay_guards(summary: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Scalar replay guard metrics from a `summarize` result (per-team pairs collapsed to one number)."""
+    s = summary or {}
+    return {
+        "ball_hold_rate": s.get("ball_hold_rate"),
+        "gk_dist_goal_line": _pair_mean(s.get("gk_dist_goal_line_mean")),
+        "gk_pickups_per_match": _pair_sum(s.get("gk_pickups")),
+        "role_inversion_rate": _pair_mean(s.get("inversion_rate")),
+        "mean_cluster_size": s.get("mean_cluster_size"),
+        "gk_wall_pinned_rate": _pair_mean(s.get("gk_wall_pinned_rate")),
+        "gk_near_miss_frames_per_match": _pair_sum(s.get("gk_near_miss_frames")),
+        "gk_facing_blocked_frames_per_match": _pair_sum(s.get("gk_facing_blocked_frames")),
+        "gk_dives_per_match": _pair_sum(s.get("gk_dives")),
+        "presser_trailing_rate": _pair_mean(s.get("presser_trailing_rate")),
+        "presser_trailing_avoidable_rate": _pair_mean(s.get("presser_trailing_avoidable_rate")),
+        "longest_hold_spell_s": s.get("longest_hold_spell_s"),
+        "loose_share": s.get("loose_share"),
+    }
+
+
 def _summary_lines(per_match: Sequence[Dict[str, Any]], summary: Dict[str, Any], max_rows: int = 8) -> List[str]:
     lines = [f"replay_metrics: {summary['n_matches']} match(es)  (teams: {TEAM_LABELS[0]}, {TEAM_LABELS[1]})"]
     for m in list(per_match)[-max_rows:]:
@@ -266,7 +324,7 @@ def _summary_lines(per_match: Sequence[Dict[str, Any]], summary: Dict[str, Any],
                 "near_ball_mean", "cluster_frame_rate", "mean_cluster_size", "inversion_rate", "inversion_rate_oop",
                 "gk_dist_ball_mean", "gk_dist_goal_line_mean", "gk_wall_pinned_rate", "gk_pickups", "gk_hold_mean_s",
                 "gk_near_miss_frames", "gk_facing_blocked_frames", "gk_dives", "presser_trailing_rate",
-                "longest_hold_spell_s"]
+                "presser_trailing_avoidable_rate", "longest_hold_spell_s"]
         lines.append("  mean over matches:")
         for k in keys:
             lines.append(f"    {k:24s} {fmt(summary.get(k))}")

@@ -383,3 +383,273 @@ def test_status_and_summary_label_team_a_as_red(tmp_path: Path, monkeypatch, cap
     assert "Head-to-Head Series (Red - Draws - Blue):** `1 W - 0 D - 0 W`" in text
     assert "Goals: **Red `3` - `1` Blue**" in text
     assert "Blue - Red" not in text
+
+
+# ==============================================================================
+# CLI defaults, generation provenance and resume mismatch warning
+# ==============================================================================
+def test_cli_defaults_run_eight_envs_for_full_matches() -> None:
+    import football_rl.train_ppo as tp
+
+    args = tp.build_arg_parser().parse_args([])
+    assert args.num_envs == 8
+    assert args.rollout_steps == 2700
+    assert args.total_updates == 100
+    assert args.seed == 42
+    assert args.save_best_only is False
+    assert args.resume is False
+
+
+def test_cli_num_envs_override_and_help_documents_default() -> None:
+    import football_rl.train_ppo as tp
+
+    parser = tp.build_arg_parser()
+    assert parser.parse_args(["--num-envs", "1"]).num_envs == 1
+    help_text = parser.format_help()
+    assert "--num-envs" in help_text
+    assert "default: 8" in help_text.replace("\n", " ").replace("  ", " ")
+
+
+def test_generation_record_carries_num_envs_and_rollout_steps(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt"
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=2, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(ckpt), seed=3,
+    )
+    trainer.train(total_updates=1)
+    rec = trainer.generation_history[-1]
+    assert rec["num_envs"] == 2
+    assert rec["rollout_steps"] == 10
+
+    history = json.loads((ckpt / "training_history.json").read_text(encoding="utf-8"))
+    assert history["generations"][-1]["num_envs"] == 2
+    assert history["generations"][-1]["rollout_steps"] == 10
+    state = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["generation_history"][-1]["num_envs"] == 2
+    assert state["generation_history"][-1]["rollout_steps"] == 10
+
+
+def _write_history(ckpt: Path, generations) -> None:
+    ckpt.mkdir(parents=True, exist_ok=True)
+    (ckpt / "training_history.json").write_text(json.dumps({"generations": generations}), encoding="utf-8")
+
+
+def test_resume_warning_fires_when_last_generation_num_envs_differs(tmp_path: Path) -> None:
+    import football_rl.train_ppo as tp
+
+    ckpt = tmp_path / "ckpt"
+    _write_history(ckpt, [{"generation": 1, "num_envs": 8}, {"generation": 2, "num_envs": 8}])
+    msg = tp.resume_num_envs_warning(str(ckpt), 1)
+    assert msg is not None
+    assert msg.startswith("WARNING")
+    assert "num_envs=8" in msg and "num_envs=1" in msg
+
+
+def test_resume_warning_silent_on_match_missing_key_or_missing_history(tmp_path: Path) -> None:
+    import football_rl.train_ppo as tp
+
+    ckpt = tmp_path / "ckpt"
+    _write_history(ckpt, [{"generation": 1, "num_envs": 4}, {"generation": 2, "num_envs": 8}])
+    assert tp.resume_num_envs_warning(str(ckpt), 8) is None  # only the LAST record counts
+
+    _write_history(ckpt, [{"generation": 1, "num_envs": 8}, {"generation": 2}])
+    assert tp.resume_num_envs_warning(str(ckpt), 1) is None  # legacy last record without the key
+
+    _write_history(ckpt, [])
+    assert tp.resume_num_envs_warning(str(ckpt), 1) is None
+    assert tp.resume_num_envs_warning(str(tmp_path / "absent"), 1) is None
+
+    (ckpt / "training_history.json").write_text("{not json", encoding="utf-8")
+    assert tp.resume_num_envs_warning(str(ckpt), 1) is None
+
+
+# ==============================================================================
+# Co-evolution soft-sync over a rolling window of completed matches
+# ==============================================================================
+def _matches_with_totals(goals_a: int, goals_b: int, n: int = 8, gen: int = 1) -> list:
+    """`n` completed-match records whose goals sum to the given team totals (spread round-robin)."""
+    recs = []
+    for i in range(n):
+        a = goals_a // n + (1 if i < goals_a % n else 0)
+        b = goals_b // n + (1 if i < goals_b % n else 0)
+        recs.append({"generation": gen, "score": [a, b]})
+    return recs
+
+
+def _coevo_trainer(tmp_path: Path, num_envs: int = 1) -> ParameterSharingPPOTrainer:
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=num_envs, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"), seed=3,
+    )
+    with torch.no_grad():
+        # Team A (stored as blue_*) = 1.0, team B (stored as red_*) = 0.0 everywhere.
+        for p in list(trainer.blue_field_policy.parameters()) + list(trainer.blue_keeper_policy.parameters()):
+            p.fill_(1.0)
+        for p in list(trainer.red_field_policy.parameters()) + list(trainer.red_keeper_policy.parameters()):
+            p.fill_(0.0)
+    return trainer
+
+
+def _team_b_weight(trainer: ParameterSharingPPOTrainer) -> float:
+    return float(next(trainer.red_field_policy.parameters()).flatten()[0])
+
+
+def _team_a_weight(trainer: ParameterSharingPPOTrainer) -> float:
+    return float(next(trainer.blue_field_policy.parameters()).flatten()[0])
+
+
+def test_coevo_window_constant_is_twenty_four_matches() -> None:
+    import football_rl.train_ppo as tp
+
+    assert tp.COEVO_WINDOW_MATCHES == 24
+
+
+def test_coevo_eight_envs_reproduces_three_generation_decisions(tmp_path: Path) -> None:
+    """8 matches per generation: window of 24 matches == old 3-generation window.
+
+    Hand-computed per-generation (A, B) goal totals and rolling-window sums:
+      gen3: A=4+3+2=9,  B=1+1+1=3   -> 9 >= 3*3 and total 12  -> sync Team B (clear)
+      gen6: A=1+0+1=2,  B=5+3+2=10  -> 10 >= 3*2 and total 12 -> sync Team A (clear)
+      gen7-9: A=B=6 (no side dominates), gen10: window gens 8-10 A=12, B=4 -> 12 >= 12 -> sync Team B
+      gen11-12: only 8 / 16 matches in the freshly cleared window -> never evaluated
+      gen13: gens 11-13 A=12, B=1 -> sync Team B
+    """
+    trainer = _coevo_trainer(tmp_path, num_envs=8)
+    per_gen = {
+        1: (4, 1), 2: (3, 1), 3: (2, 1),
+        4: (1, 5), 5: (0, 3), 6: (1, 2),
+        7: (2, 2), 8: (2, 2), 9: (2, 2),
+        10: (8, 0),
+        11: (5, 1), 12: (4, 0), 13: (3, 0),
+    }
+    synced = []
+    for gen, (a, b) in per_gen.items():
+        if trainer._coevolution_step(_matches_with_totals(a, b, gen=gen)):
+            synced.append(gen)
+    assert synced == [3, 6, 10, 13]
+    assert len(trainer.recent_match_scores) == 0
+
+
+def test_coevo_single_env_three_generations_of_three_nil_does_not_sync(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path, num_envs=1)
+    for gen in (1, 2, 3):
+        assert not trainer._coevolution_step([{"generation": gen, "score": [3, 0]}])
+    assert list(trainer.recent_match_scores) == [(3, 0)] * 3
+    assert _team_b_weight(trainer) == 0.0 and _team_a_weight(trainer) == 1.0
+
+
+def test_coevo_boundary_exactly_three_to_one_syncs_team_b_towards_a(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    recs = _matches_with_totals(6, 2, n=24)  # 24 matches: A=6, B=2 -> total 8, 6 >= 3*2
+    assert trainer._coevolution_step(recs) is True
+    assert _team_b_weight(trainer) == pytest.approx(0.35)  # 0.65*0 + 0.35*1
+    assert _team_a_weight(trainer) == 1.0  # the dominant team is untouched
+    assert len(trainer.recent_match_scores) == 0
+
+
+def test_coevo_boundary_five_to_two_does_not_sync(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    assert trainer._coevolution_step(_matches_with_totals(5, 2, n=24)) is False  # 5 < 3*2
+    assert _team_b_weight(trainer) == 0.0
+    assert len(trainer.recent_match_scores) == 24
+
+
+def test_coevo_total_goals_below_eight_does_not_sync(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    assert trainer._coevolution_step(_matches_with_totals(6, 1, n=24)) is False  # total 7
+    assert _team_b_weight(trainer) == 0.0
+    assert len(trainer.recent_match_scores) == 24
+
+
+def test_coevo_team_b_dominance_syncs_team_a_towards_b(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    assert trainer._coevolution_step(_matches_with_totals(1, 7, n=24)) is True  # 7 >= 3*max(1,1)
+    assert _team_a_weight(trainer) == pytest.approx(0.65)  # 0.65*1 + 0.35*0
+    assert _team_b_weight(trainer) == 0.0
+
+
+def test_coevo_zero_goal_opponent_uses_floor_of_one(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    assert trainer._coevolution_step(_matches_with_totals(8, 0, n=24)) is True  # 8 >= 3*max(1,0)=3
+    assert _team_b_weight(trainer) == pytest.approx(0.35)
+
+
+def test_coevo_window_is_a_sliding_deque_of_last_24_matches(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    # 23 scoreless matches then one 1-0: window not full -> no evaluation even though ordering is irrelevant.
+    trainer._coevolution_step([{"generation": 1, "score": [0, 0]}] * 23)
+    assert len(trainer.recent_match_scores) == 23
+    trainer._coevolution_step([{"generation": 2, "score": [1, 0]}])
+    assert len(trainer.recent_match_scores) == 24
+    # Oldest entry (0, 0) is evicted, newest is retained, in completion order.
+    trainer._coevolution_step([{"generation": 3, "score": [2, 0]}])
+    scores = list(trainer.recent_match_scores)
+    assert len(scores) == 24
+    assert scores[-2:] == [(1, 0), (2, 0)]
+    assert scores[0] == (0, 0)
+
+
+def test_coevo_empty_generation_is_a_noop(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    assert trainer._coevolution_step([]) is False
+    assert len(trainer.recent_match_scores) == 0
+
+
+def test_coevo_is_disabled_for_shared_teams(tmp_path: Path) -> None:
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"), seed=3, separate_teams=False,
+    )
+    assert trainer._coevolution_step(_matches_with_totals(24, 0, n=24)) is False
+    assert len(trainer.recent_match_scores) == 0
+
+
+def test_coevo_window_persists_as_pairs_and_round_trips(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    trainer._coevolution_step([{"generation": 1, "score": [2, 1]}, {"generation": 1, "score": [0, 3]}])
+    trainer.save_checkpoints()
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["recent_match_scores"] == [[2, 1], [0, 3]] or state["recent_match_scores"] == [(2, 1), (0, 3)]
+    assert "recent_team_goals" not in state
+
+    reader = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"), seed=3,
+    )
+    assert reader.load_checkpoints()
+    assert list(reader.recent_match_scores) == [(2, 1), (0, 3)]
+    assert reader.recent_match_scores.maxlen == 24
+
+
+def test_coevo_legacy_state_with_only_recent_team_goals_starts_empty(tmp_path: Path) -> None:
+    trainer = _coevo_trainer(tmp_path)
+    trainer.save_checkpoints()
+    state_path = tmp_path / "ckpt" / "training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state.pop("recent_match_scores", None)
+    state["recent_team_goals"] = [(9, 0), (9, 0), (9, 0)]
+    torch.save(state, state_path)
+
+    reader = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"), seed=3,
+    )
+    assert reader.load_checkpoints()
+    assert len(reader.recent_match_scores) == 0
+    assert reader.recent_match_scores.maxlen == 24
+
+
+def test_train_feeds_completed_matches_of_each_generation_into_window(tmp_path: Path, capsys) -> None:
+    """A generation that completes one 3-0 match (num_envs=1) never reaches the 24-match window in 3 gens."""
+    trainer = _coevo_trainer(tmp_path, num_envs=1)
+    original = trainer.collect_rollouts
+
+    def collect_with_one_match(active_generation: int):
+        out = original(active_generation=active_generation)
+        trainer.match_history.append({"generation": active_generation, "score": [3, 0], "match_id": active_generation})
+        return out
+
+    trainer.collect_rollouts = collect_with_one_match
+    trainer.train(total_updates=3)
+    assert list(trainer.recent_match_scores) == [(3, 0)] * 3
+    assert "Co-Evolution Sync" not in capsys.readouterr().out

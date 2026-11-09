@@ -234,6 +234,85 @@ class TestReplayMetrics:
         assert m["presser_trailing_rate"][0] == pytest.approx(1.0 / 3.0)
         assert m["presser_trailing_rate"][1] is None
 
+    # -- presser_trailing_avoidable_rate ---------------------------------------------------------
+    # Team A canonical x == raw x (defends the left goal); ball at x=400 -> a trailing presser sits at x > 450
+    # and a teammate can cover the goal side when canonical x <= 450.
+    _PRESS_RS = ["GK", "COVR", "COVR", "COVR", "COVR", "1stP"] + ["GK"] + ["COVR"] * 5
+    _BALL = (400.0, 420.0)
+
+    def _avoid(self, moves: Dict[int, Sequence[float]], flags: Optional[Dict[int, int]] = None, **kw: Any) -> Any:
+        f = make_frame(0, positions=with_moves(moves), ball=self._BALL, role_state=self._PRESS_RS)
+        for k, v in (flags or {}).items():
+            f["players"][k][3] = v
+        return metrics(make_replay([f]), **kw)["presser_trailing_avoidable_rate"]
+
+    def test_avoidable_trailing_with_active_goal_side_teammate_is_one(self) -> None:
+        # Presser ST trails by 100u; D1 (x=300), D2, M1 (x=500)... D1/D2 are goal-side of the ball.
+        assert self._avoid({5: (500, 420)}) == [1.0, None]
+
+    def test_unavoidable_trailing_when_every_teammate_is_also_upfield(self) -> None:
+        upfield = {1: (500, 300), 2: (500, 540), 3: (520, 300), 4: (520, 540), 5: (600, 420)}
+        m = metrics(make_replay([make_frame(0, positions=with_moves(upfield), ball=self._BALL,
+                                            role_state=self._PRESS_RS)]))
+        assert m["presser_trailing_rate"] == [1.0, None]  # still trailing ...
+        assert m["presser_trailing_avoidable_rate"] == [0.0, None]  # ... but nobody could cover; GK is excluded
+
+    def test_stunned_or_ghosted_goal_side_teammates_do_not_count(self) -> None:
+        upfield = {1: (500, 300), 2: (500, 540), 3: (520, 300), 4: (520, 540), 5: (600, 420)}
+        # D1 is the only goal-side outfielder.
+        goal_side = {**upfield, 1: (300, 300)}
+        assert self._avoid(goal_side) == [1.0, None]
+        assert self._avoid(goal_side, flags={1: 4}) == [0.0, None]  # stunned
+        assert self._avoid(goal_side, flags={1: 2}) == [0.0, None]  # ghosted
+        assert self._avoid(goal_side, flags={1: 6}) == [0.0, None]  # both
+        assert self._avoid(goal_side, flags={1: 1}) == [1.0, None]  # holder bit alone does not disqualify
+        # A second, active goal-side teammate restores avoidability.
+        assert self._avoid({**goal_side, 2: (350, 540)}, flags={1: 4}) == [1.0, None]
+
+    def test_avoidable_thresholds_are_strict_for_presser_and_inclusive_for_teammate(self) -> None:
+        upfield = {1: (500, 300), 2: (500, 540), 3: (520, 300), 4: (520, 540)}
+        # Presser exactly 50u upfield of the ball is not trailing at all.
+        assert self._avoid({**upfield, 5: (450, 420), 1: (300, 300)}) == [0.0, None]
+        # Teammate exactly at ball + 50u counts as goal-side; 0.5u further does not.
+        assert self._avoid({**upfield, 5: (600, 420), 1: (450, 300)}) == [1.0, None]
+        assert self._avoid({**upfield, 5: (600, 420), 1: (450.5, 300)}) == [0.0, None]
+
+    def test_avoidable_rate_is_fraction_of_presser_frames_and_never_exceeds_trailing_rate(self) -> None:
+        upfield = {1: (500, 300), 2: (500, 540), 3: (520, 300), 4: (520, 540)}
+        kw = dict(ball=self._BALL, role_state=self._PRESS_RS)
+        frames = [
+            make_frame(0, positions=with_moves({**upfield, 5: (600, 420), 1: (300, 300)}), **kw),  # avoidable
+            make_frame(1, positions=with_moves({**upfield, 5: (600, 420)}), **kw),  # trailing, unavoidable
+            make_frame(2, positions=with_moves({**upfield, 5: (420, 420), 1: (300, 300)}), **kw),  # not trailing
+            make_frame(3, positions=with_moves({**upfield, 5: (600, 420)}), ball=self._BALL, role_state=None),  # no presser
+        ]
+        m = metrics(make_replay(frames))
+        assert m["presser_trailing_rate"][0] == pytest.approx(2.0 / 3.0)  # unchanged definition
+        assert m["presser_trailing_avoidable_rate"][0] == pytest.approx(1.0 / 3.0)
+        assert m["presser_trailing_avoidable_rate"][0] <= m["presser_trailing_rate"][0]
+
+    def test_avoidable_rate_is_none_without_presser_frames(self) -> None:
+        assert metrics(make_replay([make_frame(0), make_frame(1)]))["presser_trailing_avoidable_rate"] == [None, None]
+        assert metrics(make_replay([]))["presser_trailing_avoidable_rate"] == [None, None]
+
+    def test_avoidable_rate_uses_canonical_x_for_team_b(self) -> None:
+        # Team B defends the right goal: canonical x = 1400 - x. Ball at x=1000 -> cx 400.
+        rs = ["GK"] + ["COVR"] * 5 + ["GK", "COVR", "COVR", "COVR", "COVR", "1stP"]
+        far = {7: (900, 300), 8: (900, 540), 9: (880, 300), 10: (880, 540)}  # cx 500/520: upfield of ball + 50
+        ball = (1000.0, 420.0)
+        trailing = {**far, 11: (800, 420)}  # cx 600: trails by 200
+        f_un = make_frame(0, positions=with_moves(trailing), ball=ball, role_state=rs)
+        f_av = make_frame(1, positions=with_moves({**trailing, 7: (1100, 300)}), ball=ball, role_state=rs)  # cx 300
+        m = metrics(make_replay([f_un, f_av]))
+        assert m["presser_trailing_rate"] == [None, 1.0]
+        assert m["presser_trailing_avoidable_rate"] == [None, 0.5]
+
+    def test_summarize_means_avoidable_rate_across_matches_skipping_none(self) -> None:
+        per_match = [{"presser_trailing_avoidable_rate": [0.5, None]},
+                     {"presser_trailing_avoidable_rate": [0.25, None]},
+                     {"presser_trailing_avoidable_rate": [None, None]}]
+        assert replay_metrics.summarize(per_match)["presser_trailing_avoidable_rate"] == [0.375, None]
+
     def test_gk_facing_blocked_frames(self) -> None:
         ball = (100.0, 420.0)
         f_away = make_frame(0, positions=with_moves({0: (80, 420)}), ball=ball)
@@ -529,6 +608,17 @@ class TestRunAll:
         nan_d = run_all.compute_deltas({"x": None}, {"x": 1.0})
         assert nan_d["x"]["delta"] is None
 
+    def test_guard_metrics_expose_avoidable_presser_rate_as_team_mean(self) -> None:
+        report = {"replays": {"summary": {"presser_trailing_avoidable_rate": [0.5, 0.25],
+                                          "presser_trailing_rate": [0.8, 0.6]}}}
+        g = run_all.guard_metrics(report)
+        assert g["presser_trailing_avoidable_rate"] == pytest.approx(0.375)
+        assert g["presser_trailing_rate"] == pytest.approx(0.7)
+        assert "presser_trailing_avoidable_rate" in run_all.GUARD_ORDER
+        one_sided = run_all.guard_metrics({"replays": {"summary": {"presser_trailing_avoidable_rate": [0.5, None]}}})
+        assert one_sided["presser_trailing_avoidable_rate"] == pytest.approx(0.5)
+        assert run_all.guard_metrics({})["presser_trailing_avoidable_rate"] is None
+
     def test_end_to_end_baseline_then_delta(self, tmp_path: Path) -> None:
         rdir = tmp_path / "replays"
         rdir.mkdir()
@@ -561,3 +651,282 @@ class TestRunAll:
         assert report["replays"]["n_matches"] == 0
         assert report["history"] is None
         assert len(report["errors"]) >= 2  # missing history + missing source dir
+
+
+# ----------------------------------------------------------------------------
+# eval_matches (fresh, unselected evaluation matches from a checkpoint)
+# ----------------------------------------------------------------------------
+import hashlib  # noqa: E402
+import importlib  # noqa: E402
+import tempfile  # noqa: E402
+from dataclasses import replace  # noqa: E402
+
+TINY_MATCH_STEPS = 40  # RL steps per match in the tiny eval runs
+EVAL_SEED = 1234
+
+
+def _em() -> Any:
+    return importlib.import_module("tools.audit.eval_matches")
+
+
+def _hash_tree(root: Path) -> Dict[str, str]:
+    return {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*")) if p.is_file()
+    }
+
+
+def _tiny_config(save_dir: str) -> Any:
+    from football_rl.config import DEFAULT_CONFIG
+
+    return replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=TINY_MATCH_STEPS),
+        replay=replace(DEFAULT_CONFIG.replay, save_dir=save_dir),
+    )
+
+
+@pytest.fixture(scope="module")
+def tiny_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    from football_rl.train_ppo import ParameterSharingPPOTrainer
+
+    root = tmp_path_factory.mktemp("eval_ckpt")
+    tiny = _tiny_config(str(root / "unused_replays"))
+    cfg = replace(tiny, replay=replace(tiny.replay, enable_recording=False))
+    trainer = ParameterSharingPPOTrainer(config=cfg, num_envs=1, rollout_steps=10, device="cpu",
+                                         checkpoint_dir=str(root / "ckpt"), seed=11)
+    try:
+        trainer.save_checkpoints()
+    finally:
+        trainer.close()
+    return root / "ckpt"
+
+
+@pytest.fixture(scope="module")
+def eval_runs(tiny_checkpoint: Path, tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
+    """Three tiny 8-match evaluations: seed S (twice, temp replays) and seed S+1 (replays kept)."""
+    em = _em()
+    sandbox = tmp_path_factory.mktemp("eval_sandbox")
+    tmp_root = sandbox / "tmp"
+    tmp_root.mkdir()
+    cwd = sandbox / "cwd"
+    cwd.mkdir()
+    kept = sandbox / "kept"
+    before = _hash_tree(tiny_checkpoint)
+    cfg = _tiny_config("ignored")
+    runs: Dict[str, Any] = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tempfile, "tempdir", str(tmp_root))
+        mp.chdir(cwd)
+        runs["a"] = em.run_eval(str(tiny_checkpoint), matches=8, seed=EVAL_SEED, config=cfg)
+        runs["b"] = em.run_eval(str(tiny_checkpoint), matches=8, seed=EVAL_SEED, config=cfg)
+        runs["c"] = em.run_eval(str(tiny_checkpoint), matches=8, seed=EVAL_SEED + 1, config=cfg,
+                                keep_replays=str(kept))
+    runs.update(before=before, after=_hash_tree(tiny_checkpoint), tmp_root=tmp_root, cwd=cwd, kept=kept)
+    return runs
+
+
+class TestEvalMatches:
+    @pytest.mark.parametrize("bad", [0, 1, 7, 9, 12, -8])
+    def test_matches_must_be_a_positive_multiple_of_eight(self, bad: int, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            _em().run_eval(str(tmp_path), matches=bad)
+
+    def test_missing_checkpoint_directory_is_reported(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            _em().run_eval(str(tmp_path / "absent"), matches=8)
+
+    def test_empty_checkpoint_directory_fails_loudly(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(RuntimeError):
+            _em().run_eval(str(empty), matches=8, config=_tiny_config(str(tmp_path / "r")))
+
+    def test_tiny_run_yields_one_entry_per_match_with_distinct_match_ids(self, eval_runs: Dict[str, Any]) -> None:
+        res = eval_runs["a"]
+        assert len(res["per_match"]) == 8
+        assert sorted(m["match_id"] for m in res["per_match"]) == list(range(1, 9))
+        assert all(m["n_frames"] > 0 for m in res["per_match"])
+
+    def test_guards_report_mean_se_and_n_for_every_replay_guard(self, eval_runs: Dict[str, Any]) -> None:
+        guards = eval_runs["a"]["guards"]
+        assert set(guards) == set(replay_metrics.REPLAY_GUARD_KEYS)
+        for name, g in guards.items():
+            assert set(g) == {"mean", "se", "n"}, name
+            assert g["n"] == 8, name
+        hold = [m["ball_hold_rate"] for m in eval_runs["a"]["per_match"]]
+        assert guards["ball_hold_rate"]["mean"] == pytest.approx(sum(hold) / 8)
+
+    def test_run_leaves_checkpoint_directory_byte_identical(self, eval_runs: Dict[str, Any]) -> None:
+        assert eval_runs["before"] and eval_runs["before"] == eval_runs["after"]
+
+    def test_run_writes_nothing_to_cwd_replays_or_checkpoints(self, eval_runs: Dict[str, Any]) -> None:
+        assert list(eval_runs["cwd"].iterdir()) == []
+
+    def test_temp_replay_directory_is_deleted_unless_kept(self, eval_runs: Dict[str, Any]) -> None:
+        assert list(eval_runs["tmp_root"].iterdir()) == []
+        kept = sorted(p.name for p in eval_runs["kept"].glob("match_*.json"))
+        assert len(kept) == 8
+
+    def test_same_seed_is_deterministic_and_other_seed_differs(self, eval_runs: Dict[str, Any]) -> None:
+        a, b, c = (json.dumps(eval_runs[k], sort_keys=True) for k in "abc")
+        assert a == b
+        assert a != c
+
+    def test_result_is_json_serialisable_without_paths(self, eval_runs: Dict[str, Any]) -> None:
+        text = json.dumps(eval_runs["a"])
+        assert str(eval_runs["tmp_root"]) not in text
+
+    # -- statistics --------------------------------------------------------------------------------
+    def test_guard_stats_hand_values(self) -> None:
+        g = _em().guard_stats([1.0, 2.0, 3.0, 4.0])
+        assert g["mean"] == pytest.approx(2.5)
+        assert g["se"] == pytest.approx(0.6454972)  # sample sd sqrt(5/3) / sqrt(4)
+        assert g["n"] == 4
+
+    def test_guard_stats_skips_none_and_handles_degenerate_samples(self) -> None:
+        em = _em()
+        assert em.guard_stats([2.0, None, 4.0]) == {"mean": 3.0, "se": pytest.approx(1.0), "n": 2}
+        assert em.guard_stats([5.0]) == {"mean": 5.0, "se": None, "n": 1}
+        assert em.guard_stats([None, None]) == {"mean": None, "se": None, "n": 0}
+        assert em.guard_stats([]) == {"mean": None, "se": None, "n": 0}
+        assert em.guard_stats([3.0, 3.0, 3.0])["se"] == 0.0
+
+    def test_match_guard_values_follow_run_all_definitions(self) -> None:
+        frames = [make_frame(0), make_frame(1, holder=0), make_frame(2, holder=0)]
+        m = metrics(make_replay(frames))
+        vals = _em().match_guard_values(m)
+        assert vals["ball_hold_rate"] == pytest.approx(2.0 / 3.0)
+        assert vals["gk_pickups_per_match"] == pytest.approx(1.0)  # sum of both keepers' pickups
+        assert vals["gk_dives_per_match"] == pytest.approx(0.0)
+        assert set(vals) == set(replay_metrics.REPLAY_GUARD_KEYS)
+
+    # -- CLI ---------------------------------------------------------------------------------------
+    def test_cli_defaults_and_out_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        em = _em()
+        seen: Dict[str, Any] = {}
+
+        def fake(checkpoint_dir: str, **kw: Any) -> Dict[str, Any]:
+            seen.update(kw, checkpoint_dir=checkpoint_dir)
+            return {"per_match": [], "guards": {}}
+
+        monkeypatch.setattr(em, "run_eval", fake)
+        out = tmp_path / "o.json"
+        assert em.main(["--checkpoint-dir", str(tmp_path), "--out", str(out)]) == 0
+        assert seen["matches"] == 32 and seen["seed"] == 1234
+        assert seen["keep_replays"] is None and seen["code_root"] is None
+        assert json.loads(out.read_text()) == {"per_match": [], "guards": {}}
+
+    def test_cli_requires_checkpoint_dir(self) -> None:
+        with pytest.raises(SystemExit):
+            _em().main([])
+
+
+# ----------------------------------------------------------------------------
+# run_all --eval-checkpoint
+# ----------------------------------------------------------------------------
+def _canned_eval(hold_frames: int) -> Dict[str, Any]:
+    """Two matches; the first has `hold_frames` GK-held frames out of 3."""
+    f = [make_frame(i, holder=0 if i < hold_frames else None) for i in range(3)]
+    return {"per_match": [metrics(make_replay(f, match_id=1)), metrics(make_replay(f, match_id=2))],
+            "guards": {}}
+
+
+class TestRunAllEval:
+    def _base_args(self, tmp_path: Path) -> List[str]:
+        pkg = TestOrphanScan()._pkg(tmp_path)
+        return ["--out-dir", str(tmp_path / "metrics"), "--replays-dir", str(tmp_path / "no_replays"),
+                "--source-dir", str(pkg), "--skip-perf", "--eval-checkpoint", str(tmp_path / "ckpt")]
+
+    def test_eval_mode_uses_fresh_matches_not_replays_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: List[Dict[str, Any]] = []
+
+        def fake(checkpoint_dir: str, matches: int, code_root: Optional[str], seed: int) -> Dict[str, Any]:
+            calls.append({"checkpoint_dir": checkpoint_dir, "matches": matches, "code_root": code_root})
+            return _canned_eval(2)
+
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", fake)
+        assert run_all.main(self._base_args(tmp_path) + ["--eval-code-root", "/some/root"]) == 0
+        assert calls == [{"checkpoint_dir": str(tmp_path / "ckpt"), "matches": 32, "code_root": "/some/root"}]
+        report = json.loads((tmp_path / "metrics" / "latest.json").read_text())
+        assert report["replays"]["n_matches"] == 2
+        assert not any("no replays" in e for e in report["errors"])
+        assert report["guards"]["ball_hold_rate"] == pytest.approx(2.0 / 3.0)
+
+    def test_eval_matches_flag_is_forwarded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: List[int] = []
+        monkeypatch.setattr(run_all, "_run_eval_subprocess",
+                            lambda checkpoint_dir, matches, code_root, seed: seen.append(matches) or _canned_eval(1))
+        run_all.main(self._base_args(tmp_path) + ["--eval-matches", "16"])
+        assert seen == [16]
+
+    def test_unbiased_baseline_is_saved_separately_and_compared_on_next_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = tmp_path / "metrics"
+        out.mkdir()
+        # A biased replay baseline must NOT be used for comparison in eval mode.
+        (out / "baseline.json").write_text(json.dumps({"guards": {"ball_hold_rate": 0.99}}))
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", lambda *a, **k: _canned_eval(2))
+        args = self._base_args(tmp_path)
+        assert run_all.main(args + ["--save-baseline-unbiased"]) == 0
+        assert (out / "baseline_unbiased.json").exists()
+        assert json.loads((out / "baseline.json").read_text()) == {"guards": {"ball_hold_rate": 0.99}}
+
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", lambda *a, **k: _canned_eval(3))
+        assert run_all.main(args) == 0
+        report = json.loads((out / "latest.json").read_text())
+        d = report["deltas"]["ball_hold_rate"]
+        assert d["before"] == pytest.approx(2.0 / 3.0)
+        assert d["after"] == pytest.approx(1.0)
+        assert d["delta"] == pytest.approx(1.0 / 3.0)
+
+    def test_save_baseline_accepts_explicit_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", lambda *a, **k: _canned_eval(1))
+        target = tmp_path / "elsewhere" / "baseline_unbiased.json"
+        assert run_all.main(self._base_args(tmp_path) + ["--save-baseline", str(target)]) == 0
+        saved = json.loads(target.read_text())
+        assert saved["guards"]["ball_hold_rate"] == pytest.approx(1.0 / 3.0)
+        assert not (tmp_path / "metrics" / "baseline.json").exists()
+
+    def test_bare_save_baseline_in_eval_mode_writes_unbiased_baseline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", lambda *a, **k: _canned_eval(1))
+        assert run_all.main(self._base_args(tmp_path) + ["--save-baseline"]) == 0
+        assert (tmp_path / "metrics" / "baseline_unbiased.json").exists()
+        assert not (tmp_path / "metrics" / "baseline.json").exists()
+
+    def test_eval_failure_is_reported_not_fatal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*a: Any, **k: Any) -> Dict[str, Any]:
+            raise RuntimeError("eval exploded")
+
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", boom)
+        assert run_all.main(self._base_args(tmp_path)) == 0
+        report = json.loads((tmp_path / "metrics" / "latest.json").read_text())
+        assert any("eval exploded" in e for e in report["errors"])
+        assert report["replays"]["n_matches"] == 0
+
+    def test_perf_profile_is_skipped_only_when_evaluating_under_another_code_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: List[int] = []
+
+        def fake_profile(**kw: Any) -> Dict[str, Any]:
+            calls.append(1)
+            return {"total_ms_per_step": 1.5, "record": True, "components": {}}
+
+        monkeypatch.setattr(run_all.perf_profile, "profile_env", fake_profile)
+        monkeypatch.setattr(run_all, "_run_eval_subprocess", lambda *a, **k: _canned_eval(1))
+        args = [a for a in self._base_args(tmp_path) if a != "--skip-perf"]
+        run_all.main(args + ["--eval-code-root", "/some/root"])
+        assert calls == []
+        run_all.main(args)
+        assert calls == [1]
+        report = json.loads((tmp_path / "metrics" / "latest.json").read_text())
+        assert report["guards"]["ms_per_step"] == 1.5
+
+    def test_eval_only_flags_require_eval_checkpoint(self, tmp_path: Path) -> None:
+        for extra in (["--eval-code-root", "x"], ["--save-baseline-unbiased"]):
+            with pytest.raises(SystemExit):
+                run_all.main(["--out-dir", str(tmp_path), "--skip-perf"] + extra)

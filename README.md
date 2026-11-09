@@ -44,7 +44,7 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
   - Free ball recoveries enjoy a $0.45\text{s}$ post-pickup tackle immunity grace period.
 - **PPO Co-Evolution & Vectorized Self-Play (`train_ppo.py`)**:
   - Independent Blue Team (`blue_field_policy` + `blue_keeper_policy`) vs. Red Team (`red_field_policy` + `red_keeper_policy`) actor-critic networks.
-  - Rolling 3-generation co-evolution soft-sync mechanism to prevent runaway dominance and preserve competitive self-play parity.
+  - Rolling co-evolution soft-sync over the last 24 completed matches (independent of `--num-envs`) to prevent runaway dominance and preserve competitive self-play parity.
   - Vectorized parallel environment multiprocessing (`--num-envs 8+`) with monotonic match persistence and `--save-best-only` replay filtering.
 - **Interactive 60 FPS Replay Visualizer (`replay.py`)**:
   - Pygame viewer rendering active dynamic semicircle boundaries, player vision cones ($210^\circ$ FOV), role rings, tackle radii, ghost recovery stuns, and scoreboard HUD.
@@ -140,7 +140,7 @@ Inspect generation count, cumulative matches, total steps, and Top 10 most excit
 | Argument | Default | Description |
 | :--- | :--- | :--- |
 | `--total-updates` | `100` | Number of PPO generations to train in this session. |
-| `--num-envs` | `1` | Number of parallel environment instances (use `8` for high throughput). |
+| `--num-envs` | `8` | Number of parallel environment instances (one generation = `num-envs` full matches). Resuming with a different value than the last recorded generation prints a `WARNING`. |
 | `--rollout-steps` | `2700` | RL steps per env per generation (`2700` = 1 full 180s match). |
 | `--interest-threshold`| `0.0` | Minimum `interest_score` to export a replay JSON (`0.0` = save all matches). |
 | `--save-best-only` | `False` | When running with `num_envs > 1`, only saves the single most interesting match per generation. |

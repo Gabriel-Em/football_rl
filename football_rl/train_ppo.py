@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import replace
 from datetime import datetime
 import json
@@ -12,7 +12,7 @@ import random
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +31,10 @@ from football_rl.config import (
 )
 from football_rl.env import FootballParallelEnv, parallel_env
 from football_rl.vec_env import make_vec_football_env, SubprocVecFootballEnv, DummyVecFootballEnv
+
+# Co-evolution soft-sync is evaluated over the last this-many completed matches, independent of how
+# many parallel environments (and therefore matches per generation) a run uses.
+COEVO_WINDOW_MATCHES = 24
 
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 0.0) -> nn.Linear:
@@ -203,7 +207,7 @@ class ParameterSharingPPOTrainer:
         self.match_history: List[Dict[str, Any]] = []
         self.generation_history: List[Dict[str, Any]] = []
         self._history_backup_checked: bool = False
-        self.recent_team_goals: List[Tuple[int, int]] = []
+        self.recent_match_scores: Deque[Tuple[int, int]] = deque(maxlen=COEVO_WINDOW_MATCHES)
         self.next_match_id: int = self._get_max_saved_match_id() + 1
 
         torch.manual_seed(seed)
@@ -911,7 +915,7 @@ class ParameterSharingPPOTrainer:
                 "red_keeper_optimizer": self.red_keeper_optimizer.state_dict(),
                 "match_history": self.match_history,
                 "generation_history": self.generation_history,
-                "recent_team_goals": self.recent_team_goals,
+                "recent_match_scores": [list(score) for score in self.recent_match_scores],
                 "team_color_schema": TEAM_COLOR_SCHEMA,
             },
             state_path,
@@ -1120,7 +1124,10 @@ class ParameterSharingPPOTrainer:
                     "team_color_schema": state.get("team_color_schema"),
                 }
             )["generations"]
-            self.recent_team_goals = [tuple(x) for x in state.get("recent_team_goals", [])]
+            self.recent_match_scores = deque(
+                ((int(a), int(b)) for a, b in state.get("recent_match_scores", [])),
+                maxlen=COEVO_WINDOW_MATCHES,
+            )
             self.next_match_id = self._get_max_saved_match_id() + 1
 
             blue_f_weights = state.get("blue_field_policy", state.get("field_policy"))
@@ -1201,6 +1208,54 @@ class ParameterSharingPPOTrainer:
     def __del__(self) -> None:
         self.close()
 
+    @staticmethod
+    def _soft_blend(dst: nn.Module, src: nn.Module, tau: float) -> None:
+        """Move `dst` parameters a fraction `tau` of the way towards `src` (in place)."""
+        with torch.no_grad():
+            for p_dst, p_src in zip(dst.parameters(), src.parameters()):
+                p_dst.data.copy_((1.0 - tau) * p_dst.data + tau * p_src.data)
+
+    def _coevolution_step(self, completed_matches: List[Dict[str, Any]]) -> bool:
+        """Record newly completed matches and soft-sync the trailing team when one side dominates.
+
+        Scores enter the rolling window in completion order. The condition is evaluated only once
+        the window holds `COEVO_WINDOW_MATCHES` matches: at least 8 total goals with one side
+        scoring >= 3x the other (opponent floored at 1 goal). The trailing team's policies are then
+        blended 35% towards the dominant team's and the window is cleared. Returns True on a sync.
+        """
+        if not self.separate_teams:
+            return False
+        for m in completed_matches:
+            self.recent_match_scores.append((int(m["score"][0]), int(m["score"][1])))
+        if len(self.recent_match_scores) < COEVO_WINDOW_MATCHES:
+            return False
+
+        sum_a = sum(x[0] for x in self.recent_match_scores)
+        sum_b = sum(x[1] for x in self.recent_match_scores)
+        if sum_a + sum_b < 8:
+            return False
+        if sum_a >= 3 * max(1, sum_b):
+            # Team A is dominating >= 75% -> soft-sync Team B towards Team A
+            self._soft_blend(self.red_field_policy, self.blue_field_policy, 0.35)
+            self._soft_blend(self.red_keeper_policy, self.blue_keeper_policy, 0.35)
+            print(
+                f"  [Co-Evolution Sync] Red dominated ({sum_a}-{sum_b} over {COEVO_WINDOW_MATCHES} matches). "
+                f"Soft-synced Blue policy (tau=0.35) to restore parity."
+            )
+        elif sum_b >= 3 * max(1, sum_a):
+            # Team B is dominating >= 75% -> soft-sync Team A towards Team B
+            self._soft_blend(self.blue_field_policy, self.red_field_policy, 0.35)
+            self._soft_blend(self.blue_keeper_policy, self.red_keeper_policy, 0.35)
+            print(
+                f"  [Co-Evolution Sync] Blue dominated ({sum_b}-{sum_a} over {COEVO_WINDOW_MATCHES} matches). "
+                f"Soft-synced Red policy (tau=0.35) to restore parity."
+            )
+        else:
+            return False
+        self.recent_match_scores.clear()
+        self._sync_cpu_policies()
+        return True
+
     def train(self, total_updates: int = 100) -> Dict[str, Any]:
         """Run `total_updates` generations of MARL PPO training."""
         start_time = time.time()
@@ -1211,6 +1266,7 @@ class ParameterSharingPPOTrainer:
         try:
             for gen in range(start_gen, end_gen + 1):
                 self.current_generation = gen
+                matches_before = len(self.match_history)
                 rollout = self.collect_rollouts(active_generation=gen)
                 metrics = self.update_policies(rollout)
                 elapsed = max(1e-6, time.time() - start_time)
@@ -1243,57 +1299,8 @@ class ParameterSharingPPOTrainer:
                         torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
                 self._sync_cpu_policies()
 
-                # Balanced Co-Evolution & Underdog Soft-Sync (over rolling 3-generation window)
-                if self.separate_teams:
-                    gen_matches = [m for m in self.match_history if m.get("generation") == gen]
-                    gen_goals_a = sum(m["score"][0] for m in gen_matches)
-                    gen_goals_b = sum(m["score"][1] for m in gen_matches)
-                    self.recent_team_goals.append((gen_goals_a, gen_goals_b))
-                    if len(self.recent_team_goals) > 3:
-                        self.recent_team_goals.pop(0)
-
-                    if len(self.recent_team_goals) >= 3:
-                        sum_a = sum(x[0] for x in self.recent_team_goals)
-                        sum_b = sum(x[1] for x in self.recent_team_goals)
-                        if sum_a + sum_b >= 8:
-                            if sum_a >= 3 * max(1, sum_b):
-                                # Team A is dominating >= 75% -> soft-sync Team B towards Team A
-                                with torch.no_grad():
-                                    for p_dst, p_src in zip(
-                                        self.red_field_policy.parameters(),
-                                        self.blue_field_policy.parameters(),
-                                    ):
-                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                    for p_dst, p_src in zip(
-                                        self.red_keeper_policy.parameters(),
-                                        self.blue_keeper_policy.parameters(),
-                                    ):
-                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                print(
-                                    f"  [Co-Evolution Sync] Red dominated ({sum_a}-{sum_b} over 3 gens). "
-                                    f"Soft-synced Blue policy (tau=0.35) to restore parity."
-                                )
-                                self.recent_team_goals.clear()
-                                self._sync_cpu_policies()
-                            elif sum_b >= 3 * max(1, sum_a):
-                                # Team B is dominating >= 75% -> soft-sync Team A towards Team B
-                                with torch.no_grad():
-                                    for p_dst, p_src in zip(
-                                        self.blue_field_policy.parameters(),
-                                        self.red_field_policy.parameters(),
-                                    ):
-                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                    for p_dst, p_src in zip(
-                                        self.blue_keeper_policy.parameters(),
-                                        self.red_keeper_policy.parameters(),
-                                    ):
-                                        p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
-                                print(
-                                    f"  [Co-Evolution Sync] Blue dominated ({sum_b}-{sum_a} over 3 gens). "
-                                    f"Soft-synced Red policy (tau=0.35) to restore parity."
-                                )
-                                self.recent_team_goals.clear()
-                                self._sync_cpu_policies()
+                # Balanced Co-Evolution & Underdog Soft-Sync (over the rolling window of completed matches)
+                self._coevolution_step(self.match_history[matches_before:])
 
                 gen_record = {
                     "generation": gen,
@@ -1305,6 +1312,8 @@ class ParameterSharingPPOTrainer:
                     "mean_keeper_reward": round(mean_keeper_rew, 5),
                     "max_interest": round(float(rollout["max_interest"]), 2),
                     "completed_matches_in_gen": int(rollout["completed_episodes"]),
+                    "num_envs": self.num_envs,
+                    "rollout_steps": self.rollout_steps,
                     "total_matches_so_far": len(self.match_history),
                 }
                 self.generation_history.append(gen_record)
@@ -1647,7 +1656,31 @@ def print_active_status(checkpoint_dir: str = "checkpoints", replay_dir: str = "
     print("=" * 80)
 
 
-def main() -> None:
+def resume_num_envs_warning(checkpoint_dir: str, num_envs: int) -> Optional[str]:
+    """Return a warning when the last recorded generation ran with a different `num_envs`.
+
+    Returns None when the history is absent/unreadable, empty, or its last generation record
+    carries no `num_envs` (legacy records), or when the values agree.
+    """
+    history_path = os.path.join(checkpoint_dir, "training_history.json")
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            generations = json.load(f).get("generations") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not generations or not isinstance(generations[-1], dict):
+        return None
+    recorded = generations[-1].get("num_envs")
+    if recorded is None or int(recorded) == int(num_envs):
+        return None
+    return (
+        f"WARNING: resuming with num_envs={num_envs} but generation "
+        f"{generations[-1].get('generation', '?')} was trained with num_envs={int(recorded)}. "
+        f"Samples per generation and the co-evolution window pacing will differ from the earlier run."
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train 6v6 MARL Football with Independent Red vs. Blue Team PPO Policies."
     )
@@ -1660,8 +1693,8 @@ def main() -> None:
     parser.add_argument(
         "--num-envs",
         type=int,
-        default=1,
-        help="Number of parallel environments (default: 1 so 1 generation = 1 full match).",
+        default=8,
+        help="Number of parallel environments (default: 8 so 1 generation = 8 full matches).",
     )
     parser.add_argument(
         "--rollout-steps",
@@ -1733,7 +1766,11 @@ def main() -> None:
         action="store_true",
         help="Show current active batch generation count, match count, and top matches and exit.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
 
     ckpt_dir = "checkpoints"
     rep_dir = DEFAULT_CONFIG.replay.save_dir
@@ -1798,6 +1835,11 @@ def main() -> None:
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")
     if not args.from_scratch and (args.resume or os.path.exists(state_file)):
+        mismatch = resume_num_envs_warning(ckpt_dir, args.num_envs)
+        if mismatch:
+            print("!" * 88)
+            print(mismatch)
+            print("!" * 88)
         if trainer.load_checkpoints():
             print(
                 f"Resuming active batch from Generation {trainer.current_generation} "
