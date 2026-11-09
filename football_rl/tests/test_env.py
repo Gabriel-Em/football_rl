@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import math
 import os
@@ -3865,4 +3866,37 @@ def test_pitch_boundary_wall_velocity_dissipation_and_bisector_depth() -> None:
     assert max_delta < 0.02
 
 
+GOLDEN_ROLLOUT_DIGEST = "a0e3c934d19f7f40cd8cba0ba0f1c5f26cd381934d38ebf97d0ffd1db1f0f2e7"
 
+
+def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False) -> str:
+    """SHA-256 over observations, rewards, kinematics and possession of a seeded random-action rollout."""
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=record,
+            interest_threshold=float("inf"),
+        ),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=seed)
+    acts = np.random.default_rng(seed).uniform(-1, 1, size=(steps, 12, 4))
+    h = hashlib.sha256()
+    for k in range(steps):
+        obs, central, rew, done, _ = env.step_array(acts[k])
+        for arr in (obs, central, rew, env.player_pos, env.player_vel, env.ball_pos):
+            h.update(np.ascontiguousarray(arr).tobytes())
+        h.update(str(env.ball_holder).encode())
+        if done:
+            env.reset(seed=seed + k + 1)
+    return h.hexdigest()
+
+
+def test_rollout_matches_golden_digest():
+    assert rollout_digest() == GOLDEN_ROLLOUT_DIGEST
+
+
+def test_rollout_digest_is_seed_sensitive_and_repeatable():
+    assert rollout_digest(steps=60, seed=1234) == rollout_digest(steps=60, seed=1234)
+    assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
