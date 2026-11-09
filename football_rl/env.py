@@ -188,6 +188,16 @@ class FootballParallelEnv(ParallelEnv):
             else:
                 roles.append(ROLE_ATK)
         self.player_role: np.ndarray = np.array(roles, dtype=np.int32)
+        self._is_keeper: np.ndarray = self.player_role == ROLE_KEEPER
+        self._is_keeper_list: List[bool] = self._is_keeper.tolist()
+        self._max_speed_arr: np.ndarray = np.array(
+            [self._get_player_max_speed(i) for i in range(len(roles))], dtype=np.float64
+        )
+        self._max_speed_list: List[float] = self._max_speed_arr.tolist()
+        self._goal_centers: Tuple[np.ndarray, np.ndarray] = (
+            np.array(self.cfg.physics.left_goal_center, dtype=np.float64),
+            np.array(self.cfg.physics.right_goal_center, dtype=np.float64),
+        )
         self.player_role_key: List[str] = [
             name.split("_", 1)[1] for name in self.possible_agents
         ]  # ["keeper", "def_1", "def_2", "mid_1", "mid_2", "atk_1"] * 2
@@ -1059,6 +1069,14 @@ class FootballParallelEnv(ParallelEnv):
         # 2. Process Player Actions (Steering, Throttle, Kick, Special)
         # ----------------------------------------------------------------------
         current_holder = self.ball_holder
+        is_keeper = self._is_keeper_list
+        max_speed_by_player = self._max_speed_list
+        turn_rate = phys.player_max_turn_rate
+        dz_pos = phys.throttle_deadzone
+        dz_neg = phys.backpedal_threshold
+        forward_denom = max(1e-6, 1.0 - dz_pos)
+        backward_denom = max(1e-6, 1.0 + dz_neg)
+        accel_alpha = min(1.0, dt * phys.player_accel_rate)
 
         for idx in range(self.num_players):
             if self.stun_timer[idx] > 0.0:
@@ -1074,8 +1092,8 @@ class FootballParallelEnv(ParallelEnv):
 
             # Decouple body yaw spin from side-foot kick aiming when actively triggering a kick
             is_aiming_kick = (self.ball_holder == idx and kick_power > mech.kick_trigger_threshold)
-            if not (self._is_field_role(self.player_role[idx]) and self.lunge_timer[idx] > 0.0) and not is_aiming_kick:
-                turn_delta = steer_raw * phys.player_max_turn_rate * dt
+            if not (not is_keeper[idx] and self.lunge_timer[idx] > 0.0) and not is_aiming_kick:
+                turn_delta = steer_raw * turn_rate * dt
                 self.player_angle[idx] = float(wrap_to_pi(self.player_angle[idx] + turn_delta))
 
             # Special Action (action[3] > 0.5): Lunge for Keepers, Tackle for Field Players
@@ -1114,28 +1132,25 @@ class FootballParallelEnv(ParallelEnv):
                 self.player_vel[idx] = self.dive_dir[idx] * (
                     self.dive_speed[idx] if self.dive_speed[idx] > 1e-6 else mech.keeper_dive_speed
                 )
-            elif self._is_field_role(self.player_role[idx]) and self.lunge_timer[idx] > 0.0:
+            elif not is_keeper[idx] and self.lunge_timer[idx] > 0.0:
                 # Field player lunge: instant override at field_lunge_speed,
                 # standard exponential acceleration smoothing is bypassed for the duration
                 pass
             else:
-                dz_pos = phys.throttle_deadzone
-                dz_neg = phys.backpedal_threshold
-                max_spd = self._get_player_max_speed(idx)
+                max_spd = max_speed_by_player[idx]
                 if dz_neg <= throttle_raw <= dz_pos:
                     target_speed = 0.0
                 elif throttle_raw > dz_pos:
-                    throttle_norm = (throttle_raw - dz_pos) / max(1e-6, 1.0 - dz_pos)
+                    throttle_norm = (throttle_raw - dz_pos) / forward_denom
                     target_speed = throttle_norm * max_spd
                 else:
-                    back_norm = (throttle_raw - dz_neg) / max(1e-6, 1.0 + dz_neg)  # in [-1.0, 0.0)
+                    back_norm = (throttle_raw - dz_neg) / backward_denom  # in [-1.0, 0.0)
                     back_mult = (
                         phys.keeper_backpedal_mult
                         if self.player_role[idx] == ROLE_KEEPER
                         else phys.field_backpedal_mult
                     )
                     target_speed = back_norm * back_mult * max_spd
-                accel_alpha = min(1.0, dt * phys.player_accel_rate)
 
                 desired_vx = math.cos(self.player_angle[idx]) * target_speed
                 desired_vy = math.sin(self.player_angle[idx]) * target_speed
@@ -1296,13 +1311,10 @@ class FootballParallelEnv(ParallelEnv):
                 abs(d_left_box - phys.keeper_box_radius) <= 24.0
                 or abs(d_right_box - phys.keeper_box_radius) <= 24.0
             )
-            players_crowding_ball = int(
-                np.sum(np.linalg.norm(self.player_pos - self.ball_pos[None, :], axis=1) <= 68.0)
-            )
             if (
                 ball_speed_now < mech.pinned_ball_speed_thresh
                 and (near_wall or near_box_edge)
-                and players_crowding_ball >= 2
+                and int(np.sum(np.linalg.norm(self.player_pos - self.ball_pos[None, :], axis=1) <= 68.0)) >= 2
             ):
                 self.pinned_ball_timer += dt
                 if self.pinned_ball_timer >= mech.pinned_ball_max_time:
@@ -1708,6 +1720,9 @@ class FootballParallelEnv(ParallelEnv):
         dx_b = self.ball_pos[0] - self.player_pos[:, 0]
         dy_b = self.ball_pos[1] - self.player_pos[:, 1]
         dists = np.hypot(dx_b, dy_b)
+        if not np.any(dists <= mech.pickup_distance):
+            return
+
         inv_dists = 1.0 / np.maximum(dists, 1e-6)
         u_bx = dx_b * inv_dists
         u_by = dy_b * inv_dists
@@ -2204,15 +2219,31 @@ class FootballParallelEnv(ParallelEnv):
                     xi = float(pos[i, 0])
                     yi = float(pos[i, 1])
 
+    def _outfield_boundary_candidates(self) -> np.ndarray:
+        """Boolean (12,) mask of outfield players close enough to a wall or keeper semicircle to need clamping.
+
+        A player outside every band cannot trigger any branch of the outfield clamp, so skipping it is exact.
+        """
+        phys = self.cfg.physics
+        r_player = phys.player_radius
+        x = self.player_pos[:, 0]
+        y = self.player_pos[:, 1]
+        band_left = max(float(self.active_box_radius[0]), r_player) + r_player + 2.0
+        band_right = max(float(self.active_box_radius[1]), r_player) + r_player + 2.0
+        near = (
+            (x < band_left)
+            | (x > phys.field_width - band_right)
+            | (y < r_player)
+            | (y > phys.field_height - r_player)
+        )
+        return near & ~self._is_keeper
+
     def _clamp_players_to_boundaries(self, apply_dynamic_push: bool = True) -> None:
         """Enforce field walls and semi-circle barriers with smooth tangential sliding and corner trap resolution."""
         phys = self.cfg.physics
         r_player = phys.player_radius
         box_r = phys.keeper_box_radius
-        goal_centers = (
-            np.array(phys.left_goal_center, dtype=np.float64),
-            np.array(phys.right_goal_center, dtype=np.float64),
-        )
+        goal_centers = self._goal_centers
 
         # 1. Keepers clamped inside own box
         for k_idx in (0, 6):
@@ -2229,121 +2260,120 @@ class FootballParallelEnv(ParallelEnv):
         eff_box_left = float(self.active_box_radius[0])
         eff_box_right = float(self.active_box_radius[1])
 
-        for field_slice in (slice(1, 6), slice(7, 12)):
-            for p_idx in range(field_slice.start, field_slice.stop):
-                px = float(self.player_pos[p_idx, 0])
-                py = float(self.player_pos[p_idx, 1])
-                vx = float(self.player_vel[p_idx, 0])
-                vy = float(self.player_vel[p_idx, 1])
+        for p_idx in np.flatnonzero(self._outfield_boundary_candidates()).tolist():
+            px = float(self.player_pos[p_idx, 0])
+            py = float(self.player_pos[p_idx, 1])
+            vx = float(self.player_vel[p_idx, 0])
+            vy = float(self.player_vel[p_idx, 1])
 
-                # Left goalmouth boundary envelope
-                dy_l = py - 420.0
-                if abs(dy_l) < eff_box_left and eff_box_left > 1e-3:
-                    dx_arc_l = math.sqrt(eff_box_left * eff_box_left - dy_l * dy_l)
-                else:
-                    dx_arc_l = 0.0
-                x_min = max(r_player, dx_arc_l + 1e-3 if dx_arc_l > 0.0 else r_player)
+            # Left goalmouth boundary envelope
+            dy_l = py - 420.0
+            if abs(dy_l) < eff_box_left and eff_box_left > 1e-3:
+                dx_arc_l = math.sqrt(eff_box_left * eff_box_left - dy_l * dy_l)
+            else:
+                dx_arc_l = 0.0
+            x_min = max(r_player, dx_arc_l + 1e-3 if dx_arc_l > 0.0 else r_player)
 
-                if px < x_min:
-                    px = x_min
+            if px < x_min:
+                px = x_min
 
-                dist_l = math.hypot(px, dy_l)
-                if abs(dy_l) < eff_box_left and dist_l <= eff_box_left + 1e-3 and eff_box_left > 1e-3:
-                    dist_safe = max(1e-6, dist_l)
-                    nx_l = px / dist_safe
-                    ny_l = dy_l / dist_safe
+            dist_l = math.hypot(px, dy_l)
+            if abs(dy_l) < eff_box_left and dist_l <= eff_box_left + 1e-3 and eff_box_left > 1e-3:
+                dist_safe = max(1e-6, dist_l)
+                nx_l = px / dist_safe
+                ny_l = dy_l / dist_safe
 
-                    if apply_dynamic_push:
-                        # Tangent vector along arc directed into the field (tx > 0) toward goalmouth
-                        s_ny = 1.0 if ny_l >= 0.0 else -1.0
-                        tx_l = abs(ny_l)
-                        ty_l = -nx_l * s_ny
+                if apply_dynamic_push:
+                    # Tangent vector along arc directed into the field (tx > 0) toward goalmouth
+                    s_ny = 1.0 if ny_l >= 0.0 else -1.0
+                    tx_l = abs(ny_l)
+                    ty_l = -nx_l * s_ny
 
-                        # Corner vertex near the wall (px <= r_player + 0.5)
-                        if px <= r_player + 0.5:
-                            pushes_away = (dy_l < 0.0 and vy < 0.0) or (dy_l > 0.0 and vy > 0.0)
-                            if pushes_away:
-                                vx = 0.0
-                            else:
-                                spd = math.hypot(vx, vy)
-                                vt_l = max(spd * tx_l, vx * tx_l + vy * ty_l)
-                                vx = vt_l * tx_l
-                                vy = vt_l * ty_l
+                    # Corner vertex near the wall (px <= r_player + 0.5)
+                    if px <= r_player + 0.5:
+                        pushes_away = (dy_l < 0.0 and vy < 0.0) or (dy_l > 0.0 and vy > 0.0)
+                        if pushes_away:
+                            vx = 0.0
                         else:
-                            vn_l = vx * nx_l + vy * ny_l
-                            if vn_l < 0.0:
-                                vx -= vn_l * nx_l
-                                vy -= vn_l * ny_l
-                            if vx < 0.0 and px <= r_player + 2.0:
-                                vt_l = max(0.0, vx * tx_l + vy * ty_l)
-                                vx = vt_l * tx_l
-                                vy = vt_l * ty_l
-                elif px <= r_player:
-                    px = r_player
-                    if apply_dynamic_push and vx < 0.0:
-                        vx = 0.0
+                            spd = math.hypot(vx, vy)
+                            vt_l = max(spd * tx_l, vx * tx_l + vy * ty_l)
+                            vx = vt_l * tx_l
+                            vy = vt_l * ty_l
+                    else:
+                        vn_l = vx * nx_l + vy * ny_l
+                        if vn_l < 0.0:
+                            vx -= vn_l * nx_l
+                            vy -= vn_l * ny_l
+                        if vx < 0.0 and px <= r_player + 2.0:
+                            vt_l = max(0.0, vx * tx_l + vy * ty_l)
+                            vx = vt_l * tx_l
+                            vy = vt_l * ty_l
+            elif px <= r_player:
+                px = r_player
+                if apply_dynamic_push and vx < 0.0:
+                    vx = 0.0
 
-                # Right goalmouth boundary envelope
-                dy_r = py - 420.0
-                if abs(dy_r) < eff_box_right and eff_box_right > 1e-3:
-                    dx_arc_r = math.sqrt(eff_box_right * eff_box_right - dy_r * dy_r)
-                else:
-                    dx_arc_r = 0.0
-                x_max = min(phys.field_width - r_player, phys.field_width - (dx_arc_r + 1e-3 if dx_arc_r > 0.0 else 0.0))
+            # Right goalmouth boundary envelope
+            dy_r = py - 420.0
+            if abs(dy_r) < eff_box_right and eff_box_right > 1e-3:
+                dx_arc_r = math.sqrt(eff_box_right * eff_box_right - dy_r * dy_r)
+            else:
+                dx_arc_r = 0.0
+            x_max = min(phys.field_width - r_player, phys.field_width - (dx_arc_r + 1e-3 if dx_arc_r > 0.0 else 0.0))
 
-                if px > x_max:
-                    px = x_max
+            if px > x_max:
+                px = x_max
 
-                dist_r = math.hypot(phys.field_width - px, dy_r)
-                if abs(dy_r) < eff_box_right and dist_r <= eff_box_right + 1e-3 and eff_box_right > 1e-3:
-                    dist_safe = max(1e-6, dist_r)
-                    nx_r = (px - phys.field_width) / dist_safe
-                    ny_r = dy_r / dist_safe
+            dist_r = math.hypot(phys.field_width - px, dy_r)
+            if abs(dy_r) < eff_box_right and dist_r <= eff_box_right + 1e-3 and eff_box_right > 1e-3:
+                dist_safe = max(1e-6, dist_r)
+                nx_r = (px - phys.field_width) / dist_safe
+                ny_r = dy_r / dist_safe
 
-                    if apply_dynamic_push:
-                        # Tangent vector along arc directed into the field (tx < 0) toward goalmouth
-                        s_ny = 1.0 if ny_r >= 0.0 else -1.0
-                        tx_r = -abs(ny_r)
-                        ty_r = nx_r * s_ny
+                if apply_dynamic_push:
+                    # Tangent vector along arc directed into the field (tx < 0) toward goalmouth
+                    s_ny = 1.0 if ny_r >= 0.0 else -1.0
+                    tx_r = -abs(ny_r)
+                    ty_r = nx_r * s_ny
 
-                        # Corner vertex near the wall (px >= field_width - r_player - 0.5)
-                        if px >= phys.field_width - r_player - 0.5:
-                            pushes_away = (dy_r < 0.0 and vy < 0.0) or (dy_r > 0.0 and vy > 0.0)
-                            if pushes_away:
-                                vx = 0.0
-                            else:
-                                spd = math.hypot(vx, vy)
-                                vt_r = max(spd * abs(tx_r), vx * tx_r + vy * ty_r)
-                                vx = vt_r * tx_r
-                                vy = vt_r * ty_r
+                    # Corner vertex near the wall (px >= field_width - r_player - 0.5)
+                    if px >= phys.field_width - r_player - 0.5:
+                        pushes_away = (dy_r < 0.0 and vy < 0.0) or (dy_r > 0.0 and vy > 0.0)
+                        if pushes_away:
+                            vx = 0.0
                         else:
-                            vn_r = vx * nx_r + vy * ny_r
-                            if vn_r < 0.0:
-                                vx -= vn_r * nx_r
-                                vy -= vn_r * ny_r
-                            if vx > 0.0 and px >= phys.field_width - r_player - 2.0:
-                                vt_r = max(0.0, vx * tx_r + vy * ty_r)
-                                vx = vt_r * tx_r
-                                vy = vt_r * ty_r
-                elif px >= phys.field_width - r_player:
-                    px = phys.field_width - r_player
-                    if apply_dynamic_push and vx > 0.0:
-                        vx = 0.0
+                            spd = math.hypot(vx, vy)
+                            vt_r = max(spd * abs(tx_r), vx * tx_r + vy * ty_r)
+                            vx = vt_r * tx_r
+                            vy = vt_r * ty_r
+                    else:
+                        vn_r = vx * nx_r + vy * ny_r
+                        if vn_r < 0.0:
+                            vx -= vn_r * nx_r
+                            vy -= vn_r * ny_r
+                        if vx > 0.0 and px >= phys.field_width - r_player - 2.0:
+                            vt_r = max(0.0, vx * tx_r + vy * ty_r)
+                            vx = vt_r * tx_r
+                            vy = vt_r * ty_r
+            elif px >= phys.field_width - r_player:
+                px = phys.field_width - r_player
+                if apply_dynamic_push and vx > 0.0:
+                    vx = 0.0
 
-                # Top & bottom field walls with normal dissipation
-                if py < r_player:
-                    py = r_player
-                    if apply_dynamic_push and vy < 0.0:
-                        vy = 0.0
-                elif py > phys.field_height - r_player:
-                    py = phys.field_height - r_player
-                    if apply_dynamic_push and vy > 0.0:
-                        vy = 0.0
+            # Top & bottom field walls with normal dissipation
+            if py < r_player:
+                py = r_player
+                if apply_dynamic_push and vy < 0.0:
+                    vy = 0.0
+            elif py > phys.field_height - r_player:
+                py = phys.field_height - r_player
+                if apply_dynamic_push and vy > 0.0:
+                    vy = 0.0
 
-                self.player_pos[p_idx, 0] = px
-                self.player_pos[p_idx, 1] = py
-                self.player_vel[p_idx, 0] = vx
-                self.player_vel[p_idx, 1] = vy
+            self.player_pos[p_idx, 0] = px
+            self.player_pos[p_idx, 1] = py
+            self.player_vel[p_idx, 0] = vx
+            self.player_vel[p_idx, 1] = vy
 
         # Kickoff Exclusion Circle: Smoothly or firmly keep opposing players outside center spot (r = 130.0)
         if self.kickoff_protection_timer > 0.0 and self.ball_holder is not None:

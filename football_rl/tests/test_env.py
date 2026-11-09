@@ -4313,6 +4313,104 @@ def test_replay_digest_is_seed_sensitive_and_repeatable():
     assert replay_digest(steps=20, seed=1234) != replay_digest(steps=20, seed=1235)
 
 
+def test_precomputed_player_tables_match_roles():
+    env = FootballParallelEnv()
+    assert env._max_speed_arr.shape == (12,)
+    assert env._max_speed_arr.tolist() == [180.0, 188.0, 188.0, 192.0, 192.0, 190.0] * 2
+    assert env._is_keeper.dtype == bool
+    assert np.flatnonzero(env._is_keeper).tolist() == [0, 6]
+    assert [env._get_player_max_speed(i) for i in range(12)] == env._max_speed_arr.tolist()
+    phys = env.cfg.physics
+    assert len(env._goal_centers) == 2
+    assert env._goal_centers[0].tolist() == list(phys.left_goal_center)
+    assert env._goal_centers[1].tolist() == list(phys.right_goal_center)
+
+
+def _random_clamp_state(env: FootballParallelEnv, rng: np.random.Generator) -> None:
+    """Random outfield states concentrated near walls, corners and both goal semicircles."""
+    phys = env.cfg.physics
+    r = phys.player_radius
+    for side, goal_x in ((0, 0.0), (1, phys.field_width)):
+        env.active_box_radius[side] = rng.choice([0.0, 1e-4, 40.0, 120.0, phys.keeper_box_radius])
+    for i in range(12):
+        zone = rng.integers(0, 5)
+        if zone == 0:  # anywhere (including slightly outside the field)
+            x = rng.uniform(-10.0, phys.field_width + 10.0)
+            y = rng.uniform(-10.0, phys.field_height + 10.0)
+        elif zone == 1:  # left corner pin region
+            x = rng.uniform(0.0, r + 3.0)
+            y = rng.uniform(phys.goal_y_min - 250.0, phys.goal_y_max + 250.0)
+        elif zone == 2:  # right corner pin region
+            x = phys.field_width - rng.uniform(0.0, r + 3.0)
+            y = rng.uniform(phys.goal_y_min - 250.0, phys.goal_y_max + 250.0)
+        elif zone == 3:  # around the semicircle envelopes
+            x = rng.choice([0.0, phys.field_width]) + rng.choice([-1.0, 1.0]) * rng.uniform(0.0, 215.0)
+            y = rng.uniform(phys.goal_y_min - 230.0, phys.goal_y_max + 230.0)
+        else:  # top and bottom walls
+            x = rng.uniform(0.0, phys.field_width)
+            y = rng.choice([0.0, phys.field_height]) + rng.choice([-1.0, 1.0]) * rng.uniform(0.0, r + 3.0)
+        env.player_pos[i] = (x, y)
+    env.player_vel[:] = rng.uniform(-200.0, 200.0, size=(12, 2))
+
+
+def test_outfield_boundary_candidates_cover_every_player_the_clamp_changes():
+    env = FootballParallelEnv()
+    env.reset(seed=0)
+    env.ball_holder = None
+    env.kickoff_protection_timer = 0.0
+    rng = np.random.default_rng(20240607)
+    changed_total = 0
+    skipped_total = 0
+    for _ in range(2000):
+        _random_clamp_state(env, rng)
+        pos_before = env.player_pos.copy()
+        vel_before = env.player_vel.copy()
+        candidates = env._outfield_boundary_candidates()
+        assert candidates.shape == (12,) and candidates.dtype == bool
+        assert not candidates[[0, 6]].any()
+        env._clamp_players_to_boundaries(apply_dynamic_push=True)
+        changed = (env.player_pos != pos_before).any(axis=1) | (env.player_vel != vel_before).any(axis=1)
+        outfield = ~env._is_keeper
+        assert not (changed & outfield & ~candidates).any(), (
+            np.flatnonzero(changed & outfield & ~candidates), pos_before, vel_before
+        )
+        changed_total += int((changed & outfield).sum())
+        skipped_total += int((outfield & ~candidates).sum())
+    # The corpus exercises both the clamp body and the skipped path.
+    assert changed_total > 5000
+    assert skipped_total > 1000
+
+
+def test_outfield_boundary_candidates_exclude_players_in_open_field():
+    env = FootballParallelEnv()
+    env.reset(seed=0)
+    env.player_pos[:] = (700.0, 420.0)
+    assert not env._outfield_boundary_candidates().any()
+    env.player_pos[3] = (3.0, 420.0)
+    env.player_pos[8] = (700.0, 2.0)
+    env.player_pos[9] = (env.cfg.physics.field_width - 2.0, 100.0)
+    assert np.flatnonzero(env._outfield_boundary_candidates()).tolist() == [3, 8, 9]
+
+
+def test_free_ball_pickup_with_no_player_in_reach_changes_nothing():
+    env = FootballParallelEnv()
+    env.reset(seed=0)
+    env.ball_holder = None
+    env.pickup_cooldown[:] = 0.0
+    env.stun_timer[:] = 0.0
+    env.ghost_timer[:] = 0.0
+    env.ball_pos = np.array([700.0, 420.0])
+    env.player_pos[:] = (100.0, 100.0)
+    rewards = np.zeros(12)
+    env._check_free_ball_pickup(rewards)
+    assert env.ball_holder is None
+    assert not rewards.any()
+    env.player_pos[4] = (700.0 + env.cfg.mechanics.pickup_distance - 1.0, 420.0)
+    env.player_angle[4] = np.pi  # facing the ball
+    env._check_free_ball_pickup(rewards)
+    assert env.ball_holder == 4
+
+
 POTENTIAL_CORPUS_PATH = Path(__file__).resolve().parent / "golden" / "potential_corpus.npz"
 
 
