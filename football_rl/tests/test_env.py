@@ -4269,3 +4269,76 @@ def test_rollout_matches_golden_digest():
 def test_rollout_digest_is_seed_sensitive_and_repeatable():
     assert rollout_digest(steps=60, seed=1234) == rollout_digest(steps=60, seed=1234)
     assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
+
+
+POTENTIAL_CORPUS_PATH = Path(__file__).resolve().parent / "golden" / "potential_corpus.npz"
+
+
+def _load_potential_corpus() -> dict[str, np.ndarray]:
+    """Load the recorded potential-field corpus: 200 consecutive RL steps of a seeded scripted-policy rollout.
+
+    Every record holds the state the potential field reads (positions, headings, ball, possession,
+    stun/ghost/lunge flags, post-kick timers, tactical biases, box radii) together with the resulting
+    per-player potentials, role labels and role targets.
+    """
+    with np.load(POTENTIAL_CORPUS_PATH) as data:
+        return {name: data[name] for name in data.files}
+
+
+def _potentials_from_env(env: FootballParallelEnv, corpus: dict[str, np.ndarray], k: int):
+    """Load record `k` into `env`, evaluate its potential field, and return (phi, role labels, role targets)."""
+    env.player_pos[:] = corpus["pos"][k]
+    env.player_angle[:] = corpus["angle"][k]
+    env.ball_pos[:] = corpus["ball"][k]
+    holder = int(corpus["holder"][k])
+    env.ball_holder = None if holder < 0 else holder
+    env.ball_kicked_in_flight = bool(corpus["in_flight"][k])
+    last_team = int(corpus["last_ball_team"][k])
+    env.last_ball_team = None if last_team < 0 else last_team
+    env.team_side[:] = corpus["team_side"][k]
+    env.stun_timer[:] = np.where(corpus["stunned"][k], 1.0, 0.0)
+    env.is_ghost[:] = corpus["disabled"][k]
+    env.lunge_timer[:] = np.where(corpus["lunging"][k], 1.0, 0.0)
+    env.post_kick_pbrs_timer[:] = corpus["post_kick_timer"][k]
+    env.active_box_radius[:] = corpus["active_box_radius"][k]
+    env._compute_potential_shaping(np.zeros(env.num_players, dtype=np.float64), any_teleport=True)
+    return env._phi_curr.copy(), list(env.last_role_states), np.array(env.last_role_targets, dtype=np.float64)
+
+
+def test_potential_corpus_covers_possession_and_role_states():
+    corpus = _load_potential_corpus()
+    holder = corpus["holder"]
+    phys = DEFAULT_CONFIG.physics
+    assert corpus["phi"].shape == (200, 12)
+
+    labels = set(corpus["role_states"].ravel().tolist())
+    assert {"GK", "BALL", "CHSE", "1stP", "2ndP", "COVR", "STUN", "LNGE"} <= labels
+
+    assert (holder < 0).any()
+    assert {0, 6} <= set(holder.tolist())
+    assert ((holder > 0) & (holder < 6)).any() and (holder > 6).any()
+    for team in (0, 1):
+        assert ((holder < 0) & corpus["in_flight"] & (corpus["last_ball_team"] == team)).any()
+    for members in (slice(0, 6), slice(6, 12)):
+        assert corpus["stunned"][:, members].any()
+        assert (corpus["post_kick_timer"][:, members] > 0.0).any()
+
+    ball = corpus["ball"]
+    for goal_x in (0.0, phys.field_width):
+        d_goal = np.hypot(ball[:, 0] - goal_x, ball[:, 1] - 0.5 * phys.field_height)
+        assert ((holder < 0) & (d_goal <= phys.keeper_box_radius + 50.0)).any()
+
+
+def test_env_potentials_match_recorded_corpus():
+    corpus = _load_potential_corpus()
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=True, interest_threshold=float("inf")),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=0)
+    for k in range(corpus["phi"].shape[0]):
+        phi, labels, targets = _potentials_from_env(env, corpus, k)
+        np.testing.assert_allclose(phi, corpus["phi"][k], rtol=0.0, atol=1e-9, err_msg=f"phi, record {k}")
+        assert labels == corpus["role_states"][k].tolist(), f"role labels, record {k}"
+        np.testing.assert_allclose(targets, corpus["role_targets"][k], rtol=0.0, atol=1e-9, err_msg=f"targets, record {k}")
