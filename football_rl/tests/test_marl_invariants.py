@@ -310,8 +310,8 @@ def test_kickoff_pass_pbrs_continuity_and_circulation_bonus():
     env.reset(seed=42)
     env.kickoff_protection_timer = 0.0
 
-    # Striker (idx 4) holds ball at center (700, 420) facing Midfielder (idx 3) at (520, 580)
-    kicker_idx, receiver_idx = 4, 3
+    # Striker (idx 5) holds ball at center (700, 420) facing Midfielder (idx 3) at (520, 580)
+    kicker_idx, receiver_idx = 5, 3
     env.ball_holder = kicker_idx
     env.last_ball_holder = kicker_idx
     env.last_ball_team = TEAM_LEFT
@@ -408,14 +408,14 @@ def test_gk_5s_violation_prevents_teammate_recovery_and_protects_goal_mouth():
 
 
 def test_bumper_to_bumper_tackle_probability_and_whiff_distance_gate():
-    """Verify Attackers have non-zero tackle probability at rigid-body contact (dist=40u) and distant tackles are gated."""
+    """Verify Attackers have non-zero tackle probability at near-contact (40u) and distant tackles are gated."""
     env = FootballEnv(EnvConfig())
     env.reset(seed=42)
     env.kickoff_protection_timer = 0.0
     env.pickup_tackle_grace_timer = 0.0
 
     # 1. Distant tackle (> 180u from ball) must be ignored without penalty
-    atk_idx = 4
+    atk_idx = 5
     carrier_idx = 8
     env.ball_holder = carrier_idx
     env.player_pos[carrier_idx] = [1000.0, 420.0]
@@ -426,7 +426,7 @@ def test_bumper_to_bumper_tackle_probability_and_whiff_distance_gate():
     env._attempt_tackle(atk_idx, rewards)
     assert rewards[atk_idx] == 0.0 and env.stats["failed_tackles"] == 0
 
-    # 2. Bumper-to-bumper contact (dist = 40.0u = 2 * player_radius) for Attacker
+    # 2. Near-contact (40.0u, beyond the 2 * player_radius = 36u touching distance) for Attacker
     env.player_pos[atk_idx] = [960.0, 420.0]  # Exactly 40.0u from carrier at (1000, 420)
     env.player_angle[atk_idx] = 0.0
     successes = 0

@@ -3866,6 +3866,278 @@ def test_pitch_boundary_wall_velocity_dissipation_and_bisector_depth() -> None:
     assert max_delta < 0.02
 
 
+# ---------------------------------------------------------------------------
+# Boundary, pin, box-radius, presser-tie and degenerate-action specifications
+# ---------------------------------------------------------------------------
+
+_CORNER_CASES = [
+    pytest.param((15.0, 15.0), (1.0, 1.0), id="top_left"),
+    pytest.param((1385.0, 15.0), (-1.0, 1.0), id="top_right"),
+    pytest.param((15.0, 825.0), (1.0, -1.0), id="bottom_left"),
+    pytest.param((1385.0, 825.0), (-1.0, -1.0), id="bottom_right"),
+]
+
+
+def _scatter_players_midfield(env: FootballParallelEnv) -> None:
+    """Park every player in the middle of the pitch, away from the corners and both boxes."""
+    for i in range(1, 6):
+        env.player_pos[i] = [700.0, 100.0 + 60.0 * (i - 1)]
+    for i in range(7, 12):
+        env.player_pos[i] = [900.0, 100.0 + 60.0 * (i - 7)]
+    env.player_pos[0] = [40.0, 420.0]
+    env.player_pos[6] = [1360.0, 420.0]
+    env.player_vel[:] = 0.0
+
+
+@pytest.mark.parametrize("corner, inward", _CORNER_CASES)
+def test_loose_ball_pinned_in_each_corner_is_nudged_toward_centre_after_two_seconds(corner, inward) -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+    _scatter_players_midfield(env)
+    sx, sy = inward
+    env.ball_holder = None
+    env.ball_pos = np.array(corner, dtype=np.float64)
+    env.ball_vel[:] = 0.0
+    # Two players beyond pickup range (28u) but inside the 68u crowding radius.
+    env.player_pos[1] = [corner[0] + sx * 45.0, corner[1]]
+    env.player_pos[7] = [corner[0], corner[1] + sy * 45.0]
+    env.pinned_ball_timer = 0.0
+
+    zero_actions = np.zeros((12, 4))
+    zero_speeds = np.zeros(12)
+    nudge_substep = None
+    prev_timer = 0.0
+    for k in range(240):
+        env._physics_substep(zero_actions, zero_speeds)
+        env.physics_frame_count += 1
+        if prev_timer > 0.0 and env.pinned_ball_timer == 0.0:
+            nudge_substep = k
+            break
+        prev_timer = env.pinned_ball_timer
+
+    assert nudge_substep is not None, "pinned loose ball was never released"
+    # 2.0 s at 60 substeps/s
+    assert 118 <= nudge_substep <= 122
+    # Direction (685, 405)/|.| * 95 u/s from the (15, 15) corner, mirrored per corner.
+    assert env.ball_vel[0] == pytest.approx(sx * 81.8, abs=0.5)
+    assert env.ball_vel[1] == pytest.approx(sy * 48.3, abs=0.5)
+
+
+@pytest.mark.parametrize("corner, inward", _CORNER_CASES)
+def test_carried_ball_pinned_in_each_corner_keeps_ball_and_carrier_on_pitch(corner, inward) -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+    _scatter_players_midfield(env)
+    sx, sy = inward
+    carrier, opponent = 3, 9
+    cx, cy = corner[0] + sx * 3.0, corner[1] + sy * 3.0
+    env.ball_holder = carrier
+    env.last_ball_holder = carrier
+    env.last_ball_team = TEAM_A
+    env.ball_hold_timer = 0.0
+    env.player_pos[carrier] = [cx, cy]
+    env.player_angle[carrier] = math.atan2(-sy, -sx)
+    env.player_pos[opponent] = [cx + sx * 40.0, cy + sy * 10.0]
+    env.ball_pos = env.player_pos[carrier] + np.array([-sx, -sy]) / math.sqrt(2.0) * 24.0
+    env.ball_vel[:] = 0.0
+
+    phys = DEFAULT_CONFIG.physics
+    r_ball, r_player = phys.ball_radius, phys.player_radius
+    zero_actions = np.zeros((12, 4))
+    zero_speeds = np.zeros(12)
+    for _ in range(180):
+        env._physics_substep(zero_actions, zero_speeds)
+        env.physics_frame_count += 1
+        assert np.isfinite(env.ball_pos).all() and np.isfinite(env.player_pos).all()
+        # The carried ball is clamped to the ball-radius inset up to sub-millimetre ordering slack
+        # from the carrier push-back that follows the clamp.
+        assert r_ball - 1e-3 <= env.ball_pos[0] <= phys.field_width - r_ball + 1e-3
+        assert r_ball - 1e-3 <= env.ball_pos[1] <= phys.field_height - r_ball + 1e-3
+        assert r_player - 1e-9 <= env.player_pos[carrier, 0] <= phys.field_width - r_player + 1e-9
+        assert r_player - 1e-9 <= env.player_pos[carrier, 1] <= phys.field_height - r_player + 1e-9
+
+
+def test_box_radius_fully_shrunk_and_nominal_on_both_sides_after_halftime_switch() -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    env._handle_halftime()
+    assert list(env.team_side) == [SIDE_RIGHT, SIDE_LEFT]
+    assert list(env.active_box_radius) == [195.0, 195.0]
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+    _scatter_players_midfield(env)
+
+    # Nominal radius on both sides: an outfielder at either goal line is pushed out to the arc (x = 195 + 1e-3).
+    env.player_pos[8] = [30.0, 420.0]
+    env.player_pos[2] = [1370.0, 420.0]
+    env._clamp_players_to_boundaries()
+    assert env.player_pos[8, 0] == pytest.approx(195.001, abs=1e-9)
+    assert env.player_pos[2, 0] == pytest.approx(1204.999, abs=1e-9)
+
+    # A dead ball in the left box (defended by team B after the switch) shrinks only the left radius.
+    env.player_pos[0] = [1380.0, 420.0]
+    env.player_pos[6] = [20.0, 420.0]
+    env.player_pos[8] = [700.0, 700.0]
+    env.player_pos[2] = [700.0, 650.0]
+    env.ball_holder = None
+    env.ball_pos = np.array([100.0, 520.0], dtype=np.float64)
+    env.ball_vel[:] = 0.0
+    zero_actions = np.zeros((12, 4))
+    zero_speeds = np.zeros(12)
+    for _ in range(60 * 8):
+        env._physics_substep(zero_actions, zero_speeds)
+        env.physics_frame_count += 1
+    assert env.active_box_radius[SIDE_LEFT] == 0.0
+    assert env.active_box_radius[SIDE_RIGHT] == 195.0
+
+    # Fully shrunk: the former exclusion zone is open; the untouched side still excludes.
+    env.player_pos[8] = [30.0, 420.0]
+    env.player_pos[2] = [1370.0, 420.0]
+    env._clamp_players_to_boundaries()
+    assert env.player_pos[8, 0] == pytest.approx(30.0, abs=1e-9)
+    assert env.player_pos[2, 0] == pytest.approx(1204.999, abs=1e-9)
+
+
+def _recording_env() -> FootballParallelEnv:
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=True, interest_threshold=float("inf")),
+    )
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+    return env
+
+
+def _team_b_holds_ball_in_team_a_attacking_half(env, d1_pos, d2_pos, st_pos) -> None:
+    env.player_pos[:] = np.array([[700.0, 100.0 + 60.0 * i] for i in range(12)], dtype=np.float64)
+    env.player_pos[0] = [40.0, 420.0]
+    env.player_pos[6] = [1360.0, 420.0]
+    env.player_pos[1] = d1_pos
+    env.player_pos[2] = d2_pos
+    env.player_pos[3] = [600.0, 300.0]
+    env.player_pos[4] = [600.0, 540.0]
+    env.player_pos[5] = st_pos
+    env.player_pos[7:12] = [[1100.0, 200.0], [1050.0, 300.0], [1000.0, 420.0], [1050.0, 540.0], [1100.0, 640.0]]
+    env.ball_holder = 8
+    env.last_ball_holder = 8
+    env.last_ball_team = TEAM_B
+    env.ball_pos = env.player_pos[8].copy()
+    env.ball_vel[:] = 0.0
+    env._compute_potential_shaping(np.zeros(env.num_players), any_teleport=True)
+
+
+def test_turnover_in_opposing_half_presser_is_nearest_player_whatever_its_role() -> None:
+    env = _recording_env()
+
+    # Both defenders are ahead of the striker and closer to the carrier at (1000, 420).
+    _team_b_holds_ball_in_team_a_attacking_half(env, [960.0, 380.0], [930.0, 470.0], [820.0, 420.0])
+    assert env.last_role_states[:6] == ["GK", "1stP", "COVR", "COVR", "COVR", "COVR"]
+    assert env._phi_curr[1] > env._phi_curr[5]
+
+    # The striker is closest: it presses and the defenders cover.
+    _team_b_holds_ball_in_team_a_attacking_half(env, [860.0, 380.0], [830.0, 470.0], [960.0, 420.0])
+    assert env.last_role_states[:6] == ["GK", "COVR", "COVR", "COVR", "COVR", "1stP"]
+
+    # Exactly one presser per team and every coverer's shaping potential is finite.
+    assert sum(1 for r in env.last_role_states[:6] if r == "1stP") == 1
+    assert np.isfinite(env._phi_curr).all()
+
+
+def test_presser_selection_tie_resolves_to_lowest_player_index() -> None:
+    env = _recording_env()
+    env.player_pos[:] = np.array([[700.0, 100.0 + 60.0 * i] for i in range(12)], dtype=np.float64)
+    env.player_pos[0] = [40.0, 420.0]
+    env.player_pos[6] = [1360.0, 420.0]
+    env.player_pos[1] = [200.0, 100.0]
+    env.player_pos[3] = [200.0, 150.0]
+    env.player_pos[5] = [200.0, 700.0]
+    env.ball_holder = None
+    env.last_ball_holder = None
+    env.last_ball_team = None
+    env.ball_pos = np.array([700.0, 420.0], dtype=np.float64)
+    env.ball_vel[:] = 0.0
+
+    # Players 2 and 4 are exactly 120u from the loose ball (above and below it).
+    for upper, lower in ((2, 4), (4, 2)):
+        env.player_pos[upper] = [700.0, 300.0]
+        env.player_pos[lower] = [700.0, 540.0]
+        env._compute_potential_shaping(np.zeros(env.num_players), any_teleport=True)
+        assert env.last_role_states[2] == "1stP"
+        assert env.last_role_states[4] == "2ndP"
+        first = list(env.last_role_states)
+        env._compute_potential_shaping(np.zeros(env.num_players), any_teleport=True)
+        assert env.last_role_states == first
+
+
+@pytest.mark.parametrize(
+    "gk_y, in_mouth",
+    [(420.0, True), (345.0, True), (250.0, False), (590.0, False)],
+    ids=["mouth_centre", "mouth_post", "box_above_mouth", "box_below_mouth"],
+)
+def test_goalkeeper_driven_into_end_wall_stays_on_pitch_and_in_box(gk_y, in_mouth) -> None:
+    phys = DEFAULT_CONFIG.physics
+    assert in_mouth == (phys.goal_y_min <= gk_y <= phys.goal_y_max)
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    env.kickoff_protection_timer = 0.0
+    _scatter_players_midfield(env)
+    env.ball_holder = None
+    env.ball_pos = np.array([700.0, 420.0], dtype=np.float64)
+    env.ball_vel[:] = 0.0
+    keeper = 0
+    env.player_pos[keeper] = [60.0, gk_y]
+    env.player_angle[keeper] = math.pi
+    actions = np.zeros((12, 4))
+    actions[keeper] = [1.0, 0.0, 0.0, 0.0]  # full throttle straight at the end wall
+    zero_speeds = np.zeros(12)
+    min_x = np.inf
+    for _ in range(180):
+        env._physics_substep(actions, zero_speeds)
+        env.physics_frame_count += 1
+        min_x = min(min_x, float(env.player_pos[keeper, 0]))
+    assert min_x >= phys.player_radius - 1e-9
+    assert env.player_pos[keeper, 0] == pytest.approx(phys.player_radius, abs=1e-9)
+    assert env.player_pos[keeper, 1] == pytest.approx(gk_y, abs=1e-6)
+    assert env.player_vel[keeper, 0] >= 0.0
+    assert np.isfinite(env.player_pos[keeper]).all() and np.isfinite(env.player_vel[keeper]).all()
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf], ids=["+inf", "-inf"])
+def test_step_array_clips_infinite_actions_to_finite_state(bad) -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    actions = np.zeros((12, 4))
+    actions[3, 0] = bad
+    actions[4, 1] = bad
+    actions[5, 2] = bad
+    actions[0, 3] = bad
+    obs, central, rew, _, _ = env.step_array(actions)
+    for arr in (obs, central, rew, env.player_pos, env.player_vel, env.player_angle, env.ball_pos):
+        assert np.isfinite(arr).all()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="np.clip does not clip NaN; NaN actions propagate into positions, observations and rewards",
+)
+def test_step_array_rejects_or_clips_nan_actions() -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    actions = np.zeros((12, 4))
+    actions[3, 0] = np.nan
+    try:
+        obs, central, rew, _, _ = env.step_array(actions)
+    except (ValueError, FloatingPointError):
+        return
+    for arr in (obs, central, rew, env.player_pos, env.player_vel, env.player_angle, env.ball_pos):
+        assert np.isfinite(arr).all()
+
+
 GOLDEN_ROLLOUT_DIGEST = "a0e3c934d19f7f40cd8cba0ba0f1c5f26cd381934d38ebf97d0ffd1db1f0f2e7"
 
 
