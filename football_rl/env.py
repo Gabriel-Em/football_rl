@@ -213,10 +213,9 @@ class FootballParallelEnv(ParallelEnv):
             [self._entity_player_slots[i] for i in range(self.num_players)],
             dtype=np.int32,
         )
-        self._row_idx_12x1: np.ndarray = np.arange(self.num_players, dtype=np.int32)[:, None]
         self._max_self_vel: np.ndarray = np.array(
             [
-                self.cfg.mechanics.lunge_speed
+                self.cfg.mechanics.keeper_obs_speed_norm
                 if self.player_role[i] == ROLE_KEEPER
                 else self._get_player_max_speed(i)
                 for i in range(self.num_players)
@@ -273,7 +272,6 @@ class FootballParallelEnv(ParallelEnv):
 
         # Potential State, Anti-Loop Trackers & Steering Vectors
         self.raw_steer_input: np.ndarray = np.zeros(self.num_players, dtype=np.float32)
-        self.prev_ball_potential: np.ndarray = np.zeros(2, dtype=np.float64)
         self.prev_tactical_potential: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.last_turnover_reward_time: float = -999.0
         self.last_kick_time: np.ndarray = np.full(self.num_players, -999.0, dtype=np.float64)
@@ -315,7 +313,7 @@ class FootballParallelEnv(ParallelEnv):
         )
 
         self._inv_keeper_box_radius: float = 1.0 / float(self.cfg.physics.keeper_box_radius)
-        self._inv_keeper_box_loose_max_time: float = 1.0 / float(self.cfg.mechanics.keeper_box_loose_max_time)
+        self._inv_keeper_box_loose_max_time: float = 1.0 / float(self.cfg.mechanics.box_timer_obs_norm)
         self._inv_max_field_dist: float = 1.0 / self._max_field_dist
         self._inv_pi: float = 1.0 / math.pi
         self._fade_rad: float = math.radians(15.0)
@@ -382,7 +380,6 @@ class FootballParallelEnv(ParallelEnv):
         self.ball_hold_timer: float = 0.0
         self.kick_grace_timer: float = 0.0
         self._box_loose_ball_timer: _DualBoxTimer = _DualBoxTimer(0.0, 0.0)
-        self._gk_box_possession_timer: np.ndarray = np.zeros(2, dtype=np.float64)
         self.last_ball_holder: Optional[int] = None
         self.last_ball_team: Optional[int] = None
         self.ball_kick_origin: np.ndarray = np.zeros(2, dtype=np.float64)
@@ -679,7 +676,6 @@ class FootballParallelEnv(ParallelEnv):
             "team_saves": [0, 0],
             "shots": [0, 0],
             "field_5s_violations": 0,
-            "field_3s_violations": 0,  # alias for backwards compatibility
             "keeper_5s_violations": 0,
             "possession_frames": [0, 0],
             "stationary_ball_frames": 0,
@@ -713,7 +709,6 @@ class FootballParallelEnv(ParallelEnv):
         self.raw_steer_input.fill(0.0)
         self.prev_tactical_potential.fill(0.0)
         self._box_loose_ball_timer.fill(0.0)
-        self._gk_box_possession_timer.fill(0.0)
         self.last_turnover_reward_time = -999.0
         self.last_kick_time.fill(-999.0)
         self.last_shot_sot_reward = 0.0
@@ -722,10 +717,6 @@ class FootballParallelEnv(ParallelEnv):
 
         # Set initial kickoff formation and initialize Markovian potentials
         self._setup_kickoff(starting_team=self.first_half_kickoff_team)
-        self.prev_ball_potential[:] = [
-            self._compute_ball_potential(TEAM_A),
-            self._compute_ball_potential(TEAM_B),
-        ]
         self._compute_potential_shaping(
             np.zeros(self.num_players, dtype=np.float64), any_teleport=True
         )
@@ -789,8 +780,6 @@ class FootballParallelEnv(ParallelEnv):
         # Tier 2: Strict Policy-Invariant PBRS (Ball Threat & Off-Ball Positioning)
         phi_ball_end_a = self._compute_ball_potential(TEAM_A)
         phi_ball_end_b = self._compute_ball_potential(TEAM_B)
-        self.prev_ball_potential[0] = phi_ball_end_a
-        self.prev_ball_potential[1] = phi_ball_end_b
         r_ball_adv = np.zeros(self.num_players, dtype=np.float64)
         if not any_teleport:
             rew = self.cfg.rewards
@@ -1046,7 +1035,7 @@ class FootballParallelEnv(ParallelEnv):
                 holder_role == ROLE_KEEPER
                 and self.ball_hold_timer >= mech.keeper_max_hold_time - 1e-9
             ):
-                self._handle_keeper_5s_violation(self.ball_holder, step_rewards, is_hold_violation=True)
+                self._handle_keeper_5s_violation(self.ball_holder, step_rewards)
                 return True
         else:
             if math.hypot(float(self.ball_vel[0]), float(self.ball_vel[1])) < 1.0:
@@ -1086,7 +1075,7 @@ class FootballParallelEnv(ParallelEnv):
                         dive_angle = float(
                             wrap_to_pi(
                                 self.player_angle[idx]
-                                + steer_raw * math.radians(phys.kick_steer_max_deflection_deg)
+                                + steer_raw * math.radians(mech.kick_steer_max_deflection_deg)
                             )
                         )
                         u_dive = np.array(
@@ -1350,11 +1339,11 @@ class FootballParallelEnv(ParallelEnv):
         base_angle = float(wrap_to_pi(self.player_angle[kicker_idx] + steer_defl))
 
         # Kick Deflection Realism & Taper
-        abs_deflect_deg = abs(float(self.raw_steer_input[kicker_idx])) * phys.kick_steer_max_deflection_deg
+        abs_deflect_deg = abs(float(self.raw_steer_input[kicker_idx])) * mech.kick_steer_max_deflection_deg
         if abs_deflect_deg > 35.0 and kicker_role != ROLE_KEEPER:
             deflect_excess = _fast_clip(
                 (abs_deflect_deg - 35.0)
-                / max(1.0, phys.kick_steer_max_deflection_deg - 35.0),
+                / max(1.0, mech.kick_steer_max_deflection_deg - 35.0),
                 0.0,
                 1.0,
             )
@@ -1493,12 +1482,7 @@ class FootballParallelEnv(ParallelEnv):
                 power_factor = 0.6 + 0.4 * power_norm
                 mu_xg = _fast_clip(mu_dist * mu_gk_open * flank_angle_mult * power_factor, 0.05, 1.0)
 
-                base_sot = (
-                    rew.atk_shot_on_target_ind
-                    if kicker_role == ROLE_ATK
-                    else rew.other_shot_on_target_ind
-                )
-                sot_rew = base_sot * mu_xg
+                sot_rew = rew.shot_on_target_ind * mu_xg
                 team_sot_rew = rew.shot_on_target_team * mu_xg
                 step_rewards[kicker_idx] += sot_rew
                 self._add_team_reward(step_rewards, kicker_team, team_sot_rew)
@@ -2117,7 +2101,6 @@ class FootballParallelEnv(ParallelEnv):
         step_rewards[violator_idx] += rew.field_5s_violation_ind
         self._add_team_reward(step_rewards, team, rew.field_5s_violation_team)
         self.stats["field_5s_violations"] += 1
-        self.stats["field_3s_violations"] += 1
         self._emit_event(
             "5s VIOLATION!",
             self.player_pos[violator_idx],
@@ -2126,16 +2109,8 @@ class FootballParallelEnv(ParallelEnv):
             reward=rew.field_5s_violation_ind + rew.field_5s_violation_team,
         )
 
-    # Backwards-compatible alias
-    _handle_field_3s_violation = _handle_field_5s_violation
-
-    def _handle_keeper_5s_violation(
-        self, keeper_idx: int, step_rewards: np.ndarray, is_hold_violation: bool = True
-    ) -> None:
+    def _handle_keeper_5s_violation(self, keeper_idx: int, step_rewards: np.ndarray) -> None:
         """Penalize 5s GK violation by awarding wide flank possession to opponents while resetting GK to goal mouth."""
-        if not is_hold_violation:
-            return
-
         phys = self.cfg.physics
         mech = self.cfg.mechanics
         rew = self.cfg.rewards
@@ -2146,7 +2121,7 @@ class FootballParallelEnv(ParallelEnv):
         if step_rewards is not None:
             step_rewards[keeper_idx] += rew.keeper_5s_violation_ind
 
-        own_side = int(self.team_side[keeper_team]) if hasattr(self, "team_side") else keeper_team
+        own_side = int(self.team_side[keeper_team])
         own_goal = self.left_goal_center if own_side == SIDE_LEFT else self.right_goal_center
         outward_sign = 1.0 if own_side == SIDE_LEFT else -1.0
 
@@ -2175,20 +2150,19 @@ class FootballParallelEnv(ParallelEnv):
         # 3. Lock out the offending team from immediate recovery for 1.5s
         team_mask = self.player_team == keeper_team
         self.pickup_cooldown[team_mask] = np.maximum(self.pickup_cooldown[team_mask], 1.5)
-        keeper_foul_cd = getattr(mech, "keeper_foul_cooldown", 2.0)
-        self.pickup_cooldown[keeper_idx] = max(float(self.pickup_cooldown[keeper_idx]), keeper_foul_cd)
+        self.pickup_cooldown[keeper_idx] = max(
+            float(self.pickup_cooldown[keeper_idx]), mech.keeper_foul_pickup_cooldown
+        )
 
         self.ball_holder = None
         self.ball_hold_timer = 0.0
         self.ball_kicked_in_flight = False
         self.is_wall_pass_in_flight = False
-        self._gk_box_possession_timer[keeper_team] = 0.0
         self._box_loose_ball_timer[own_side] = 0.0
         self.active_box_radius[own_side] = phys.keeper_box_radius
 
-        event_name = "5s KEEPER HOLD FOUL!" if is_hold_violation else "5s UNCLAIMED BOX BALL!"
         self._emit_event(
-            event_name,
+            "5s KEEPER HOLD FOUL!",
             self.ball_pos,
             team=keeper_team,
             agent=self.idx_to_agent[keeper_idx],
@@ -2558,10 +2532,7 @@ class FootballParallelEnv(ParallelEnv):
 
         if self.last_ball_holder is not None:
             if int(self.player_team[self.last_ball_holder]) == scoring_team:
-                if int(self.player_role[self.last_ball_holder]) == ROLE_ATK:
-                    scorer_ind = rew.atk_goal_scorer_ind
-                else:
-                    scorer_ind = rew.goal_scorer_ind
+                scorer_ind = rew.goal_scorer_ind
                 step_rewards[self.last_ball_holder] += scorer_ind
 
                 # Goal Assist Award (within goal_assist_window_sec)

@@ -399,7 +399,7 @@ def test_gk_5s_violation_prevents_teammate_recovery_and_protects_goal_mouth():
     env.ball_holder = gk_idx
 
     rewards = np.zeros(env.num_players, dtype=np.float64)
-    env._handle_keeper_5s_violation(gk_idx, rewards, is_hold_violation=True)
+    env._handle_keeper_5s_violation(gk_idx, rewards)
 
     # 1. Offending team must have pickup cooldown >= 1.5s so teammate cannot grab the foul ball
     assert env.pickup_cooldown[teammate_idx] >= 1.5

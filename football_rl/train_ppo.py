@@ -231,12 +231,6 @@ class ParameterSharingPPOTrainer:
             self.red_field_optimizer = self.blue_field_optimizer
             self.red_keeper_optimizer = self.blue_keeper_optimizer
 
-        # Backwards-compatible aliases
-        self.field_policy = self.blue_field_policy
-        self.keeper_policy = self.blue_keeper_policy
-        self.field_optimizer = self.blue_field_optimizer
-        self.keeper_optimizer = self.blue_keeper_optimizer
-
         # CPU shadow policies for fast rollout inference (when device == 'cuda')
         if self.device.type == "cuda":
             self.cpu_blue_field_policy = ActorCritic(
@@ -543,8 +537,7 @@ class ParameterSharingPPOTrainer:
                         "successful_tackles": int(fstats.get("successful_tackles", 0)),
                         "team_saves": list(fstats.get("team_saves", [0, 0])),
                         "keeper_saves": int(fstats.get("keeper_saves", 0)),
-                        "field_5s_violations": int(fstats.get("field_5s_violations", fstats.get("field_3s_violations", 0))),
-                        "field_3s_violations": int(fstats.get("field_3s_violations", fstats.get("field_5s_violations", 0))),
+                        "field_5s_violations": int(fstats.get("field_5s_violations", 0)),
                         "keeper_5s_violations": int(fstats.get("keeper_5s_violations", 0)),
                         "replay_path": rpath or "",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1016,7 +1009,7 @@ class ParameterSharingPPOTrainer:
             passes = f"{m['team_passes'][0]}/{m['team_passes'][1]}"
             tackles = f"{m['team_tackles'][0]}/{m['team_tackles'][1]}"
             saves = f"{m['team_saves'][0]}/{m['team_saves'][1]}"
-            f_viol = m.get("field_5s_violations", m.get("field_3s_violations", 0))
+            f_viol = m.get("field_5s_violations", 0)
             k_viol = m.get("keeper_5s_violations", 0)
             fouls = f"{f_viol}/{k_viol}"
             rfile = os.path.basename(m["replay_path"]) if m["replay_path"] else "_(not saved)_"

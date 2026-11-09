@@ -75,17 +75,12 @@ class PhysicsConfig:
     mid_max_speed: float = 192.0
     atk_max_speed: float = 190.0
     keeper_max_speed: float = 180.0
-    player_max_turn_rate_deg: float = 270.0
     player_max_turn_rate: float = 1.5 * math.pi  # 270 deg/sec in rad/sec
-
-    # Dynamic Pass & Smother Parameters
-    kick_steer_max_deflection_deg: float = 35.0   # Clean side-foot deflection angle (+/- 35 deg) decoupled from body spin
 
     # Ball Kinematics
     ball_radius: float = 10.0
     ball_min_kick_speed: float = 160.0
     ball_max_launch_speed: float = 640.0  # Maximum launch speed
-    ball_kick_speed_span: float = 480.0   # 160.0 + power_norm * 480.0 -> 640.0
     def_max_kick_speed: float = 560.0
     mid_max_kick_speed: float = 600.0
     atk_max_kick_speed: float = 640.0
@@ -97,14 +92,11 @@ class PhysicsConfig:
     ball_wall_restitution: float = 0.85
 
     # Tick Rate & Frame Skipping
-    match_duration: float = 180.0
-    half_duration: float = 90.0
     physics_hz: int = 60
     dt: float = 1.0 / 60.0
     rl_hz: int = 15
     frame_skip: int = 4
     max_rl_steps: int = 2700        # 180.0s * 15 Hz
-    half_rl_steps: int = 1350       # 90.0s * 15 Hz
     max_physics_frames: int = 10800  # 180.0s * 60 Hz
     half_physics_frames: int = 5400  # 90.0s * 60 Hz
 
@@ -153,22 +145,11 @@ class MechanicsConfig:
     tackle_prob_mid: float = 0.82
     tackle_prob_atk: float = 0.74
 
-    # Backward-compatible aliases and derived limits
-    tackle_range: float = 75.0         # base / Midfielder
-    def_tackle_range: float = 85.0
-    mid_tackle_range: float = 75.0
-    atk_tackle_range: float = 65.0
-    tackle_near_range: float = 127.5   # Max aiming range (1.5 * tackle_radius_def = 127.5)
-    tackle_success_prob: float = 0.82  # base / Midfielder
-    def_tackle_success_prob: float = 0.90
-    mid_tackle_success_prob: float = 0.82
-    atk_tackle_success_prob: float = 0.74
-    tackle_stun_duration: float = 1.0  # Synced to tackle_victim_stun_time
     tackled_opponent_cooldown: float = 1.0
     tackle_fail_cooldown: float = 0.8  # Synced to tackle_miss_stun_time
 
     # Keeper Lunge & Perimeter Strip
-    lunge_speed: float = 430.0
+    keeper_obs_speed_norm: float = 430.0  # observation normalisation for keeper velocity
     keeper_dive_speed: float = 340.0
     lunge_duration: float = 0.25
     lunge_cooldown: float = 1.8
@@ -182,7 +163,8 @@ class MechanicsConfig:
     field_violation_pickup_cooldown: float = 3.0
     field_violation_tackle_cooldown: float = 3.0
     keeper_max_hold_time: float = 5.0
-    keeper_box_loose_max_time: float = 5.0  # Max time a loose ball can sit in keeper semicircle before foul teleport
+    box_timer_obs_norm: float = 5.0         # observation normalisation for the loose-box-ball timer
+    keeper_foul_pickup_cooldown: float = 2.0  # Pickup lockout (s) applied to a keeper after a 5s hold foul
     post_save_box_grace_time: float = 2.0   # Grace period (s) after GK save before box loose timer accumulates
 
     # Dynamic Semicircle Shrinking Parameters (Anti-Stall on Unclaimed Loose Box Balls)
@@ -213,7 +195,6 @@ class VisionConfig:
     """Observation space & vision cone parameters."""
 
     fov_deg: float = 210.0
-    fov_rad: float = math.radians(210.0)
     half_fov_rad: float = math.radians(105.0)  # +/- 105 deg (210 deg total FOV)
     max_range: float = 650.0
     peripheral_radar_presence: float = 0.25  # Non-zero presence flag for entities outside the 650u / 210-deg cone
@@ -234,24 +215,19 @@ class RewardConfig:
     goal_team_shared: float = 10.0
     goal_concede_team_shared: float = -10.0
     goal_scorer_ind: float = 3.0
-    atk_goal_scorer_ind: float = 3.0
     goal_assist_ind: float = 2.5
     goal_assist_window_sec: float = 4.0
     own_goal_ind: float = -3.0
 
     # Shot on Target & Save (Zero-Sum Paired Accounting)
-    atk_shot_on_target_ind: float = 0.45
-    other_shot_on_target_ind: float = 0.45
+    shot_on_target_ind: float = 0.45
     shot_on_target_team: float = 0.15
     keeper_save_ind: float = 1.20
     keeper_save_team: float = 0.30
 
     # Passing & Progression (Team-Cooperative + Anti-Oscillation)
-    pass_threat_weight: float = 6.0
     pass_threat_coeff: float = 6.0
-    pass_space_weight: float = 0.60
     pass_press_escape_coeff: float = 0.60
-    lead_pass_bonus: float = 0.80
     through_ball_stride_bonus: float = 0.80
     completed_pass_receiver_ind: float = 0.15
     completed_pass_team: float = 0.20
@@ -277,7 +253,6 @@ class RewardConfig:
     field_5s_violation_ind: float = -1.5
     field_5s_violation_team: float = -0.3
     keeper_5s_violation_ind: float = -1.5
-    keeper_5s_violation_team: float = -0.3
     failed_tackle_ind: float = -0.20
 
 

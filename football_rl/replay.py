@@ -262,7 +262,7 @@ class ReplayViewer:
                     self.goal_frames.append((idx, team, ev_t == "OWN GOAL!"))
                 elif ev_t in ("KEEPER SAVE!", "LUNGE SAVE!") or "SAVE" in ev_t.upper():
                     self.save_frames.append((idx, team, ev_t == "LUNGE SAVE!"))
-                elif "FOUL" in ev_t.upper() or "VIOLATION" in ev_t.upper() or "UNCLAIMED BOX BALL" in ev_t.upper():
+                elif "FOUL" in ev_t.upper() or "VIOLATION" in ev_t.upper():
                     self.foul_frames.append((idx, team, ev_t))
                 elif rew_val >= 5.0:
                     self.high_reward_frames.append((idx, team, ev_t, rew_val))

@@ -8,10 +8,17 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 from pettingzoo.test import parallel_api_test
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.audit import orphan_scan  # noqa: E402
 
 from football_rl.config import (
     ACTION_DIM,
@@ -205,7 +212,6 @@ def test_field_5s_violation_ghost_mode_and_other_player_reset() -> None:
     assert env.pickup_cooldown[carrier_idx] > 2.9
     assert env.tackle_cooldown[carrier_idx] > 2.9
     assert env.stats["field_5s_violations"] == 1
-    assert env.stats["field_3s_violations"] == 1
     assert total_carrier_reward < -1.5
 
     # Move teammate a_def_1 onto the ball to pick it up -> must not clear carrier's cooldown
@@ -662,7 +668,6 @@ def test_no_interception_penalty_on_gk_save_and_prime_hesitation_penalty() -> No
     env.ball_vel[:] = 0.0
     env.kick_grace_timer = 0.0
     phi_before = env._compute_ball_potential(TEAM_A)
-    env.prev_ball_potential[TEAM_A] = phi_before
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
 
     # Step without moving or kicking: discounted PBRS (gamma * phi - phi) is slightly negative
@@ -968,7 +973,7 @@ def test_ping_pong_lateral_pass_suppression_and_pairwise_decay() -> None:
     env._check_free_ball_pickup(rew4)
 
     d_phi = env._compute_ball_potential(team, env.player_pos[p3]) - env._compute_ball_potential(team, env.player_pos[p2])
-    r_pass = env.cfg.rewards.pass_threat_weight * d_phi
+    r_pass = env.cfg.rewards.pass_threat_coeff * d_phi
     team_bonus = getattr(env.cfg.rewards, "completed_pass_team", 0.0)
     expected_p2 = 0.60 * r_pass + team_bonus
     expected_p3 = 0.40 * r_pass + env.cfg.rewards.completed_pass_receiver_ind + team_bonus
@@ -998,7 +1003,7 @@ def test_gk_observation_state_separation() -> None:
     assert obs_gk[8] == 0.0
     assert obs_gk[13] == -1.0
     assert math.isclose(obs_gk[14], 1.0, abs_tol=1e-5)
-    expected_obs15 = 1.5 / env.cfg.mechanics.keeper_box_loose_max_time
+    expected_obs15 = 1.5 / env.cfg.mechanics.box_timer_obs_norm
     assert math.isclose(obs_gk[15], expected_obs15, abs_tol=1e-5)
     # Field DEF player encodes depth, flank, and active box norm in obs[13:16]
     np.testing.assert_allclose(obs_def[13:16], [-1.0, -1.0, 1.0], atol=1e-6)
@@ -1032,7 +1037,7 @@ def test_tiki_taka_chain_multiplier_and_own_goal_exclusion() -> None:
     env._handle_goal_scored(TEAM_A, step_rew)
 
     expected_team_goal = rew_cfg.goal_team_shared
-    expected_atk_goal = rew_cfg.atk_goal_scorer_ind
+    expected_atk_goal = rew_cfg.goal_scorer_ind
     assert math.isclose(step_rew[atk_idx], expected_atk_goal + expected_team_goal, abs_tol=1e-5)
     assert math.isclose(step_rew[env.agent_to_idx["a_def_1"]], expected_team_goal, abs_tol=1e-5)
     assert env.team_pass_chain == [0, 0]
@@ -1051,7 +1056,7 @@ def test_tiki_taka_chain_multiplier_and_own_goal_exclusion() -> None:
 
 
 def test_kinematic_lead_pass_targeting() -> None:
-    """Verify that receiving a progressive pass in-stride toward goal awards lead_pass_bonus."""
+    """Verify that receiving a progressive pass in-stride toward goal awards through_ball_stride_bonus."""
     cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
     env = FootballParallelEnv(cfg)
     env.reset(seed=42)
@@ -1082,8 +1087,8 @@ def test_kinematic_lead_pass_targeting() -> None:
     d_phi = env._compute_ball_potential(TEAM_A, env.player_pos[runner_idx]) - env._compute_ball_potential(
         TEAM_A, env.player_pos[kicker_idx]
     )
-    base_prog = 0.60 * env.cfg.rewards.pass_threat_weight * d_phi
-    assert step_rew[kicker_idx] > base_prog + 0.30 * env.cfg.rewards.lead_pass_bonus
+    base_prog = 0.60 * env.cfg.rewards.pass_threat_coeff * d_phi
+    assert step_rew[kicker_idx] > base_prog + 0.30 * env.cfg.rewards.through_ball_stride_bonus
 
 
 def test_kickoff_carrier_faces_own_keeper_and_sees_teammates() -> None:
@@ -1649,12 +1654,12 @@ def test_keeper_obs13_instant_step_signal_and_sweeper_fetch_priority() -> None:
     obs = env._build_single_observation(gk_idx)
     np.testing.assert_allclose(obs[13:16], [-1.0, 1.0, 0.0], atol=1e-4)
 
-    half_time = 0.5 * env.cfg.mechanics.keeper_box_loose_max_time
+    half_time = 0.5 * env.cfg.mechanics.box_timer_obs_norm
     env.box_loose_ball_timer = half_time
     obs = env._build_single_observation(gk_idx)
     assert math.isclose(obs[15], 0.5, abs_tol=1e-4)
 
-    env.box_loose_ball_timer = env.cfg.mechanics.keeper_box_loose_max_time
+    env.box_loose_ball_timer = env.cfg.mechanics.box_timer_obs_norm
     obs = env._build_single_observation(gk_idx)
     assert math.isclose(obs[15], 1.0, abs_tol=1e-4)
 
@@ -1698,7 +1703,7 @@ def test_foul_restart_formation_opens_central_lane_and_forward_halfspace_runners
     env.ball_pos = np.array([84.0, 420.0], dtype=np.float64)
 
     step_rewards = np.zeros(env.num_players, dtype=np.float64)
-    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
+    env._handle_keeper_5s_violation(gk_idx, step_rewards)
 
     assert env.ball_holder is None
     assert math.isclose(env.pickup_cooldown[gk_idx], 2.0, abs_tol=1e-5)
@@ -1743,7 +1748,7 @@ def test_intermediate_teammate_pass_not_classified_as_shot_on_target() -> None:
     assert env.ball_kick_was_shot_on_target is False
     assert env.stats["shots"][TEAM_B] == 0
     # Kicker does not receive shot-on-target rewards
-    assert step_rewards[kicker_idx] < env.cfg.rewards.other_shot_on_target_ind * 0.5
+    assert step_rewards[kicker_idx] < env.cfg.rewards.shot_on_target_ind * 0.5
 
     # 2. Now move teammate away out of the pass corridor
     env.reset(seed=128)
@@ -2436,7 +2441,7 @@ def test_keeper_turnover_penalty_gradient() -> None:
 
 
 def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
-    """Verify GK hold violation event, suppression of obsolete unclaimed box ball foul, and post-save grace timer."""
+    """Verify GK hold violation event and post-save grace timer."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     env.reset(seed=42)
 
@@ -2447,17 +2452,10 @@ def test_keeper_5s_unclaimed_box_ball_and_post_save_grace() -> None:
     env.ball_holder = gk_idx
     env.ball_hold_timer = 5.01
     env._frame_events.clear()
-    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
+    env._handle_keeper_5s_violation(gk_idx, step_rewards)
     assert any(e["type"] == "5s KEEPER HOLD FOUL!" for e in env._frame_events)
 
-    # 2. Verify deprecated is_hold_violation=False is a no-op (no foul, no unclaimed event)
-    env._frame_events.clear()
-    prev_violations = env.stats["keeper_5s_violations"]
-    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=False)
-    assert not any(e["type"] == "5s UNCLAIMED BOX BALL!" for e in env._frame_events)
-    assert env.stats["keeper_5s_violations"] == prev_violations
-
-    # 3. Verify post-save grace pauses box_loose_ball_timer accumulation
+    # 2. Verify post-save grace pauses box_loose_ball_timer accumulation
     env.ball_holder = None
     env.ball_pos = np.array([80.0, 420.0], dtype=np.float64)  # Inside left keeper box
     env.box_loose_ball_timer = 0.0
@@ -3386,10 +3384,6 @@ def test_open_space_carry_multiplier() -> None:
     env.player_angle[carrier] = 0.0
     env.player_vel[carrier] = np.array([150.0, 0.0], dtype=np.float64)
     env.ball_pos = env.player_pos[carrier] + np.array([24.0, 0.0], dtype=np.float64)
-    env.prev_ball_potential[:] = [
-        env._compute_ball_potential(TEAM_A),
-        env._compute_ball_potential(TEAM_B),
-    ]
     env._compute_potential_shaping(np.zeros(12, dtype=np.float64), any_teleport=True)
 
     actions = _zero_actions(env)
@@ -3418,7 +3412,6 @@ def test_multiepisodic_rollout_halftime_goals_foul_smoke() -> None:
             env._handle_keeper_5s_violation(
                 env._team_keeper_idx(TEAM_B),
                 np.zeros(12, dtype=np.float64),
-                is_hold_violation=True,
             )
         elif step_i == 150:
             env.physics_frame_count = env.cfg.physics.half_physics_frames - 2
@@ -3728,7 +3721,7 @@ def test_keeper_5s_hold_turnover_wide_flank_and_team_lockout() -> None:
     env.player_pos[gk_idx] = np.array([120.0, 500.0], dtype=np.float64)
 
     step_rewards = np.zeros(env.num_players, dtype=np.float64)
-    env._handle_keeper_5s_violation(gk_idx, step_rewards, is_hold_violation=True)
+    env._handle_keeper_5s_violation(gk_idx, step_rewards)
 
     # GK reset to home goal mouth anchor
     assert env.player_pos[gk_idx, 0] == 40.0
@@ -4136,6 +4129,87 @@ def test_step_array_rejects_or_clips_nan_actions() -> None:
         return
     for arr in (obs, central, rew, env.player_pos, env.player_vel, env.player_angle, env.ball_pos):
         assert np.isfinite(arr).all()
+
+
+# ---------------------------------------------------------------------------
+# Configuration consolidation and dead-state specifications
+# ---------------------------------------------------------------------------
+
+def test_config_has_no_unread_fields_and_env_has_no_dead_state() -> None:
+    res = orphan_scan.scan(REPO_ROOT / "football_rl")
+    assert res["unread_config_fields"] == []
+    assert res["unused_class_aliases"] == []
+    api_attrs = {
+        "FootballParallelEnv.action_spaces",
+        "FootballParallelEnv.observation_spaces",
+        "FootballParallelEnv.render_mode",
+    }
+    assert set(res["write_only_attributes"]) <= api_attrs
+
+
+def test_consolidated_config_fields_carry_the_values_production_reads() -> None:
+    mech, rew, phys = DEFAULT_CONFIG.mechanics, DEFAULT_CONFIG.rewards, DEFAULT_CONFIG.physics
+    assert mech.keeper_foul_pickup_cooldown == 2.0
+    assert mech.box_timer_obs_norm == 5.0
+    assert mech.keeper_obs_speed_norm == 430.0
+    assert mech.kick_steer_max_deflection_deg == 35.0
+    assert rew.shot_on_target_ind == 0.45
+    assert rew.goal_scorer_ind == 3.0
+    assert rew.pass_threat_coeff == 6.0
+    assert rew.through_ball_stride_bonus == 0.80
+    assert rew.pass_press_escape_coeff == 0.60
+    removed = {
+        mech: [
+            "keeper_box_loose_max_time", "lunge_speed", "tackle_range", "def_tackle_range", "mid_tackle_range",
+            "atk_tackle_range", "tackle_near_range", "tackle_success_prob", "def_tackle_success_prob",
+            "mid_tackle_success_prob", "atk_tackle_success_prob", "tackle_stun_duration",
+        ],
+        rew: [
+            "pass_threat_weight", "pass_space_weight", "lead_pass_bonus", "atk_goal_scorer_ind",
+            "atk_shot_on_target_ind", "other_shot_on_target_ind", "keeper_5s_violation_team",
+        ],
+        phys: [
+            "kick_steer_max_deflection_deg", "ball_kick_speed_span", "half_duration", "half_rl_steps",
+            "match_duration", "player_max_turn_rate_deg",
+        ],
+        DEFAULT_CONFIG.vision: ["fov_rad"],
+    }
+    for cfg_obj, names in removed.items():
+        for name in names:
+            assert not hasattr(cfg_obj, name), name
+
+
+def test_keeper_hold_foul_charges_only_the_keeper_and_emits_hold_foul_event() -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    keeper = 0
+    env.ball_holder = keeper
+    env.ball_pos = env.player_pos[keeper].copy()
+    env.ball_hold_timer = 5.0
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_keeper_5s_violation(keeper, rewards)
+
+    assert rewards[keeper] == pytest.approx(-1.5, abs=1e-12)
+    others = [i for i in range(env.num_players) if i != keeper]
+    assert np.all(rewards[others] == 0.0)
+    assert env.stats["keeper_5s_violations"] == 1
+    assert env.pickup_cooldown[keeper] == pytest.approx(2.0, abs=1e-12)
+    assert [e["type"] for e in env._frame_events] == ["5s KEEPER HOLD FOUL!"]
+
+
+def test_field_hold_foul_charges_violator_and_team_while_only_5s_stat_is_kept() -> None:
+    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env.reset(seed=42)
+    violator = 3
+    env.ball_holder = violator
+    env.ball_hold_timer = 5.0
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_field_5s_violation(violator, rewards)
+
+    assert env.stats["field_5s_violations"] == 1
+    assert "field_3s_violations" not in env.stats
+    assert not hasattr(env, "_handle_field_3s_violation")
+    assert rewards[violator] < -1.5
 
 
 GOLDEN_ROLLOUT_DIGEST = "a0e3c934d19f7f40cd8cba0ba0f1c5f26cd381934d38ebf97d0ffd1db1f0f2e7"
