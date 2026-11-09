@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
+import json
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from football_rl.config import (
@@ -20,6 +25,8 @@ from football_rl.train_ppo import (
     ActorCritic,
     ParameterSharingPPOTrainer,
     archive_batch,
+    migrate_team_color_keys,
+    print_active_status,
     select_archive_replays,
 )
 
@@ -209,3 +216,170 @@ def test_archive_batch_default_timestamp_naming(tmp_path: Path) -> None:
 
 
 
+
+
+def _quiet_cfg(save_dir: str = "replays", recording: bool = False):
+    return replace(
+        DEFAULT_CONFIG,
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=recording, save_dir=save_dir),
+    )
+
+
+def _full_match(score=(3, 1), match_id=1, gen=1) -> dict:
+    return {
+        "match_id": match_id,
+        "generation": gen,
+        "score": list(score),
+        "interest_score": 12.0,
+        "possession_pct": [60.0, 40.0],
+        "shots": [5, 2],
+        "team_passes": [30, 20],
+        "team_tackles": [4, 6],
+        "team_saves": [1, 3],
+        "field_5s_violations": 0,
+        "keeper_5s_violations": 0,
+        "replay_path": None,
+    }
+
+
+def test_migrate_team_color_keys_swaps_reward_keys_and_marks_schema() -> None:
+    out = migrate_team_color_keys({"generations": [{"blue_mean_reward": 1.0, "red_mean_reward": 2.0}]})
+    gen = out["generations"][0]
+    assert gen["red_mean_reward"] == 1.0
+    assert gen["blue_mean_reward"] == 2.0
+    assert out["team_color_schema"] == 2
+
+
+def test_migrate_team_color_keys_is_idempotent_and_does_not_mutate_input() -> None:
+    legacy = {"generations": [{"generation": 1, "blue_mean_reward": 1.0, "red_mean_reward": 2.0}]}
+    snapshot = copy.deepcopy(legacy)
+    once = migrate_team_color_keys(legacy)
+    assert legacy == snapshot
+    twice = migrate_team_color_keys(copy.deepcopy(once))
+    assert twice == once
+    assert once["generations"][0]["generation"] == 1
+
+
+def test_migrate_team_color_keys_degenerate_histories() -> None:
+    assert migrate_team_color_keys({"generations": []}) == {"generations": [], "team_color_schema": 2}
+    entry = {"generation": 7, "mean_field_reward": 0.5}
+    out = migrate_team_color_keys({"generations": [dict(entry)]})
+    assert out["generations"] == [entry]
+    assert out["team_color_schema"] == 2
+    # A history without a generations list only receives the marker.
+    assert migrate_team_color_keys({}) == {"team_color_schema": 2}
+    # Only one of the two keys present: the value moves to the opposite key, nothing is invented.
+    lone = migrate_team_color_keys({"generations": [{"blue_mean_reward": 4.0}]})["generations"][0]
+    assert lone == {"red_mean_reward": 4.0}
+
+
+def test_series_summary_team_a_is_red() -> None:
+    ns = SimpleNamespace(match_history=[{"score": [3, 1]}])
+    series = ParameterSharingPPOTrainer._compute_series_summary(ns)
+    assert series["red_wins"] == 1
+    assert series["blue_wins"] == 0
+    assert series["red_goals"] == 3
+    assert series["blue_goals"] == 1
+    assert series["draws"] == 0
+
+
+def test_series_summary_counts_draws_and_blue_wins() -> None:
+    ns = SimpleNamespace(match_history=[{"score": [0, 2]}, {"score": [1, 1]}, {"score": [2, 0]}])
+    series = ParameterSharingPPOTrainer._compute_series_summary(ns)
+    assert (series["red_wins"], series["blue_wins"], series["draws"]) == (1, 1, 1)
+    assert (series["red_goals"], series["blue_goals"]) == (3, 3)
+    empty = ParameterSharingPPOTrainer._compute_series_summary(SimpleNamespace(match_history=[]))
+    assert empty == {"red_wins": 0, "blue_wins": 0, "draws": 0, "red_goals": 0, "blue_goals": 0}
+
+
+def test_generation_record_stores_team_a_reward_under_red_key(tmp_path: Path) -> None:
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"), seed=3,
+    )
+    captured = {}
+    original = trainer.collect_rollouts
+
+    def spy(*args, **kwargs):
+        captured["rollout"] = original(*args, **kwargs)
+        return captured["rollout"]
+
+    trainer.collect_rollouts = spy
+    trainer.train(total_updates=1)
+    rewards = captured["rollout"]["rewards"]
+    team_a = round(float(rewards[:, :, [0, 1, 2, 3, 4, 5]].mean()), 5)
+    team_b = round(float(rewards[:, :, [6, 7, 8, 9, 10, 11]].mean()), 5)
+    assert team_a != team_b
+    rec = trainer.generation_history[0]
+    assert rec["red_mean_reward"] == team_a
+    assert rec["blue_mean_reward"] == team_b
+
+
+def test_save_backs_up_legacy_history_once_and_stamps_schema(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    legacy_text = json.dumps({"generations": [{"blue_mean_reward": 1.0, "red_mean_reward": 2.0}]})
+    (ckpt / "training_history.json").write_text(legacy_text, encoding="utf-8")
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(ckpt), seed=3,
+    )
+    trainer.save_checkpoints()
+    backup = ckpt / "training_history.pre_color_schema.json"
+    assert backup.read_text(encoding="utf-8") == legacy_text
+    saved = json.loads((ckpt / "training_history.json").read_text(encoding="utf-8"))
+    assert saved["team_color_schema"] == 2
+
+    trainer.save_checkpoints()
+    assert backup.read_text(encoding="utf-8") == legacy_text
+
+
+def test_load_migrates_legacy_generation_history_exactly_once(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt"
+    kwargs = dict(config=_quiet_cfg(), num_envs=1, rollout_steps=10, device="cpu",
+                  checkpoint_dir=str(ckpt), seed=3)
+    writer = ParameterSharingPPOTrainer(**kwargs)
+    writer.generation_history = [{"generation": 1, "blue_mean_reward": 1.0, "red_mean_reward": 2.0}]
+    writer.save_checkpoints()
+    state_path = ckpt / "training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state.pop("team_color_schema", None)
+    torch.save(state, state_path)
+
+    reader = ParameterSharingPPOTrainer(**kwargs)
+    assert reader.load_checkpoints()
+    rec = reader.generation_history[0]
+    assert (rec["red_mean_reward"], rec["blue_mean_reward"]) == (1.0, 2.0)
+
+    reader.save_checkpoints()
+    again = ParameterSharingPPOTrainer(**kwargs)
+    assert again.load_checkpoints()
+    rec = again.generation_history[0]
+    assert (rec["red_mean_reward"], rec["blue_mean_reward"]) == (1.0, 2.0)
+
+
+def test_status_and_summary_label_team_a_as_red(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "training_history.json").write_text(
+        json.dumps({"current_generation": 1, "matches": [_full_match((3, 1))]}), encoding="utf-8"
+    )
+    print_active_status(str(ckpt), str(tmp_path / "rep"))
+    out = capsys.readouterr().out
+    assert "Series (Red - Blue) : 1 Wins - 0 Draws - 0 Wins" in out
+    assert "Goals: Red 3 - 1 Blue" in out
+    assert "Score (R-B)" in out
+
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp_path / "rep"), recording=True), num_envs=1,
+        rollout_steps=10, device="cpu", checkpoint_dir=str(ckpt), seed=3,
+    )
+    trainer.match_history = [_full_match((3, 1))]
+    path = trainer._write_matches_summary_markdown()
+    text = Path(path).read_text(encoding="utf-8")
+    assert "Score (Red - Blue)" in text
+    assert "Poss% (R/B)" in text
+    assert "Head-to-Head Series (Red - Draws - Blue):** `1 W - 0 D - 0 W`" in text
+    assert "Goals: **Red `3` - `1` Blue**" in text
+    assert "Blue - Red" not in text

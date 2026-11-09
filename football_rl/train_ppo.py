@@ -1,4 +1,4 @@
-"""Multi-Agent PPO with Per-Team Role Parameter Sharing (Blue Team vs. Red Team) for 6v6 MARL Football."""
+"""Multi-Agent PPO with Per-Team Role Parameter Sharing (Red Team vs. Blue Team) for 6v6 MARL Football."""
 
 from __future__ import annotations
 
@@ -130,11 +130,44 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, value
 
 
-class ParameterSharingPPOTrainer:
-    """MARL PPO trainer with independent Blue (`TEAM_A`) vs. Red (`TEAM_B`) role policies by default.
+TEAM_COLOR_SCHEMA = 2
 
-    - Blue Team (`TEAM_A`, indices 0..5): `blue_keeper_policy` ([0]) + `blue_field_policy` ([1..5])
-    - Red Team (`TEAM_B`, indices 6..11): `red_keeper_policy` ([6]) + `red_field_policy` ([7..11])
+
+def migrate_team_color_keys(history: Dict[str, Any]) -> Dict[str, Any]:
+    """Return `history` with team-colour keyed generation records in the current schema.
+
+    Team A (indices 0..5) is Red and team B (indices 6..11) is Blue. Records written before
+    `team_color_schema` was 2 stored team A's mean reward under `blue_mean_reward` and team B's
+    under `red_mean_reward`; those two values are swapped and the schema marker is set. Histories
+    already marked as schema 2 are returned unchanged. The input is never mutated.
+    """
+    if history.get("team_color_schema") == TEAM_COLOR_SCHEMA:
+        return history
+    migrated = dict(history)
+    generations = history.get("generations")
+    if generations is not None:
+        swapped: List[Dict[str, Any]] = []
+        for record in generations:
+            rec = dict(record)
+            has_blue = "blue_mean_reward" in rec
+            has_red = "red_mean_reward" in rec
+            blue_val = rec.pop("blue_mean_reward", None)
+            red_val = rec.pop("red_mean_reward", None)
+            if has_blue:
+                rec["red_mean_reward"] = blue_val
+            if has_red:
+                rec["blue_mean_reward"] = red_val
+            swapped.append(rec)
+        migrated["generations"] = swapped
+    migrated["team_color_schema"] = TEAM_COLOR_SCHEMA
+    return migrated
+
+
+class ParameterSharingPPOTrainer:
+    """MARL PPO trainer with independent Red (`TEAM_A`) vs. Blue (`TEAM_B`) role policies by default.
+
+    - Red Team (`TEAM_A`, indices 0..5): `blue_keeper_policy` ([0]) + `blue_field_policy` ([1..5])
+    - Blue Team (`TEAM_B`, indices 6..11): `red_keeper_policy` ([6]) + `red_field_policy` ([7..11])
     If `separate_teams=False`, both teams share `blue_field_policy` and `blue_keeper_policy`.
     """
 
@@ -169,6 +202,7 @@ class ParameterSharingPPOTrainer:
         self.total_env_steps: int = 0
         self.match_history: List[Dict[str, Any]] = []
         self.generation_history: List[Dict[str, Any]] = []
+        self._history_backup_checked: bool = False
         self.recent_team_goals: List[Tuple[int, int]] = []
         self.next_match_id: int = self._get_max_saved_match_id() + 1
 
@@ -180,6 +214,8 @@ class ParameterSharingPPOTrainer:
         self.envs: List[FootballParallelEnv] = getattr(self.vec_env, "envs", [])
 
         # Role & Team index masks across the 12 agents:
+        # Storage names: `blue_*` identifiers and checkpoint files hold team A (rendered red);
+        # `red_*` hold team B (rendered blue). Kept for checkpoint compatibility.
         self.blue_keeper_indices = [0]                    # a_keeper
         self.blue_field_indices = [1, 2, 3, 4, 5]         # a_def_1, a_def_2, a_mid_1, a_mid_2, a_atk_1
         self.red_keeper_indices = [6]                     # b_keeper
@@ -188,7 +224,7 @@ class ParameterSharingPPOTrainer:
         self.keeper_indices = [0, 6]
         self.field_indices = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
-        # Blue Team (TEAM_A) Policies (on self.device, e.g. CUDA)
+        # Red Team (TEAM_A) Policies (on self.device, e.g. CUDA)
         self.blue_field_policy = ActorCritic(
             obs_dim=OBS_DIM,
             action_dim=ACTION_DIM,
@@ -207,7 +243,7 @@ class ParameterSharingPPOTrainer:
             self.blue_keeper_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5
         )
 
-        # Red Team (TEAM_B) Policies (independent weights & optimizers when separate_teams=True)
+        # Blue Team (TEAM_B) Policies (independent weights & optimizers when separate_teams=True)
         if self.separate_teams:
             self.red_field_policy = ActorCritic(
                 obs_dim=OBS_DIM,
@@ -330,7 +366,7 @@ class ParameterSharingPPOTrainer:
         central_batch: Optional[np.ndarray] = None,
         deterministic: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Query Blue and Red role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
+        """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
         cen_t = (
             torch.as_tensor(central_batch, dtype=torch.float32, device=self.inference_device)
@@ -718,7 +754,7 @@ class ParameterSharingPPOTrainer:
         }
 
     def update_policies(self, rollout: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-        """Update Blue and Red role networks independently (or pooled if `separate_teams=False`)."""
+        """Update Red and Blue role networks independently (or pooled if `separate_teams=False`)."""
         obs = rollout["obs"]
         central_state = rollout.get("central_state")
         actions = rollout["actions"]
@@ -837,7 +873,7 @@ class ParameterSharingPPOTrainer:
         return metrics
 
     def save_checkpoints(self) -> Tuple[str, str]:
-        """Save Blue and Red policies, optimizers, generation counter, and match summaries to disk."""
+        """Save Red and Blue policies, optimizers, generation counter, and match summaries to disk."""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         field_path = os.path.join(self.checkpoint_dir, "field_policy.pt")
         keeper_path = os.path.join(self.checkpoint_dir, "keeper_policy.pt")
@@ -876,6 +912,7 @@ class ParameterSharingPPOTrainer:
                 "match_history": self.match_history,
                 "generation_history": self.generation_history,
                 "recent_team_goals": self.recent_team_goals,
+                "team_color_schema": TEAM_COLOR_SCHEMA,
             },
             state_path,
         )
@@ -886,9 +923,11 @@ class ParameterSharingPPOTrainer:
             "total_env_steps": self.total_env_steps,
             "separate_teams": self.separate_teams,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "team_color_schema": TEAM_COLOR_SCHEMA,
             "matches": self.match_history,
             "generations": self.generation_history,
         }
+        self._backup_pre_migration_history(history_path)
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history_payload, f, indent=2)
 
@@ -897,29 +936,45 @@ class ParameterSharingPPOTrainer:
 
         return field_path, keeper_path
 
+    def _backup_pre_migration_history(self, history_path: str) -> None:
+        """Copy an on-disk history that predates the current team-colour schema, once per trainer."""
+        if self._history_backup_checked:
+            return
+        self._history_backup_checked = True
+        backup_path = os.path.join(self.checkpoint_dir, "training_history.pre_color_schema.json")
+        if not os.path.exists(history_path) or os.path.exists(backup_path):
+            return
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                on_disk_schema = json.load(f).get("team_color_schema")
+        except ValueError:
+            on_disk_schema = None
+        if on_disk_schema != TEAM_COLOR_SCHEMA:
+            shutil.copy2(history_path, backup_path)
+
     def _compute_series_summary(self) -> Dict[str, int]:
-        """Compute cumulative Blue vs. Red wins, draws, and goals across `self.match_history`."""
-        blue_wins = 0
+        """Compute cumulative Red (team A) vs. Blue (team B) wins, draws, and goals across `self.match_history`."""
         red_wins = 0
+        blue_wins = 0
         draws = 0
-        blue_goals = 0
         red_goals = 0
+        blue_goals = 0
         for m in self.match_history:
-            sb, sr = int(m["score"][0]), int(m["score"][1])
-            blue_goals += sb
+            sr, sb = int(m["score"][0]), int(m["score"][1])
             red_goals += sr
-            if sb > sr:
-                blue_wins += 1
-            elif sr > sb:
+            blue_goals += sb
+            if sr > sb:
                 red_wins += 1
+            elif sb > sr:
+                blue_wins += 1
             else:
                 draws += 1
         return {
-            "blue_wins": blue_wins,
             "red_wins": red_wins,
+            "blue_wins": blue_wins,
             "draws": draws,
-            "blue_goals": blue_goals,
             "red_goals": red_goals,
+            "blue_goals": blue_goals,
         }
 
     def _write_matches_summary_markdown(self) -> Optional[str]:
@@ -927,7 +982,7 @@ class ParameterSharingPPOTrainer:
         os.makedirs(self.cfg.replay.save_dir, exist_ok=True)
         summary_path = os.path.join(self.cfg.replay.save_dir, "matches_summary.md")
         series = self._compute_series_summary()
-        mode_str = "Independent Team Policies (Blue vs. Red Co-Evolution)" if self.separate_teams else "Shared Mirror Policies"
+        mode_str = "Independent Team Policies (Red vs. Blue Co-Evolution)" if self.separate_teams else "Shared Mirror Policies"
 
         lines: List[str] = [
             "# Match & Generation Summary",
@@ -935,7 +990,7 @@ class ParameterSharingPPOTrainer:
             f"- **Training Mode:** `{mode_str}`",
             f"- **Generations Trained:** `{self.current_generation}`",
             f"- **Total Completed Matches:** `{len(self.match_history)}`",
-            f"- **Head-to-Head Series (Blue - Draws - Red):** `{series['blue_wins']} W - {series['draws']} D - {series['red_wins']} W` (Goals: **Blue `{series['blue_goals']}` - `{series['red_goals']}` Red**)",
+            f"- **Head-to-Head Series (Red - Draws - Blue):** `{series['red_wins']} W - {series['draws']} D - {series['blue_wins']} W` (Goals: **Red `{series['red_goals']}` - `{series['blue_goals']}` Blue**)",
             f"- **Total RL Steps:** `{self.total_env_steps:,}`",
             f"- **Last Updated:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
             "",
@@ -968,7 +1023,7 @@ class ParameterSharingPPOTrainer:
             [
                 "## Top 15 Most Exciting Matches (by Interest Score)",
                 "",
-                "| Rank | Match # | Gen | Score (Blue - Red) | Interest | Poss% (B/R) | Shots (B/R) | Passes (B/R) | Tackles (B/R) | Saves (B/R) | Watch Command |",
+                "| Rank | Match # | Gen | Score (Red - Blue) | Interest | Poss% (R/B) | Shots (R/B) | Passes (R/B) | Tackles (R/B) | Saves (R/B) | Watch Command |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
@@ -995,7 +1050,7 @@ class ParameterSharingPPOTrainer:
                 "",
                 "## All Matches (Chronological: Match 1 to " + str(len(self.match_history)) + ")",
                 "",
-                "| Match # | Gen | Score (Blue - Red) | Interest | Poss% (B/R) | Shots (B/R) | Passes (B/R) | Tackles (B/R) | Saves (B/R) | Fouls (Field 5s/GK 5s) | Replay File |",
+                "| Match # | Gen | Score (Red - Blue) | Interest | Poss% (R/B) | Shots (R/B) | Passes (R/B) | Tackles (R/B) | Saves (R/B) | Fouls (Field 5s/GK 5s) | Replay File |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
@@ -1049,7 +1104,7 @@ class ParameterSharingPPOTrainer:
         policy.load_state_dict(adapted, strict=False)
 
     def load_checkpoints(self) -> bool:
-        """Load Blue and Red policies, optimizers, and cumulative generation/match state."""
+        """Load Red and Blue policies, optimizers, and cumulative generation/match state."""
         state_path = os.path.join(self.checkpoint_dir, "training_state.pt")
         field_path = os.path.join(self.checkpoint_dir, "field_policy.pt")
         keeper_path = os.path.join(self.checkpoint_dir, "keeper_policy.pt")
@@ -1059,7 +1114,12 @@ class ParameterSharingPPOTrainer:
             self.current_generation = int(state.get("current_generation", 0))
             self.total_env_steps = int(state.get("total_env_steps", 0))
             self.match_history = list(state.get("match_history", []))
-            self.generation_history = list(state.get("generation_history", []))
+            self.generation_history = migrate_team_color_keys(
+                {
+                    "generations": list(state.get("generation_history", [])),
+                    "team_color_schema": state.get("team_color_schema"),
+                }
+            )["generations"]
             self.recent_team_goals = [tuple(x) for x in state.get("recent_team_goals", [])]
             self.next_match_id = self._get_max_saved_match_id() + 1
 
@@ -1162,10 +1222,10 @@ class ParameterSharingPPOTrainer:
 
                 mean_field_rew = float(rollout["rewards"][:, :, self.field_indices].mean())
                 mean_keeper_rew = float(rollout["rewards"][:, :, self.keeper_indices].mean())
-                blue_rew = float(
+                team_a_rew = float(
                     rollout["rewards"][:, :, self.blue_keeper_indices + self.blue_field_indices].mean()
                 )
-                red_rew = float(
+                team_b_rew = float(
                     rollout["rewards"][:, :, self.red_keeper_indices + self.red_field_indices].mean()
                 )
 
@@ -1210,8 +1270,8 @@ class ParameterSharingPPOTrainer:
                                     ):
                                         p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
                                 print(
-                                    f"  [Co-Evolution Sync] Team A dominated ({sum_a}-{sum_b} over 3 gens). "
-                                    f"Soft-synced Red policy (tau=0.35) to restore parity."
+                                    f"  [Co-Evolution Sync] Red dominated ({sum_a}-{sum_b} over 3 gens). "
+                                    f"Soft-synced Blue policy (tau=0.35) to restore parity."
                                 )
                                 self.recent_team_goals.clear()
                                 self._sync_cpu_policies()
@@ -1229,8 +1289,8 @@ class ParameterSharingPPOTrainer:
                                     ):
                                         p_dst.data.copy_(0.65 * p_dst.data + 0.35 * p_src.data)
                                 print(
-                                    f"  [Co-Evolution Sync] Team B dominated ({sum_b}-{sum_a} over 3 gens). "
-                                    f"Soft-synced Blue policy (tau=0.35) to restore parity."
+                                    f"  [Co-Evolution Sync] Blue dominated ({sum_b}-{sum_a} over 3 gens). "
+                                    f"Soft-synced Red policy (tau=0.35) to restore parity."
                                 )
                                 self.recent_team_goals.clear()
                                 self._sync_cpu_policies()
@@ -1239,8 +1299,8 @@ class ParameterSharingPPOTrainer:
                     "generation": gen,
                     "total_env_steps": self.total_env_steps,
                     "sps": sps,
-                    "blue_mean_reward": round(blue_rew, 5),
-                    "red_mean_reward": round(red_rew, 5),
+                    "red_mean_reward": round(team_a_rew, 5),
+                    "blue_mean_reward": round(team_b_rew, 5),
                     "mean_field_reward": round(mean_field_rew, 5),
                     "mean_keeper_reward": round(mean_keeper_rew, 5),
                     "max_interest": round(float(rollout["max_interest"]), 2),
@@ -1253,7 +1313,7 @@ class ParameterSharingPPOTrainer:
                     f"[Gen {gen:04d}/{end_gen:04d}] "
                     f"Matches: {len(self.match_history):4d} | "
                     f"Steps: {self.total_env_steps:8d} ({sps:5d} SPS) | "
-                    f"Blue Rew: {blue_rew:+.4f} | Red Rew: {red_rew:+.4f} | "
+                    f"Red Rew: {team_a_rew:+.4f} | Blue Rew: {team_b_rew:+.4f} | "
                     f"Interest: {rollout['max_interest']:.1f}"
                 )
                 for rpath in rollout["exported_replays"]:
@@ -1270,8 +1330,8 @@ class ParameterSharingPPOTrainer:
                     "red_field": metrics["red_field"],
                     "mean_field_reward": mean_field_rew,
                     "mean_keeper_reward": mean_keeper_rew,
-                    "blue_mean_reward": blue_rew,
-                    "red_mean_reward": red_rew,
+                    "red_mean_reward": team_a_rew,
+                    "blue_mean_reward": team_b_rew,
                     "total_matches": len(self.match_history),
                 }
 
@@ -1508,7 +1568,7 @@ def list_archived_batches(archive_root: str = "archives") -> List[Dict[str, Any]
         hist_path = os.path.join(bdir, "checkpoints", "training_history.json")
         if os.path.exists(hist_path):
             with open(hist_path, "r", encoding="utf-8") as f:
-                h = json.load(f)
+                h = migrate_team_color_keys(json.load(f))
             matches = h.get("matches", [])
             best_score = max((m.get("interest_score", 0.0) for m in matches), default=0.0)
             entries.append(
@@ -1544,14 +1604,14 @@ def print_active_status(checkpoint_dir: str = "checkpoints", replay_dir: str = "
         return
 
     with open(hist_path, "r", encoding="utf-8") as f:
-        h = json.load(f)
+        h = migrate_team_color_keys(json.load(f))
 
     matches = h.get("matches", [])
-    blue_w = sum(1 for m in matches if m["score"][0] > m["score"][1])
-    red_w = sum(1 for m in matches if m["score"][1] > m["score"][0])
-    draws = len(matches) - blue_w - red_w
-    blue_g = sum(int(m["score"][0]) for m in matches)
-    red_g = sum(int(m["score"][1]) for m in matches)
+    red_w = sum(1 for m in matches if m["score"][0] > m["score"][1])
+    blue_w = sum(1 for m in matches if m["score"][1] > m["score"][0])
+    draws = len(matches) - red_w - blue_w
+    red_g = sum(int(m["score"][0]) for m in matches)
+    blue_g = sum(int(m["score"][1]) for m in matches)
 
     print("=" * 80)
     print(f"ACTIVE TRAINING BATCH STATUS")
@@ -1559,8 +1619,8 @@ def print_active_status(checkpoint_dir: str = "checkpoints", replay_dir: str = "
     print(f"  Generations Trained : {h.get('current_generation', 0)}")
     print(f"  Completed Matches   : {len(matches)}")
     print(
-        f"  Series (Blue - Red) : {blue_w} Wins - {draws} Draws - {red_w} Wins "
-        f"(Goals: Blue {blue_g} - {red_g} Red)"
+        f"  Series (Red - Blue) : {red_w} Wins - {draws} Draws - {blue_w} Wins "
+        f"(Goals: Red {red_g} - {blue_g} Blue)"
     )
     print(f"  Total RL Steps      : {h.get('total_env_steps', 0):,}")
     print(f"  Last Updated        : {h.get('last_updated', 'N/A')}")
@@ -1571,7 +1631,7 @@ def print_active_status(checkpoint_dir: str = "checkpoints", replay_dir: str = "
         top = sorted(matches, key=lambda m: float(m.get("interest_score", 0.0)), reverse=True)[:10]
         print("  TOP 10 MOST EXCITING MATCHES:")
         print(
-            f"  {'Match #':<9} {'Gen':<7} {'Score (B-R)':<13} {'Interest':<10} "
+            f"  {'Match #':<9} {'Gen':<7} {'Score (R-B)':<13} {'Interest':<10} "
             f"{'Shots':<9} {'Passes':<9} {'Tackles':<9} {'Saves':<7}"
         )
         for m in top:
@@ -1589,7 +1649,7 @@ def print_active_status(checkpoint_dir: str = "checkpoints", replay_dir: str = "
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train 6v6 MARL Football with Independent Blue vs. Red Team PPO Policies."
+        description="Train 6v6 MARL Football with Independent Red vs. Blue Team PPO Policies."
     )
     parser.add_argument(
         "--total-updates",
@@ -1626,7 +1686,7 @@ def main() -> None:
     parser.add_argument(
         "--shared-teams",
         action="store_true",
-        help="Share a single field_policy and keeper_policy across both Blue and Red (default: False, Blue and Red train separate brains).",
+        help="Share a single field_policy and keeper_policy across both Red and Blue (default: False, Red and Blue train separate brains).",
     )
     parser.add_argument(
         "--device",
@@ -1746,7 +1806,7 @@ def main() -> None:
                 f"(Gen {trainer.current_generation + 1}..{trainer.current_generation + args.total_updates})..."
             )
     else:
-        mode_label = "Independent Blue vs. Red Policies" if not args.shared_teams else "Shared Mirror Policies"
+        mode_label = "Independent Red vs. Blue Policies" if not args.shared_teams else "Shared Mirror Policies"
         print(
             f"Training new batch ({mode_label}) from Generation 1..{args.total_updates} "
             f"(num_envs={args.num_envs}, rollout_steps={args.rollout_steps}, "
