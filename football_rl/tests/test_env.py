@@ -255,6 +255,29 @@ def test_keeper_5s_foul_teleport_and_zero_advance_spike() -> None:
     assert rewards["a_keeper"] < -1.0
 
 
+def test_keeper_5s_foul_charges_keeper_only_while_field_foul_also_charges_team() -> None:
+    """A keeper 5 s foul changes only the keeper's reward; a field 5 s foul also charges teammates."""
+    env = parallel_env(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=33)
+    keeper_idx = env.agent_to_idx["a_keeper"]
+    carrier_idx = env.agent_to_idx["a_atk_1"]
+
+    keeper_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_keeper_5s_violation(keeper_idx, keeper_rewards)
+    expected = np.zeros(env.num_players, dtype=np.float64)
+    expected[keeper_idx] = -1.5
+    np.testing.assert_array_equal(keeper_rewards, expected)
+
+    field_rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._handle_field_5s_violation(carrier_idx, field_rewards)
+    expected = np.zeros(env.num_players, dtype=np.float64)
+    expected[:6] = -0.3
+    expected[carrier_idx] = -1.8
+    np.testing.assert_allclose(field_rewards, expected, rtol=0, atol=1e-12)
+
+
 def test_role_tactical_bias_encoding() -> None:
     """Verify tactical depth bias, lateral flank bias, and box state in obs[13:16]."""
     env = parallel_env(

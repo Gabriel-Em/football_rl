@@ -743,7 +743,8 @@ class FootballParallelEnv(ParallelEnv):
         """Execute physics sub-steps, PBRS, and end-of-episode bookkeeping for a (12, 4) action array."""
         # Store raw steering input for instantaneous kick deflection
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
-        self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
+        if self.cfg.replay.enable_recording:
+            self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
         if v_preds is not None:
             self.last_v_preds = np.asarray(v_preds, dtype=np.float32)
 
@@ -969,10 +970,12 @@ class FootballParallelEnv(ParallelEnv):
         bvy = float(self.ball_vel[1])
         ball_spd = math.hypot(bvx, bvy)
 
-        d_left = math.hypot(bx - 0.0, by - 420.0)
-        d_right = math.hypot(bx - phys.field_width, by - 420.0)
-        in_left_box = d_left <= 205.0
-        in_right_box = d_right <= 205.0
+        goal_cy = phys.field_center[1]
+        box_reach = phys.keeper_box_radius + phys.ball_radius
+        d_left = math.hypot(bx - 0.0, by - goal_cy)
+        d_right = math.hypot(bx - phys.field_width, by - goal_cy)
+        in_left_box = d_left <= box_reach
+        in_right_box = d_right <= box_reach
 
         for side_idx, (in_box, d_goal) in enumerate(((in_left_box, d_left), (in_right_box, d_right))):
             defending_team = 0 if self.team_side[0] == side_idx else 1
@@ -982,7 +985,7 @@ class FootballParallelEnv(ParallelEnv):
             # Check if ball is actively escaping the box radially
             if d_goal > 1e-6:
                 u_rad_0 = (bx - goal_cx) / d_goal
-                u_rad_1 = (by - 420.0) / d_goal
+                u_rad_1 = (by - goal_cy) / d_goal
                 rad_ball_spd = bvx * u_rad_0 + bvy * u_rad_1
             else:
                 rad_ball_spd = 0.0
@@ -1201,9 +1204,9 @@ class FootballParallelEnv(ParallelEnv):
             d_nearest_opp = float(np.sqrt(np.min(diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1])))
             opp_crowding = d_nearest_opp <= 55.0
 
-            if ball_spd_carrier < 18.0 and near_outer_wall and opp_crowding:
+            if ball_spd_carrier < mech.pinned_ball_speed_thresh and near_outer_wall and opp_crowding:
                 self.pinned_ball_timer += dt
-                if self.pinned_ball_timer >= 2.0:
+                if self.pinned_ball_timer >= mech.pinned_ball_max_time:
                     self.ball_holder = None
                     self.ball_hold_timer = 0.0
                     center_vec = np.array(phys.field_center, dtype=np.float64) - self.ball_pos
@@ -1252,7 +1255,7 @@ class FootballParallelEnv(ParallelEnv):
                 max_flight = (
                     mech.max_wall_pass_flight_time
                     if self.is_wall_pass_in_flight
-                    else getattr(phys, "max_pass_flight_time", mech.max_pass_flight_time)
+                    else mech.max_pass_flight_time
                 )
                 ball_speed_sq = float(
                     self.ball_vel[0] * self.ball_vel[0] + self.ball_vel[1] * self.ball_vel[1]
@@ -1338,32 +1341,10 @@ class FootballParallelEnv(ParallelEnv):
         steer_defl = float(self.raw_steer_input[kicker_idx]) * max_defl_rad
         base_angle = float(wrap_to_pi(self.player_angle[kicker_idx] + steer_defl))
 
-        # Kick Deflection Realism & Taper
-        abs_deflect_deg = abs(float(self.raw_steer_input[kicker_idx])) * mech.kick_steer_max_deflection_deg
-        if abs_deflect_deg > 35.0 and kicker_role != ROLE_KEEPER:
-            deflect_excess = _fast_clip(
-                (abs_deflect_deg - 35.0)
-                / max(1.0, mech.kick_steer_max_deflection_deg - 35.0),
-                0.0,
-                1.0,
-            )
-            bonus_speed = power_norm * (max_kick_spd - phys.ball_min_kick_speed) * (1.0 - 0.25 * deflect_excess)
-            launch_speed = phys.ball_min_kick_speed + bonus_speed
-        else:
-            deflect_excess = 0.0
-
         if power_norm > 0.65 and jitter_rad > 0.0:
             kick_angle = base_angle + float(self.np_random.uniform(-jitter_rad, jitter_rad))
         else:
             kick_angle = base_angle
-
-        if deflect_excess > 0.0 and power_norm > 0.50:
-            kick_angle = float(
-                wrap_to_pi(
-                    kick_angle
-                    + self.np_random.uniform(-1.0, 1.0) * math.radians(4.0 * deflect_excess)
-                )
-            )
 
         k_angle = float(kick_angle)
         k_dx = math.cos(k_angle)
@@ -2989,7 +2970,7 @@ class FootballParallelEnv(ParallelEnv):
         r_sparse: Optional[np.ndarray] = None,
         r_ball_adv: Optional[np.ndarray] = None,
     ) -> None:
-        """Evaluate strictly non-negative [0, Phi_max] Markovian potentials and apply exact PBRS."""
+        """Evaluate Markovian potentials (each bounded above by its role weight; the crowd penalty can make Phi negative) and apply exact PBRS."""
         rew = self.cfg.rewards
         phys = self.cfg.physics
         gamma = self.cfg.ppo.gamma

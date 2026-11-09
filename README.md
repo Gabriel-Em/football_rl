@@ -20,21 +20,21 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
   - **60 Entity Features (`indices 16..75`)**: 12 entity slots $\times$ 5 features (Slot 0: Ball with $360^\circ$ awareness; Slots 1..5: 5 Teammates; Slots 6..10: 5 Field Opponents; Slot 11: Enemy Goalkeeper). Peripheral vision fades smoothly from $170^\circ$ to $210^\circ$ FOV.
 - **4-Dimensional Continuous Action Space ($\mathbf{a} \in [-1, 1]^4$)**:
   - `action[0]`: Throttle force (with $[-0.35, +0.15]$ deadzone and backpedal multipliers).
-  - `action[1]`: Angular steering rate ($270^\circ$/s max body turn rate). Also acts as real-time **kick-steer deflection** ($\pm 50^\circ$) on kick execution.
+  - `action[1]`: Angular steering rate ($270^\circ$/s max body turn rate). Also acts as real-time **kick-steer deflection** ($\pm 35^\circ$) on kick execution.
   - `action[2]`: Kick trigger & power threshold ($> 0.35$ triggers kick with power scaled to $[260, 640]\text{ u/s}$).
   - `action[3]`: Special tactical ability / dynamic slide tackle / goalkeeper holonomic dive.
-- **Kick-Steer Deflection ($\pm 50^\circ$) & Passing Mechanics**:
-  - Outfielders and keepers can deflect their kick release by up to $\pm 50^\circ$ using `action[1]`, executing instant side-foot passes and angled clearances without waiting for full body reorientation.
+- **Kick-Steer Deflection ($\pm 35^\circ$) & Passing Mechanics**:
+  - Outfielders and keepers can deflect their kick release by up to $\pm 35^\circ$ using `action[1]`, executing instant side-foot passes and angled clearances without waiting for full body reorientation.
   - Frame-0 Dangerous Own-Goal Threat Penalty ($-3.0$) penalizes kicks directed back into one's own net from the defensive third ($X_c \le 350.0\text{u}$).
   - Goalkeeper wall-ricochet / bank clearances reward high-power releases reflecting off touchlines past pressed defensive corridors.
   - Blocked-kick detection checks a forward corridor ($185.0\text{u} \times 30.0\text{u}$) and penalizes kicks fired straight into close defenders ($-0.85$).
 - **Through-Balls & Tactical Movement**:
-  - Progressive lead passes completed to teammates running in forward stride ($v_{x,c} \ge 90.0\text{ u/s}$) award a shared `lead_pass_bonus` ($+1.50$) and trigger `"THROUGH BALL!"` visual events.
+  - Progressive lead passes completed to teammates running in forward stride ($v_{x,c} \ge 90.0\text{ u/s}$) award a shared through-ball stride bonus ($+0.80$, `through_ball_stride_bonus`) and trigger `"THROUGH BALL!"` visual events.
   - Receiving agents compute in-flight lead intercept trajectories $\mathbf{p}_{\text{int}} \in [\mathbf{p}_b, \mathbf{p}_b + 0.8\mathbf{v}_b]$ to meet passes in stride.
   - Half-turn body readiness rewards off-ball support players maintaining forward-facing field orientation ($\cos(\theta_c) \ge -0.10$) while reading the ball.
   - Continuous lateral unmasking reward ($+0.015$) encourages shadowed teammates to slide laterally into clear passing lanes.
 - **Heterogeneous Role Profiles & Kinematics**:
-  - **Goalkeeper (`ROLE_KEEPER` / 1 per team)**: $180.0\text{ u/s}$ top speed ($0.75\times$ backpedal), $430.0\text{ u/s}$ holonomic dives/lunges in any direction (`0.25s` duration, `1.8s` cooldown), $640.0\text{ u/s}$ boosted clearance speed, $5.0\text{s}$ maximum hold time, and strip-stun recovery.
+  - **Goalkeeper (`ROLE_KEEPER` / 1 per team)**: $180.0\text{ u/s}$ top speed ($0.75\times$ backpedal), $340.0\text{ u/s}$ holonomic dives/lunges in any direction (`0.25s` duration, `1.8s` cooldown), $640.0\text{ u/s}$ boosted clearance speed, $5.0\text{s}$ maximum hold time, and strip-stun recovery.
   - **Center Backs (`ROLE_DEF` / 2 per team)**: $182.0\text{ u/s}$ speed, $510.0\text{ u/s}$ kick launch velocity, widest dynamic tackle reach ($48.0\text{ u}$ nominal radius, 86% success), tactical spreading width ($420 \pm 175\text{ u}$) to build out from deep.
   - **Box-to-Box Midfielders (`ROLE_MID` / 2 per team)**: $195.0\text{ u/s}$ speed (fastest field runners), $560.0\text{ u/s}$ kick velocity, balanced dynamic tackles ($44.0\text{ u}$ radius, 78% success), flank channel spreading, half-turn posture, and link-up play.
   - **Attacking Striker (`ROLE_ATK` / 1 per team)**: $190.0\text{ u/s}$ speed, highest launch kick velocity ($640.0\text{ u/s}$) with **zero kick jitter (pinpoint laser)**, dynamic tackle ($40.0\text{ u}$ radius, 70% success), and prime finishing bonuses inside $320.0\text{ u}$ of goal.

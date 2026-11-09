@@ -239,7 +239,7 @@ class RewardConfig:
     intercepted_kicker_ind: float = -0.40
     intercepted_team: float = -0.25
 
-    # Tier 2: Strict Policy-Invariant Non-Negative PBRS Weights (Phi in [0, Phi_max])
+    # Tier 2: Policy-Invariant PBRS Weights (each Phi is bounded above by its weight; the crowd penalty can make Phi negative)
     team_advance_pbrs_weight: float = 6.0
     support_potential_weight: float = 0.85
     def_press_potential_weight: float = 0.65
