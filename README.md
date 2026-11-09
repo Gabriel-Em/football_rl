@@ -61,6 +61,7 @@ football_rl/
 │   ├── config.py             # Dataclass configurations: physics, mechanics, vision, rewards, PPO
 │   ├── env.py                # PettingZoo ParallelEnv: 60Hz physics, Dec-POMDP obs, rules & rewards
 │   ├── potentials.py         # Pure per-player potential field (roles, crowding, cover assignment) behind PBRS
+│   ├── recording.py          # Preallocated 60 Hz replay recorder; builds JSON frames on demand
 │   ├── replay.py             # 60 FPS Pygame replay visualizer & match analyzer
 │   ├── train_ppo.py          # Vectorized PPO training loop, parameter sharing, co-evolution
 │   └── tests/

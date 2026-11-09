@@ -39,6 +39,7 @@ from football_rl.potentials import (
     compute_potentials,
     potential_gradient_arrows,
 )
+from football_rl.recording import ReplayBuffer
 
 TEAM_LEFT = SIDE_LEFT
 TEAM_RIGHT = SIDE_RIGHT
@@ -419,7 +420,10 @@ class FootballParallelEnv(ParallelEnv):
 
         # Statistics & replay buffer
         self.stats: Dict[str, Any] = {}
-        self.replay_frames: List[Dict[str, Any]] = []
+        self._replay_buffer: Optional[ReplayBuffer] = None
+        self._replay_frames_cache: Optional[List[Dict[str, Any]]] = None
+        self._replay_frames_cache_version = -1
+        self._replay_step_index = 0
         self._frame_events: List[Dict[str, Any]] = []
         self.last_saved_replay_path: Optional[str] = None
         self._deferred_replay: Optional[Dict[str, Any]] = None
@@ -487,6 +491,25 @@ class FootballParallelEnv(ParallelEnv):
     @property
     def record_replay(self) -> bool:
         return bool(self.cfg.replay.enable_recording)
+
+    @property
+    def replay_frames(self) -> List[Dict[str, Any]]:
+        """JSON-ready 60 Hz frames recorded since the last reset (empty when recording is disabled)."""
+        buf = self._replay_buffer
+        if buf is None:
+            return []
+        if self._replay_frames_cache is None or self._replay_frames_cache_version != buf.version:
+            self._replay_frames_cache = buf.materialize()
+            self._replay_frames_cache_version = buf.version
+        return self._replay_frames_cache
+
+    def _ensure_replay_buffer(self) -> ReplayBuffer:
+        """Return the replay buffer, allocating it for a full match on first use."""
+        if self._replay_buffer is None:
+            self._replay_buffer = ReplayBuffer(
+                max_frames=self.cfg.physics.max_physics_frames + 1, num_players=self.num_players
+            )
+        return self._replay_buffer
 
     @property
     def box_loose_ball_timer(self) -> _DualBoxTimer:
@@ -683,7 +706,9 @@ class FootballParallelEnv(ParallelEnv):
             "stationary_ball_frames": 0,
         }
 
-        self.replay_frames = []
+        if self.cfg.replay.enable_recording:
+            self._ensure_replay_buffer().reset()
+        self._replay_step_index = 0
         self._frame_events = []
         self.last_v_preds = None
         self.last_rew_breakdown = None
@@ -725,6 +750,7 @@ class FootballParallelEnv(ParallelEnv):
 
         # Record initial frame (t = 0.0s) if recording enabled
         if self.cfg.replay.enable_recording:
+            self._ensure_replay_buffer().set_step_payload(0, self._replay_step_payload())
             self._record_replay_frame()
 
         observations = self._get_observations()
@@ -746,6 +772,7 @@ class FootballParallelEnv(ParallelEnv):
         # Store raw steering input for instantaneous kick deflection
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
         if self.cfg.replay.enable_recording:
+            self._replay_step_index = self.rl_step_count + 1
             self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
         if v_preds is not None:
             self.last_v_preds = np.asarray(v_preds, dtype=np.float32)
@@ -804,26 +831,8 @@ class FootballParallelEnv(ParallelEnv):
         # Update reward tracking arrays for visual feedback & replay recording
         self.last_step_rewards = step_rewards.astype(np.float32)
         self.cum_player_rewards += self.last_step_rewards
-        if self.cfg.replay.enable_recording and len(self.replay_frames) > 0:
-            p_rews = [round(float(r), 4) for r in self.last_step_rewards]
-            c_rews = [round(float(r), 2) for r in self.cum_player_rewards]
-            v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
-            start_back = max(0, len(self.replay_frames) - self.cfg.physics.frame_skip)
-            for f_idx in range(start_back, len(self.replay_frames)):
-                self.replay_frames[f_idx]["player_rewards"] = p_rews
-                self.replay_frames[f_idx]["cum_rewards"] = c_rews
-                if v_preds_data is not None:
-                    self.replay_frames[f_idx]["v_pred"] = v_preds_data
-                if self.last_rew_breakdown is not None:
-                    self.replay_frames[f_idx]["rew_breakdown"] = self.last_rew_breakdown
-                if self.last_grad_phi is not None:
-                    self.replay_frames[f_idx]["grad_phi"] = self.last_grad_phi
-                if self.last_role_states is not None:
-                    self.replay_frames[f_idx]["role_state"] = list(self.last_role_states)
-                if self.last_role_targets is not None:
-                    self.replay_frames[f_idx]["role_targets"] = self.last_role_targets
-                if self.last_actions is not None:
-                    self.replay_frames[f_idx]["actions"] = self.last_actions
+        if self.cfg.replay.enable_recording and self._replay_buffer is not None:
+            self._replay_buffer.set_step_payload(self._replay_step_index, self._replay_step_payload())
 
         # Episode termination / truncation at t = 180.0s (2,700 RL steps)
         is_truncated = self.rl_step_count >= self.cfg.physics.max_rl_steps
@@ -836,8 +845,8 @@ class FootballParallelEnv(ParallelEnv):
                 team=-1,
                 agent="referee",
             )
-            if self.cfg.replay.enable_recording and len(self.replay_frames) > 0:
-                self.replay_frames[-1]["events"].append(
+            if self.cfg.replay.enable_recording and self._replay_buffer is not None and len(self._replay_buffer) > 0:
+                self._replay_buffer.append_event_to_last_frame(
                     {
                         "type": "FULLTIME!",
                         "x": float(self.cfg.physics.field_center[0]),
@@ -3065,87 +3074,57 @@ class FootballParallelEnv(ParallelEnv):
             }
         )
 
+    def _replay_step_payload(self) -> Dict[str, Any]:
+        """Per-RL-step telemetry shared by every replay frame recorded during that step."""
+        v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
+        return {
+            "player_rewards": [round(float(r), 4) for r in self.last_step_rewards],
+            "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
+            "v_pred": v_preds_data,
+            "rew_breakdown": self.last_rew_breakdown,
+            "grad_phi": self.last_grad_phi,
+            "role_state": (list(self.last_role_states) if self.last_role_states is not None else None),
+            "role_targets": self.last_role_targets,
+            "actions": self.last_actions,
+        }
+
     def _record_replay_frame(self) -> None:
-        """Append the current 60 Hz state snapshot to `self.replay_frames`."""
+        """Copy the current 60 Hz state snapshot into the replay buffer."""
         if not self.cfg.replay.enable_recording:
             return
-        players_frame = []
-        for idx in range(self.num_players):
-            flags = 0
-            if self.ball_holder == idx:
-                flags |= 1
-            if self.is_ghost[idx]:
-                flags |= 2
-            if self.stun_timer[idx] > 0.0:
-                flags |= 4
-            if self.lunge_timer[idx] > 0.0:
-                flags |= 8
-            players_frame.append(
-                [
-                    round(float(self.player_pos[idx, 0]), 2),
-                    round(float(self.player_pos[idx, 1]), 2),
-                    round(float(self.player_angle[idx]), 4),
-                    flags,
-                    round(float(self.player_vel[idx, 0]), 2),
-                    round(float(self.player_vel[idx, 1]), 2),
-                ]
-            )
+        flags = self.is_ghost * 2.0 + (self.stun_timer > 0.0) * 4.0 + (self.lunge_timer > 0.0) * 8.0
+        if self.ball_holder is not None:
+            flags[self.ball_holder] += 1.0
 
         ball_team_color = (
             int(self.player_team[self.ball_holder])
             if self.ball_holder is not None
             else (int(self.last_ball_team) if self.last_ball_team is not None else -1)
         )
-        ball_frame = [
-            round(float(self.ball_pos[0]), 2),
-            round(float(self.ball_pos[1]), 2),
-            ball_team_color,
-            round(float(self.ball_vel[0]), 2),
-            round(float(self.ball_vel[1]), 2),
-        ]
 
-        total_poss = max(1, sum(self.stats["possession_frames"]))
-        poss_pct = [
-            round(100.0 * self.stats["possession_frames"][0] / total_poss, 1),
-            round(100.0 * self.stats["possession_frames"][1] / total_poss, 1),
-        ]
-        total_frames = max(1, self.physics_frame_count)
-        true_poss_pct = [
-            round(100.0 * self.stats["possession_frames"][0] / total_frames, 1),
-            round(100.0 * self.stats["possession_frames"][1] / total_frames, 1),
-            round(100.0 * max(0, total_frames - sum(self.stats["possession_frames"])) / total_frames, 1),
-        ]
-
-        v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
-        self.replay_frames.append(
-            {
-                "frame": self.physics_frame_count,
-                "time": round(self.physics_frame_count * self.cfg.physics.dt, 3),
-                "half": self.current_half,
-                "team_side": [int(self.team_side[0]), int(self.team_side[1])],
-                "box_radii": [round(float(self.active_box_radius[0]), 1), round(float(self.active_box_radius[1]), 1)],
-                "players": players_frame,
-                "ball": ball_frame,
-                "player_rewards": [round(float(r), 4) for r in self.last_step_rewards],
-                "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
-                "v_pred": v_preds_data,
-                "rew_breakdown": self.last_rew_breakdown,
-                "grad_phi": self.last_grad_phi,
-                "role_state": (list(self.last_role_states) if self.last_role_states is not None else None),
-                "role_targets": self.last_role_targets,
-                "actions": self.last_actions,
-                "stats": {
-                    "score": list(self.stats["score"]),
-                    "possession_pct": poss_pct,
-                    "true_possession_pct": true_poss_pct,
-                    "stationary_ball_frames": int(self.stats.get("stationary_ball_frames", 0)),
-                    "passes": list(self.stats["team_passes"]),
-                    "tackles": list(self.stats["team_tackles"]),
-                    "saves": list(self.stats["team_saves"]),
-                    "shots": list(self.stats["shots"]),
-                },
-                "events": list(self._frame_events),
-            }
+        stats = self.stats
+        self._ensure_replay_buffer().record_frame(
+            frame=self.physics_frame_count,
+            time=self.physics_frame_count * self.cfg.physics.dt,
+            half=self.current_half,
+            team_side=self.team_side,
+            box_radii=self.active_box_radius,
+            player_pos=self.player_pos,
+            player_angle=self.player_angle,
+            player_flags=flags,
+            player_vel=self.player_vel,
+            ball_pos=self.ball_pos,
+            ball_team=ball_team_color,
+            ball_vel=self.ball_vel,
+            step_index=self._replay_step_index,
+            score=stats["score"],
+            possession_frames=stats["possession_frames"],
+            stationary=stats.get("stationary_ball_frames", 0),
+            passes=stats["team_passes"],
+            tackles=stats["team_tackles"],
+            saves=stats["team_saves"],
+            shots=stats["shots"],
+            events=self._frame_events,
         )
 
     def compute_interest_score(self) -> float:
@@ -3289,7 +3268,7 @@ class FootballParallelEnv(ParallelEnv):
                     "generation": self.current_generation,
                     "interest_score": interest_score,
                     "stats": copy.deepcopy(self.stats),
-                    "frames": list(self.replay_frames),
+                    "frames": self._ensure_replay_buffer().snapshot(),
                 }
             self.last_saved_replay_path = None
             return None
@@ -3312,9 +3291,9 @@ class FootballParallelEnv(ParallelEnv):
                 generation=int(payload["generation"]),
                 interest_score=float(payload["interest_score"]),
                 stats=payload["stats"],
-                frames=payload["frames"],
+                frames=payload["frames"].materialize(),
             )
-        if self.replay_frames:
+        if self._replay_buffer is not None and len(self._replay_buffer) > 0:
             interest_score = self.compute_interest_score()
             if interest_score >= self.cfg.replay.interest_threshold:
                 return self._write_replay_to_disk(
