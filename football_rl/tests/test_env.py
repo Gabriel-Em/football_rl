@@ -4272,6 +4272,47 @@ def test_rollout_digest_is_seed_sensitive_and_repeatable():
     assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
 
 
+GOLDEN_REPLAY_DIGEST = "4630bf92c66483c59e2728baed93bab98911d77a3874789e1d8e883c4c3f5f82"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST = "89964bf213162456ee32ddec0f2cba54d114b4953769c4766b7a865cafa44ddd"
+
+
+def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bool = False) -> str:
+    """SHA-256 of the JSON-serialised replay frames of a seeded random-action rollout with recording on.
+
+    With `with_value_predictions`, critic values are supplied on two of every three RL steps.
+    """
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=True,
+            interest_threshold=float("inf"),
+        ),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=seed)
+    acts = np.random.default_rng(seed).uniform(-1, 1, size=(steps, 12, 4))
+    values = np.random.default_rng(seed + 7).uniform(-1, 1, size=(steps, 12))
+    for k in range(steps):
+        v_preds = values[k] if (with_value_predictions and k % 3) else None
+        env.step_array(acts[k], v_preds=v_preds)
+    return hashlib.sha256(json.dumps(env.replay_frames, sort_keys=True).encode()).hexdigest()
+
+
+def test_replay_frames_match_golden_digest():
+    assert replay_digest() == GOLDEN_REPLAY_DIGEST
+
+
+def test_full_match_replay_frames_match_golden_digest():
+    """Covers half-time, full-time events and intermittent critic values over all 10,801 frames."""
+    assert replay_digest(steps=2700, with_value_predictions=True) == GOLDEN_FULL_MATCH_REPLAY_DIGEST
+
+
+def test_replay_digest_is_seed_sensitive_and_repeatable():
+    assert replay_digest(steps=20) == replay_digest(steps=20)
+    assert replay_digest(steps=20, seed=1234) != replay_digest(steps=20, seed=1235)
+
+
 POTENTIAL_CORPUS_PATH = Path(__file__).resolve().parent / "golden" / "potential_corpus.npz"
 
 
