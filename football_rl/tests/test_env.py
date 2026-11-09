@@ -37,6 +37,7 @@ from football_rl.config import (
     TEAM_B,
 )
 from football_rl.env import FootballParallelEnv, parallel_env, wrap_to_pi
+from football_rl.potentials import PotentialState, compute_potentials
 from football_rl.replay import (
     ReplayViewer,
     find_replay_by_match_id,
@@ -4342,3 +4343,40 @@ def test_env_potentials_match_recorded_corpus():
         np.testing.assert_allclose(phi, corpus["phi"][k], rtol=0.0, atol=1e-9, err_msg=f"phi, record {k}")
         assert labels == corpus["role_states"][k].tolist(), f"role labels, record {k}"
         np.testing.assert_allclose(targets, corpus["role_targets"][k], rtol=0.0, atol=1e-9, err_msg=f"targets, record {k}")
+
+
+def _potential_state_from_corpus(corpus: dict[str, np.ndarray], k: int) -> PotentialState:
+    holder = int(corpus["holder"][k])
+    return PotentialState(
+        pos=corpus["pos"][k],
+        angle=corpus["angle"][k],
+        ball=corpus["ball"][k],
+        holder=holder,
+        ball_in_flight=bool(corpus["in_flight"][k]),
+        last_ball_team=int(corpus["last_ball_team"][k]),
+        team_side=corpus["team_side"][k],
+        disabled=corpus["disabled"][k],
+        stunned=corpus["stunned"][k],
+        post_kick_timer=corpus["post_kick_timer"][k],
+        depth_bias=corpus["depth_bias"][k],
+        flank_bias=corpus["flank_bias"][k],
+        active_box_radius=corpus["active_box_radius"][k],
+    )
+
+
+def test_pure_potentials_match_recorded_corpus():
+    corpus = _load_potential_corpus()
+    codes = ("GK", "BALL", "CHSE", "1stP", "2ndP", "COVR")
+    for k in range(corpus["phi"].shape[0]):
+        res = compute_potentials(_potential_state_from_corpus(corpus, k), DEFAULT_CONFIG.rewards, DEFAULT_CONFIG.physics)
+        np.testing.assert_allclose(res.phi, corpus["phi"][k], rtol=0.0, atol=1e-9, err_msg=f"phi, record {k}")
+
+        # Stun and lunge overlay the positional role in the recorded labels.
+        labels = [
+            "STUN" if corpus["stunned"][k][i] else "LNGE" if corpus["lunging"][k][i] else codes[res.role_code[i]]
+            for i in range(12)
+        ]
+        assert labels == corpus["role_states"][k].tolist(), f"role labels, record {k}"
+
+        rounded = np.array([[round(float(v), 1) for v in row] for row in res.target])
+        np.testing.assert_allclose(rounded, corpus["role_targets"][k], rtol=0.0, atol=1e-9, err_msg=f"targets, record {k}")

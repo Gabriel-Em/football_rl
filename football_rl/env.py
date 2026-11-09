@@ -31,6 +31,14 @@ from football_rl.config import (
     TEAM_B,
     TEAM_B_AGENTS,
 )
+from football_rl.potentials import (
+    ROLE_GK,
+    ROLE_LABELS,
+    PotentialResult,
+    PotentialState,
+    compute_potentials,
+    potential_gradient_arrows,
+)
 
 TEAM_LEFT = SIDE_LEFT
 TEAM_RIGHT = SIDE_RIGHT
@@ -282,12 +290,6 @@ class FootballParallelEnv(ParallelEnv):
         self.spell_max_threat: np.ndarray = np.full(2, -1.0, dtype=np.float64)
 
         # Preallocated buffers and constants for high-performance observation and critic computation
-        self._inv_2_165_sq: float = 1.0 / (2.0 * 165.0 * 165.0)
-        self._inv_2_240_sq: float = 1.0 / (2.0 * 240.0 * 240.0)
-        self._inv_2_260_sq: float = 1.0 / (2.0 * 260.0 * 260.0)
-        self._inv_2_280_sq: float = 1.0 / (2.0 * 280.0 * 280.0)
-        self._inv_2_95_sq: float = 1.0 / (2.0 * 95.0 * 95.0)
-        self._inv_lambda_chase: float = 1.0 / 220.0
         self._phi_curr: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
 
         self._critic_feat_a: np.ndarray = np.empty((self.num_players, 4), dtype=np.float32)
@@ -2970,475 +2972,78 @@ class FootballParallelEnv(ParallelEnv):
         r_sparse: Optional[np.ndarray] = None,
         r_ball_adv: Optional[np.ndarray] = None,
     ) -> None:
-        """Evaluate Markovian potentials (each bounded above by its role weight; the crowd penalty can make Phi negative) and apply exact PBRS."""
-        rew = self.cfg.rewards
-        phys = self.cfg.physics
-        gamma = self.cfg.ppo.gamma
-
-        pos = self.player_pos
-        bx = float(self.ball_pos[0])
-        by = float(self.ball_pos[1])
-
-        phi_curr = self._phi_curr
-        phi_curr.fill(0.0)
-
-        record_telemetry = bool(self.cfg.replay.enable_recording)
-        if record_telemetry:
-            phi_role = [0.0] * self.num_players
-            phi_crowd = [0.0] * self.num_players
-            grad_phi = [[0.0, 0.0, 0.0] for _ in range(self.num_players)]
-            role_states = ["COVR"] * self.num_players
-            role_targets = [[0.0, 0.0] for _ in range(self.num_players)]
-            crowd_rep_grads = [[0.0, 0.0] for _ in range(self.num_players)]
-
-        dx_b = pos[:, 0] - bx
-        dy_b = pos[:, 1] - by
-        ball_dists = np.hypot(dx_b, dy_b)
-
+        """Evaluate the potential field and apply potential-based shaping: `step_rewards += Phi(s') - Phi(s)`."""
+        stunned = self.stun_timer > 0.0
         holder = self.ball_holder
-        holder_team = int(self.player_team[holder]) if holder is not None else -1
+        last_team = self.last_ball_team
+        state = PotentialState(
+            pos=self.player_pos,
+            angle=self.player_angle,
+            ball=self.ball_pos,
+            holder=-1 if holder is None else holder,
+            ball_in_flight=self.ball_kicked_in_flight,
+            last_ball_team=-1 if last_team is None else last_team,
+            team_side=self.team_side,
+            disabled=stunned | self.is_ghost,
+            stunned=stunned,
+            post_kick_timer=self.post_kick_pbrs_timer,
+            depth_bias=self._tactical_depth_bias,
+            flank_bias=self._tactical_flank_bias,
+            active_box_radius=self.active_box_radius,
+        )
+        result = compute_potentials(state, self.cfg.rewards, self.cfg.physics)
+        phi_curr = result.phi
+        self._phi_curr = phi_curr
 
-        depth_bias_arr = self._tactical_depth_bias
-        flank_bias_arr = self._tactical_flank_bias
-
-        w_supp = rew.support_potential_weight
-        w_press = rew.def_press_potential_weight
-        w_cover = rew.def_cover_potential_weight
-        w_bisect = rew.keeper_bisect_potential_weight
-
-        carrier_baseline = w_press  # 0.65: continuous with pass_chaser reception (d_ib -> 0)
-        goal_y_min_bound = phys.goal_y_min + 8.0
-        goal_y_max_bound = phys.goal_y_max - 8.0
-        box_loose_thresh = phys.keeper_box_radius + 50.0
-
-        inv_2_165_sq = self._inv_2_165_sq
-        inv_2_240_sq = self._inv_2_240_sq
-        inv_2_260_sq = self._inv_2_260_sq
-        inv_2_280_sq = self._inv_2_280_sq
-        inv_2_95_sq = self._inv_2_95_sq
-        inv_lambda_chase = self._inv_lambda_chase
-
-        inv_115 = 1.0 / 115.0
-        inv_75 = 1.0 / 75.0
-        inv_980 = 1.0 / 980.0
-
-        for team_id in (TEAM_A, TEAM_B):
-            own_side = int(self.team_side[team_id])
-            is_left = (own_side == SIDE_LEFT)
-            own_gx = 0.0 if is_left else phys.field_width
-            own_gy = 420.0
-            sign_x = 1.0 if is_left else -1.0
-            sign_y = 1.0 if is_left else -1.0
-
-            f_start = 1 if team_id == TEAM_A else 7
-            o_start = 7 if team_id == TEAM_A else 1
-            keeper_idx = 0 if team_id == TEAM_A else 6
-
-            in_possession = (holder_team == team_id) or (
-                holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id
-            )
-
-            # 1. Additive Teammate Crowding Penalty (Fix 3: prevents gradient death from multiplicative 0.0)
-            p0_x, p0_y = float(pos[f_start, 0]), float(pos[f_start, 1])
-            p1_x, p1_y = float(pos[f_start + 1, 0]), float(pos[f_start + 1, 1])
-            p2_x, p2_y = float(pos[f_start + 2, 0]), float(pos[f_start + 2, 1])
-            p3_x, p3_y = float(pos[f_start + 3, 0]), float(pos[f_start + 3, 1])
-            p4_x, p4_y = float(pos[f_start + 4, 0]), float(pos[f_start + 4, 1])
-
-            centroid_x = (p0_x + p1_x + p2_x + p3_x + p4_x) * 0.2
-            centroid_y = (p0_y + p1_y + p2_y + p3_y + p4_y) * 0.2
-            ref_x = 0.65 * bx + 0.35 * centroid_x
-            ref_y = 0.50 * by + 0.50 * centroid_y
-
-            tf_positions = ((p0_x, p0_y), (p1_x, p1_y), (p2_x, p2_y), (p3_x, p3_y), (p4_x, p4_y))
-            r_crowd = rew.teammate_crowd_radius
-            w_crowd = rew.teammate_crowd_weight
-            inv_r_crowd = 1.0 / max(1e-6, r_crowd)
-            crowd_penalties = [0.0, 0.0, 0.0, 0.0, 0.0]
-            for loc_i in range(5):
-                px_i, py_i = tf_positions[loc_i]
-                c_pen = 0.0
-                rep_x = 0.0
-                rep_y = 0.0
-                for loc_j in range(5):
-                    if loc_i == loc_j:
-                        continue
-                    if self.stun_timer[f_start + loc_j] > 0.0 or self.is_ghost[f_start + loc_j]:
-                        continue
-                    px_j, py_j = tf_positions[loc_j]
-                    d_ij = math.hypot(px_i - px_j, py_i - py_j)
-                    if d_ij < r_crowd:
-                        viol = (r_crowd - d_ij) * inv_r_crowd
-                        c_pen += viol * viol
-                        if record_telemetry and d_ij > 1e-4:
-                            coeff = 2.0 * w_crowd * viol * inv_r_crowd / d_ij
-                            rep_x += coeff * (px_i - px_j)
-                            rep_y += coeff * (py_i - py_j)
-                crowd_penalties[loc_i] = w_crowd * c_pen
-                if record_telemetry:
-                    crowd_rep_grads[f_start + loc_i] = [rep_x, rep_y]
-                    phi_crowd[f_start + loc_i] = -float(w_crowd * c_pen)
-
-            if in_possession:
-                pass_chaser = -1
-                if holder is None and self.ball_kicked_in_flight and self.last_ball_team == team_id:
-                    min_c_dist = 1e9
-                    for cand in range(f_start, f_start + 5):
-                        d_c = float(ball_dists[cand])
-                        if d_c < min_c_dist:
-                            min_c_dist = d_c
-                            pass_chaser = cand
-
-                # Opponent outfield positions
-                op0_x, op0_y = float(pos[o_start, 0]), float(pos[o_start, 1])
-                op1_x, op1_y = float(pos[o_start + 1, 0]), float(pos[o_start + 1, 1])
-                op2_x, op2_y = float(pos[o_start + 2, 0]), float(pos[o_start + 2, 1])
-                op3_x, op3_y = float(pos[o_start + 3, 0]), float(pos[o_start + 3, 1])
-                op4_x, op4_y = float(pos[o_start + 4, 0]), float(pos[o_start + 4, 1])
-
-                for loc_i, (px, py) in enumerate(tf_positions):
-                    i = f_start + loc_i
-                    if i == holder:
-                        phi_curr[i] = carrier_baseline
-                        if record_telemetry:
-                            phi_role[i] = carrier_baseline
-                            role_states[i] = "BALL"
-                            role_targets[i] = [round(bx, 1), round(by, 1)]
-                            grad_phi[i] = [round(sign_x, 3), 0.0, 0.02]
-                        continue
-                    if i == pass_chaser:
-                        d_ib = float(ball_dists[i])
-                        d_eff = max(0.0, d_ib - 28.0)
-                        val = w_press * math.exp(-d_eff * inv_lambda_chase)
-                        phi_curr[i] = val
-                        if record_telemetry:
-                            phi_role[i] = val
-                            role_states[i] = "CHSE"
-                            role_targets[i] = [round(bx, 1), round(by, 1)]
-                            d_safe = max(1e-4, d_ib)
-                            dir_b = [(bx - px) / d_safe, (by - py) / d_safe]
-                            mag = val * inv_lambda_chase
-                            grad_phi[i] = [round(dir_b[0], 3), round(dir_b[1], 3), round(mag, 4)]
-                        continue
-
-                    # Relative Tactical Depth & Flank Channel Target
-                    depth_bias = float(depth_bias_arr[i])
-                    flank_bias = float(flank_bias_arr[i])
-
-                    target_x = _fast_clip(ref_x + sign_x * (depth_bias * 210.0), 90.0, 1310.0)
-                    target_y = _fast_clip(ref_y + sign_y * (flank_bias * 195.0), 75.0, 765.0)
-                    dx_chan = px - target_x
-                    dy_chan = py - target_y
-                    d_chan_sq = dx_chan * dx_chan + dy_chan * dy_chan
-                    psi_channel = 0.30 + 0.70 * math.exp(-d_chan_sq * inv_2_240_sq)
-
-                    # Support ring around ball
-                    d_ib = float(ball_dists[i])
-                    if d_ib <= 45.0:
-                        c_val = 0.0
-                    elif d_ib >= 95.0:
-                        c_val = 1.0
-                    else:
-                        c_val = (d_ib - 45.0) * 0.02
-                    d_diff = d_ib - 265.0
-                    f_val = math.exp(-(d_diff * d_diff) * inv_2_165_sq)
-                    psi_ring = c_val * f_val
-
-                    # Passing lane openness: point to segment from ball_pos (bx, by) to receiver (px, py)
-                    abx = px - bx
-                    aby = py - by
-                    d2 = abx * abx + aby * aby
-                    if d2 < 1e-12:
-                        min_seg = min(
-                            math.hypot(op0_x - bx, op0_y - by),
-                            math.hypot(op1_x - bx, op1_y - by),
-                            math.hypot(op2_x - bx, op2_y - by),
-                            math.hypot(op3_x - bx, op3_y - by),
-                            math.hypot(op4_x - bx, op4_y - by),
-                        )
-                    else:
-                        inv_d2 = 1.0 / d2
-                        t0 = _fast_clip(((op0_x - bx) * abx + (op0_y - by) * aby) * inv_d2, 0.0, 1.0)
-                        d_seg0 = math.hypot(op0_x - (bx + t0 * abx), op0_y - (by + t0 * aby))
-                        t1 = _fast_clip(((op1_x - bx) * abx + (op1_y - by) * aby) * inv_d2, 0.0, 1.0)
-                        d_seg1 = math.hypot(op1_x - (bx + t1 * abx), op1_y - (by + t1 * aby))
-                        t2 = _fast_clip(((op2_x - bx) * abx + (op2_y - by) * aby) * inv_d2, 0.0, 1.0)
-                        d_seg2 = math.hypot(op2_x - (bx + t2 * abx), op2_y - (by + t2 * aby))
-                        t3 = _fast_clip(((op3_x - bx) * abx + (op3_y - by) * aby) * inv_d2, 0.0, 1.0)
-                        d_seg3 = math.hypot(op3_x - (bx + t3 * abx), op3_y - (by + t3 * aby))
-                        t4 = _fast_clip(((op4_x - bx) * abx + (op4_y - by) * aby) * inv_d2, 0.0, 1.0)
-                        d_seg4 = math.hypot(op4_x - (bx + t4 * abx), op4_y - (by + t4 * aby))
-
-                        min_seg = min(d_seg0, d_seg1, d_seg2, d_seg3, d_seg4)
-
-                    psi_lane = _fast_clip(min_seg * inv_75, 0.15, 1.0)
-
-                    ring_pot = (
-                        w_supp
-                        * psi_ring
-                        * psi_lane
-                        * psi_channel
-                    )
-                    ring_pot_unpen = ring_pot
-                    ring_pot = ring_pot - crowd_penalties[loc_i]
-                    if self.post_kick_pbrs_timer[i] > 0.0:
-                        alpha_kick = float(self.post_kick_pbrs_timer[i]) / 0.50
-                        phi_curr[i] = max(ring_pot, alpha_kick * carrier_baseline + (1.0 - alpha_kick) * ring_pot)
-                    else:
-                        phi_curr[i] = ring_pot
-
-                    if record_telemetry:
-                        phi_role[i] = ring_pot_unpen
-                        role_states[i] = "COVR"
-                        role_targets[i] = [round(target_x, 1), round(target_y, 1)]
-                        dx = target_x - px
-                        dy = target_y - py
-                        d_t = math.hypot(dx, dy)
-                        pull_mag = ring_pot_unpen * 2.0 * inv_2_240_sq * d_t
-                        ux_pull = (dx / d_t) if d_t > 1e-4 else 0.0
-                        uy_pull = (dy / d_t) if d_t > 1e-4 else 0.0
-                        rx, ry = crowd_rep_grads[i]
-                        gx = ux_pull * pull_mag + rx
-                        gy = uy_pull * pull_mag + ry
-                        g_mag = math.hypot(gx, gy)
-                        if g_mag > 1e-6:
-                            grad_phi[i] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
-                        else:
-                            grad_phi[i] = [0.0, 0.0, 0.0]
-            else:
-                # Out-of-Possession: Dynamic Loose-Ball Pursuit & Cover Defense (Fix 4.1)
-                # Filter active (non-stunned, non-ghost) players for primary presser selection
-                presser_scores = []
-                for loc_i in range(5):
-                    i = f_start + loc_i
-                    d_b = float(ball_dists[i])
-                    is_dis = (self.stun_timer[i] > 0.0) or self.is_ghost[i]
-                    presser_scores.append((d_b + (10000.0 if is_dis else 0.0), d_b, loc_i, i))
-                presser_scores.sort(key=lambda item: item[0])
-
-                loc_presser = presser_scores[0][2]
-                presser = presser_scores[0][3]
-                d_eff = max(0.0, presser_scores[0][1] - 28.0)
-                phi_press = w_press * math.exp(-d_eff * inv_lambda_chase)
-                phi_curr[presser] = phi_press
-                if record_telemetry:
-                    phi_role[presser] = phi_press
-                    role_states[presser] = "1stP"
-                    role_targets[presser] = [round(bx, 1), round(by, 1)]
-                    px, py = tf_positions[loc_presser]
-                    d_b = max(1e-4, presser_scores[0][1])
-                    gx = (bx - px) / d_b * (phi_press * inv_lambda_chase)
-                    gy = (by - py) / d_b * (phi_press * inv_lambda_chase)
-                    g_mag = math.hypot(gx, gy)
-                    if g_mag > 1e-6:
-                        grad_phi[presser] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
-                    else:
-                        grad_phi[presser] = [0.0, 0.0, 0.0]
-
-                # Fix 4.1: If ball is loose (holder is None), allow 2nd closest active player
-                # to pursue/recover the loose ball without cover-anchor freeze
-                sec_presser_loc = -1
-                sec_presser_pot = 0.0
-                if holder is None and len(presser_scores) > 1:
-                    sec_loc = presser_scores[1][2]
-                    sec_i = presser_scores[1][3]
-                    sec_dist = presser_scores[1][1]
-                    if not ((self.stun_timer[sec_i] > 0.0) or self.is_ghost[sec_i]):
-                        sec_presser_loc = sec_loc
-                        d_eff_sec = max(0.0, sec_dist - 28.0)
-                        sec_presser_pot = (
-                            rew.loose_ball_secondary_press_blend
-                            * w_press
-                            * math.exp(-d_eff_sec * inv_lambda_chase)
-                        )
-
-                tf_all_pos = tf_positions
-                cover_defs = []
-                cov_locs = []
-                for loc_i in range(5):
-                    if loc_i != loc_presser:
-                        cover_defs.append(f_start + loc_i)
-                        cov_locs.append(loc_i)
-
-                if holder is not None and o_start <= holder < o_start + 5:
-                    mark_opps = [o for o in range(o_start, o_start + 5) if o != holder]
-                else:
-                    opp_dists = [(float(ball_dists[o]), o) for o in range(o_start, o_start + 5)]
-                    opp_dists.sort(key=lambda item: item[0])
-                    mark_opps = [item[1] for item in opp_dists[1:]]
-
-                cov_pts = []
-                for o in mark_opps:
-                    ox = float(pos[o, 0])
-                    oy = float(pos[o, 1])
-                    cov_pts.append((ox + 0.35 * (own_gx - ox), oy + 0.35 * (own_gy - oy)))
-
-                pairs = []
-                for c_idx, d_i in enumerate(cover_defs):
-                    px, py = tf_all_pos[cov_locs[c_idx]]
-                    for m_idx, (cx, cy) in enumerate(cov_pts):
-                        pairs.append((math.hypot(px - cx, py - cy), c_idx, m_idx))
-                pairs.sort(key=lambda item: item[0])
-
-                assigned_def = 0
-                assigned_opp = 0
-                d_cov_map = {}
-                for dist_val, c_idx, m_idx in pairs:
-                    if not (assigned_def & (1 << c_idx)) and not (assigned_opp & (1 << m_idx)):
-                        assigned_def |= (1 << c_idx)
-                        assigned_opp |= (1 << m_idx)
-                        d_cov_map[cover_defs[c_idx]] = dist_val
-                        if assigned_def == 15:
-                            break
-
-                for loc_i in cov_locs:
-                    i = f_start + loc_i
-                    px, py = tf_all_pos[loc_i]
-                    d_cov = d_cov_map.get(i, 300.0)
-                    psi_cov = math.exp(-(d_cov * d_cov) * inv_2_260_sq)
-
-                    depth_bias = float(depth_bias_arr[i])
-                    flank_bias = float(flank_bias_arr[i])
-                    anchor_x = _fast_clip(ref_x + sign_x * (depth_bias * 190.0), 80.0, 1320.0)
-                    anchor_y = _fast_clip(ref_y + sign_y * (flank_bias * 180.0), 75.0, 765.0)
-                    dx_chan = px - anchor_x
-                    dy_chan = py - anchor_y
-                    d_chan_sq = dx_chan * dx_chan + dy_chan * dy_chan
-                    psi_chan = 0.40 + 0.60 * math.exp(-d_chan_sq * inv_2_280_sq)
-
-                    base_cover = w_cover * psi_cov * psi_chan
-                    if loc_i == sec_presser_loc:
-                        base_role = max(base_cover, sec_presser_pot)
-                        if record_telemetry:
-                            role_states[i] = "2ndP"
-                            role_targets[i] = [round(bx, 1), round(by, 1)]
-                    else:
-                        base_role = base_cover
-                        if record_telemetry:
-                            role_states[i] = "COVR"
-                            role_targets[i] = [round(anchor_x, 1), round(anchor_y, 1)]
-
-                    phi_curr[i] = base_role - crowd_penalties[loc_i]
-
-                    if record_telemetry:
-                        phi_role[i] = base_role
-                        tgt_x, tgt_y = role_targets[i]
-                        dx = tgt_x - px
-                        dy = tgt_y - py
-                        d_t = math.hypot(dx, dy)
-                        pull_mag = base_role * 2.0 * inv_2_280_sq * d_t
-                        ux_pull = (dx / d_t) if d_t > 1e-4 else 0.0
-                        uy_pull = (dy / d_t) if d_t > 1e-4 else 0.0
-                        rx, ry = crowd_rep_grads[i]
-                        gx = ux_pull * pull_mag + rx
-                        gy = uy_pull * pull_mag + ry
-                        g_mag = math.hypot(gx, gy)
-                        if g_mag > 1e-6:
-                            grad_phi[i] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
-                        else:
-                            grad_phi[i] = [0.0, 0.0, 0.0]
-
-            # Goalkeeper strictly non-negative bisector & loose-box-ball claim potential
-            ray_x = bx - own_gx
-            ray_y = by - own_gy
-            ray_norm = max(1e-6, math.hypot(ray_x, ray_y))
-            ray_norm_inv = 1.0 / ray_norm
-            t_depth = _fast_clip((1400.0 - ray_norm) * inv_980, 0.0, 1.0)
-            target_depth = 38.0 + 47.0 * t_depth
-            bis_x = own_gx + (ray_x * ray_norm_inv) * target_depth
-            bis_y = _fast_clip(
-                own_gy + (ray_y * ray_norm_inv) * target_depth,
-                goal_y_min_bound,
-                goal_y_max_bound,
-            )
-            if is_left:
-                bis_x = _fast_clip(bis_x, 38.0, 95.0)
-            else:
-                bis_x = _fast_clip(bis_x, phys.field_width - 95.0, phys.field_width - 38.0)
-
-            gk_x = float(pos[keeper_idx, 0])
-            gk_y = float(pos[keeper_idx, 1])
-            if holder == keeper_idx:
-                # Target the front outlet arc of the keeper box so pickup is reward-positive
-                # and the GK naturally orients downfield rather than turning into their own net.
-                clear_x = (
-                    own_gx + (phys.keeper_box_radius - 25.0)
-                    if is_left
-                    else own_gx - (phys.keeper_box_radius - 25.0)
-                )
-                clear_y = float(np.clip(gk_y, own_gy - 110.0, own_gy + 110.0))
-                d_target_gk = math.hypot(gk_x - clear_x, gk_y - clear_y) * 0.5
-                psi_face = 1.0
-                tgt_gk_x, tgt_gk_y = clear_x, clear_y
-            elif holder is None and ray_norm <= box_loose_thresh:
-                d_target_gk = float(ball_dists[keeper_idx])
-                u_gk_x = math.cos(float(self.player_angle[keeper_idx]))
-                u_gk_y = math.sin(float(self.player_angle[keeper_idx]))
-                d_bx = bx - gk_x
-                d_by = by - gk_y
-                inv_db = 1.0 / max(1e-6, math.hypot(d_bx, d_by))
-                cos_phi = u_gk_x * (d_bx * inv_db) + u_gk_y * (d_by * inv_db)
-                psi_face = _fast_clip(1.0 + cos_phi, 0.0, 1.0)
-                tgt_gk_x, tgt_gk_y = bx, by
-            else:
-                d_target_gk = math.hypot(gk_x - bis_x, gk_y - bis_y)
-                u_gk_x = math.cos(float(self.player_angle[keeper_idx]))
-                u_gk_y = math.sin(float(self.player_angle[keeper_idx]))
-                d_bx = bx - gk_x
-                d_by = by - gk_y
-                inv_db = 1.0 / max(1e-6, math.hypot(d_bx, d_by))
-                cos_phi = u_gk_x * (d_bx * inv_db) + u_gk_y * (d_by * inv_db)
-                psi_face = _fast_clip(1.0 + cos_phi, 0.0, 1.0)
-                tgt_gk_x, tgt_gk_y = bis_x, bis_y
-
-            phi_curr[keeper_idx] = (
-                w_bisect
-                * math.exp(-(d_target_gk * d_target_gk) * inv_2_95_sq)
-                * psi_face
-            )
-
-            if record_telemetry:
-                role_states[keeper_idx] = "GK"
-                role_targets[keeper_idx] = [round(tgt_gk_x, 1), round(tgt_gk_y, 1)]
-                phi_role[keeper_idx] = phi_curr[keeper_idx]
-                phi_crowd[keeper_idx] = 0.0
-                dx = tgt_gk_x - gk_x
-                dy = tgt_gk_y - gk_y
-                d_gk = math.hypot(dx, dy)
-                g_mag = phi_curr[keeper_idx] * 2.0 * inv_2_95_sq * d_gk
-                if d_gk > 1e-4 and g_mag > 1e-6:
-                    grad_phi[keeper_idx] = [round(dx / d_gk, 3), round(dy / d_gk, 3), round(g_mag, 4)]
-                else:
-                    grad_phi[keeper_idx] = [0.0, 0.0, 0.0]
-
-        if record_telemetry:
-            for i in range(self.num_players):
-                if self.stun_timer[i] > 0.0:
-                    role_states[i] = "STUN"
-                elif self.lunge_timer[i] > 0.0:
-                    role_states[i] = "LNGE"
-
-            pot_delta = (phi_curr - self.prev_tactical_potential) if not any_teleport else np.zeros_like(phi_curr)
-            r_adv = r_ball_adv if r_ball_adv is not None else np.zeros(self.num_players)
-            r_sp = r_sparse if r_sparse is not None else np.zeros(self.num_players)
-            rew_breakdown = []
-            for i in range(self.num_players):
-                rew_breakdown.append({
-                    "r_ball_adv": round(float(r_adv[i]), 4),
-                    "r_pot_i": round(float(pot_delta[i]), 4),
-                    "phi_role": round(float(phi_role[i]), 4),
-                    "phi_crowd": round(float(phi_crowd[i]), 4),
-                    "r_sparse": round(float(r_sp[i]), 4),
-                    "grad_phi_xy": grad_phi[i],
-                })
-            self.last_rew_breakdown = rew_breakdown
-            self.last_grad_phi = grad_phi
-            self.last_role_states = role_states
-            self.last_role_targets = role_targets
+        if self.cfg.replay.enable_recording:
+            self._record_potential_telemetry(state, result, any_teleport, r_sparse, r_ball_adv)
 
         if not any_teleport:
             step_rewards += phi_curr - self.prev_tactical_potential
         self.prev_tactical_potential[:] = phi_curr
+
+    def _record_potential_telemetry(
+        self,
+        state: PotentialState,
+        result: PotentialResult,
+        any_teleport: bool,
+        r_sparse: Optional[np.ndarray],
+        r_ball_adv: Optional[np.ndarray],
+    ) -> None:
+        """Store per-player role labels, role targets, gradient arrows and the reward breakdown for replay frames."""
+        n = self.num_players
+        stunned = state.stunned.tolist()
+        lunging = (self.lunge_timer > 0.0).tolist()
+        role_codes = result.role_code.tolist()
+        role_states = [ROLE_LABELS[code] for code in role_codes]
+        for i in range(n):
+            if stunned[i]:
+                role_states[i] = "STUN"
+            elif lunging[i]:
+                role_states[i] = "LNGE"
+
+        grad_phi = potential_gradient_arrows(state, result, self.cfg.rewards)
+        pot_delta = (
+            result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
+        ).tolist()
+        r_adv = (r_ball_adv if r_ball_adv is not None else np.zeros(n)).tolist()
+        r_sp = (r_sparse if r_sparse is not None else np.zeros(n)).tolist()
+        phi_role = result.phi_role.tolist()
+        crowd = result.crowd.tolist()
+        self.last_rew_breakdown = [
+            {
+                "r_ball_adv": round(r_adv[i], 4),
+                "r_pot_i": round(pot_delta[i], 4),
+                "phi_role": round(phi_role[i], 4),
+                "phi_crowd": round(0.0 if role_codes[i] == ROLE_GK else -crowd[i], 4),
+                "r_sparse": round(r_sp[i], 4),
+                "grad_phi_xy": grad_phi[i],
+            }
+            for i in range(n)
+        ]
+        self.last_grad_phi = grad_phi
+        self.last_role_states = role_states
+        self.last_role_targets = [[round(x, 1), round(y, 1)] for x, y in result.target.tolist()]
 
     def _emit_event(
         self,
