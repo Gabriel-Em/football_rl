@@ -4588,3 +4588,38 @@ def test_pure_potentials_match_recorded_corpus():
 
         rounded = np.array([[round(float(v), 1) for v in row] for row in res.target])
         np.testing.assert_allclose(rounded, corpus["role_targets"][k], rtol=0.0, atol=1e-9, err_msg=f"targets, record {k}")
+
+
+def _wall_pinned_carrier_env() -> FootballParallelEnv:
+    """Team-A carrier on the top wall, facing it, with an opponent inside 55u and a stationary ball."""
+    env = _oop_env()
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+    c = 3
+    env.ball_holder = c
+    env.last_ball_holder = c
+    env.last_ball_team = 0
+    env.ball_hold_timer = 0.0
+    env.player_pos[c] = [600.0, 40.0]
+    env.player_angle[c] = -math.pi / 2
+    env.player_vel[c] = 0.0
+    env.player_pos[9] = [640.0, 60.0]
+    env.ball_pos = env.player_pos[c] + np.array([0.0, -24.0])
+    env.ball_vel[:] = 0.0
+    return env
+
+
+def test_wall_pinned_carrier_gets_exactly_one_five_second_violation() -> None:
+    env = _wall_pinned_carrier_env()
+    v0 = env.stats["field_5s_violations"]
+    for _ in range(6 * 60):
+        env._physics_substep(np.zeros((12, 4)), np.zeros(12))
+        env.physics_frame_count += 1
+    assert env.stats["field_5s_violations"] - v0 == 1
+
+
+def test_carried_ball_never_accumulates_the_loose_pin_timer() -> None:
+    env = _wall_pinned_carrier_env()
+    env.pinned_ball_timer = 1.9
+    env._physics_substep(np.zeros((12, 4)), np.zeros(12))
+    assert env.pinned_ball_timer == 0.0

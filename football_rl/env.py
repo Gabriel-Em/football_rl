@@ -1216,32 +1216,7 @@ class FootballParallelEnv(ParallelEnv):
             if d_ball_carrier < mech.ball_carry_offset - 1e-4:
                 self.player_pos[h_idx] = self.ball_pos - facing_vec * mech.ball_carry_offset
 
-            # Carrier corner-pin unsticking: increment pinned_ball_timer if ball speed < 18, near wall, opponent <= 55u
-            ball_spd_carrier = float(np.linalg.norm(self.ball_vel))
-            bx, by = float(self.ball_pos[0]), float(self.ball_pos[1])
-            near_outer_wall = (
-                bx <= r_b + 22.0
-                or bx >= W - (r_b + 22.0)
-                or by <= r_b + 22.0
-                or by >= H - (r_b + 22.0)
-            )
-            opp_slice = self._team_right_indices if int(self.player_team[h_idx]) == TEAM_LEFT else self._team_left_indices
-            diff = self.player_pos[opp_slice] - self.player_pos[h_idx]
-            d_nearest_opp = float(np.sqrt(np.min(diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1])))
-            opp_crowding = d_nearest_opp <= 55.0
-
-            if ball_spd_carrier < mech.pinned_ball_speed_thresh and near_outer_wall and opp_crowding:
-                self.pinned_ball_timer += dt
-                if self.pinned_ball_timer >= mech.pinned_ball_max_time:
-                    self.ball_holder = None
-                    self.ball_hold_timer = 0.0
-                    center_vec = np.array(phys.field_center, dtype=np.float64) - self.ball_pos
-                    c_dist = float(np.linalg.norm(center_vec))
-                    if c_dist > 1e-6:
-                        self.ball_vel = (center_vec / c_dist) * mech.pinned_ball_nudge_speed
-                    self.pinned_ball_timer = 0.0
-            else:
-                self.pinned_ball_timer = 0.0
+            self.pinned_ball_timer = 0.0
 
             # Check if a held ball protruding near the goal line crosses into a goal
             goal_scored_by = self._check_goal_scored()
