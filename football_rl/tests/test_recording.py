@@ -23,7 +23,6 @@ PAYLOAD = {
     "cum_rewards": [1.5, 2.5],
     "v_pred": None,
     "rew_breakdown": [{"r": 1.0}, {"r": 2.0}],
-    "grad_phi": [[0.0, 1.0], [2.0, 3.0]],
     "role_state": ["GK", "BALL"],
     "role_targets": [[1.0, 2.0], [3.0, 4.0]],
     "actions": [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
@@ -71,7 +70,6 @@ EXPECTED_FRAME = {
     "cum_rewards": [1.5, 2.5],
     "v_pred": None,
     "rew_breakdown": [{"r": 1.0}, {"r": 2.0}],
-    "grad_phi": [[0.0, 1.0], [2.0, 3.0]],
     "role_state": ["GK", "BALL"],
     "role_targets": [[1.0, 2.0], [3.0, 4.0]],
     "actions": [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
@@ -338,3 +336,60 @@ def test_env_deferred_replay_survives_the_next_reset():
     for k in range(10):
         env.step_array(acts[k])
     assert env._deferred_replay["frames"].materialize()[-1] == last_before
+
+
+def test_frames_recorded_with_flight_state_carry_inflight_and_rounded_post_kick_timers():
+    buf = ReplayBuffer(max_frames=2, num_players=2)
+    buf.set_step_payload(1, PAYLOAD)
+    kwargs = dict(
+        frame=7, time=7 / 60.0, half=1, team_side=np.array([0, 1]), box_radii=np.array([12.34, 15.0]),
+        player_pos=np.zeros((2, 2)), player_angle=np.zeros(2), player_flags=np.zeros(2),
+        player_vel=np.zeros((2, 2)), ball_pos=np.zeros(2), ball_team=0, ball_vel=np.zeros(2), step_index=1,
+        score=[0, 0], possession_frames=[0, 0], stationary=0, passes=[0, 0], tackles=[0, 0], saves=[0, 0],
+        shots=[0, 0],
+    )
+    buf.record_frame(**kwargs, inflight=True, post_kick=np.array([0.12345, 0.5]))
+    buf.record_frame(**kwargs, inflight=False, post_kick=np.array([0.0, 0.0004]))
+    frames = buf.materialize()
+    assert frames[0]["inflight"] is True and frames[0]["pk"] == [0.123, 0.5]
+    assert frames[1]["inflight"] is False and frames[1]["pk"] == [0.0, 0.0]
+
+
+def test_materialized_frames_carry_no_stored_gradient_arrows():
+    buf = _buffer()
+    _record(buf)
+    assert "grad_phi" not in buf.materialize()[0]
+
+
+def test_frames_recorded_without_flight_state_materialise_without_inflight_and_pk():
+    buf = ReplayBuffer(max_frames=1, num_players=2)
+    buf.set_step_payload(1, PAYLOAD)
+    _record(buf)
+    frame = buf.materialize()[0]
+    assert "inflight" not in frame and "pk" not in frame
+
+
+def test_flight_state_survives_growth_and_snapshot():
+    buf = ReplayBuffer(max_frames=1, num_players=2)
+    buf.set_step_payload(1, PAYLOAD)
+    for k in range(3):
+        buf.record_frame(
+            frame=k, time=0.0, half=1, team_side=np.array([0, 1]), box_radii=np.zeros(2),
+            player_pos=np.zeros((2, 2)), player_angle=np.zeros(2), player_flags=np.zeros(2),
+            player_vel=np.zeros((2, 2)), ball_pos=np.zeros(2), ball_team=0, ball_vel=np.zeros(2), step_index=1,
+            score=[0, 0], possession_frames=[0, 0], stationary=0, passes=[0, 0], tackles=[0, 0], saves=[0, 0],
+            shots=[0, 0], inflight=(k == 1), post_kick=np.array([0.25 * k, 0.0]),
+        )
+    for frames in (buf.materialize(), buf.snapshot().materialize()):
+        assert [f["inflight"] for f in frames] == [False, True, False]
+        assert [f["pk"][0] for f in frames] == [0.0, 0.25, 0.5]
+
+
+def test_env_frames_carry_flight_state_and_post_kick_timers():
+    env = _recording_env(steps=40)
+    frames = env.replay_frames
+    assert all(isinstance(f["inflight"], bool) and len(f["pk"]) == 12 for f in frames)
+    assert all(0.0 <= t <= 0.5 for f in frames for t in f["pk"])
+    last = frames[-1]
+    assert last["inflight"] == env.ball_kicked_in_flight
+    assert last["pk"] == [round(float(t), 3) for t in env.post_kick_pbrs_timer]

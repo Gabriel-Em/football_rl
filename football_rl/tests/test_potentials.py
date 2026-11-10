@@ -19,7 +19,7 @@ from football_rl.potentials import (
     ROLE_SECOND_PRESS,
     PotentialState,
     compute_potentials,
-    potential_gradient_arrows,
+    potential_gradient,
 )
 
 REW = DEFAULT_CONFIG.rewards
@@ -404,82 +404,6 @@ def test_post_kick_timer_lifts_a_supporting_receivers_potential_toward_the_carri
     np.testing.assert_array_equal(lifted.phi[[1, 2, 4, 5]], base.phi[[1, 2, 4, 5]])
 
 
-def arrows_of(state: PotentialState):
-    return potential_gradient_arrows(state, evaluate(state), REW)
-
-
-def test_gradient_arrows_have_one_triple_per_player():
-    rng = np.random.default_rng(13)
-    for _ in range(20):
-        arrows = arrows_of(random_state(rng))
-        assert len(arrows) == 12
-        assert all(len(a) == 3 and all(math.isfinite(v) for v in a) for a in arrows)
-
-
-def test_gradient_arrows_are_unit_directions_or_zero():
-    rng = np.random.default_rng(17)
-    for _ in range(60):
-        for ux, uy, mag in arrows_of(random_state(rng)):
-            if (ux, uy, mag) == (0.0, 0.0, 0.0):
-                continue
-            assert math.hypot(ux, uy) == pytest.approx(1.0, abs=2e-3)
-            assert mag >= 0.0
-
-
-def test_carrier_arrow_points_in_the_attacking_direction_of_its_side():
-    state = make_state(holder=5, ball=FORMATION_A[5] + np.array([12.0, 0.0]))
-    assert arrows_of(state)[5] == pytest.approx([1.0, 0.0, 0.02], abs=1e-12)
-    right_side = state._replace(team_side=np.array([1, 0], dtype=np.int32))
-    assert arrows_of(right_side)[5] == pytest.approx([-1.0, 0.0, 0.02], abs=1e-12)
-
-
-def test_presser_arrow_points_at_the_ball_with_the_chase_gradient_magnitude():
-    # Presser 100 u from the ball: phi = 0.65 * exp(-(100 - 28) / 220) = 0.46858, magnitude = phi / 220 = 0.00213.
-    arrows = arrows_of(make_state())
-    assert arrows[5] == pytest.approx([1.0, 0.0, 0.0021], abs=1e-12)
-    assert arrows[11] == pytest.approx([-1.0, 0.0, 0.0021], abs=1e-12)
-
-
-def test_chaser_arrow_points_at_the_ball_in_flight():
-    # Chaser mid_1 at (450, 200), ball at (520, 300): offset (70, 100), distance 122.066 u.
-    state = make_state(ball=np.array([520.0, 300.0]), ball_in_flight=True, last_ball_team=0)
-    assert arrows_of(state)[3] == pytest.approx([0.573, 0.819, 0.0019], abs=1e-12)
-
-
-def test_keeper_arrow_points_at_its_target_with_a_gaussian_gradient_magnitude():
-    state = make_state()
-    pos = state.pos.copy()
-    pos[0] = [38.0 + 47.0 * 700.0 / 980.0, 380.0]  # 40 u below the bisector target, facing the ball
-    # phi = 0.6 * exp(-40^2 / (2 * 95^2)) = 0.54910, magnitude = phi * 2 * 40 / (2 * 95^2) = 0.002434.
-    assert arrows_of(state._replace(pos=pos))[0] == pytest.approx([0.0, 1.0, 0.0024], abs=1e-12)
-
-
-def push_scenario(neighbour_offset, disabled_neighbour=False):
-    """Keeper holds the ball; defender 1 sits 40 u from it (zero ring pull) with defender 2 beside it."""
-    state = make_state(holder=0, ball=np.array([60.0, 420.0]))
-    pos = state.pos.copy()
-    pos[1] = [60.0, 460.0]
-    pos[2] = pos[1] + np.asarray(neighbour_offset)
-    disabled = np.zeros(12, dtype=bool)
-    disabled[2] = disabled_neighbour
-    return state._replace(pos=pos, disabled=disabled, stunned=disabled)
-
-
-def test_supporter_inside_the_ring_radius_is_pushed_directly_away_from_a_crowding_teammate():
-    # No ring pull inside 45 u of the ball, so the arrow is the push alone. Neighbour offset (30, 40) is 50 u away:
-    # overlap (110 - 50) / 110, push = 2 * 0.35 * overlap / 110 / 50 * (-30, -40), magnitude 0.003471.
-    assert arrows_of(push_scenario((30.0, 40.0)))[1] == pytest.approx([-0.6, -0.8, 0.0035], abs=1e-12)
-    assert arrows_of(push_scenario((-30.0, -40.0)))[1] == pytest.approx([0.6, 0.8, 0.0035], abs=1e-12)
-    # Still inside the 110 u crowd radius at 80 u: overlap 30 / 110, magnitude 0.001736.
-    assert arrows_of(push_scenario((48.0, 64.0)))[1] == pytest.approx([-0.6, -0.8, 0.0017], abs=1e-12)
-
-
-def test_disabled_or_coincident_teammates_exert_no_push():
-    assert arrows_of(push_scenario((30.0, 40.0), disabled_neighbour=True))[1] == [0.0, 0.0, 0.0]
-    assert arrows_of(push_scenario((0.0, 0.0)))[1] == [0.0, 0.0, 0.0]
-    assert arrows_of(push_scenario((300.0, 40.0)))[1] == [0.0, 0.0, 0.0]
-
-
 def test_keeper_bisector_stays_at_least_38_units_off_the_goal_line():
     # Ball level with the goal line: the unclamped bisector would sit 4.5 u from it.
     res = evaluate(make_state(ball=np.array([20.0, 800.0])))
@@ -831,3 +755,88 @@ def test_line_order_config_rejects_unusable_values(overrides):
 def test_line_order_config_accepts_a_zero_weight_and_the_defaults():
     assert replace(REW, line_order_weight=0.0).line_order_weight == 0.0
     assert REW.line_order_weight == 0.6 and REW.line_order_sigma == 120.0
+
+
+def test_central_difference_gradient_of_a_keeper_matches_the_hand_derived_gaussian_slope():
+    # Ball at the centre spot, loose; keeper A at (60, 400) facing it. Bisector target: ray length 700,
+    # depth 38 + 47 * 700 / 980 = 71.5714286 on the goal-centre row y = 420. Offset (-11.5714286, -20),
+    # squared distance 533.89796, phi = 0.6 * exp(-533.89796 / (2 * 95^2)) = 0.5825126.
+    # d phi / dp = -phi * (p - target) / 95^2 = (0.00074687014, 0.00129088665).
+    state = make_state()
+    pos = state.pos.copy()
+    pos[0] = [60.0, 400.0]
+    state = state._replace(pos=pos)
+    grad = potential_gradient(state, REW, PHYS)
+    assert grad.shape == (12, 2)
+    np.testing.assert_allclose(grad[0], [0.00074687014, 0.00129088665], rtol=0.0, atol=1e-6)
+
+
+def test_central_difference_gradient_of_a_presser_points_at_the_ball_with_the_exponential_slope():
+    # Team A presser (striker, slot 5) at (600, 420), ball at (700, 420): 100 u away.
+    # phi = 0.65 * exp(-(100 - 28) / 220); d phi / dx = phi / 220 = 0.00212963 toward the ball.
+    grad = potential_gradient(make_state(), REW, PHYS)
+    phi = 0.65 * math.exp(-72.0 / 220.0)
+    np.testing.assert_allclose(grad[5], [phi / 220.0, 0.0], rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(grad[11], [-phi / 220.0, 0.0], rtol=0.0, atol=1e-6)
+
+
+def _tied_presser_state():
+    """Team A defenders 1 and 2 stand symmetrically about a loose ball; everyone else is further away."""
+    pos = make_state().pos.copy()
+    pos[1] = [500.0, 300.0]
+    pos[2] = [500.0, 540.0]
+    pos[3] = [100.0, 100.0]
+    pos[4] = [100.0, 740.0]
+    pos[5] = [60.0, 420.0]
+    return make_state(pos=pos)
+
+
+def test_frozen_roles_survive_perturbing_either_tied_player_in_every_axis():
+    state = _tied_presser_state()
+    res0 = compute_potentials(state, REW, PHYS)
+    assert res0.role_code[1] == ROLE_PRESS and res0.role_code[2] == ROLE_SECOND_PRESS
+    flipped_without_freeze = False
+    for i in (1, 2):
+        for axis in (0, 1):
+            for sign in (-0.5, 0.5):
+                pos = state.pos.copy()
+                pos[i, axis] += sign
+                moved = state._replace(pos=pos)
+                frozen = compute_potentials(moved, REW, PHYS, frozen=res0)
+                np.testing.assert_array_equal(frozen.role_code, res0.role_code)
+                np.testing.assert_array_equal(frozen.cover_mark, res0.cover_mark)
+                free = compute_potentials(moved, REW, PHYS)
+                flipped_without_freeze |= not np.array_equal(free.role_code, res0.role_code)
+    assert flipped_without_freeze
+
+
+def test_frozen_presser_potential_stays_on_its_pull_branch_when_a_tied_rival_would_take_the_role():
+    # Defender 1 steps 0.5 u away from the ball: unfrozen, defender 2 becomes the presser. Frozen, defender 1
+    # keeps the pull: distance sqrt(200.5^2 + 120^2) = 233.66696, phi = 0.65 * exp(-(233.66696 - 28) / 220).
+    state = _tied_presser_state()
+    res0 = compute_potentials(state, REW, PHYS)
+    pos = state.pos.copy()
+    pos[1, 0] -= 0.5
+    moved = state._replace(pos=pos)
+    assert compute_potentials(moved, REW, PHYS).role_code[1] != ROLE_PRESS
+    frozen = compute_potentials(moved, REW, PHYS, frozen=res0)
+    assert frozen.phi[1] == pytest.approx(0.2552191345, abs=1e-9)
+
+
+def test_gradient_of_a_tied_presser_follows_the_pull_branch_on_both_sides_of_the_tie():
+    # Defender 1 at (500, 300) ties defender 2 for the press, ball at (700, 420): offset (200, 120), distance
+    # 233.2381, phi = 0.65 * exp(-(233.2381 - 28) / 220); d phi / dp = phi / 220 * offset / distance.
+    grad = potential_gradient(_tied_presser_state(), REW, PHYS)
+    np.testing.assert_allclose(grad[1], [0.00099670755, 0.00059802453], rtol=0.0, atol=1e-8)
+
+
+def test_gradient_leaves_the_state_unmodified_and_is_repeatable():
+    rng = np.random.default_rng(23)
+    state = random_state(rng)
+    before = [np.array(a, copy=True) for a in state]
+    first = potential_gradient(state, REW, PHYS)
+    second = potential_gradient(state, REW, PHYS)
+    np.testing.assert_array_equal(first, second)
+    assert np.all(np.isfinite(first))
+    for a, b in zip(before, state):
+        np.testing.assert_array_equal(a, b)

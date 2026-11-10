@@ -918,7 +918,7 @@ def test_backward_compatibility_older_replays() -> None:
 
 
 def test_env_replay_recording_telemetry_fields() -> None:
-    """Verify FootballEnv records v_pred, rew_breakdown, grad_phi, role_state, role_targets, actions."""
+    """Verify FootballEnv records v_pred, rew_breakdown, flight state, role_state, role_targets, actions."""
     from dataclasses import replace
     import numpy as np
     from football_rl.config import DEFAULT_CONFIG
@@ -942,12 +942,8 @@ def test_env_replay_recording_telemetry_fields() -> None:
     assert "r_pot_i" in env.last_rew_breakdown[0]
     assert "phi_role" in env.last_rew_breakdown[0]
     assert "phi_crowd" in env.last_rew_breakdown[0]
-    assert "grad_phi_xy" in env.last_rew_breakdown[0]
-
-    assert env.last_grad_phi is not None
-    assert len(env.last_grad_phi) == 12
-    for g in env.last_grad_phi:
-        assert len(g) == 3
+    assert "grad_phi_xy" not in env.last_rew_breakdown[0]
+    assert not hasattr(env, "last_grad_phi")
 
     assert env.last_role_states is not None
     assert len(env.last_role_states) == 12
@@ -961,7 +957,9 @@ def test_env_replay_recording_telemetry_fields() -> None:
     rf = env.replay_frames[-1]
     assert "v_pred" in rf
     assert "rew_breakdown" in rf
-    assert "grad_phi" in rf
+    assert "grad_phi" not in rf
+    assert isinstance(rf["inflight"], bool)
+    assert len(rf["pk"]) == 12
     assert "role_state" in rf
     assert "role_targets" in rf
     assert "actions" in rf
@@ -973,3 +971,57 @@ def test_env_replay_recording_telemetry_fields() -> None:
 
 
 
+
+
+def _flight_state_replay_data() -> Dict[str, Any]:
+    """Mock replay whose frames carry the flight state needed to rebuild the potential field."""
+    data = _create_mock_replay_data()
+    for fr in data["frames"]:
+        fr["players"][0] = [60.0, 400.0, 0.0, 0]
+        fr["ball"] = [700.0, 420.0, -1, 0.0, 0.0]
+        fr["box_radii"] = [195.0, 195.0]
+        fr["inflight"] = False
+        fr["pk"] = [0.0] * 12
+        fr["grad_phi"] = [[0.707, 0.707, 0.05] for _ in range(12)]
+    return data
+
+
+def test_gradient_arrows_are_the_true_potential_gradient_when_flight_state_is_recorded() -> None:
+    # Keeper A at (60, 400) facing a loose centre-spot ball: its potential is a Gaussian in the distance to the
+    # goal-line bisector point (71.5714, 420); the gradient is (0.00074687, 0.00129089), i.e. direction
+    # (0.501, 0.866) and magnitude 0.0015.
+    viz = ReplayVisualizer(_flight_state_replay_data(), headless=True)
+    arrows, legacy = viz.gradient_arrows(0)
+    assert not legacy
+    assert len(arrows) == 12
+    assert arrows[0] == pytest.approx([0.501, 0.866, 0.0015], abs=1e-12)
+
+
+def test_ball_carrier_has_a_flat_true_gradient() -> None:
+    # The carrier potential is the constant carrier baseline, so its true gradient vanishes.
+    data = _flight_state_replay_data()
+    data["frames"][0]["players"][5] = [700.0, 420.0, 0.0, 1]
+    data["frames"][0]["ball"] = [700.0, 420.0, 0, 0.0, 0.0]
+    viz = ReplayVisualizer(data, headless=True)
+    arrows, legacy = viz.gradient_arrows(0)
+    assert not legacy
+    assert arrows[5] == [0.0, 0.0, 0.0]
+
+
+def test_gradient_arrows_are_cached_per_frame_index() -> None:
+    viz = ReplayVisualizer(_flight_state_replay_data(), headless=True)
+    first, _ = viz.gradient_arrows(3)
+    second, _ = viz.gradient_arrows(3)
+    assert first is second
+
+
+def test_replays_without_flight_state_draw_the_stored_arrows_and_are_flagged_legacy() -> None:
+    data = _flight_state_replay_data()
+    for fr in data["frames"]:
+        fr.pop("inflight")
+        fr.pop("pk")
+    viz = ReplayVisualizer(data, headless=True, show_gradient=True, show_telemetry=True)
+    arrows, legacy = viz.gradient_arrows(0)
+    assert legacy
+    assert arrows[0] == [0.707, 0.707, 0.05]
+    assert isinstance(viz.render_frame(), pygame.Surface)

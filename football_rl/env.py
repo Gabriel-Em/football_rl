@@ -37,7 +37,6 @@ from football_rl.potentials import (
     PotentialResult,
     PotentialState,
     compute_potentials,
-    potential_gradient_arrows,
 )
 from football_rl.recording import ReplayBuffer
 
@@ -443,7 +442,6 @@ class FootballParallelEnv(ParallelEnv):
         # Telemetry & Critic recording buffers
         self.last_v_preds: Optional[np.ndarray] = None
         self.last_rew_breakdown: Optional[List[Dict[str, Any]]] = None
-        self.last_grad_phi: Optional[List[List[float]]] = None
         self.last_role_states: List[str] = [
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
@@ -722,7 +720,6 @@ class FootballParallelEnv(ParallelEnv):
         self._frame_events = []
         self.last_v_preds = None
         self.last_rew_breakdown = None
-        self.last_grad_phi = None
         self.last_role_states = [
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
@@ -3023,7 +3020,7 @@ class FootballParallelEnv(ParallelEnv):
         r_sparse: Optional[np.ndarray],
         r_ball_adv: Optional[np.ndarray],
     ) -> None:
-        """Store per-player role labels, role targets, gradient arrows and the reward breakdown for replay frames."""
+        """Store per-player role labels, role targets and the reward breakdown for replay frames."""
         n = self.num_players
         stunned = state.stunned.tolist()
         lunging = (self.lunge_timer > 0.0).tolist()
@@ -3035,7 +3032,6 @@ class FootballParallelEnv(ParallelEnv):
             elif lunging[i]:
                 role_states[i] = "LNGE"
 
-        grad_phi = potential_gradient_arrows(state, result, self.cfg.rewards)
         pot_delta = (
             result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
         ).tolist()
@@ -3050,11 +3046,9 @@ class FootballParallelEnv(ParallelEnv):
                 "phi_role": round(phi_role[i], 4),
                 "phi_crowd": round(0.0 if role_codes[i] == ROLE_GK else -crowd[i], 4),
                 "r_sparse": round(r_sp[i], 4),
-                "grad_phi_xy": grad_phi[i],
             }
             for i in range(n)
         ]
-        self.last_grad_phi = grad_phi
         self.last_role_states = role_states
         self.last_role_targets = [[round(x, 1), round(y, 1)] for x, y in result.target.tolist()]
 
@@ -3086,7 +3080,6 @@ class FootballParallelEnv(ParallelEnv):
             "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
             "v_pred": v_preds_data,
             "rew_breakdown": self.last_rew_breakdown,
-            "grad_phi": self.last_grad_phi,
             "role_state": (list(self.last_role_states) if self.last_role_states is not None else None),
             "role_targets": self.last_role_targets,
             "actions": self.last_actions,
@@ -3129,6 +3122,8 @@ class FootballParallelEnv(ParallelEnv):
             saves=stats["team_saves"],
             shots=stats["shots"],
             events=self._frame_events,
+            inflight=self.ball_kicked_in_flight,
+            post_kick=self.post_kick_pbrs_timer,
         )
 
     def compute_interest_score(self) -> float:

@@ -44,6 +44,8 @@ class ReplayBuffer:
         self.tackles = np.zeros((capacity, 2), dtype=np.int64)
         self.saves = np.zeros((capacity, 2), dtype=np.int64)
         self.shots = np.zeros((capacity, 2), dtype=np.int64)
+        self.inflight = np.full(capacity, -1, dtype=np.int8)  # -1: not recorded, else 0/1
+        self.post_kick = np.zeros((capacity, self.num_players), dtype=np.float64)
 
     _COLUMNS = (
         "players",
@@ -61,6 +63,8 @@ class ReplayBuffer:
         "tackles",
         "saves",
         "shots",
+        "inflight",
+        "post_kick",
     )
 
     def __len__(self) -> int:
@@ -78,6 +82,8 @@ class ReplayBuffer:
         for name in self._COLUMNS:
             old = getattr(self, name)
             grown = np.zeros((new_capacity,) + old.shape[1:], dtype=old.dtype)
+            if name == "inflight":
+                grown[:] = -1
             grown[: self._capacity] = old
             setattr(self, name, grown)
         self._capacity = new_capacity
@@ -111,8 +117,14 @@ class ReplayBuffer:
         saves: Sequence[int],
         shots: Sequence[int],
         events: Sequence[Dict[str, Any]] | None = None,
+        inflight: bool | None = None,
+        post_kick: np.ndarray | None = None,
     ) -> None:
-        """Copy one physics frame into the next free slot."""
+        """Copy one physics frame into the next free slot.
+
+        `inflight` (a kicked ball is travelling) and `post_kick` (per-player post-kick shaping timers) are
+        stored together; frames recorded without them materialise without the `inflight` / `pk` keys.
+        """
         i = self._count
         if i == self._capacity:
             self._grow()
@@ -138,6 +150,11 @@ class ReplayBuffer:
         self.tackles[i] = tackles
         self.saves[i] = saves
         self.shots[i] = shots
+        if inflight is None:
+            self.inflight[i] = -1
+        else:
+            self.inflight[i] = 1 if inflight else 0
+            self.post_kick[i] = post_kick
         if events:
             self._events[i] = list(events)
         self._count = i + 1
@@ -179,6 +196,8 @@ class ReplayBuffer:
         tackles = self.tackles[:n].tolist()
         saves = self.saves[:n].tolist()
         shots = self.shots[:n].tolist()
+        inflight = self.inflight[:n].tolist()
+        post_kick = self.post_kick[:n].round(3).tolist()
 
         frames: List[Dict[str, Any]] = []
         for i in range(n):
@@ -203,7 +222,6 @@ class ReplayBuffer:
                     "cum_rewards": payload["cum_rewards"],
                     "v_pred": payload["v_pred"],
                     "rew_breakdown": payload["rew_breakdown"],
-                    "grad_phi": payload["grad_phi"],
                     "role_state": payload["role_state"],
                     "role_targets": payload["role_targets"],
                     "actions": payload["actions"],
@@ -227,4 +245,7 @@ class ReplayBuffer:
                     "events": list(self._events.get(i, ())),
                 }
             )
+            if inflight[i] >= 0:
+                frames[-1]["inflight"] = bool(inflight[i])
+                frames[-1]["pk"] = post_kick[i]
         return frames

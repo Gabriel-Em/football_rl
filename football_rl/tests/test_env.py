@@ -4305,9 +4305,9 @@ def test_rollout_digest_is_seed_sensitive_and_repeatable():
     assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
 
 
-GOLDEN_REPLAY_DIGEST = "40687227c7c551d52215b14eb69f22944188ffaa59462b31b8245680c315e707"
-GOLDEN_FULL_MATCH_REPLAY_DIGEST = "f69b9687f64d441351ea2c3da0f95398fd6600c535aa411459f427d1c98b36bb"
-GOLDEN_FULL_MATCH_REPLAY_DIGEST_WITHOUT_LINE_ORDER = "5143452ad8e31c690373e916bf9cd1efa6f77f49f2917bde10417e9e53136d7c"
+GOLDEN_REPLAY_DIGEST = "9accb1139ab1e0cf1419b4b2c6aa9a3789046210e2d27f7f59deac8e7a439bde"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST = "b696f562f722eca42049da1e6118bc6e42ec52cf41e36bfb79cd5280e3b0611e"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST_WITHOUT_LINE_ORDER = "d23cef4d09f54ee91c3b55a9bab2caf7710ef1d120e9957304832280d677e90b"
 
 
 def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bool = False, rewards=None) -> str:

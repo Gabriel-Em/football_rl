@@ -15,6 +15,12 @@ import pygame
 
 from football_rl.config import DEFAULT_CONFIG, ReplayConfig
 from football_rl.env import parallel_env
+from football_rl.potentials import (
+    TACTICAL_DEPTH_BIAS,
+    TACTICAL_FLANK_BIAS,
+    PotentialState,
+    potential_gradient,
+)
 
 
 # ==============================================================================
@@ -220,6 +226,15 @@ class ReplayViewer:
         self.ball_trail: List[Tuple[float, float, float, float, int]] = []
         self.telemetry_row_rects: Dict[int, pygame.Rect] = {}
         self.telemetry_chip_rects: Dict[str, pygame.Rect] = {}
+        self._gradient_cache: Dict[int, Tuple[List[List[float]], bool]] = {}
+        self._potential_physics = replace(
+            DEFAULT_CONFIG.physics,
+            field_width=self.field_w,
+            field_height=self.field_h,
+            goal_y_min=self.goal_y_min,
+            goal_y_max=self.goal_y_max,
+            keeper_box_radius=self.box_radius,
+        )
 
         self.win_w = self.disp_field_w + 2 * self.margin_x + (self.side_panel_w if self.show_telemetry else 0)
         self.win_h = self.disp_field_h + self.hud_height + self.scrubber_height
@@ -2144,13 +2159,64 @@ class ReplayViewer:
                 # Cyan dashed tether toward ball
                 _draw_dashed_line(self.screen, p_scr, ball_scr, (80, 225, 255), dash_len=5.0, space_len=4.0, width=1)
 
+    def gradient_arrows(self, frame_idx: int) -> Tuple[Optional[List[List[float]]], bool]:
+        """Per-player ``[direction x, direction y, magnitude]`` arrows for one frame, and whether they are legacy.
+
+        Frames that record the ball-flight state and post-kick timers rebuild the potential field and use the
+        central-difference gradient of each player's potential with respect to its own position, with roles and
+        marks frozen. Older frames fall back to the stored arrows (`legacy` is True). Results are cached per frame.
+        """
+        cached = self._gradient_cache.get(frame_idx)
+        if cached is not None:
+            return cached
+        frame = self.frames[frame_idx]
+        if "inflight" in frame and "pk" in frame:
+            result = (self._true_gradient_arrows(frame), False)
+        else:
+            stored = frame.get("grad_phi")
+            if stored is None:
+                rb = frame.get("rew_breakdown")
+                if rb:
+                    stored = [b.get("grad_phi_xy", [0.0, 0.0, 0.0]) for b in rb]
+            result = (stored, True)
+        self._gradient_cache[frame_idx] = result
+        return result
+
+    def _true_gradient_arrows(self, frame: Dict[str, Any]) -> List[List[float]]:
+        """Rebuild the potential state of a recorded frame and convert its gradients to arrow triples."""
+        players = np.asarray([p[:4] for p in frame["players"]], dtype=np.float64)
+        flags = players[:, 3].astype(np.int64)
+        held = np.flatnonzero(flags & 1)
+        disabled = (flags & 6) > 0
+        ball_team = int(frame["ball"][2])
+        state = PotentialState(
+            pos=players[:, 0:2].copy(),
+            angle=players[:, 2].copy(),
+            ball=np.asarray(frame["ball"][0:2], dtype=np.float64),
+            holder=int(held[0]) if held.size else -1,
+            ball_in_flight=bool(frame["inflight"]),
+            last_ball_team=ball_team,
+            team_side=np.asarray(frame["team_side"], dtype=np.int32),
+            disabled=disabled,
+            stunned=(flags & 4) > 0,
+            post_kick_timer=np.asarray(frame["pk"], dtype=np.float64),
+            depth_bias=TACTICAL_DEPTH_BIAS,
+            flank_bias=TACTICAL_FLANK_BIAS,
+            active_box_radius=np.asarray(frame.get("box_radii", [self.box_radius] * 2), dtype=np.float64),
+        )
+        grad = potential_gradient(state, DEFAULT_CONFIG.rewards, self._potential_physics)
+        mags = np.hypot(grad[:, 0], grad[:, 1])
+        arrows: List[List[float]] = []
+        for (gx, gy), mag in zip(grad.tolist(), mags.tolist()):
+            if mag > 1e-6:
+                arrows.append([round(gx / mag, 3), round(gy / mag, 3), round(mag, 4)])
+            else:
+                arrows.append([0.0, 0.0, 0.0])
+        return arrows
+
     def _draw_gradient_compass(self, frame: Dict[str, Any]) -> None:
         """Render gold potential gradient arrows and warning red crosses for flat zones."""
-        grad_phi = frame.get("grad_phi")
-        if grad_phi is None:
-            rb = frame.get("rew_breakdown")
-            if rb:
-                grad_phi = [b.get("grad_phi_xy", [0.0, 0.0, 0.0]) for b in rb]
+        grad_phi, _ = self.gradient_arrows(self.current_frame_idx)
         if not grad_phi:
             return
 
@@ -2329,6 +2395,13 @@ class ReplayViewer:
             pygame.draw.rect(self.screen, chip_col, chip_rect, width=1, border_radius=3)
             self.screen.blit(chip_txt, (cx + 4, cy + 2))
             cx += c_w + 5
+
+        if self.show_gradient and self.gradient_arrows(self.current_frame_idx)[1]:
+            legacy_txt = self.font_small.render("legacy arrows", True, (255, 170, 70))
+            if cx + legacy_txt.get_width() > panel_x + panel_w - 8:
+                cx = panel_x + 12
+                cy += 20
+            self.screen.blit(legacy_txt, (cx, cy + 2))
 
         # 5. Player Tables Header
         tbl_y = cy + 24

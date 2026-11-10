@@ -135,6 +135,11 @@ _POST_KICK_WINDOW = 0.50
 _GOAL_CENTER_Y = 420.0
 _DISABLED_RANK_PENALTY = 10000.0
 
+# Tactical depth (-1 defensive, 0 middle, +1 attacking) and flank (-1, 0, +1) per player slot: keeper, two
+# defenders, two midfielders, striker, identical for both teams.
+TACTICAL_DEPTH_BIAS = np.array([-1.0, -1.0, -1.0, 0.0, 0.0, 1.0] * 2)
+TACTICAL_FLANK_BIAS = np.array([0.0, -1.0, 1.0, -1.0, 1.0, 0.0] * 2)
+
 _ROLE_TEMPLATE = [ROLE_GK, *([ROLE_COVER] * 5), ROLE_GK, *([ROLE_COVER] * 5)]
 
 # Distance charged per unit of danger weight to a mark left without a coverer (the distance the potential
@@ -195,8 +200,19 @@ def assign_cover(cover_xy: np.ndarray, cov_pts: np.ndarray, weights: np.ndarray)
     return perms[int(np.argmin(totals))]
 
 
-def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsConfig) -> PotentialResult:
-    """Evaluate the potential field for one state."""
+def compute_potentials(
+    state: PotentialState,
+    rew: RewardConfig,
+    phys: PhysicsConfig,
+    frozen: PotentialResult | None = None,
+) -> PotentialResult:
+    """Evaluate the potential field for one state.
+
+    With `frozen`, the carrier, pass chaser, pressers and marking assignment are taken from that result
+    instead of being selected from the state, so every potential is a smooth function of the positions
+    (selection ties and keeper claims cannot flip under a small displacement). The returned `role_code`
+    and `cover_mark` equal those of `frozen`.
+    """
     pos_arr = state.pos
     bx = float(state.ball[0])
     by = float(state.ball[1])
@@ -218,8 +234,10 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
     phi_role = [0.0] * 12
     role = list(_ROLE_TEMPLATE)
     target = [0.0] * 24
-    cover_mark = [-1] * 12
     crowd = [0.0] * 12
+    frozen_role = None if frozen is None else frozen.role_code.tolist()
+    frozen_mark = None if frozen is None else frozen.cover_mark.tolist()
+    cover_mark = [-1] * 12 if frozen is None else list(frozen_mark)
 
     # Teammate crowding: additive penalty from the squared overlap with enabled teammates, summed in
     # ascending teammate order (accumulated in `crowd`, then scaled by the weight).
@@ -248,7 +266,7 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
         if in_possession:
             _support_possession(
                 team, side[team] == SIDE_LEFT, rew, holder, bx, by, pos, ball_dist, depth, flank, kick, crowd,
-                phi, phi_role, role, target,
+                phi, phi_role, role, target, frozen_role,
             )
         else:
             defending.append(team)
@@ -256,6 +274,7 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
         _cover_defence(
             team, side[team] == SIDE_LEFT, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled,
             box_radius[side[team]], crowd, phi, phi_role, role, target, cover_mark,
+            frozen_role, frozen_mark,
         )
 
     for team in (0, 1):
@@ -294,7 +313,8 @@ def _reference_point(f0, bx, by, pos):
 
 
 def _support_possession(
-    team, is_left, rew, holder, bx, by, pos, ball_dist, depth, flank, kick, crowd, phi, phi_role, role, target
+    team, is_left, rew, holder, bx, by, pos, ball_dist, depth, flank, kick, crowd, phi, phi_role, role, target,
+    frozen_role=None,
 ):
     """Carrier baseline, pass chaser, and support ring for the team in possession."""
     f0 = 1 + 6 * team
@@ -305,7 +325,11 @@ def _support_possession(
     w_supp = rew.support_potential_weight
 
     chaser = -1
-    if holder < 0:
+    if frozen_role is not None:
+        for g in range(f0, f0 + 5):
+            if frozen_role[g] == ROLE_CHASE:
+                chaser = g
+    elif holder < 0:
         nearest = 1e9
         for g in range(f0, f0 + 5):
             if ball_dist[g] < nearest:
@@ -392,7 +416,7 @@ def _press_pull(w_press, d_ball):
 
 def _cover_defence(
     team, is_left, rew, phys, holder, bx, by, pos, ball_dist, depth, flank, disabled, box_radius, crowd,
-    phi, phi_role, role, target, cover_mark,
+    phi, phi_role, role, target, cover_mark, frozen_role=None, frozen_mark=None,
 ):
     """Presser selection, keeper claim of a loose ball, optimal marking assignment, and cover potentials."""
     f0 = 1 + 6 * team
@@ -404,69 +428,92 @@ def _cover_defence(
 
     # Presser: lowest-cost outfielder, the distance to the ball plus a penalty for standing upfield of it
     # (disabled players rank behind every enabled one; ties go to the nearer, then the lower index).
-    trail_weight = rew.press_trail_weight
-    ball_depth = (bx - own_gx) * sign
-    scores = []
-    for loc in range(5):
-        g = f0 + loc
-        trail = (pos[g][0] - own_gx) * sign - ball_depth
-        cost = ball_dist[g] + trail_weight * (trail if trail > 0.0 else 0.0)
-        scores.append((cost + (_DISABLED_RANK_PENALTY if disabled[g] else 0.0), ball_dist[g], loc))
-    scores.sort()
+    if frozen_role is None:
+        trail_weight = rew.press_trail_weight
+        ball_depth = (bx - own_gx) * sign
+        scores = []
+        for loc in range(5):
+            g = f0 + loc
+            trail = (pos[g][0] - own_gx) * sign - ball_depth
+            cost = ball_dist[g] + trail_weight * (trail if trail > 0.0 else 0.0)
+            scores.append((cost + (_DISABLED_RANK_PENALTY if disabled[g] else 0.0), ball_dist[g], loc))
+        scores.sort()
 
-    # A keeper that is enabled and nearer to a loose ball inside its box than the best press cost claims the
-    # ball: no outfielder presses and all five mark.
-    keeper = 6 * team
-    keeper_claims = (
-        holder < 0
-        and not disabled[keeper]
-        and math.hypot(bx - own_gx, by - _GOAL_CENTER_Y) <= box_radius
-        and ball_dist[keeper] < scores[0][0]
-    )
-    presser = -1 if keeper_claims else scores[0][2]
-    second = -1
-    second_pot = 0.0
-    if holder < 0 and not keeper_claims and not disabled[f0 + scores[1][2]]:
-        second = scores[1][2]
-        second_pot = rew.loose_ball_secondary_press_blend * w_press * exp(
-            -max(0.0, ball_dist[f0 + second] - _PICKUP_REACH) * _INV_LAMBDA_CHASE
+        # A keeper that is enabled and nearer to a loose ball inside its box than the best press cost claims the
+        # ball: no outfielder presses and all five mark.
+        keeper = 6 * team
+        keeper_claims = (
+            holder < 0
+            and not disabled[keeper]
+            and math.hypot(bx - own_gx, by - _GOAL_CENTER_Y) <= box_radius
+            and ball_dist[keeper] < scores[0][0]
         )
+        presser = -1 if keeper_claims else scores[0][2]
+        second = -1
+        second_pot = 0.0
+        if holder < 0 and not keeper_claims and not disabled[f0 + scores[1][2]]:
+            second = scores[1][2]
+            second_pot = rew.loose_ball_secondary_press_blend * w_press * exp(
+                -max(0.0, ball_dist[f0 + second] - _PICKUP_REACH) * _INV_LAMBDA_CHASE
+            )
 
-    # Opponents to mark: every outfield opponent except the carrier, or, when the ball is loose, except the one
-    # nearest the ball (unless the keeper claims the ball, which leaves all five to be marked).
-    if o0 <= holder < o0 + 5:
-        marks = [o for o in range(o0, o0 + 5) if o != holder]
+        # Opponents to mark: every outfield opponent except the carrier, or, when the ball is loose, except the one
+        # nearest the ball (unless the keeper claims the ball, which leaves all five to be marked).
+        if o0 <= holder < o0 + 5:
+            marks = [o for o in range(o0, o0 + 5) if o != holder]
+        else:
+            marks = sorted(range(o0, o0 + 5), key=ball_dist.__getitem__)
+            if not keeper_claims:
+                marks = marks[1:]
+        cover_locs = [loc for loc in range(5) if loc != presser]
+        n_cover = len(cover_locs)
+        n_mark = len(marks)
+        assert n_cover <= n_mark
+
+        # Marking points sit between each opponent and the defended goal; each is weighted by how close its
+        # opponent stands to that goal (2 on the goal line, 1 on the far one).
+        points = []
+        for j, o in enumerate(marks):
+            ox, oy = pos[o]
+            point_x = ox + 0.35 * (own_gx - ox)
+            point_y = oy + 0.35 * (_GOAL_CENTER_Y - oy)
+            points.append((point_x, point_y))
+            _COVER_PTS[j, 0] = point_x
+            _COVER_PTS[j, 1] = point_y
+            advance = (ox - own_gx) * sign / phys.field_width
+            _COVER_WEIGHT[j] = 2.0 - (0.0 if advance < 0.0 else (1.0 if advance > 1.0 else advance))
+        for c, loc in enumerate(cover_locs):
+            mate = pos[f0 + loc]
+            _COVER_XY[c, 0] = mate[0]
+            _COVER_XY[c, 1] = mate[1]
+        assignment = assign_cover(_COVER_XY[:n_cover], _COVER_PTS[:n_mark], _COVER_WEIGHT[:n_mark]).tolist()
+        assigned_gap = [300.0] * 5
+        for c, loc in enumerate(cover_locs):
+            m = assignment[c]
+            assigned_gap[loc] = dist(pos[f0 + loc], points[m])
+            cover_mark[f0 + loc] = marks[m]
     else:
-        marks = sorted(range(o0, o0 + 5), key=ball_dist.__getitem__)
-        if not keeper_claims:
-            marks = marks[1:]
-    cover_locs = [loc for loc in range(5) if loc != presser]
-    n_cover = len(cover_locs)
-    n_mark = len(marks)
-    assert n_cover <= n_mark
+        # Roles and marks are taken as given; only the gap to each assigned marking point is re-measured.
+        presser = -1
+        second = -1
+        for loc in range(5):
+            code = frozen_role[f0 + loc]
+            if code == ROLE_PRESS:
+                presser = loc
+            elif code == ROLE_SECOND_PRESS:
+                second = loc
+        second_pot = 0.0
+        if second >= 0:
+            second_pot = rew.loose_ball_secondary_press_blend * w_press * exp(
+                -max(0.0, ball_dist[f0 + second] - _PICKUP_REACH) * _INV_LAMBDA_CHASE
+            )
+        assigned_gap = [300.0] * 5
+        for loc in range(5):
+            o = frozen_mark[f0 + loc]
+            if o >= 0:
+                ox, oy = pos[o]
+                assigned_gap[loc] = dist(pos[f0 + loc], (ox + 0.35 * (own_gx - ox), oy + 0.35 * (_GOAL_CENTER_Y - oy)))
 
-    # Marking points sit between each opponent and the defended goal; each is weighted by how close its
-    # opponent stands to that goal (2 on the goal line, 1 on the far one).
-    points = []
-    for j, o in enumerate(marks):
-        ox, oy = pos[o]
-        point_x = ox + 0.35 * (own_gx - ox)
-        point_y = oy + 0.35 * (_GOAL_CENTER_Y - oy)
-        points.append((point_x, point_y))
-        _COVER_PTS[j, 0] = point_x
-        _COVER_PTS[j, 1] = point_y
-        advance = (ox - own_gx) * sign / phys.field_width
-        _COVER_WEIGHT[j] = 2.0 - (0.0 if advance < 0.0 else (1.0 if advance > 1.0 else advance))
-    for c, loc in enumerate(cover_locs):
-        mate = pos[f0 + loc]
-        _COVER_XY[c, 0] = mate[0]
-        _COVER_XY[c, 1] = mate[1]
-    assignment = assign_cover(_COVER_XY[:n_cover], _COVER_PTS[:n_mark], _COVER_WEIGHT[:n_mark]).tolist()
-    assigned_gap = [300.0] * 5
-    for c, loc in enumerate(cover_locs):
-        m = assignment[c]
-        assigned_gap[loc] = dist(pos[f0 + loc], points[m])
-        cover_mark[f0 + loc] = marks[m]
 
     w_cover = rew.def_cover_potential_weight
     for loc in range(5):
@@ -555,87 +602,32 @@ def _keeper_value(team, is_left, state, rew, phys, holder, bx, by, pos, ball_dis
     target[2 * keeper + 1] = tgt_y
 
 
-def potential_gradient_arrows(state: PotentialState, res: PotentialResult, rew: RewardConfig) -> list:
-    """Per-player ``[direction x, direction y, magnitude]`` of the analytic pull toward the role target.
+def potential_gradient(
+    state: PotentialState,
+    rew: RewardConfig,
+    phys: PhysicsConfig,
+    res0: PotentialResult | None = None,
+    h: float = 0.5,
+) -> np.ndarray:
+    """Gradient of each player's potential with respect to that player's own position, shape (12, 2).
 
-    Supporters and defenders add the push away from crowding teammates to the pull toward their
-    target; the carrier, pass chaser, presser and keepers use their own pulls. Values are rounded
-    (direction to 3 decimals, magnitude to 4) for replay telemetry and are ``[0.0, 0.0, 0.0]`` when
-    the pull vanishes.
+    Each entry is the central difference ``(Phi_i(p_i + h e) - Phi_i(p_i - h e)) / (2 h)`` along x and y with
+    every other player and the ball held fixed. Roles and marking assignments are taken from `res0` (evaluated
+    from `state` when omitted) so a displacement never changes which role a player holds. The state is not modified.
     """
-    pos = state.pos.tolist()
-    bx = float(state.ball[0])
-    by = float(state.ball[1])
-    holder = int(state.holder)
-    ball_dist = np.hypot(state.pos[:, 0] - bx, state.pos[:, 1] - by).tolist()
-    disabled = state.disabled.tolist()
-    side = state.team_side.tolist()
-    role = res.role_code.tolist()
-    value = res.phi_role.tolist()
-    target = res.target.tolist()
-    holder_team = -1 if holder < 0 else (0 if holder < 6 else 1)
-    flight_team = int(state.last_ball_team) if (holder < 0 and state.ball_in_flight) else -1
-    r_crowd = rew.teammate_crowd_radius
-    w_crowd = rew.teammate_crowd_weight
-    inv_r_crowd = 1.0 / max(1e-6, r_crowd)
-
-    arrows = [[0.0, 0.0, 0.0] for _ in range(12)]
-    for g in range(12):
-        r = role[g]
-        team = 0 if g < 6 else 1
-        px, py = pos[g]
-        if r == ROLE_BALL:
-            arrows[g] = [round(1.0 if side[team] == SIDE_LEFT else -1.0, 3), 0.0, 0.02]
-        elif r == ROLE_CHASE:
-            d_safe = max(1e-4, ball_dist[g])
-            arrows[g] = [
-                round((bx - px) / d_safe, 3),
-                round((by - py) / d_safe, 3),
-                round(value[g] * _INV_LAMBDA_CHASE, 4),
-            ]
-        elif r == ROLE_PRESS:
-            d_safe = max(1e-4, ball_dist[g])
-            gx = (bx - px) / d_safe * (value[g] * _INV_LAMBDA_CHASE)
-            gy = (by - py) / d_safe * (value[g] * _INV_LAMBDA_CHASE)
-            g_mag = math.hypot(gx, gy)
-            if g_mag > 1e-6:
-                arrows[g] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
-        elif r == ROLE_GK:
-            dx = target[g][0] - px
-            dy = target[g][1] - py
-            d_gk = math.hypot(dx, dy)
-            g_mag = value[g] * 2.0 * _INV_2_95_SQ * d_gk
-            if d_gk > 1e-4 and g_mag > 1e-6:
-                arrows[g] = [round(dx / d_gk, 3), round(dy / d_gk, 3), round(g_mag, 4)]
-        else:
-            if holder_team == team or flight_team == team:
-                tgt_x, tgt_y = target[g]
-                inv_sigma = _INV_2_240_SQ
-            else:
-                tgt_x = round(target[g][0], 1)
-                tgt_y = round(target[g][1], 1)
-                inv_sigma = _INV_2_280_SQ
-            dx = tgt_x - px
-            dy = tgt_y - py
-            d_t = math.hypot(dx, dy)
-            pull_mag = value[g] * 2.0 * inv_sigma * d_t
-            ux = (dx / d_t) if d_t > 1e-4 else 0.0
-            uy = (dy / d_t) if d_t > 1e-4 else 0.0
-            push_x = 0.0
-            push_y = 0.0
-            f0 = 1 + 6 * team
-            for j in range(f0, f0 + 5):
-                if j == g or disabled[j]:
-                    continue
-                d_ij = math.hypot(px - pos[j][0], py - pos[j][1])
-                if d_ij < r_crowd and d_ij > 1e-4:
-                    viol = (r_crowd - d_ij) * inv_r_crowd
-                    coeff = 2.0 * w_crowd * viol * inv_r_crowd / d_ij
-                    push_x += coeff * (px - pos[j][0])
-                    push_y += coeff * (py - pos[j][1])
-            gx = ux * pull_mag + push_x
-            gy = uy * pull_mag + push_y
-            g_mag = math.hypot(gx, gy)
-            if g_mag > 1e-6:
-                arrows[g] = [round(gx / g_mag, 3), round(gy / g_mag, 3), round(g_mag, 4)]
-    return arrows
+    if res0 is None:
+        res0 = compute_potentials(state, rew, phys)
+    work = state.pos.copy()
+    probe = state._replace(pos=work)
+    grad = np.zeros((12, 2))
+    inv_2h = 0.5 / h
+    for i in range(12):
+        for axis in (0, 1):
+            origin = work[i, axis]
+            work[i, axis] = origin + h
+            up = compute_potentials(probe, rew, phys, res0).phi[i]
+            work[i, axis] = origin - h
+            down = compute_potentials(probe, rew, phys, res0).phi[i]
+            work[i, axis] = origin
+            grad[i, axis] = (up - down) * inv_2h
+    return grad
