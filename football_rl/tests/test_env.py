@@ -4262,13 +4262,14 @@ def test_field_hold_foul_charges_violator_and_team_while_only_5s_stat_is_kept() 
     assert rewards[violator] < -1.5
 
 
-GOLDEN_ROLLOUT_DIGEST = "e726782a53270dbbc008e1912e551635033b95a6583dc78c7c946adaf7b339ae"
+GOLDEN_ROLLOUT_DIGEST = "a975ea438aa843ea120651b05ce4773fce294a0f1694c23f33d605b0f0051f6c"
+GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER = "e726782a53270dbbc008e1912e551635033b95a6583dc78c7c946adaf7b339ae"
 
 
-def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False) -> str:
+def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False, rewards=None) -> str:
     """SHA-256 over observations, rewards, kinematics and possession of a seeded random-action rollout."""
     cfg = replace(
-        DEFAULT_CONFIG,
+        DEFAULT_CONFIG if rewards is None else replace(DEFAULT_CONFIG, rewards=rewards),
         replay=replace(
             DEFAULT_CONFIG.replay,
             enable_recording=record,
@@ -4293,22 +4294,29 @@ def test_rollout_matches_golden_digest():
     assert rollout_digest() == GOLDEN_ROLLOUT_DIGEST
 
 
+def test_rollout_without_line_order_penalty_matches_golden_digest():
+    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0)
+    assert rollout_digest(rewards=rewards) == GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER
+    assert rollout_digest() != GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER
+
+
 def test_rollout_digest_is_seed_sensitive_and_repeatable():
     assert rollout_digest(steps=60, seed=1234) == rollout_digest(steps=60, seed=1234)
     assert rollout_digest(steps=60, seed=1234) != rollout_digest(steps=60, seed=1235)
 
 
 GOLDEN_REPLAY_DIGEST = "40687227c7c551d52215b14eb69f22944188ffaa59462b31b8245680c315e707"
-GOLDEN_FULL_MATCH_REPLAY_DIGEST = "5143452ad8e31c690373e916bf9cd1efa6f77f49f2917bde10417e9e53136d7c"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST = "f69b9687f64d441351ea2c3da0f95398fd6600c535aa411459f427d1c98b36bb"
+GOLDEN_FULL_MATCH_REPLAY_DIGEST_WITHOUT_LINE_ORDER = "5143452ad8e31c690373e916bf9cd1efa6f77f49f2917bde10417e9e53136d7c"
 
 
-def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bool = False) -> str:
+def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bool = False, rewards=None) -> str:
     """SHA-256 of the JSON-serialised replay frames of a seeded random-action rollout with recording on.
 
     With `with_value_predictions`, critic values are supplied on two of every three RL steps.
     """
     cfg = replace(
-        DEFAULT_CONFIG,
+        DEFAULT_CONFIG if rewards is None else replace(DEFAULT_CONFIG, rewards=rewards),
         replay=replace(
             DEFAULT_CONFIG.replay,
             enable_recording=True,
@@ -4332,6 +4340,14 @@ def test_replay_frames_match_golden_digest():
 def test_full_match_replay_frames_match_golden_digest():
     """Covers half-time, full-time events and intermittent critic values over all 10,801 frames."""
     assert replay_digest(steps=2700, with_value_predictions=True) == GOLDEN_FULL_MATCH_REPLAY_DIGEST
+
+
+def test_replay_frames_without_line_order_penalty_match_golden_digests():
+    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0)
+    assert replay_digest(rewards=rewards) == GOLDEN_REPLAY_DIGEST
+    full = replay_digest(steps=2700, with_value_predictions=True, rewards=rewards)
+    assert full == GOLDEN_FULL_MATCH_REPLAY_DIGEST_WITHOUT_LINE_ORDER
+    assert full != GOLDEN_FULL_MATCH_REPLAY_DIGEST
 
 
 def test_replay_digest_is_seed_sensitive_and_repeatable():
@@ -4527,6 +4543,33 @@ def _potential_state_from_corpus(corpus: dict[str, np.ndarray], k: int) -> Poten
         flank_bias=corpus["flank_bias"][k],
         active_box_radius=corpus["active_box_radius"][k],
     )
+
+
+def test_potentials_without_line_order_penalty_match_recorded_corpus():
+    """Switching the line-order term off reproduces the recorded unpenalised potentials in the env and in the pure field."""
+    corpus = _load_potential_corpus()
+    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0)
+    cfg = replace(
+        DEFAULT_CONFIG,
+        rewards=rewards,
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=True, interest_threshold=float("inf")),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=0)
+    expected = corpus["phi_without_line_order"]
+    for k in range(expected.shape[0]):
+        phi, _, _ = _potentials_from_env(env, corpus, k)
+        np.testing.assert_allclose(phi, expected[k], rtol=0.0, atol=1e-9, err_msg=f"env phi, record {k}")
+        res = compute_potentials(_potential_state_from_corpus(corpus, k), rewards, DEFAULT_CONFIG.physics)
+        np.testing.assert_allclose(res.phi, expected[k], rtol=0.0, atol=1e-9, err_msg=f"pure phi, record {k}")
+
+
+def test_recorded_corpus_penalises_only_covering_defenders_ahead_of_their_striker():
+    corpus = _load_potential_corpus()
+    drop = corpus["phi_without_line_order"] - corpus["phi"]
+    assert (drop >= 0.0).all() and (drop < DEFAULT_CONFIG.rewards.line_order_weight).all()
+    assert not drop[:, [0, 3, 4, 5, 6, 9, 10, 11]].any()
+    assert drop[:, [1, 2]].any() and drop[:, [7, 8]].any()
 
 
 def test_pure_potentials_match_recorded_corpus():

@@ -930,3 +930,361 @@ class TestRunAllEval:
         for extra in (["--eval-code-root", "x"], ["--save-baseline-unbiased"]):
             with pytest.raises(SystemExit):
                 run_all.main(["--out-dir", str(tmp_path), "--skip-perf"] + extra)
+
+
+# ----------------------------------------------------------------------------
+# retreat_probe (line-order retreat share and cluster proxy on checkpoint snapshots)
+# ----------------------------------------------------------------------------
+import numpy as np  # noqa: E402
+
+_FIELD_W, _FIELD_H = 1400.0, 840.0
+# Team A outfield (defender, defender, midfielder, midfielder, striker) and its keeper; team B is the point reflection.
+_A_BASE = [(40, 420), (250, 250), (250, 590), (450, 200), (450, 640), (600, 420)]
+_DEPTH = [-1.0, -1.0, -1.0, 0.0, 0.0, 1.0] * 2
+_FLANK = [0.0, -1.0, 1.0, -1.0, 1.0, 0.0] * 2
+
+
+def _rp() -> Any:
+    return importlib.import_module("tools.audit.retreat_probe")
+
+
+def _snapshot(a_positions: Sequence[Sequence[float]], b_positions: Optional[Sequence[Sequence[float]]] = None,
+              ball: Sequence[float] = (700.0, 420.0), holder: int = -1, left: bool = True) -> Any:
+    """PotentialState with team A at `a_positions` (6 rows); team B defaults to the point reflection of team A's base."""
+    from football_rl.potentials import PotentialState
+
+    if b_positions is None:
+        b_positions = [(_FIELD_W - x, _FIELD_H - y) for x, y in _A_BASE]
+    pos = np.array(list(a_positions) + list(b_positions), dtype=np.float64)
+    if not left:  # team A defends the right goal: point-reflect the whole pitch
+        pos = np.array([_FIELD_W, _FIELD_H]) - pos
+        ball = (_FIELD_W - ball[0], _FIELD_H - ball[1])
+    return PotentialState(
+        pos=pos,
+        angle=np.array([0.0] * 6 + [math.pi] * 6),
+        ball=np.array(ball, dtype=np.float64),
+        holder=holder,
+        ball_in_flight=False,
+        last_ball_team=-1,
+        team_side=np.array([0, 1] if left else [1, 0], dtype=np.int32),
+        disabled=np.zeros(12, dtype=bool),
+        stunned=np.zeros(12, dtype=bool),
+        post_kick_timer=np.zeros(12),
+        depth_bias=np.array(_DEPTH),
+        flank_bias=np.array(_FLANK),
+        active_box_radius=np.array([195.0, 195.0]),
+    )
+
+
+# Defender 1 stands at the maximum of its own cover potential (a point inside the opponent half and 280 u
+# ahead of its striker), with the ball loose on the far flank, so that a step back can only lower that potential.
+_B_DEEP = [(1360, 420), (1380, 590), (1380, 250), (1370, 640), (1370, 200), (1380, 420)]
+
+
+def _out_of_line(d1: Sequence[float] = (880.0, 270.0), striker_x: float = 600.0, ball: Sequence[float] = (1200.0, 420.0),
+                 holder: int = -1, left: bool = True) -> Any:
+    a = [(40, 420), tuple(d1), (60, 700), (1150, 380), (1150, 460), (striker_x, 420)]
+    return _snapshot(a, _B_DEEP, ball=ball, holder=holder, left=left)
+
+
+def _rewards(**kw: float) -> Any:
+    from football_rl.config import DEFAULT_CONFIG
+
+    return replace(DEFAULT_CONFIG.rewards, **kw)
+
+
+def _share(state_list: Sequence[Any], **kw: float) -> Dict[str, Any]:
+    from football_rl.config import DEFAULT_CONFIG
+
+    return _rp().retreat_penalty_share(state_list, _rewards(**kw), DEFAULT_CONFIG.physics)
+
+
+class TestRewardsOverride:
+    def test_applies_numeric_fields_and_leaves_the_rest(self) -> None:
+        from football_rl.config import DEFAULT_CONFIG
+
+        r = _rp().parse_rewards_override(["line_order_weight=0", "line_order_sigma = 60.5"])
+        assert r.line_order_weight == 0.0 and r.line_order_sigma == 60.5
+        assert r.teammate_crowd_weight == DEFAULT_CONFIG.rewards.teammate_crowd_weight
+
+    @pytest.mark.parametrize("items", [None, []])
+    def test_no_items_return_the_defaults(self, items: Any) -> None:
+        from football_rl.config import DEFAULT_CONFIG
+
+        assert _rp().parse_rewards_override(items) == DEFAULT_CONFIG.rewards
+
+    @pytest.mark.parametrize("bad", ["line_order_weight", "no_such_field=1", "line_order_weight=abc", "line_order_sigma=0",
+                                     "line_order_weight=-1", "line_order_weight=nan"])
+    def test_malformed_unknown_or_rejected_items_raise(self, bad: str) -> None:
+        with pytest.raises(ValueError):
+            _rp().parse_rewards_override([bad])
+
+
+class TestRetreatPenaltyShare:
+    def test_step_back_lowers_the_potential_without_the_penalty_and_raises_it_with_it(self) -> None:
+        s = _out_of_line()
+        off = _share([s], line_order_weight=0.0)
+        assert off["overall"] == {"n": 1, "share": 1.0}
+        assert off["out_of_possession"] == {"n": 1, "share": 1.0}
+        assert off["in_possession"] == {"n": 0, "share": None}
+        assert _share([s])["overall"] == {"n": 1, "share": 0.0}  # default weight
+        assert _share([s], line_order_weight=50.0)["overall"] == {"n": 1, "share": 0.0}
+
+    def test_team_defending_the_right_goal_gives_the_same_result(self) -> None:
+        s = _out_of_line(left=False)
+        assert _share([s], line_order_weight=0.0)["overall"] == {"n": 1, "share": 1.0}
+        assert _share([s])["overall"] == {"n": 1, "share": 0.0}
+
+    def test_second_team_gives_the_same_result(self) -> None:
+        # Team B plays right-to-left with the same out-of-line defender; team A stays in its own half.
+        b = [(1360, 420), (1400 - 880, 840 - 270), (1340, 140), (1400 - 1150, 840 - 380), (1400 - 1150, 840 - 460), (800, 420)]
+        a = [(40, 420), (20, 590), (20, 250), (30, 640), (30, 200), (20, 420)]
+        s = _snapshot(a, b, ball=(200.0, 420.0))
+        s = s._replace(pos=s.pos.copy())
+        assert _share([s], line_order_weight=0.0)["overall"]["n"] == 1
+        assert _share([s], line_order_weight=50.0)["overall"] == {"n": 1, "share": 0.0}
+
+    def test_possession_buckets(self) -> None:
+        loose = _share([_out_of_line()])
+        held = _share([_out_of_line(ball=(1150.0, 380.0), holder=3)])  # team A midfielder carries the ball
+        assert (loose["out_of_possession"]["n"], loose["in_possession"]["n"]) == (1, 0)
+        assert (held["out_of_possession"]["n"], held["in_possession"]["n"]) == (0, 1)
+        assert held["overall"]["n"] == 1
+
+    def test_counts_add_over_snapshots(self) -> None:
+        s = _out_of_line()
+        r = _share([s, s, s], line_order_weight=0.0)
+        assert r["overall"] == {"n": 3, "share": 1.0}
+
+    @pytest.mark.parametrize(
+        "kwargs, counted",
+        [
+            (dict(striker_x=850.0), False),     # lead exactly 30 u: not strictly ahead
+            (dict(striker_x=849.9), True),      # lead 30.1 u
+            (dict(d1=(700.0, 270.0), striker_x=600.0), False),   # exactly on the halfway line
+            (dict(d1=(700.1, 270.0), striker_x=600.0), True),
+            (dict(d1=(660.0, 270.0), striker_x=300.0), False),   # well ahead of the striker but in its own half
+            (dict(d1=(880.0, 270.0), ball=(880.0, 300.0)), False),  # presser, not a coverer
+        ],
+    )
+    def test_selection_of_out_of_line_covering_defenders(self, kwargs: Dict[str, Any], counted: bool) -> None:
+        assert _share([_out_of_line(**kwargs)])["overall"]["n"] == int(counted)
+
+    def test_second_defender_is_also_probed(self) -> None:
+        a = [(40, 420), (60, 700), (880, 270), (1150, 380), (1150, 460), (600, 420)]
+        s = _snapshot(a, _B_DEEP, ball=(1200.0, 420.0))
+        assert _share([s], line_order_weight=0.0)["overall"]["n"] == 1
+
+    def test_empty_snapshot_list(self) -> None:
+        r = _share([])
+        assert r["overall"] == {"n": 0, "share": None}
+
+
+class TestClusterProxy:
+    @staticmethod
+    def _crowded(holder: int = 9) -> Any:
+        # Team A defenders and a midfielder 30-80 u apart; team B (holder 9, on the ball) is in possession.
+        a = [(40, 420), (250, 250), (300, 250), (330, 250), (450, 640), (600, 420)]
+        return _snapshot(a, ball=(950.0, 200.0), holder=holder)
+
+    @staticmethod
+    def _proxy(state_list: Sequence[Any], **kw: Any) -> Dict[str, Any]:
+        from football_rl.config import DEFAULT_CONFIG
+
+        return _rp().cluster_proxy(state_list, DEFAULT_CONFIG.rewards, DEFAULT_CONFIG.physics, **kw)
+
+    def test_formation_statistics_before_any_ascent(self) -> None:
+        p = self._proxy([self._crowded()], rounds=0)
+        assert p["n_states"] == 1 and p["oop_teams"] == 1
+        assert p["mean_cluster_size"] == 1.0 and p["mean_cluster_size_start"] == 1.0  # only the carrier is within 90 u
+        assert p["oop_pairs_lt_110"] == 3.0  # defender pair (50), defender-midfielder (30 and 80)
+        assert p["oop_nn_dist"] == pytest.approx((50 + 30 + 30 + 2 * math.sqrt(70900.0)) / 5.0, abs=1e-9)
+        assert p["inversion_after_ascent"] == 0.0
+
+    def test_loose_ball_puts_both_teams_out_of_possession(self) -> None:
+        p = self._proxy([self._crowded(holder=-1)], rounds=0)
+        assert p["oop_teams"] == 2
+        # Team B's undisturbed formation has no pair closer than 110 u: 3 pairs over 2 teams.
+        assert p["oop_pairs_lt_110"] == 1.5
+
+    def test_inversion_flags_a_defender_ahead_of_its_striker_in_the_opponent_half(self) -> None:
+        a = [(40, 420), (800, 150), (250, 590), (450, 200), (450, 640), (600, 420)]
+        assert self._proxy([_snapshot(a, ball=(950.0, 200.0), holder=9)], rounds=0)["inversion_after_ascent"] == 1.0
+        a[1] = (630, 150)  # 30 u ahead: not counted, and short of halfway
+        assert self._proxy([_snapshot(a, ball=(950.0, 200.0), holder=9)], rounds=0)["inversion_after_ascent"] == 0.0
+
+    def test_ball_cluster_radius_is_inclusive_at_ninety_units(self) -> None:
+        a = [(40, 420), (250, 250), (250, 590), (860, 200), (950, 290.5), (600, 420)]  # 90.0 u and 90.5 u from the ball
+        p = self._proxy([_snapshot(a, ball=(950.0, 200.0), holder=9)], rounds=0)
+        assert p["mean_cluster_size_start"] == 2.0 and p["mean_cluster_size"] == 2.0  # carrier and the player exactly 90 u away
+
+    def test_the_possessing_team_does_not_take_part_in_the_ascent(self) -> None:
+        # Team B's supporter 50 u from its carrier would walk out to the support ring if it were free to move.
+        b = [(1360, 420), (1150, 590), (1150, 250), (950, 200), (1000, 200), (800, 420)]
+        p = self._proxy([_snapshot(_A_BASE, b, ball=(950.0, 200.0), holder=9)], rounds=10)
+        assert p["mean_cluster_size"] == 2.0 and p["mean_cluster_size_start"] == 2.0
+
+    def test_ascent_result_does_not_depend_on_the_order_of_the_movers(self) -> None:
+        from football_rl.config import DEFAULT_CONFIG
+
+        state = self._crowded()
+        args = (state, DEFAULT_CONFIG.rewards, DEFAULT_CONFIG.physics)
+        forward = _rp()._ascend(*args, [1, 2, 3, 4, 5], 3)
+        backward = _rp()._ascend(*args, [5, 4, 3, 2, 1], 3)
+        np.testing.assert_array_equal(forward, backward)
+        assert not np.array_equal(forward, state.pos)
+        np.testing.assert_array_equal(forward[[0, 6, 7, 8, 9, 10, 11]], state.pos[[0, 6, 7, 8, 9, 10, 11]])
+
+    def test_candidate_points_are_the_stay_put_point_and_eight_compass_steps(self) -> None:
+        pts = _rp()._candidate_points(700.0, 420.0, _FIELD_W, _FIELD_H)
+        r = 20.0 / math.sqrt(2.0)
+        expected = [(700, 420), (720, 420), (700 + r, 420 + r), (700, 440), (700 - r, 420 + r),
+                    (680, 420), (700 - r, 420 - r), (700, 400), (700 + r, 420 - r)]
+        assert len(pts) == 9
+        np.testing.assert_allclose(pts, expected, rtol=0.0, atol=1e-9)
+
+    @pytest.mark.parametrize("x, y", [(18.0, 18.0), (1382.0, 822.0), (18.0, 822.0), (25.0, 420.0)])
+    def test_candidate_points_stay_inside_the_pitch_margin(self, x: float, y: float) -> None:
+        for px, py in _rp()._candidate_points(x, y, _FIELD_W, _FIELD_H):
+            assert 18.0 <= px <= _FIELD_W - 18.0 and 18.0 <= py <= _FIELD_H - 18.0
+        assert (x, y) in _rp()._candidate_points(x, y, _FIELD_W, _FIELD_H)
+
+    def test_ascent_spreads_a_crowded_out_of_possession_team(self) -> None:
+        p = self._proxy([self._crowded()], rounds=10)
+        assert p["oop_pairs_lt_110"] < 3.0
+        assert p["oop_nn_dist"] > 128.5
+
+    def test_sampling_is_seeded_and_clamped_to_the_available_snapshots(self) -> None:
+        states = [self._crowded(), self._crowded(holder=-1), _out_of_line()]
+        a = self._proxy(states, n_states=2, rounds=1)
+        assert a == self._proxy(states, n_states=2, rounds=1)
+        assert a["n_states"] == 2
+        assert self._proxy(states, n_states=50, rounds=0)["n_states"] == 3
+
+    def test_no_snapshots(self) -> None:
+        assert self._proxy([]) == {"n_states": 0}
+
+
+@pytest.fixture(scope="module")
+def probe_runs(tiny_checkpoint: Path, tmp_path_factory: pytest.TempPathFactory) -> Dict[str, Any]:
+    """Tiny probe runs: seeds (11, 12) twice, seed (13,) once, and an override run, in an isolated sandbox."""
+    rp = _rp()
+    sandbox = tmp_path_factory.mktemp("probe_sandbox")
+    tmp_root = sandbox / "tmp"
+    tmp_root.mkdir()
+    cwd = sandbox / "cwd"
+    cwd.mkdir()
+    cfg = _tiny_config("ignored")
+    before = _hash_tree(tiny_checkpoint)
+    runs: Dict[str, Any] = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tempfile, "tempdir", str(tmp_root))
+        mp.chdir(cwd)
+        kw = dict(steps=10, every=3, cluster_states=5, config=cfg)
+        runs["a"] = rp.run_probe(str(tiny_checkpoint), seeds=(11, 12), **kw)
+        runs["b"] = rp.run_probe(str(tiny_checkpoint), seeds=(11, 12), **kw)
+        runs["other_seed"] = rp.run_probe(str(tiny_checkpoint), seeds=(13,), **kw)
+        runs["off"] = rp.run_probe(str(tiny_checkpoint), seeds=(11, 12), rewards_override=["line_order_weight=0"], **kw)
+        runs["states_a"] = rp.collect_states(str(tiny_checkpoint), seeds=(11, 12), steps=10, every=3, config=cfg)
+        runs["states_b"] = rp.collect_states(str(tiny_checkpoint), seeds=(11, 12), steps=10, every=3, config=cfg)
+        runs["states_c"] = rp.collect_states(str(tiny_checkpoint), seeds=(13,), steps=10, every=3, config=cfg)
+    runs.update(before=before, after=_hash_tree(tiny_checkpoint), tmp_root=tmp_root, cwd=cwd)
+    return runs
+
+
+class TestRetreatProbeRuns:
+    def test_snapshots_are_taken_every_third_step_per_seed(self, probe_runs: Dict[str, Any]) -> None:
+        got = probe_runs["states_a"]
+        assert got["per_seed"] == [4, 4]  # steps 0, 3, 6, 9
+        assert len(got["states"]) == 8
+        s = got["states"][0]
+        assert s.pos.shape == (12, 2) and s.angle.shape == (12,) and s.ball.shape == (2,)
+        assert s.team_side.tolist() == [0, 1]
+        assert got["generation"] == 0
+
+    def test_snapshots_are_independent_copies(self, probe_runs: Dict[str, Any]) -> None:
+        s = probe_runs["states_a"]["states"]
+        assert not np.array_equal(s[0].pos, s[3].pos)  # the same match, three steps apart
+        assert not np.shares_memory(s[0].pos, s[1].pos)
+
+    def test_same_seeds_are_deterministic_and_other_seeds_differ(self, probe_runs: Dict[str, Any]) -> None:
+        a, b, c = (probe_runs[k]["states"] for k in ("states_a", "states_b", "states_c"))
+        for x, y in zip(a, b):
+            for fx, fy in zip(x, y):
+                np.testing.assert_array_equal(fx, fy)
+        assert not np.array_equal(a[3].pos, c[3].pos)  # seed 13 plays a different match than seed 11
+        assert json.dumps(probe_runs["a"], sort_keys=True) == json.dumps(probe_runs["b"], sort_keys=True)
+
+    def test_result_structure_and_json(self, probe_runs: Dict[str, Any]) -> None:
+        r = probe_runs["a"]
+        assert set(r) == {"retreat_penalty_share", "cluster_proxy", "meta"}
+        assert set(r["retreat_penalty_share"]) == {"overall", "out_of_possession", "in_possession"}
+        assert r["meta"]["snapshots"] == 8 and r["meta"]["seeds"] == [11, 12] and r["meta"]["rewards_override"] == []
+        assert r["cluster_proxy"]["n_states"] == 5
+        assert str(probe_runs["tmp_root"]) not in json.dumps(r)
+
+    def test_override_changes_only_the_evaluation_not_the_snapshots(self, probe_runs: Dict[str, Any]) -> None:
+        a, off = probe_runs["a"], probe_runs["off"]
+        assert off["meta"]["rewards_override"] == ["line_order_weight=0"]
+        assert off["meta"]["snapshots"] == a["meta"]["snapshots"]
+        assert off["cluster_proxy"]["mean_cluster_size_start"] == a["cluster_proxy"]["mean_cluster_size_start"]
+        assert off["retreat_penalty_share"]["overall"]["n"] == a["retreat_penalty_share"]["overall"]["n"]
+
+    def test_checkpoint_directory_is_byte_identical_after_runs(self, probe_runs: Dict[str, Any]) -> None:
+        assert probe_runs["before"] and probe_runs["before"] == probe_runs["after"]
+
+    def test_runs_write_nothing_to_cwd_and_delete_scratch_replays(self, probe_runs: Dict[str, Any]) -> None:
+        assert list(probe_runs["cwd"].iterdir()) == []
+        assert list(probe_runs["tmp_root"].iterdir()) == []
+
+    def test_missing_or_unloadable_checkpoint_is_reported(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            _rp().collect_states(str(tmp_path / "absent"))
+        with pytest.raises(RuntimeError):
+            _rp().collect_states(str(tmp_path), seeds=(11,), steps=3, config=_tiny_config("ignored"))
+
+    @pytest.mark.parametrize("steps", [0, -1, TINY_MATCH_STEPS, TINY_MATCH_STEPS + 5])
+    def test_steps_must_stay_inside_one_match(self, steps: int, tiny_checkpoint: Path) -> None:
+        with pytest.raises(ValueError):
+            _rp().collect_states(str(tiny_checkpoint), steps=steps, config=_tiny_config("ignored"))
+
+    def test_every_must_be_positive(self, tiny_checkpoint: Path) -> None:
+        with pytest.raises(ValueError):
+            _rp().collect_states(str(tiny_checkpoint), steps=3, every=0, config=_tiny_config("ignored"))
+
+    def test_default_steps_stop_one_short_of_a_full_match(self, tiny_checkpoint: Path) -> None:
+        got = _rp().collect_states(str(tiny_checkpoint), seeds=(11,), every=1, config=_tiny_config("ignored"))
+        assert got["per_seed"] == [TINY_MATCH_STEPS - 1]
+
+
+class TestRetreatProbeCli:
+    def test_main_prints_a_summary_and_writes_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture) -> None:
+        rp = _rp()
+        seen: Dict[str, Any] = {}
+        canned = {
+            "retreat_penalty_share": {"overall": {"n": 4, "share": 0.25}, "out_of_possession": {"n": 3, "share": 0.0},
+                                      "in_possession": {"n": 1, "share": 1.0}},
+            "cluster_proxy": {"n_states": 5, "oop_teams": 7, "mean_cluster_size": 1.5, "mean_cluster_size_start": 1.25,
+                              "oop_pairs_lt_110": 2.0, "oop_nn_dist": 120.0, "inversion_after_ascent": 0.5},
+            "meta": {"checkpoint_generation": 9, "snapshots": 12, "seeds": [1, 2], "every": 3,
+                     "rewards_override": ["line_order_weight=0"]},
+        }
+
+        def fake(checkpoint_dir: str, **kw: Any) -> Dict[str, Any]:
+            seen.update(kw, checkpoint_dir=checkpoint_dir)
+            return canned
+
+        monkeypatch.setattr(rp, "run_probe", fake)
+        out = tmp_path / "probe.json"
+        assert rp.main(["--checkpoint-dir", str(tmp_path), "--seeds", "1", "2", "--rewards-override", "line_order_weight=0",
+                        "--rewards-override", "line_order_sigma=60", "--json", str(out)]) == 0
+        assert seen["seeds"] == [1, 2] and seen["rewards_override"] == ["line_order_weight=0", "line_order_sigma=60"]
+        assert json.loads(out.read_text()) == canned
+        text = capsys.readouterr().out
+        assert "overall 0.250 (n=4)" in text and "out_of_possession 0.000 (n=3)" in text and "in_possession 1.000 (n=1)" in text
+        assert "mean_cluster_size 1.500 (start 1.250)" in text and "oop_pairs<110 2.000" in text
+
+    def test_cli_requires_checkpoint_dir(self) -> None:
+        with pytest.raises(SystemExit):
+            _rp().main([])

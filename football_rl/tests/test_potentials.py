@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -159,7 +160,7 @@ def test_phi_is_bounded_by_largest_role_weight_and_by_crowd_penalty():
     for _ in range(50):
         res = evaluate(random_state(rng))
         assert np.all(res.phi <= weight_cap + 1e-12)
-        assert np.all(res.phi >= -res.crowd - 1e-12)
+        assert np.all(res.phi >= -res.crowd - REW.line_order_weight - 1e-12)
 
 
 def test_ball_carrier_holds_baseline_and_teammates_are_never_pressers():
@@ -642,3 +643,191 @@ def test_presser_labels_follow_possession_and_the_keeper_claim():
                     assert not keeper_closest
                     pressed_in_box += 1
     assert claimed >= 30 and pressed_in_box >= 30
+
+
+# --- Line-order penalty for covering defenders standing ahead of their own striker -------------------------------
+
+STRIKER_X = 100.0
+
+
+def side_swapped(state: PotentialState) -> PotentialState:
+    """Point reflection of the pitch that keeps every team index: team A now defends the right goal."""
+    reflect = np.array([W, H])
+    return state._replace(
+        pos=reflect - state.pos,
+        angle=state.angle + math.pi,
+        ball=reflect - state.ball,
+        team_side=np.array([SIDE_RIGHT, SIDE_LEFT], dtype=np.int32),
+    )
+
+
+def line_order_state(lead: float, kind: str = "cover") -> PotentialState:
+    """Team A (left) with defender 1 standing `lead` units ahead of its striker (index 5) in canonical x.
+
+    `kind` selects defender 1's role: cover (loose ball far from it), press, second_press, ball (carrier)
+    or chase (pass in flight toward it).
+    """
+    pos = np.vstack([FORMATION_A, np.array([W, H]) - FORMATION_A])
+    pos[5] = (STRIKER_X, 420.0)
+    pos[2] = (60.0, 700.0)
+    pos[3] = (300.0, 380.0)
+    pos[4] = (300.0, 460.0)
+    if kind == "cover":
+        pos[1] = (STRIKER_X + lead, 150.0)
+        return make_state(pos=pos, ball=np.array([300.0, 420.0]))
+    pos[1] = (STRIKER_X + lead, 300.0)
+    ball = np.array([STRIKER_X + lead + 20.0, 300.0])
+    if kind == "second_press":
+        pos[3] = (ball[0] + 5.0, 310.0)
+    if kind == "ball":
+        return make_state(pos=pos, ball=pos[1].copy(), holder=1)
+    if kind == "chase":
+        return make_state(pos=pos, ball=ball, ball_in_flight=True, last_ball_team=0)
+    return make_state(pos=pos, ball=ball)
+
+
+def line_order_penalty(state: PotentialState, **overrides) -> np.ndarray:
+    """Per-player drop in phi caused by the line-order term (zero when the term is switched off)."""
+    off = compute_potentials(state, replace(REW, line_order_weight=0.0), PHYS)
+    on = compute_potentials(state, replace(REW, **overrides) if overrides else REW, PHYS)
+    assert (off.role_code == on.role_code).all() and (off.crowd == on.crowd).all()
+    assert (off.cover_mark == on.cover_mark).all() and (off.phi_role == on.phi_role).all()
+    np.testing.assert_array_equal(off.target, on.target)
+    return off.phi - on.phi
+
+
+@pytest.mark.parametrize(
+    "lead, expected",
+    [
+        (30.0, 0.14695119744222548),
+        (60.0, 0.2772702943560058),
+        (120.0, 0.4569564935734589),
+        (240.0, 0.5784165480454901),
+        (1000.0, 0.5999999306670217),
+        (1e-4, 4.999999999998843e-07),
+    ],
+)
+def test_line_order_penalty_saturates_with_the_lead_over_the_striker(lead, expected):
+    state = line_order_state(lead)
+    assert evaluate(state).role_code[1] == ROLE_COVER
+    assert line_order_penalty(state)[1] == pytest.approx(expected, abs=1e-12)
+
+
+@pytest.mark.parametrize("lead", [0.0, -1e-9, -50.0, -300.0])
+def test_line_order_penalty_vanishes_level_with_or_behind_the_striker(lead):
+    state = line_order_state(lead)
+    assert evaluate(state).role_code[1] == ROLE_COVER
+    assert line_order_penalty(state)[1] == 0.0
+
+
+def test_line_order_penalty_is_continuous_at_zero_lead():
+    assert line_order_penalty(line_order_state(1e-4))[1] < 1e-6
+
+
+@pytest.mark.parametrize(
+    "kind, role",
+    [("press", ROLE_PRESS), ("second_press", ROLE_SECOND_PRESS), ("ball", ROLE_BALL), ("chase", ROLE_CHASE)],
+)
+def test_line_order_penalty_applies_to_covering_defenders_only(kind, role):
+    state = line_order_state(300.0, kind)
+    assert evaluate(state).role_code[1] == role
+    assert line_order_penalty(state)[1] == 0.0
+    assert line_order_penalty(line_order_state(300.0))[1] > 0.0
+
+
+@pytest.mark.parametrize("lead", [30.0, 120.0, 400.0])
+def test_line_order_penalty_is_the_same_for_a_team_defending_the_right_goal(lead):
+    state = line_order_state(lead)
+    expected = line_order_penalty(state)[1]
+    assert expected > 0.0
+    right = side_swapped(state)
+    assert evaluate(right).role_code[1] == ROLE_COVER
+    assert line_order_penalty(right)[1] == pytest.approx(expected, abs=1e-12)
+
+
+@pytest.mark.parametrize("lead", [30.0, 120.0, 400.0])
+def test_line_order_penalty_is_the_same_for_the_second_team(lead):
+    state = line_order_state(lead)
+    expected = line_order_penalty(state)[1]
+    assert expected > 0.0
+    swapped = mirrored(state)
+    drop = line_order_penalty(swapped)
+    assert evaluate(swapped).role_code[7] == ROLE_COVER
+    assert drop[7] == pytest.approx(expected, abs=1e-12)
+    assert drop[1] == 0.0
+
+
+def test_line_order_penalty_applies_to_both_defenders_of_both_teams():
+    pos = np.vstack([FORMATION_A, np.array([W, H]) - FORMATION_A])
+    pos[1] = (400.0, 150.0)  # canonical x of team A defenders: 400 and 340 against a striker at 100
+    pos[2] = (340.0, 700.0)
+    pos[5] = (100.0, 420.0)
+    pos[7] = (W - 400.0, H - 150.0)
+    pos[8] = (W - 340.0, H - 700.0)
+    pos[11] = (W - 100.0, H - 420.0)
+    state = make_state(pos=pos, ball=np.array([700.0, 420.0]), holder=3)
+    res = evaluate(state)
+    assert res.role_code[[1, 2, 7, 8]].tolist() == [ROLE_COVER] * 4
+    drop = line_order_penalty(state)
+    expected = [0.6 * math.tanh(300.0 / 120.0), 0.6 * math.tanh(240.0 / 120.0)] * 2
+    np.testing.assert_allclose(drop[[1, 2, 7, 8]], expected, rtol=0.0, atol=1e-12)
+    assert not drop[[0, 3, 4, 5, 6, 9, 10, 11]].any()
+
+
+def test_line_order_penalty_is_strictly_increasing_in_the_lead():
+    drops = [line_order_penalty(line_order_state(lead))[1] for lead in (1.0, 10.0, 50.0, 200.0, 800.0)]
+    assert all(a < b for a, b in zip(drops, drops[1:]))
+    assert drops[-1] < 0.6
+
+
+def test_line_order_penalty_scales_with_weight_and_sigma():
+    state = line_order_state(60.0)
+    assert line_order_penalty(state, line_order_weight=0.3)[1] == pytest.approx(0.3 * math.tanh(0.5), abs=1e-12)
+    assert line_order_penalty(state, line_order_sigma=30.0)[1] == pytest.approx(0.6 * math.tanh(2.0), abs=1e-12)
+
+
+def test_line_order_penalty_properties_on_random_states():
+    rng = np.random.default_rng(0)
+    penalised = 0
+    for i in range(500):
+        state = random_state(rng)
+        if i % 2:
+            state = side_swapped(state)
+        res = evaluate(state)
+        drop = line_order_penalty(state)
+        assert (drop >= 0.0).all()
+        assert not drop[[0, 3, 4, 5, 6, 9, 10, 11]].any()
+        canonical_x = np.where(state.team_side[[0, 1]] == SIDE_LEFT, 1.0, -1.0)
+        for team, defenders in ((0, (1, 2)), (1, (7, 8))):
+            striker = 5 + 6 * team
+            sign = canonical_x[team]
+            for g in defenders:
+                lead = sign * (state.pos[g, 0] - state.pos[striker, 0])
+                if drop[g] != 0.0:
+                    assert res.role_code[g] == ROLE_COVER and lead > 0.0
+                if res.role_code[g] == ROLE_COVER and lead > 1e-3:
+                    assert drop[g] > 0.0
+                    penalised += 1
+    assert penalised >= 200
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(line_order_sigma=0.0),
+        dict(line_order_sigma=-1.0),
+        dict(line_order_sigma=float("nan")),
+        dict(line_order_sigma=float("inf")),
+        dict(line_order_weight=float("nan")),
+        dict(line_order_weight=float("inf")),
+        dict(line_order_weight=-0.1),
+    ],
+)
+def test_line_order_config_rejects_unusable_values(overrides):
+    with pytest.raises(ValueError):
+        replace(REW, **overrides)
+
+
+def test_line_order_config_accepts_a_zero_weight_and_the_defaults():
+    assert replace(REW, line_order_weight=0.0).line_order_weight == 0.0
+    assert REW.line_order_weight == 0.6 and REW.line_order_sigma == 120.0

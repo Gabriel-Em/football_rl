@@ -26,6 +26,12 @@ defending. Role potentials, before the teammate-crowding penalty, are:
 The teammate-crowding penalty is additive and subtracted from supporters and defenders, so a
 potential can be negative.
 
+A covering defender (role `ROLE_COVER`, either possession phase) that stands ahead of its own striker,
+measured along the attacking direction, loses `line_order_weight * tanh(lead / line_order_sigma)` from
+its potential, where `lead` is how far the defender is ahead of the striker. The term is zero level
+with or behind the striker, saturates at `line_order_weight`, and leaves the role potential, the
+crowding penalty, the role labels and the targets untouched.
+
 The field is evaluated with scalar arithmetic over Python floats taken from the state arrays. With
 five players per team the arrays are too small for NumPy dispatch to pay for itself: element-wise
 array code measures several times slower than these loops. The marking assignment is the one NumPy
@@ -254,6 +260,20 @@ def compute_potentials(state: PotentialState, rew: RewardConfig, phys: PhysicsCo
 
     for team in (0, 1):
         _keeper_value(team, side[team] == SIDE_LEFT, state, rew, phys, holder, bx, by, pos, ball_dist, phi, phi_role, target)
+
+    w_line = rew.line_order_weight
+    if w_line > 0.0:
+        inv_sigma = 1.0 / rew.line_order_sigma
+        for team in (0, 1):
+            f0 = 1 + 6 * team
+            sgn = 1.0 if side[team] == SIDE_LEFT else -1.0
+            striker_cx = pos[f0 + 4][0] * sgn
+            for g in (f0, f0 + 1):
+                if role[g] != ROLE_COVER:
+                    continue
+                lead = pos[g][0] * sgn - striker_cx
+                if lead > 0.0:
+                    phi[g] -= w_line * math.tanh(lead * inv_sigma)
 
     return PotentialResult(
         np.array(phi),

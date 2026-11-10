@@ -5,6 +5,7 @@
 - `tools/audit/training_progress.py --bucket 100 --last-gens 15` → per-bucket interest/goals/passes/shots/tackles/saves/loose%/stationary.
 - `tools/audit/replay_metrics.py --last 8` (or `--match ID`, `--gen G`, paths) → possession, width/depth, clustering, inversion, GK stats.
 - `tools/audit/frame_inspect.py --match 13204 --frames 760 5531 [--viewer]` → full per-player state; `--viewer` = viewer frame counter.
+- `tools/audit/retreat_probe.py --checkpoint-dir DIR [--seeds 11 12 13] [--rewards-override KEY=VALUE ...] [--json OUT]` → plays one match per seed, then reports the share of out-of-line covering defenders whose potential falls when they step 20 u back (overall / out of / in possession) and a cluster proxy from best-response ascent of out-of-possession outfielders. Overrides apply to the evaluation only, so before/after runs see the same states.
 - `tools/audit/orphan_scan.py` → unread config fields, write-only attributes, unused aliases, duplicate-valued config fields.
 - `tools/audit/perf_profile.py --steps 300 --seed 0 [--no-record]` → per-component ms/step and numpy calls/step.
 - Every script takes `--json OUT` for full detail; stdout stays a short summary. Nothing writes to replays or source.

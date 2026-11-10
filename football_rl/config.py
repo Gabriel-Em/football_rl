@@ -239,7 +239,7 @@ class RewardConfig:
     intercepted_kicker_ind: float = -0.40
     intercepted_team: float = -0.25
 
-    # Tier 2: Policy-Invariant PBRS Weights (each Phi is bounded above by its weight; the crowd penalty can make Phi negative)
+    # Tier 2: Policy-Invariant PBRS Weights (each Phi is bounded above by its weight; the crowd and line-order penalties can make Phi negative)
     team_advance_pbrs_weight: float = 6.0
     support_potential_weight: float = 0.85
     def_press_potential_weight: float = 0.65
@@ -247,6 +247,8 @@ class RewardConfig:
     keeper_bisect_potential_weight: float = 0.60
     teammate_crowd_weight: float = 0.35
     teammate_crowd_radius: float = 110.0
+    line_order_weight: float = 0.6  # Phi penalty scale for a covering defender standing ahead of its own striker
+    line_order_sigma: float = 120.0  # distance (u) over which the line-order penalty saturates (tanh)
     loose_ball_secondary_press_blend: float = 0.75
     press_trail_weight: float = 1.0  # presser cost = ball distance + this * how far the player stands upfield of the ball
 
@@ -255,6 +257,12 @@ class RewardConfig:
     field_5s_violation_team: float = -0.3
     keeper_5s_violation_ind: float = -1.5
     failed_tackle_ind: float = -0.20
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.line_order_weight) and self.line_order_weight >= 0.0):
+            raise ValueError(f"line_order_weight must be finite and >= 0, got {self.line_order_weight}")
+        if not (math.isfinite(self.line_order_sigma) and self.line_order_sigma > 0.0):
+            raise ValueError(f"line_order_sigma must be finite and > 0, got {self.line_order_sigma}")
 
 
 @dataclass(frozen=True)
