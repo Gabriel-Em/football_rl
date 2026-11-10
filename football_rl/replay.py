@@ -481,10 +481,10 @@ class ReplayViewer:
                     self.show_pocket_halos = not self.show_pocket_halos
                 elif event.key == pygame.K_r:
                     self.seek_to_frame(0)
-                elif event.key == pygame.K_a:
-                    self.change_playback_speed(-1)
-                elif event.key == pygame.K_d:
+                elif event.key == pygame.K_UP:
                     self.change_playback_speed(1)
+                elif event.key == pygame.K_DOWN:
+                    self.change_playback_speed(-1)
                 elif event.key == pygame.K_RIGHT:
                     mods = pygame.key.get_mods()
                     delta = 1 if (mods & pygame.KMOD_SHIFT or self.paused) else self.physics_hz * 5
@@ -661,7 +661,7 @@ class ReplayViewer:
     SPEED_LEVELS: List[float] = [0.25, 0.5, 0.75, 1.0, 2.0, 4.0]
 
     def change_playback_speed(self, delta: int) -> float:
-        """Step playback speed: delta < 0 slows down (e.g. 'A'), delta > 0 speeds up (e.g. 'D')."""
+        """Step playback speed: delta < 0 slows down (Down Arrow), delta > 0 speeds up (Up Arrow)."""
         curr_idx = min(
             range(len(self.SPEED_LEVELS)),
             key=lambda i: abs(self.SPEED_LEVELS[i] - self.playback_speed),
@@ -673,6 +673,13 @@ class ReplayViewer:
     def toggle_playback_speed(self, reverse: bool = False) -> float:
         """Step playback speed: reverse=True slows down (-1), reverse=False speeds up (+1)."""
         return self.change_playback_speed(-1 if reverse else 1)
+
+    @property
+    def focused_player_idx(self) -> Optional[int]:
+        """Return the index of the currently focused player (selected or hovered), or None if nobody is focused."""
+        if self.inspect_player_idx is not None:
+            return self.inspect_player_idx
+        return self.hovered_player_idx
 
     # ==========================================================================
     # Rendering Pipeline
@@ -1624,7 +1631,7 @@ class ReplayViewer:
             cone_str = f"{len(self.selected_cone_players)} Sel"
 
         left_part = f"[SPACE] {'PAUSED' if self.paused else 'PLAYING'}   "
-        speed_part = f"[A/D] Speed: {speed_str}"
+        speed_part = f"[UP/DOWN] Speed: {speed_str}"
         right_part = (
             f"   [F] FollowBall:{'ON' if self.auto_focus_carrier else 'OFF'}   "
             f"[V] Cones:{cone_str}   "
@@ -2452,18 +2459,15 @@ class ReplayViewer:
             )
 
         # 8. Selected / Focused Player Card (at bottom)
-        focus_idx = (
-            self.inspect_player_idx
-            if self.inspect_player_idx is not None
-            else self.hovered_player_idx
-        )
-        if focus_idx is None and num_players > 0:
-            focus_idx = 0
+        focus_idx = self.focused_player_idx
+        card_h = 136
+        card_x = panel_x + 10
+        card_y = panel_y + panel_h - card_h - 8
+        card_w = panel_w - 20
         if focus_idx is not None and focus_idx < num_players:
-            card_h = 136
-            self._draw_focus_player_card(
-                panel_x + 10, panel_y + panel_h - card_h - 8, panel_w - 20, focus_idx
-            )
+            self._draw_focus_player_card(card_x, card_y, card_w, focus_idx)
+        else:
+            self._draw_empty_focus_card(card_x, card_y, card_w)
 
     def _draw_telemetry_row(
         self, rx: int, ry: int, rw: int, idx: int, is_team_a: bool, mx: int, my: int
@@ -2563,6 +2567,17 @@ class ReplayViewer:
         self.screen.blit(sts_txt, (rx + 224, ry + 4))
 
         return ry + row_h
+
+    def _draw_empty_focus_card(self, cx: int, cy: int, cw: int) -> None:
+        """Render a placeholder card when no player is currently selected or focused."""
+        card_h = 136
+        card_rect = pygame.Rect(cx, cy, cw, card_h)
+        pygame.draw.rect(self.screen, (16, 22, 30), card_rect, border_radius=6)
+        pygame.draw.rect(self.screen, (40, 52, 70), card_rect, width=1, border_radius=6)
+        hint_txt = self.font_small.render("NO PLAYER FOCUSED", True, (130, 145, 165))
+        hint_sub = self.font_small.render("Click or hover a player to inspect", True, (85, 100, 120))
+        self.screen.blit(hint_txt, (cx + (cw - hint_txt.get_width()) // 2, cy + 48))
+        self.screen.blit(hint_sub, (cx + (cw - hint_sub.get_width()) // 2, cy + 70))
 
     def _draw_focus_player_card(self, cx: int, cy: int, cw: int, idx: int) -> None:
         """Render an expanded mini-dossier card for the active/selected player."""

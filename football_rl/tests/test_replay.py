@@ -357,13 +357,13 @@ def test_vision_cone_player_isolation_and_tab_cycling() -> None:
     viz.handle_events()
     assert viz.selected_cone_players == {2}
 
-    # Post 'a' key -> slows speed down to 0.75x
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    # Post Down Arrow key -> slows speed down to 0.75x
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
 
-    # Post 'd' key -> speeds back up to 1.0x
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    # Post Up Arrow key -> speeds back up to 1.0x
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
 
@@ -628,68 +628,70 @@ def test_auto_carrier_focus_and_pitch_single_select() -> None:
     assert viz.inspect_player_idx == 1
 
 
-def test_speed_toggle_0_5_and_0_75_options() -> None:
-    """Verify A slows down and D speeds up through playback speeds starting at normal (1.0x)."""
+def test_speed_toggle_up_and_down_arrows() -> None:
+    """Verify Down Arrow slows down and Up Arrow speeds up through playback speeds starting at normal (1.0x)."""
     data = _create_mock_replay_data()
     viz = ReplayVisualizer(data, headless=True)
     # Starts with normal (1.0x)
     assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
 
-    # 1. 'A' slows down: 1.0 -> 0.75 -> 0.5 -> 0.25 (clamped)
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    # 1. Down Arrow slows down: 1.0 -> 0.75 -> 0.5 -> 0.25 (clamped)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.50, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.25, abs_tol=1e-3)
 
-    # Further 'A' stays clamped at min 0.25
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    # Further Down Arrow stays clamped at min 0.25
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.25, abs_tol=1e-3)
 
-    # 2. 'D' speeds up: 0.25 -> 0.50 -> 0.75 -> 1.0 -> 2.0 -> 4.0 (clamped)
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    # 2. Up Arrow speeds up: 0.25 -> 0.50 -> 0.75 -> 1.0 -> 2.0 -> 4.0 (clamped)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.50, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 0.75, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 2.0, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 4.0, abs_tol=1e-3)
 
-    # Further 'D' stays clamped at max 4.0
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d, mod=0))
+    # Further Up Arrow stays clamped at max 4.0
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 4.0, abs_tol=1e-3)
 
-    # 'A' slows down from 4.0 -> 2.0 -> 1.0
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    # Down Arrow slows down from 4.0 -> 2.0 -> 1.0
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 2.0, abs_tol=1e-3)
 
-    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_DOWN, mod=0))
     viz.handle_events()
     assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
 
-    # 3. Ensure other keys (s, 0, 1, 2, 4, 5, 7, brackets, comma, dot) do NOT trigger speed changes
+    # 3. Ensure other keys (including A and D which were deprecated) do NOT trigger speed changes
     for ignored_key in (
+        pygame.K_a,
+        pygame.K_d,
         pygame.K_s,
         pygame.K_0,
         pygame.K_1,
@@ -712,6 +714,63 @@ def test_speed_toggle_0_5_and_0_75_options() -> None:
         pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(100, 70), button=button))
         viz.handle_events()
         assert math.isclose(viz.playback_speed, 1.0, abs_tol=1e-3)
+
+    # 5. Method API toggle_playback_speed
+    assert math.isclose(viz.toggle_playback_speed(reverse=False), 2.0, abs_tol=1e-3)
+    assert math.isclose(viz.toggle_playback_speed(reverse=True), 1.0, abs_tol=1e-3)
+
+
+def test_default_no_player_focused() -> None:
+    """Verify that by default when no player is selected, nobody is focused (not Red GK)."""
+    data = _create_mock_replay_data()
+    viz = ReplayViewer(data, headless=True, show_telemetry=True)
+
+    # Initially before and after rendering, no player is inspected or hovered
+    assert viz.inspect_player_idx is None
+    assert viz.hovered_player_idx is None
+    assert viz.focused_player_idx is None
+
+    # Render initial frame
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+    assert viz.focused_player_idx is None
+    assert viz.inspect_player_idx is None
+
+    # Explicitly focus player 1 -> focused_player_idx becomes 1
+    viz.inspect_player_idx = 1
+    assert viz.focused_player_idx == 1
+
+    # Deselect player -> focused_player_idx returns to None (nobody focused)
+    viz.inspect_player_idx = None
+    assert viz.focused_player_idx is None
+
+    # Hovering player 2 temporarily sets focused_player_idx to 2
+    viz.hovered_player_idx = 2
+    assert viz.focused_player_idx == 2
+    viz.hovered_player_idx = None
+    assert viz.focused_player_idx is None
+
+    # When player 0 (Red GK) is intentionally focused, it works as expected
+    viz.inspect_player_idx = 0
+    assert viz.focused_player_idx == 0
+    surf_p0 = viz.render_frame()
+    assert isinstance(surf_p0, pygame.Surface)
+
+    # Boundary: out of bounds inspect_player_idx does not crash render
+    viz.inspect_player_idx = 999
+    assert viz.focused_player_idx == 999
+    surf_oob = viz.render_frame()
+    assert isinstance(surf_oob, pygame.Surface)
+
+    # Boundary: empty players list does not crash render with no player focused
+    viz.inspect_player_idx = None
+    data_empty = _create_mock_replay_data()
+    for fr in data_empty["frames"]:
+        fr["players"] = []
+    viz_empty = ReplayViewer(data_empty, headless=True, show_telemetry=True)
+    surf_empty = viz_empty.render_frame()
+    assert isinstance(surf_empty, pygame.Surface)
+    assert viz_empty.focused_player_idx is None
 
 
 def test_subframe_accumulator_0_5_and_0_75() -> None:
