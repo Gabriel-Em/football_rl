@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import numpy as np
@@ -264,3 +265,47 @@ def test_step_array_and_single_worker_replay_export(tmp_path: Path) -> None:
         trainer.close()
 
 
+
+
+@pytest.mark.parametrize("num_envs", [1, 2])
+def test_action_means_and_uniform_capture_reach_only_the_selected_worker(tmp_path: Path, num_envs: int) -> None:
+    """Means travel through `step_array`; only the worker selected for capture keeps and exports its match."""
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=4),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            save_dir=str(tmp_path / "rep"),
+            enable_recording=True,
+            interest_threshold=float("inf"),
+        ),
+    )
+    chosen = num_envs - 1
+    vec = make_vec_football_env(cfg, num_envs=num_envs)
+    try:
+        vec.reset_array(
+            seeds=list(range(num_envs)),
+            options_list=[{"generation": 3, "match_id": 10 + i} for i in range(num_envs)],
+        )
+        vec.set_generation(3)
+        vec.set_uniform_capture(chosen)
+        means = np.full((num_envs, 12, ACTION_DIM), 0.25, dtype=np.float32)
+        done = np.zeros(num_envs, dtype=bool)
+        for _ in range(4):
+            _, _, _, done, _ = vec.step_array(np.zeros((num_envs, 12, ACTION_DIM), dtype=np.float32), action_means=means)
+        assert done.all()
+        for idx in range(num_envs):
+            path = vec.export_uniform_replay(idx)
+            if idx != chosen:
+                assert path is None
+                continue
+            assert path is not None and "_uniform_" in Path(path).name and f"match_{10 + idx:04d}_gen0003" in Path(path).name
+            frames = json.loads(Path(path).read_text(encoding="utf-8"))["frames"]
+            assert len(frames) == 4 * DEFAULT_CONFIG.physics.frame_skip + 1
+            assert frames[-1]["action_mean"] == [[0.25] * ACTION_DIM] * 12
+        assert sorted(p.name for p in (tmp_path / "rep").glob("match_*.json")) == [Path(path).name]
+        vec.set_uniform_capture(None)
+        vec.set_generation(4)
+        assert vec.export_uniform_replay(chosen) is None
+    finally:
+        vec.close()

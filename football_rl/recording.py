@@ -248,4 +248,6 @@ class ReplayBuffer:
             if inflight[i] >= 0:
                 frames[-1]["inflight"] = bool(inflight[i])
                 frames[-1]["pk"] = post_kick[i]
+            if payload.get("action_mean") is not None:
+                frames[-1]["action_mean"] = payload["action_mean"]
         return frames

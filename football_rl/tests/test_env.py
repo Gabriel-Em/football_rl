@@ -4623,3 +4623,189 @@ def test_carried_ball_never_accumulates_the_loose_pin_timer() -> None:
     env.pinned_ball_timer = 1.9
     env._physics_substep(np.zeros((12, 4)), np.zeros(12))
     assert env.pinned_ball_timer == 0.0
+
+
+# ==============================================================================
+# Kick-outcome and keeper-hold counters
+# ==============================================================================
+KICK_KEYS = ("kicks", "kick_to_teammate", "kick_to_opponent", "kick_other", "gk_holds")
+
+
+def _kick_env(seed: int = 410) -> FootballParallelEnv:
+    env = FootballParallelEnv(
+        replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=seed)
+    env.kickoff_protection_timer = 0.0
+    env.pickup_tackle_grace_timer = 0.0
+    return env
+
+
+def _kick_and_deliver(env: FootballParallelEnv, kicker: int, receiver: int, power: float) -> None:
+    """Kick from `kicker`, then put the ball on top of `receiver` and run the pickup check."""
+    env.ball_holder = kicker
+    env.kick_grace_timer = 0.0
+    rewards = np.zeros(env.num_players, dtype=np.float64)
+    env._execute_kick(kicker, kick_power=power, step_rewards=rewards)
+    env.ball_pos = env.player_pos[receiver].copy()
+    env.ball_vel[:] = 0.0
+    env.pickup_cooldown[receiver] = 0.0
+    env._check_free_ball_pickup(rewards)
+    assert env.ball_holder == receiver
+
+
+def test_fresh_match_has_zero_kick_and_keeper_hold_counters() -> None:
+    env = _kick_env()
+    assert {k: env.stats[k] for k in KICK_KEYS} == {k: 0 for k in KICK_KEYS}
+
+
+def test_one_pass_one_interception_and_one_unresolved_kick_are_counted_once_each() -> None:
+    env = _kick_env()
+    d1 = env.agent_to_idx["a_def_1"]
+    d2 = env.agent_to_idx["a_def_2"]
+    b_atk = env.agent_to_idx["b_atk_1"]
+    env.player_pos[d1] = np.array([300.0, 300.0])
+    env.player_pos[d2] = np.array([420.0, 300.0])
+    env.player_pos[b_atk] = np.array([700.0, 700.0])
+
+    _kick_and_deliver(env, kicker=d1, receiver=d2, power=0.5)
+    assert env.stats["kicks"] == 1 and env.stats["kick_to_teammate"] == 1
+
+    _kick_and_deliver(env, kicker=d2, receiver=b_atk, power=0.5)
+    assert env.stats["kicks"] == 2
+    assert env.stats["kick_to_teammate"] == 1 and env.stats["kick_to_opponent"] == 1
+
+    env.ball_holder = b_atk
+    env.player_angle[b_atk] = 0.0
+    env._execute_kick(b_atk, kick_power=0.5, step_rewards=np.zeros(12))
+    assert env.stats["kicks"] == 3
+    assert env.stats["kick_other"] == 0, "an in-flight kick is not yet resolved"
+
+    env.rl_step_count = env.cfg.physics.max_rl_steps - 1
+    _, _, _, done, summary = env.step_array(np.zeros((12, 4)))
+    assert done
+    final = summary["final_stats"]
+    assert (final["kicks"], final["kick_to_teammate"], final["kick_to_opponent"], final["kick_other"]) == (3, 1, 1, 1)
+    assert final["kicks"] == final["kick_to_teammate"] + final["kick_to_opponent"] + final["kick_other"]
+
+
+def test_kick_picked_up_again_by_the_kicker_is_other_not_teammate() -> None:
+    env = _kick_env()
+    d1 = env.agent_to_idx["a_def_1"]
+    env.player_pos[d1] = np.array([300.0, 300.0])
+    _kick_and_deliver(env, kicker=d1, receiver=d1, power=0.5)
+    assert (env.stats["kicks"], env.stats["kick_to_teammate"], env.stats["kick_to_opponent"], env.stats["kick_other"]) == (1, 0, 0, 1)
+
+
+def test_second_kick_before_any_pickup_resolves_the_first_as_other() -> None:
+    env = _kick_env()
+    d1 = env.agent_to_idx["a_def_1"]
+    env.player_pos[d1] = np.array([300.0, 300.0])
+    for _ in range(2):
+        env.ball_holder = d1
+        env._execute_kick(d1, kick_power=0.5, step_rewards=np.zeros(12))
+    assert (env.stats["kicks"], env.stats["kick_other"]) == (2, 1)
+
+
+def test_kickoff_discards_the_pending_kick_as_other() -> None:
+    env = _kick_env()
+    d1 = env.agent_to_idx["a_def_1"]
+    env.ball_holder = d1
+    env._execute_kick(d1, kick_power=0.5, step_rewards=np.zeros(12))
+    env._setup_kickoff(TEAM_B)
+    assert (env.stats["kicks"], env.stats["kick_other"]) == (1, 1)
+    env.reset(seed=3)
+    assert {k: env.stats[k] for k in KICK_KEYS} == {k: 0 for k in KICK_KEYS}
+
+
+def test_keeper_pickups_count_as_keeper_holds_and_outfield_pickups_do_not() -> None:
+    env = _kick_env(seed=88)
+    k_idx = env.agent_to_idx["a_keeper"]
+    b_atk = env.agent_to_idx["b_atk_1"]
+    d1 = env.agent_to_idx["a_def_1"]
+    env.player_pos[d1] = np.array([500.0, 300.0])
+    env.player_pos[b_atk] = np.array([400.0, 420.0])
+    env.player_angle[b_atk] = math.pi
+    env.ball_holder = b_atk
+    env._execute_kick(b_atk, kick_power=1.0, step_rewards=np.zeros(12))
+    env.player_pos[k_idx] = env.ball_pos.copy()
+    env._check_free_ball_pickup(np.zeros(12))
+    assert env.ball_holder == k_idx
+    assert env.stats["gk_holds"] == 1
+    assert env.stats["kick_to_opponent"] == 1 and env.stats["keeper_saves"] == 1
+
+    env.ball_holder = None
+    env.ball_pos = env.player_pos[d1].copy()
+    env.ball_vel[:] = 0.0
+    env.ball_kicked_in_flight = False
+    env.pickup_cooldown[:] = 0.0
+    env._check_free_ball_pickup(np.zeros(12))
+    assert env.ball_holder == d1
+    assert env.stats["gk_holds"] == 1
+
+
+def test_random_rollout_kick_counters_balance_every_step() -> None:
+    env = _kick_env(seed=7)
+    acts = np.random.default_rng(7).uniform(-1, 1, size=(900, 12, 4))
+    for k in range(900):
+        env.step_array(acts[k])
+        s = env.stats
+        resolved = s["kick_to_teammate"] + s["kick_to_opponent"] + s["kick_other"]
+        assert s["kicks"] - resolved in (0, 1), f"step {k}: at most one kick may be unresolved"
+    assert env.stats["kicks"] > 0
+
+
+# ==============================================================================
+# Uniform replay capture
+# ==============================================================================
+def _uniform_env(tmp_path: Path, **replay_kwargs) -> FootballParallelEnv:
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=True,
+            interest_threshold=float("inf"),
+            save_dir=str(tmp_path / "rep"),
+            **replay_kwargs,
+        ),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=5, options={"generation": 12, "match_id": 34})
+    return env
+
+
+def _play_full_match(env: FootballParallelEnv, seed: int = 5) -> None:
+    acts = np.random.default_rng(seed).uniform(-1, 1, size=(env.cfg.physics.max_rl_steps, 12, 4))
+    for k in range(env.cfg.physics.max_rl_steps):
+        env.step_array(acts[k])
+
+
+def test_uniform_capture_exports_a_below_threshold_match_with_uniform_in_the_name(tmp_path: Path) -> None:
+    env = _uniform_env(tmp_path)
+    env.uniform_capture = True
+    _play_full_match(env)
+    assert env.last_saved_replay_path is None, "interest threshold is infinite; only the uniform capture may export"
+    path = env.export_uniform_replay()
+    assert path is not None and Path(path).exists()
+    name = Path(path).name
+    assert name.startswith("match_0034_gen0012_score") and "_uniform_" in name
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert len(data["frames"]) == env.cfg.physics.max_physics_frames + 1
+    assert data["metadata"]["match_id"] == 34 and data["metadata"]["generation"] == 12
+    assert env.export_uniform_replay() is None, "a captured replay is exported once"
+
+
+def test_uniform_capture_off_keeps_nothing(tmp_path: Path) -> None:
+    env = _uniform_env(tmp_path)
+    _play_full_match(env)
+    assert env.export_uniform_replay() is None
+    assert not (tmp_path / "rep").exists()
+
+
+def test_uniform_capture_survives_the_next_reset_and_is_independent_of_best_only(tmp_path: Path) -> None:
+    env = _uniform_env(tmp_path, save_best_only=True)
+    env.uniform_capture = True
+    _play_full_match(env)
+    env.reset(seed=6, options={"generation": 13, "match_id": 35})
+    path = env.export_uniform_replay()
+    assert path is not None and "gen0012" in Path(path).name

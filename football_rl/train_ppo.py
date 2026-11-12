@@ -117,7 +117,9 @@ class ActorCritic(nn.Module):
         action: Optional[torch.Tensor] = None,
         deterministic: bool = False,
         central_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_mean: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended."""
         actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
         action_mean = self.actor_mean(actor_obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -131,7 +133,29 @@ class ActorCritic(nn.Module):
         entropy = probs.entropy().sum(-1)
         critic_in = self._prepare_critic_input(actor_obs, central_state)
         value = self.critic(critic_in).squeeze(-1)
+        if return_mean:
+            return action, log_prob, entropy, value, action_mean
         return action, log_prob, entropy, value
+
+
+SNAPSHOT_INTERVAL = 50
+SNAPSHOT_POLICY_FILES = (
+    "field_policy.pt",
+    "keeper_policy.pt",
+    "blue_field_policy.pt",
+    "blue_keeper_policy.pt",
+    "red_field_policy.pt",
+    "red_keeper_policy.pt",
+)
+
+
+def uniform_env_index(seed: int, generation: int, num_envs: int) -> int:
+    """Environment whose match is exported as the unbiased replay of `generation`.
+
+    Drawn from a generator seeded with `seed + generation` before the rollout, so it is independent of
+    how the matches turn out and reproducible across resumes.
+    """
+    return int(np.random.default_rng(int(seed) + int(generation)).integers(int(num_envs)))
 
 
 TEAM_COLOR_SCHEMA = 2
@@ -371,8 +395,12 @@ class ParameterSharingPPOTrainer:
         obs_batch: np.ndarray,
         central_batch: Optional[np.ndarray] = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations."""
+        with_means: bool = False,
+    ) -> Tuple[np.ndarray, ...]:
+        """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations.
+
+        Returns `(actions, logprobs, values)`; with `with_means` the policy mean actions are appended.
+        """
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
         cen_t = (
             torch.as_tensor(central_batch, dtype=torch.float32, device=self.inference_device)
@@ -382,6 +410,11 @@ class ParameterSharingPPOTrainer:
         actions = torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
         logprobs = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
         values = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
+        means = (
+            torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
+            if with_means
+            else None
+        )
 
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
@@ -390,9 +423,11 @@ class ParameterSharingPPOTrainer:
                 if cen_t is not None
                 else None
             )
-            k_act, k_logp, _, k_val = self.cpu_blue_keeper_policy.get_action_and_value(
-                k_obs, deterministic=deterministic, central_state=k_cen
+            k_act, k_logp, _, k_val, *k_mean = self.cpu_blue_keeper_policy.get_action_and_value(
+                k_obs, deterministic=deterministic, central_state=k_cen, return_mean=with_means
             )
+            if with_means:
+                means[:, self.keeper_indices, :] = k_mean[0].view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
             actions[:, self.keeper_indices, :] = k_act.view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
             logprobs[:, self.keeper_indices] = k_logp.view(self.num_envs, len(self.keeper_indices))
             values[:, self.keeper_indices] = k_val.view(self.num_envs, len(self.keeper_indices))
@@ -403,9 +438,11 @@ class ParameterSharingPPOTrainer:
                 if cen_t is not None
                 else None
             )
-            f_act, f_logp, _, f_val = self.cpu_blue_field_policy.get_action_and_value(
-                f_obs, deterministic=deterministic, central_state=f_cen
+            f_act, f_logp, _, f_val, *f_mean = self.cpu_blue_field_policy.get_action_and_value(
+                f_obs, deterministic=deterministic, central_state=f_cen, return_mean=with_means
             )
+            if with_means:
+                means[:, self.field_indices, :] = f_mean[0].view(self.num_envs, len(self.field_indices), ACTION_DIM)
             actions[:, self.field_indices, :] = f_act.view(self.num_envs, len(self.field_indices), ACTION_DIM)
             logprobs[:, self.field_indices] = f_logp.view(self.num_envs, len(self.field_indices))
             values[:, self.field_indices] = f_val.view(self.num_envs, len(self.field_indices))
@@ -424,18 +461,23 @@ class ParameterSharingPPOTrainer:
                     if cen_t is not None
                     else None
                 )
-                g_act, g_logp, _, g_val = policy.get_action_and_value(
-                    g_obs, deterministic=deterministic, central_state=g_cen
+                g_act, g_logp, _, g_val, *g_mean = policy.get_action_and_value(
+                    g_obs, deterministic=deterministic, central_state=g_cen, return_mean=with_means
                 )
+                if with_means:
+                    means[:, indices, :] = g_mean[0].view(self.num_envs, cnt, ACTION_DIM)
                 actions[:, indices, :] = g_act.view(self.num_envs, cnt, ACTION_DIM)
                 logprobs[:, indices] = g_logp.view(self.num_envs, cnt)
                 values[:, indices] = g_val.view(self.num_envs, cnt)
 
-        return (
+        result = (
             actions.cpu().numpy(),
             logprobs.cpu().numpy(),
             values.cpu().numpy(),
         )
+        if with_means:
+            return result + (means.cpu().numpy(),)
+        return result
 
     @torch.no_grad()
     def _compute_values(
@@ -517,20 +559,27 @@ class ParameterSharingPPOTrainer:
         gen_completed_matches: List[Tuple[int, Dict[str, Any]]] = []
 
         self.vec_env.set_generation(active_generation)
+        recording = bool(self.cfg.replay.enable_recording)
 
         for t in range(T):
             buf_obs[t] = self.current_obs
             buf_central[t] = self.current_central_state
-            actions, logprobs, values = self._select_actions(
-                self.current_obs, self.current_central_state
-            )
+            if recording:
+                actions, logprobs, values, action_means = self._select_actions(
+                    self.current_obs, self.current_central_state, with_means=True
+                )
+            else:
+                actions, logprobs, values = self._select_actions(
+                    self.current_obs, self.current_central_state
+                )
+                action_means = None
             buf_act[t] = actions
             buf_logp[t] = logprobs
             buf_val[t] = values
 
             act_clipped = np.clip(actions, -1.0, 1.0)
             obs_batch, central_batch, rew_batch, done_batch, ep_summaries = (
-                self.vec_env.step_array(act_clipped, values)
+                self.vec_env.step_array(act_clipped, values, action_means=action_means)
             )
             buf_rew[t] = rew_batch
             buf_done[t] = done_batch[:, None].astype(np.float32)
@@ -581,6 +630,11 @@ class ParameterSharingPPOTrainer:
                         "keeper_saves": int(fstats.get("keeper_saves", 0)),
                         "field_5s_violations": int(fstats.get("field_5s_violations", 0)),
                         "keeper_5s_violations": int(fstats.get("keeper_5s_violations", 0)),
+                        "gk_holds": int(fstats.get("gk_holds", 0)),
+                        "kicks": int(fstats.get("kicks", 0)),
+                        "kick_to_teammate": int(fstats.get("kick_to_teammate", 0)),
+                        "kick_to_opponent": int(fstats.get("kick_to_opponent", 0)),
+                        "kick_other": int(fstats.get("kick_other", 0)),
                         "replay_path": rpath or "",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
@@ -940,7 +994,31 @@ class ParameterSharingPPOTrainer:
         if self.cfg.replay.enable_recording:
             self._write_matches_summary_markdown()
 
+        self._write_generation_snapshot()
+
         return field_path, keeper_path
+
+    def _write_generation_snapshot(self) -> Optional[str]:
+        """Copy the policy files and training state to `snapshots/genNNNN/` on every 50th completed generation.
+
+        A snapshot that already exists is left untouched, so resuming or saving again at the same
+        generation never rewrites it. The directory appears atomically (copy to a temp name, then rename).
+        """
+        gen = self.current_generation
+        if gen <= 0 or gen % SNAPSHOT_INTERVAL != 0:
+            return None
+        root = os.path.join(self.checkpoint_dir, "snapshots")
+        final = os.path.join(root, f"gen{gen:04d}")
+        if os.path.isdir(final):
+            return final
+        staging = final + ".tmp"
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        os.makedirs(staging)
+        for name in SNAPSHOT_POLICY_FILES + ("training_state.pt",):
+            shutil.copyfile(os.path.join(self.checkpoint_dir, name), os.path.join(staging, name))
+        os.replace(staging, final)
+        return final
 
     def _backup_pre_migration_history(self, history_path: str) -> None:
         """Copy an on-disk history that predates the current team-colour schema, once per trainer."""
@@ -1271,7 +1349,15 @@ class ParameterSharingPPOTrainer:
         try:
             for gen in range(start_gen, end_gen + 1):
                 matches_before = len(self.match_history)
+                recording = bool(self.cfg.replay.enable_recording)
+                uniform_env = uniform_env_index(self.seed, gen, self.num_envs)
+                if recording:
+                    self.vec_env.set_uniform_capture(uniform_env)
                 rollout = self.collect_rollouts(active_generation=gen)
+                uniform_replay = None
+                if recording:
+                    uniform_replay = self.vec_env.export_uniform_replay(uniform_env)
+                    self.vec_env.set_uniform_capture(None)
                 metrics = self.update_policies(rollout)
                 elapsed = max(1e-6, time.time() - start_time)
 
@@ -1319,6 +1405,8 @@ class ParameterSharingPPOTrainer:
                     "num_envs": self.num_envs,
                     "rollout_steps": self.rollout_steps,
                     "total_matches_so_far": len(self.match_history),
+                    "uniform_env": uniform_env,
+                    "uniform_replay": uniform_replay,
                 }
                 self.generation_history.append(gen_record)
                 self.current_generation = gen
@@ -1332,6 +1420,8 @@ class ParameterSharingPPOTrainer:
                 )
                 for rpath in rollout["exported_replays"]:
                     print(f"  -> Saved replay: {rpath}")
+                if uniform_replay:
+                    print(f"  -> Saved uniform replay (env {uniform_env}): {uniform_replay}")
 
                 last_metrics = {
                     "update": gen,

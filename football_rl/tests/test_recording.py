@@ -393,3 +393,69 @@ def test_env_frames_carry_flight_state_and_post_kick_timers():
     last = frames[-1]
     assert last["inflight"] == env.ball_kicked_in_flight
     assert last["pk"] == [round(float(t), 3) for t in env.post_kick_pbrs_timer]
+
+
+# ==============================================================================
+# Policy mean actions
+# ==============================================================================
+def _mean_action_table() -> np.ndarray:
+    """(12, 4) table whose entry [p, j] is (4p + j) / 100, so every cell is individually recognisable."""
+    return (np.arange(48, dtype=np.float64).reshape(12, 4)) / 100.0
+
+
+def _env_with_means(steps: int, with_means_from: int = 0) -> FootballParallelEnv:
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=True, interest_threshold=float("inf")),
+    )
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=11)
+    acts = np.random.default_rng(11).uniform(-1, 1, size=(steps, 12, 4))
+    for k in range(steps):
+        env.step_array(acts[k], action_means=_mean_action_table() if k >= with_means_from else None)
+    return env
+
+
+def test_buffer_frame_carries_action_mean_from_the_step_payload():
+    buf = ReplayBuffer(max_frames=4, num_players=2)
+    buf.set_step_payload(1, {**PAYLOAD, "action_mean": [[0.1, 0.2, 0.3, 0.4], [-0.1, -0.2, -0.3, -0.4]]})
+    _record(buf)
+    assert buf.materialize()[0]["action_mean"] == [[0.1, 0.2, 0.3, 0.4], [-0.1, -0.2, -0.3, -0.4]]
+
+
+def test_buffer_frame_without_action_mean_has_no_such_key():
+    buf = _buffer()
+    _record(buf)
+    assert "action_mean" not in buf.materialize()[0]
+
+
+def test_env_replay_frames_carry_a_12_by_4_action_mean_next_to_the_sampled_actions():
+    env = _env_with_means(steps=2)
+    skip = DEFAULT_CONFIG.physics.frame_skip
+    frames = env.replay_frames
+    assert len(frames) == 1 + 2 * skip
+    for f in frames[1:]:
+        mean = f["action_mean"]
+        assert len(mean) == 12 and all(len(row) == 4 for row in mean)
+        assert mean[0] == [0.0, 0.01, 0.02, 0.03]
+        assert mean[11] == [0.44, 0.45, 0.46, 0.47]
+        assert f["actions"] != mean
+
+
+def test_env_steps_without_means_record_no_action_mean_and_do_not_inherit_stale_ones():
+    env = _env_with_means(steps=3, with_means_from=2)
+    skip = DEFAULT_CONFIG.physics.frame_skip
+    frames = env.replay_frames
+    assert all("action_mean" not in f for f in frames[: 1 + 2 * skip])
+    assert all("action_mean" in f for f in frames[1 + 2 * skip :])
+    env2 = _env_with_means(steps=2)
+    env2.step_array(np.zeros((12, 4)))
+    assert "action_mean" not in env2.replay_frames[-1]
+
+
+def test_env_rejects_action_means_of_the_wrong_shape():
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=True))
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=1)
+    with pytest.raises(ValueError):
+        env.step_array(np.zeros((12, 4)), action_means=np.zeros((6, 4)))

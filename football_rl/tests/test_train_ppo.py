@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
 from dataclasses import replace
 import json
 import os
@@ -28,6 +30,7 @@ from football_rl.train_ppo import (
     migrate_team_color_keys,
     print_active_status,
     select_archive_replays,
+    uniform_env_index,
 )
 
 
@@ -733,3 +736,177 @@ def test_train_feeds_completed_matches_of_each_generation_into_window(tmp_path: 
     trainer.train(total_updates=3)
     assert list(trainer.recent_match_scores) == [(3, 0)] * 3
     assert "Co-Evolution Sync" not in capsys.readouterr().out
+
+
+# ==============================================================================
+# Uniform replay selection, generation snapshots and per-match kick KPIs
+# ==============================================================================
+SNAPSHOT_FILES = (
+    "field_policy.pt",
+    "keeper_policy.pt",
+    "blue_field_policy.pt",
+    "blue_keeper_policy.pt",
+    "red_field_policy.pt",
+    "red_keeper_policy.pt",
+    "training_state.pt",
+)
+
+
+def test_uniform_env_index_is_uniform_over_200_seeded_generations() -> None:
+    num_envs, gens = 8, 200
+    counts = [0] * num_envs
+    for g in range(1, gens + 1):
+        counts[uniform_env_index(seed=42, generation=g, num_envs=num_envs)] += 1
+    expected = gens / num_envs
+    tolerance = 3.0 * math.sqrt(gens * (1 / num_envs) * (1 - 1 / num_envs))
+    assert sum(counts) == gens
+    assert all(abs(c - expected) <= tolerance for c in counts), counts
+
+
+def test_uniform_env_index_is_seeded_bounded_and_trivial_for_one_env() -> None:
+    picks = [uniform_env_index(seed=7, generation=g, num_envs=8) for g in range(1, 60)]
+    assert picks == [uniform_env_index(seed=7, generation=g, num_envs=8) for g in range(1, 60)]
+    assert picks != [uniform_env_index(seed=8, generation=g, num_envs=8) for g in range(1, 60)]
+    assert all(0 <= p < 8 for p in picks)
+    assert {uniform_env_index(seed=7, generation=g, num_envs=1) for g in range(1, 20)} == {0}
+    assert type(picks[0]) is int
+
+
+def _snapshot_dirs(ckpt: Path) -> list:
+    root = ckpt / "snapshots"
+    return sorted(p.name for p in root.iterdir()) if root.exists() else []
+
+
+def test_snapshot_written_at_generation_50_and_100_but_not_49(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+    ckpt = tmp_path / "ckpt"
+    trainer.current_generation = 48
+    trainer.train(total_updates=1)  # completes generation 49
+    assert trainer.current_generation == 49
+    assert _snapshot_dirs(ckpt) == []
+
+    trainer.train(total_updates=1)  # completes generation 50
+    assert _snapshot_dirs(ckpt) == ["gen0050"]
+    snap = ckpt / "snapshots" / "gen0050"
+    assert sorted(p.name for p in snap.iterdir()) == sorted(SNAPSHOT_FILES)
+    state = torch.load(snap / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["current_generation"] == 50
+
+    trainer.current_generation = 99
+    trainer.train(total_updates=1)
+    assert _snapshot_dirs(ckpt) == ["gen0050", "gen0100"]
+
+
+def test_snapshot_is_frozen_while_live_checkpoint_moves_on(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+    ckpt = tmp_path / "ckpt"
+    trainer.current_generation = 49
+    trainer.train(total_updates=2)  # generations 50 and 51
+    live = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+    snap = torch.load(ckpt / "snapshots" / "gen0050" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert live["current_generation"] == 51 and snap["current_generation"] == 50
+    assert _snapshot_dirs(ckpt) == ["gen0050"]
+
+
+def test_resume_and_repeated_save_do_not_duplicate_or_rewrite_a_snapshot(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+    ckpt = tmp_path / "ckpt"
+    trainer.current_generation = 49
+    trainer.train(total_updates=1)
+    snap = ckpt / "snapshots" / "gen0050"
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in snap.iterdir()}
+
+    trainer.save_checkpoints()  # e.g. an interrupt landing exactly on the snapshot generation
+    resumed = _recording_trainer(tmp_path)
+    assert resumed.load_checkpoints() and resumed.current_generation == 50
+    for p in resumed.cpu_blue_field_policy.parameters():
+        p.data.add_(1.0)  # the live weights now differ from the snapshot
+    resumed.blue_field_policy.load_state_dict(resumed.cpu_blue_field_policy.state_dict())
+    resumed.save_checkpoints()
+
+    assert _snapshot_dirs(ckpt) == ["gen0050"]
+    assert sorted(p.name for p in (ckpt / "snapshots").iterdir()) == ["gen0050"]
+    after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in snap.iterdir()}
+    assert after == before
+
+
+def test_no_snapshot_at_generation_zero(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+    trainer.save_checkpoints()
+    assert _snapshot_dirs(tmp_path / "ckpt") == []
+
+
+@pytest.fixture(scope="module")
+def one_full_generation(tmp_path_factory):
+    """One 2,700-step generation on one recording env; only the uniform capture can export a replay."""
+    root = tmp_path_factory.mktemp("full_gen")
+    cfg = replace(
+        DEFAULT_CONFIG,
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=True,
+            interest_threshold=float("inf"),
+            save_dir=str(root / "rep"),
+        ),
+    )
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg, num_envs=1, rollout_steps=2700, device="cpu",
+        checkpoint_dir=str(root / "ckpt"), seed=3,
+    )
+    trainer.train(total_updates=1)
+    return root, trainer
+
+
+def test_each_generation_exports_one_uniform_replay_from_the_pre_drawn_env(one_full_generation) -> None:
+    root, trainer = one_full_generation
+    files = sorted(p.name for p in (root / "rep").glob("match_*.json"))
+    assert len(files) == 1 and "_uniform_" in files[0] and "_gen0001_" in files[0]
+    rec = trainer.generation_history[0]
+    assert rec["uniform_env"] == uniform_env_index(seed=3, generation=1, num_envs=1) == 0
+    assert Path(rec["uniform_replay"]).name == files[0]
+    assert trainer.match_history[0]["replay_path"] == "" or "uniform" not in trainer.match_history[0]["replay_path"]
+
+
+def test_uniform_replay_frames_carry_action_means_of_shape_12_by_4(one_full_generation) -> None:
+    root, trainer = one_full_generation
+    path = Path(trainer.generation_history[0]["uniform_replay"])
+    frames = json.loads(path.read_text(encoding="utf-8"))["frames"]
+    assert len(frames) == 10801
+    assert "action_mean" not in frames[0]
+    for f in (frames[1], frames[5400], frames[-1]):
+        mean = f["action_mean"]
+        assert len(mean) == 12 and all(len(row) == ACTION_DIM for row in mean)
+        assert len(f["actions"]) == 12 and f["actions"] != mean
+
+
+def test_match_record_carries_balanced_kick_and_keeper_hold_counters(one_full_generation) -> None:
+    _, trainer = one_full_generation
+    m = trainer.match_history[0]
+    for key in ("gk_holds", "kicks", "kick_to_teammate", "kick_to_opponent", "kick_other"):
+        assert isinstance(m[key], int) and m[key] >= 0, key
+    assert m["kicks"] > 0
+    assert m["kicks"] == m["kick_to_teammate"] + m["kick_to_opponent"] + m["kick_other"]
+    persisted = json.loads((Path(trainer.checkpoint_dir) / "training_history.json").read_text(encoding="utf-8"))
+    assert persisted["matches"][0]["kicks"] == m["kicks"]
+
+
+def test_collect_rollouts_alone_exports_no_uniform_replay(tmp_path: Path) -> None:
+    """Only `train()` owns the uniform replay; evaluation tools that call `collect_rollouts` see no extra files."""
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=4),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=True,
+            interest_threshold=float("inf"),
+            save_dir=str(tmp_path / "rep"),
+        ),
+    )
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg, num_envs=1, rollout_steps=4, device="cpu", checkpoint_dir=str(tmp_path / "ckpt"), seed=3
+    )
+    rollout = trainer.collect_rollouts(active_generation=1)
+    assert rollout["completed_episodes"] == 1
+    assert not (tmp_path / "rep").exists() or list((tmp_path / "rep").glob("*.json")) == []
+    trainer.train(total_updates=1)
+    assert len(list((tmp_path / "rep").glob("match_*_uniform_*.json"))) == 1

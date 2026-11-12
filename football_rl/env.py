@@ -436,11 +436,17 @@ class FootballParallelEnv(ParallelEnv):
         self._frame_events: List[Dict[str, Any]] = []
         self.last_saved_replay_path: Optional[str] = None
         self._deferred_replay: Optional[Dict[str, Any]] = None
+        # When set, every completed match is kept (whatever its interest score) until exported.
+        self.uniform_capture: bool = False
+        self._uniform_replay: Optional[Dict[str, Any]] = None
+        # Kicker index of the last kick whose receiver has not been determined yet (-1: none).
+        self._pending_kick_idx: int = -1
         self.current_generation: int = 0
         self.current_match_id: int = 0
 
         # Telemetry & Critic recording buffers
         self.last_v_preds: Optional[np.ndarray] = None
+        self.last_action_means: Optional[List[List[float]]] = None
         self.last_rew_breakdown: Optional[List[Dict[str, Any]]] = None
         self.last_role_states: List[str] = [
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
@@ -712,13 +718,20 @@ class FootballParallelEnv(ParallelEnv):
             "keeper_5s_violations": 0,
             "possession_frames": [0, 0],
             "stationary_ball_frames": 0,
+            "gk_holds": 0,
+            "kicks": 0,
+            "kick_to_teammate": 0,
+            "kick_to_opponent": 0,
+            "kick_other": 0,
         }
+        self._pending_kick_idx = -1
 
         if self.cfg.replay.enable_recording:
             self._ensure_replay_buffer().reset()
         self._replay_step_index = 0
         self._frame_events = []
         self.last_v_preds = None
+        self.last_action_means = None
         self.last_rew_breakdown = None
         self.last_role_states = [
             "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
@@ -773,14 +786,27 @@ class FootballParallelEnv(ParallelEnv):
         return observations, infos
 
     def _step_core(
-        self, act_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        act_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, bool, bool]:
-        """Execute physics sub-steps, PBRS, and end-of-episode bookkeeping for a (12, 4) action array."""
+        """Execute physics sub-steps, PBRS, and end-of-episode bookkeeping for a (12, 4) action array.
+
+        `action_means` is the policy's mean action per player; it is only recorded in replay frames.
+        """
+        if action_means is not None and np.shape(action_means) != (self.num_players, 4):
+            raise ValueError(
+                f"action_means must have shape ({self.num_players}, 4), got {np.shape(action_means)}"
+            )
         # Store raw steering input for instantaneous kick deflection
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
         if self.cfg.replay.enable_recording:
             self._replay_step_index = self.rl_step_count + 1
             self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
+            self.last_action_means = (
+                None if action_means is None else np.round(np.asarray(action_means, dtype=np.float64), 3).tolist()
+            )
         if v_preds is not None:
             self.last_v_preds = np.asarray(v_preds, dtype=np.float32)
 
@@ -846,6 +872,7 @@ class FootballParallelEnv(ParallelEnv):
         is_terminated = False
 
         if is_truncated or is_terminated:
+            self._resolve_pending_kick_as_other()
             self._emit_event(
                 "FULLTIME!",
                 np.array(self.cfg.physics.field_center, dtype=np.float64),
@@ -869,11 +896,16 @@ class FootballParallelEnv(ParallelEnv):
         return step_rewards, is_terminated, is_truncated
 
     def step_array(
-        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        actions_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Optional[Dict[str, Any]]]:
         """Execute one RL step using a (12, 4) action array and return contiguous NumPy arrays."""
         act_array = np.clip(np.asarray(actions_array, dtype=np.float64), -1.0, 1.0)
-        step_rewards, is_terminated, is_truncated = self._step_core(act_array, v_preds=v_preds)
+        step_rewards, is_terminated, is_truncated = self._step_core(
+            act_array, v_preds=v_preds, action_means=action_means
+        )
 
         obs_arr = self._get_observations_array()
         central_arr = self.get_centralized_state()
@@ -1307,6 +1339,25 @@ class FootballParallelEnv(ParallelEnv):
     # ==========================================================================
     # Mechanics Helpers: Kicks, Tackles, Violations, Pickups, Collisions
     # ==========================================================================
+    def _resolve_pending_kick_as_other(self) -> None:
+        """Count the unresolved kick, if any, as neither received by a teammate nor won by an opponent."""
+        if self._pending_kick_idx >= 0:
+            self.stats["kick_other"] += 1
+            self._pending_kick_idx = -1
+
+    def _resolve_pending_kick(self, receiver_idx: int) -> None:
+        """Attribute the unresolved kick to its first receiver: teammate, opponent, or the kicker again."""
+        kicker_idx = self._pending_kick_idx
+        if kicker_idx < 0:
+            return
+        self._pending_kick_idx = -1
+        if receiver_idx == kicker_idx:
+            self.stats["kick_other"] += 1
+        elif self.player_team[receiver_idx] == self.player_team[kicker_idx]:
+            self.stats["kick_to_teammate"] += 1
+        else:
+            self.stats["kick_to_opponent"] += 1
+
     def _execute_kick(
         self,
         kicker_idx: int,
@@ -1314,6 +1365,9 @@ class FootballParallelEnv(ParallelEnv):
         step_rewards: Optional[np.ndarray] = None,
     ) -> None:
         """Launch the ball from kicker, record release state, check shot-on-target, and apply pickup cooldown."""
+        self._resolve_pending_kick_as_other()
+        self.stats["kicks"] += 1
+        self._pending_kick_idx = int(kicker_idx)
         self.kickoff_protection_timer = 0.0
         self.pickup_tackle_grace_timer = 0.0
         phys = self.cfg.physics
@@ -1709,6 +1763,9 @@ class FootballParallelEnv(ParallelEnv):
         new_team = int(self.player_team[new_holder])
         new_role = int(self.player_role[new_holder])
 
+        self._resolve_pending_kick(new_holder)
+        if new_role == ROLE_KEEPER:
+            self.stats["gk_holds"] += 1
         self._on_new_player_touched_ball(new_holder)
 
         is_teammate_pass = False
@@ -2660,6 +2717,7 @@ class FootballParallelEnv(ParallelEnv):
 
     def _setup_kickoff(self, starting_team: int) -> None:
         """Position both teams in Kickoff formation, respecting their current physical side."""
+        self._resolve_pending_kick_as_other()
         self._clear_all_dynamic_timers()
         self.kickoff_protection_timer = self.cfg.mechanics.kickoff_protection_time
         form = self.cfg.formations
@@ -3076,6 +3134,7 @@ class FootballParallelEnv(ParallelEnv):
         """Per-RL-step telemetry shared by every replay frame recorded during that step."""
         v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
         return {
+            "action_mean": self.last_action_means,
             "player_rewards": [round(float(r), 4) for r in self.last_step_rewards],
             "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
             "v_pred": v_preds_data,
@@ -3178,18 +3237,20 @@ class FootballParallelEnv(ParallelEnv):
         interest_score: float,
         stats: Dict[str, Any],
         frames: List[Dict[str, Any]],
+        tag: str = "",
     ) -> str:
-        """Serialize and write a 60 Hz JSON replay trajectory to disk."""
+        """Serialize and write a 60 Hz JSON replay trajectory to disk; `tag` is appended to the file name."""
         os.makedirs(self.cfg.replay.save_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         score_str = f"{interest_score:.1f}".replace(".", "_")
+        tag_str = f"_{tag}" if tag else ""
         if match_id > 0:
             filename = (
                 f"match_{match_id:04d}_gen{generation:04d}"
-                f"_score{score_str}_{timestamp}.json"
+                f"_score{score_str}{tag_str}_{timestamp}.json"
             )
         else:
-            filename = f"unindexed_{timestamp}_score{score_str}.json"
+            filename = f"unindexed_{timestamp}_score{score_str}{tag_str}.json"
         filepath = os.path.join(self.cfg.replay.save_dir, filename)
 
         highlights = []
@@ -3250,6 +3311,14 @@ class FootballParallelEnv(ParallelEnv):
     def _maybe_export_replay(self) -> Optional[str]:
         """Export or defer the full 60 Hz JSON trajectory if `interest_score >= threshold`."""
         interest_score = self.compute_interest_score()
+        if self.uniform_capture:
+            self._uniform_replay = {
+                "match_id": self.current_match_id,
+                "generation": self.current_generation,
+                "interest_score": interest_score,
+                "stats": copy.deepcopy(self.stats),
+                "frames": self._ensure_replay_buffer().snapshot(),
+            }
         if interest_score < self.cfg.replay.interest_threshold:
             return None
 
@@ -3279,6 +3348,24 @@ class FootballParallelEnv(ParallelEnv):
             stats=self.stats,
             frames=self.replay_frames,
         )
+
+    def export_uniform_replay(self) -> Optional[str]:
+        """Write the most recent match captured while `uniform_capture` was set, once; `None` if there is none."""
+        payload = self._uniform_replay
+        if payload is None:
+            return None
+        self._uniform_replay = None
+        previous = self.last_saved_replay_path
+        path = self._write_replay_to_disk(
+            match_id=int(payload["match_id"]),
+            generation=int(payload["generation"]),
+            interest_score=float(payload["interest_score"]),
+            stats=payload["stats"],
+            frames=payload["frames"].materialize(),
+            tag="uniform",
+        )
+        self.last_saved_replay_path = previous
+        return path
 
     def export_deferred_replay(self) -> Optional[str]:
         """Write the deferred replay snapshot to disk when selected as the winning worker."""

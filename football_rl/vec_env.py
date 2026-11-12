@@ -33,7 +33,12 @@ def _worker(
                 env_done = (len(env.agents) == 0)
                 remote.send((next_obs, rewards, terminations, truncations, infos, env_done))
             elif cmd == "step_array":
-                if isinstance(data, tuple) and len(data) == 2:
+                if isinstance(data, tuple) and len(data) == 3:
+                    act_data, val_data, mean_data = data
+                    obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(
+                        act_data, v_preds=val_data, action_means=mean_data
+                    )
+                elif isinstance(data, tuple) and len(data) == 2:
                     act_data, val_data = data
                     obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(act_data, v_preds=val_data)
                 else:
@@ -49,8 +54,14 @@ def _worker(
                 remote.send((env._get_observations_array(), env.get_centralized_state()))
             elif cmd == "export_replay":
                 remote.send(env.export_deferred_replay())
+            elif cmd == "export_uniform_replay":
+                remote.send(env.export_uniform_replay())
+            elif cmd == "set_uniform_capture":
+                env.uniform_capture = bool(data)
+                remote.send(True)
             elif cmd == "set_generation":
                 env._deferred_replay = None
+                env._uniform_replay = None
                 env.current_generation = int(data)
                 remote.send(True)
             elif cmd == "get_stats":
@@ -162,14 +173,21 @@ class SubprocVecFootballEnv:
         return obs_batch, central_batch
 
     def step_array_async(
-        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        actions_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> None:
         """Send (num_envs, 12, 4) action array to all workers without dictionary construction."""
         act_np = np.asarray(actions_array, dtype=np.float32)
         val_np = np.asarray(v_preds, dtype=np.float32) if v_preds is not None else None
+        mean_np = np.asarray(action_means, dtype=np.float32) if action_means is not None else None
         for idx, (remote, act) in enumerate(zip(self.remotes, act_np)):
             v = val_np[idx] if val_np is not None else None
-            remote.send(("step_array", (act, v)))
+            if mean_np is None:
+                remote.send(("step_array", (act, v)))
+            else:
+                remote.send(("step_array", (act, v, mean_np[idx])))
         self.waiting = True
 
 
@@ -205,7 +223,10 @@ class SubprocVecFootballEnv:
         return obs_batch, central_batch, rew_batch, done_batch, ep_summaries
 
     def step_array(
-        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        actions_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> Tuple[
         np.ndarray,
         np.ndarray,
@@ -214,12 +235,28 @@ class SubprocVecFootballEnv:
         List[Optional[Dict[str, Any]]],
     ]:
         """Execute a synchronous batched step using contiguous (num_envs, 12, 4) arrays."""
-        self.step_array_async(actions_array, v_preds=v_preds)
+        self.step_array_async(actions_array, v_preds=v_preds, action_means=action_means)
         return self.step_array_wait()
 
     def export_replay(self, env_idx: int) -> Optional[str]:
         """Instruct worker `env_idx` to write its deferred replay trajectory to disk."""
         self.remotes[env_idx].send(("export_replay", None))
+        res = self.remotes[env_idx].recv()
+        if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
+            err_msg, tb = res[1]
+            raise RuntimeError(f"Error in SubprocVec worker {env_idx}:\n{tb}")
+        return res
+
+    def set_uniform_capture(self, env_idx: Optional[int]) -> None:
+        """Keep every completed match of worker `env_idx` (and of no other worker) for `export_uniform_replay`."""
+        for idx, remote in enumerate(self.remotes):
+            remote.send(("set_uniform_capture", idx == env_idx))
+        for remote in self.remotes:
+            remote.recv()
+
+    def export_uniform_replay(self, env_idx: int) -> Optional[str]:
+        """Instruct worker `env_idx` to write its captured uniform replay to disk."""
+        self.remotes[env_idx].send(("export_uniform_replay", None))
         res = self.remotes[env_idx].recv()
         if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) and res[0] == "ERROR":
             err_msg, tb = res[1]
@@ -319,7 +356,15 @@ class DummyVecFootballEnv:
     def set_generation(self, generation: int) -> None:
         for env in self.envs:
             env._deferred_replay = None
+            env._uniform_replay = None
             env.current_generation = generation
+
+    def set_uniform_capture(self, env_idx: Optional[int]) -> None:
+        for idx, env in enumerate(self.envs):
+            env.uniform_capture = idx == env_idx
+
+    def export_uniform_replay(self, env_idx: int) -> Optional[str]:
+        return self.envs[env_idx].export_uniform_replay()
 
     def reset_array(
         self,
@@ -344,10 +389,16 @@ class DummyVecFootballEnv:
         return obs_batch, central_batch
 
     def step_array_async(
-        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        actions_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> None:
         self._pending_actions_array = np.asarray(actions_array, dtype=np.float32)
         self._pending_v_preds = np.asarray(v_preds, dtype=np.float32) if v_preds is not None else None
+        self._pending_action_means = (
+            np.asarray(action_means, dtype=np.float32) if action_means is not None else None
+        )
 
     def step_array_wait(
         self,
@@ -365,9 +416,13 @@ class DummyVecFootballEnv:
         ep_summaries: List[Optional[Dict[str, Any]]] = [None] * self.num_envs
 
         val_np = getattr(self, "_pending_v_preds", None)
+        mean_np = getattr(self, "_pending_action_means", None)
         for idx, (env, act) in enumerate(zip(self.envs, self._pending_actions_array)):
             v = val_np[idx] if val_np is not None else None
-            obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(act, v_preds=v)
+            m = mean_np[idx] if mean_np is not None else None
+            obs_arr, central_arr, rew_arr, env_done, ep_summary = env.step_array(
+                act, v_preds=v, action_means=m
+            )
             obs_batch[idx] = obs_arr
             central_batch[idx] = central_arr
             rew_batch[idx] = rew_arr
@@ -377,7 +432,10 @@ class DummyVecFootballEnv:
         return obs_batch, central_batch, rew_batch, done_batch, ep_summaries
 
     def step_array(
-        self, actions_array: np.ndarray, v_preds: Optional[np.ndarray] = None
+        self,
+        actions_array: np.ndarray,
+        v_preds: Optional[np.ndarray] = None,
+        action_means: Optional[np.ndarray] = None,
     ) -> Tuple[
         np.ndarray,
         np.ndarray,
@@ -385,7 +443,7 @@ class DummyVecFootballEnv:
         np.ndarray,
         List[Optional[Dict[str, Any]]],
     ]:
-        self.step_array_async(actions_array, v_preds=v_preds)
+        self.step_array_async(actions_array, v_preds=v_preds, action_means=action_means)
         return self.step_array_wait()
 
     def export_replay(self, env_idx: int) -> Optional[str]:
