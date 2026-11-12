@@ -763,3 +763,28 @@ def test_vec_env_state_after_a_worker_failure_is_closed_cleanly() -> None:
     vec.close()
     assert time.monotonic() - start < 5.0
     assert vec.closed
+
+
+def test_pipe_command_picked_up_by_idle_poll_does_not_cause_a_spurious_step() -> None:
+    """A pipe command the worker handled before its semaphore release arrives must not leave a stale step permit.
+
+    The parent sends a command and then releases the worker's semaphore; an idle worker can notice the message
+    between those two actions. Its late permit must then be discarded instead of being run as a step, which would
+    advance the environment, publish an unrequested done signal and desynchronise the pipe replies.
+    """
+    vec = make_vec_football_env(_no_recording_config(), num_envs=2)
+    try:
+        _reset_vec(vec)
+        vec.step_array(np.zeros((2, 12, ACTION_DIM), dtype=np.float32))
+        assert vec._done_sem.get_value() == 0
+
+        vec.remotes[0].send(("set_uniform_capture", False))
+        assert vec.remotes[0].poll(10.0), "worker never answered the pipe command"
+        assert vec.remotes[0].recv() is True
+        vec._cmd_sems[0].release()
+
+        vec.step_array(np.zeros((2, 12, ACTION_DIM), dtype=np.float32))
+        vec.set_generation(1)
+        assert vec._done_sem.get_value() == 0
+    finally:
+        vec.close()

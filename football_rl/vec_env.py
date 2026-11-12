@@ -86,12 +86,22 @@ def _worker(
     shm = shared_memory.SharedMemory(name=shm_name) if shm_name is not None else None
     views = _shm_views(shm.buf, shm_layout) if shm is not None else {}
     env = env_fn()
+    owed_permits = 0
     try:
         while True:
-            if not cmd_sem.acquire(timeout=_WORKER_IDLE_POLL_S) and not remote.poll(0):
+            acquired = cmd_sem.acquire(timeout=_WORKER_IDLE_POLL_S)
+            has_message = remote.poll(0)
+            if not acquired and not has_message:
                 continue
-            if remote.poll(0):
+            if has_message:
+                if not acquired:
+                    # The parent sends a command and then releases the semaphore; the message was noticed in
+                    # between, so that release arrives later and must not be mistaken for a step signal.
+                    owed_permits += 1
                 cmd, data = remote.recv()
+            elif owed_permits:
+                owed_permits -= 1
+                continue
             else:
                 cmd, data = "step_array", (int(views["ctl"][worker_index, 0]), int(views["ctl"][worker_index, 1]))
             if cmd == "step":
