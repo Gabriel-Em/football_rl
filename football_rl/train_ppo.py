@@ -185,6 +185,7 @@ class ParameterSharingPPOTrainer:
         seed: int = 42,
         separate_teams: bool = True,
         save_best_only: bool = False,
+        write_root_summary: bool = False,
     ) -> None:
         self.cfg = config
         self.num_envs = num_envs
@@ -194,6 +195,7 @@ class ParameterSharingPPOTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.seed = seed
         self.separate_teams = separate_teams
+        self.write_root_summary = write_root_summary
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
         if self.save_best_only != self.cfg.replay.save_best_only:
             self.cfg = replace(
@@ -981,6 +983,21 @@ class ParameterSharingPPOTrainer:
             "blue_goals": blue_goals,
         }
 
+    def _write_root_summary_copy(self, summary_path: str, content: str) -> None:
+        """Mirror the summary to `./matches_summary.md` when enabled; never writes through a symlink."""
+        if not self.write_root_summary:
+            return
+        root_summary = "matches_summary.md"
+        if os.path.islink(root_summary):
+            return
+        if os.path.abspath(summary_path) == os.path.abspath(root_summary):
+            return
+        try:
+            with open(root_summary, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError:
+            pass
+
     def _write_matches_summary_markdown(self) -> Optional[str]:
         """Write a human-friendly `replays/matches_summary.md` table for quick scanning."""
         os.makedirs(self.cfg.replay.save_dir, exist_ok=True)
@@ -1010,13 +1027,7 @@ class ParameterSharingPPOTrainer:
             content = "\n".join(lines)
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            root_summary = "matches_summary.md"
-            if os.path.abspath(summary_path) != os.path.abspath(root_summary):
-                try:
-                    with open(root_summary, "w", encoding="utf-8") as f:
-                        f.write(content)
-                except Exception:
-                    pass
+            self._write_root_summary_copy(summary_path, content)
             return summary_path
 
         # 1. Top 15 Most Exciting Matches Leaderboard
@@ -1081,13 +1092,7 @@ class ParameterSharingPPOTrainer:
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        root_summary = "matches_summary.md"
-        if os.path.abspath(summary_path) != os.path.abspath(root_summary):
-            try:
-                with open(root_summary, "w", encoding="utf-8") as f:
-                    f.write(content)
-            except Exception:
-                pass
+        self._write_root_summary_copy(summary_path, content)
 
         return summary_path
 
@@ -1265,7 +1270,6 @@ class ParameterSharingPPOTrainer:
 
         try:
             for gen in range(start_gen, end_gen + 1):
-                self.current_generation = gen
                 matches_before = len(self.match_history)
                 rollout = self.collect_rollouts(active_generation=gen)
                 metrics = self.update_policies(rollout)
@@ -1317,6 +1321,7 @@ class ParameterSharingPPOTrainer:
                     "total_matches_so_far": len(self.match_history),
                 }
                 self.generation_history.append(gen_record)
+                self.current_generation = gen
 
                 print(
                     f"[Gen {gen:04d}/{end_gen:04d}] "
@@ -1831,6 +1836,7 @@ def main() -> None:
         seed=args.seed,
         separate_teams=not args.shared_teams,
         save_best_only=args.save_best_only,
+        write_root_summary=True,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")

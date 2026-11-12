@@ -385,6 +385,86 @@ def test_status_and_summary_label_team_a_as_red(tmp_path: Path, monkeypatch, cap
     assert "Blue - Red" not in text
 
 
+def _recording_trainer(tmp_path: Path, **kwargs) -> ParameterSharingPPOTrainer:
+    return ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp_path / "rep"), recording=True), num_envs=1,
+        rollout_steps=10, device="cpu", checkpoint_dir=str(tmp_path / "ckpt"), seed=3, **kwargs,
+    )
+
+
+def test_summary_not_written_to_cwd(tmp_path: Path, monkeypatch) -> None:
+    decoy = tmp_path / "decoy.md"
+    decoy.write_bytes(b"decoy-bytes\n")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "matches_summary.md").symlink_to(decoy)
+    monkeypatch.chdir(cwd)
+
+    trainer = _recording_trainer(tmp_path)
+    trainer.train(total_updates=1)
+
+    assert decoy.read_bytes() == b"decoy-bytes\n"
+    assert (tmp_path / "rep" / "matches_summary.md").exists()
+
+
+def test_root_summary_copy_written_only_when_enabled_and_never_through_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    trainer = _recording_trainer(tmp_path, write_root_summary=True)
+    trainer.current_generation = 7
+    trainer._write_matches_summary_markdown()
+    root = cwd / "matches_summary.md"
+    assert root.exists() and not root.is_symlink()
+    assert "`7`" in root.read_text(encoding="utf-8")
+
+    root.unlink()
+    decoy = tmp_path / "decoy.md"
+    decoy.write_bytes(b"keep")
+    root.symlink_to(decoy)
+    trainer._write_matches_summary_markdown()
+    assert decoy.read_bytes() == b"keep"
+
+    root.unlink()
+    off = _recording_trainer(tmp_path)
+    off._write_matches_summary_markdown()
+    assert not root.exists()
+
+
+def test_interrupt_saves_completed_generation_count(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+    original = trainer.collect_rollouts
+
+    def interrupting(active_generation: int):
+        if active_generation == 2:
+            raise KeyboardInterrupt
+        return original(active_generation=active_generation)
+
+    trainer.collect_rollouts = interrupting
+    trainer.train(total_updates=3)
+
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert len(state["generation_history"]) == 1
+    assert state["current_generation"] == 1
+    history = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+    assert history["current_generation"] == 1
+
+
+def test_interrupt_before_first_generation_completes_saves_zero(tmp_path: Path) -> None:
+    trainer = _recording_trainer(tmp_path)
+
+    def interrupting(active_generation: int):
+        raise KeyboardInterrupt
+
+    trainer.collect_rollouts = interrupting
+    trainer.train(total_updates=2)
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["current_generation"] == 0
+    assert state["generation_history"] == []
+
+
 # ==============================================================================
 # CLI defaults, generation provenance and resume mismatch warning
 # ==============================================================================

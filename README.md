@@ -16,7 +16,7 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
   When an unclaimed loose ball rests inside the goalkeeper box and comes to a complete stop ($\le 15.0\text{ u/s}$), after a $2.0\text{s}$ grace period the semicircle boundary smoothly contracts at $55.0\text{ u/s}$ down toward $0.0\text{u}$. This enables outfield attackers to contest deadlocked loose balls cleanly without artificial foul teleports while preventing any premature shrinking when the ball is merely passing through in motion. Upon possession recovery, movement, or clearance, the box smoothly re-expands at $220.0\text{ u/s}$ back to nominal $195.0\text{u}$ radius, gently nudging outfielders outside.
 - **76-Dimensional Team-Canonical Observation Space ($\mathbf{o} \in \mathbb{R}^{76}$)**:
   Dynamically transforms coordinates and velocities by $180^\circ$ for whichever team currently defends the right goal, ensuring an invariant forward-attacking perspective ($+X$ toward opponent goal) across both halves:
-  - **16 Self Features (`indices 0..15`)**: Canonical position, facing angle vector $(\sin, \cos)$, normalized velocity, score differential, ball possession flag, hold/box timers, tackle/lunge cooldown, ghost/stun timer, relative goal angle and distance, and 3-bit one-hot role vector `[is_def, is_mid, is_atk]`.
+  - **16 Self Features (`indices 0..15`)**: Canonical position, facing angle vector $(\sin, \cos)$, normalized velocity, score differential, ball possession flag, hold/box timers, tackle/lunge cooldown, ghost/stun timer, relative goal angle and distance, `obs[13]` = role depth bias, `obs[14]` = flank bias (keepers: own active box radius), and `obs[15]` = active box radius (keepers: own loose-ball timer).
   - **60 Entity Features (`indices 16..75`)**: 12 entity slots $\times$ 5 features (Slot 0: Ball with $360^\circ$ awareness; Slots 1..5: 5 Teammates; Slots 6..10: 5 Field Opponents; Slot 11: Enemy Goalkeeper). Peripheral vision fades smoothly from $170^\circ$ to $210^\circ$ FOV.
 - **4-Dimensional Continuous Action Space ($\mathbf{a} \in [-1, 1]^4$)**:
   - `action[0]`: Throttle force (with $[-0.35, +0.15]$ deadzone and backpedal multipliers).
@@ -25,19 +25,15 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
   - `action[3]`: Special tactical ability / dynamic slide tackle / goalkeeper holonomic dive.
 - **Kick-Steer Deflection ($\pm 35^\circ$) & Passing Mechanics**:
   - Outfielders and keepers can deflect their kick release by up to $\pm 35^\circ$ using `action[1]`, executing instant side-foot passes and angled clearances without waiting for full body reorientation.
-  - Frame-0 Dangerous Own-Goal Threat Penalty ($-3.0$) penalizes kicks directed back into one's own net from the defensive third ($X_c \le 350.0\text{u}$).
-  - Goalkeeper wall-ricochet / bank clearances reward high-power releases reflecting off touchlines past pressed defensive corridors.
-  - Blocked-kick detection checks a forward corridor ($185.0\text{u} \times 30.0\text{u}$) and penalizes kicks fired straight into close defenders ($-0.85$).
 - **Through-Balls & Tactical Movement**:
   - Progressive lead passes completed to teammates running in forward stride ($v_{x,c} \ge 90.0\text{ u/s}$) award a shared through-ball stride bonus ($+0.80$, `through_ball_stride_bonus`) and trigger `"THROUGH BALL!"` visual events.
   - Receiving agents compute in-flight lead intercept trajectories $\mathbf{p}_{\text{int}} \in [\mathbf{p}_b, \mathbf{p}_b + 0.8\mathbf{v}_b]$ to meet passes in stride.
   - Half-turn body readiness rewards off-ball support players maintaining forward-facing field orientation ($\cos(\theta_c) \ge -0.10$) while reading the ball.
-  - Continuous lateral unmasking reward ($+0.015$) encourages shadowed teammates to slide laterally into clear passing lanes.
 - **Heterogeneous Role Profiles & Kinematics**:
-  - **Goalkeeper (`ROLE_KEEPER` / 1 per team)**: $180.0\text{ u/s}$ top speed ($0.75\times$ backpedal), $340.0\text{ u/s}$ holonomic dives/lunges in any direction (`0.25s` duration, `1.8s` cooldown), $640.0\text{ u/s}$ boosted clearance speed, $5.0\text{s}$ maximum hold time, and strip-stun recovery.
-  - **Center Backs (`ROLE_DEF` / 2 per team)**: $182.0\text{ u/s}$ speed, $510.0\text{ u/s}$ kick launch velocity, widest dynamic tackle reach ($48.0\text{ u}$ nominal radius, 86% success), tactical spreading width ($420 \pm 175\text{ u}$) to build out from deep.
-  - **Box-to-Box Midfielders (`ROLE_MID` / 2 per team)**: $195.0\text{ u/s}$ speed (fastest field runners), $560.0\text{ u/s}$ kick velocity, balanced dynamic tackles ($44.0\text{ u}$ radius, 78% success), flank channel spreading, half-turn posture, and link-up play.
-  - **Attacking Striker (`ROLE_ATK` / 1 per team)**: $190.0\text{ u/s}$ speed, highest launch kick velocity ($640.0\text{ u/s}$) with **zero kick jitter (pinpoint laser)**, dynamic tackle ($40.0\text{ u}$ radius, 70% success), and prime finishing bonuses inside $320.0\text{ u}$ of goal.
+  - **Goalkeeper (`ROLE_KEEPER` / 1 per team)**: $180.0\text{ u/s}$ top speed (full-speed backpedal), $340.0\text{ u/s}$ holonomic dives/lunges in any direction (`0.25s` duration, `1.8s` cooldown), $640.0\text{ u/s}$ maximum kick speed, $5.0\text{s}$ maximum hold time, and strip-stun recovery.
+  - **Center Backs (`ROLE_DEF` / 2 per team)**: $188.0\text{ u/s}$ speed, $560.0\text{ u/s}$ maximum kick speed, widest tackle reach ($85.0\text{ u}$ radius).
+  - **Midfielders (`ROLE_MID` / 2 per team)**: $192.0\text{ u/s}$ speed (fastest field runners), $600.0\text{ u/s}$ maximum kick speed, mid-range tackle reach ($75.0\text{ u}$ radius).
+  - **Striker (`ROLE_ATK` / 1 per team)**: $190.0\text{ u/s}$ speed, highest field-player kick speed ($640.0\text{ u/s}$), shortest tackle reach ($65.0\text{ u}$ radius).
 - **Physical Contests, Shielding & Dynamic Tackling**:
   - Dynamic tackle reach decays quadratically with relative closing speed, rewarding controlled defensive positioning over reckless sprint-ram tackles.
   - Contested loose-ball recoveries apply a $0.35$ speed damping and $15.0\text{ u}$ radial separation to defeated opponents within $45.0\text{ u}$, granting physical shielding.
@@ -48,7 +44,7 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
   - Vectorized parallel environment multiprocessing (`--num-envs 8+`) with monotonic match persistence and `--save-best-only` replay filtering.
 - **Interactive 60 FPS Replay Visualizer (`replay.py`)**:
   - Pygame viewer rendering active dynamic semicircle boundaries, player vision cones ($210^\circ$ FOV), role rings, tackle radii, ghost recovery stuns, and scoreboard HUD.
-  - Color-coded floating event notifications: `"GOAL!"`, `"SAVE!"`, `"TACKLE!"`, `"THROUGH BALL!"`, `"WALL CLEARANCE!"`, and `"BALL WON!"`.
+  - Color-coded floating event notifications: `"GOAL!"`, `"SAVE!"`, `"TACKLE!"`, `"THROUGH BALL!"`, and `"BALL WON!"`.
   - Interactive timeline scrubbing, goal/halftime tick marks, speed controls (`1x`, `2x`, `4x`), and match filtering.
 
 ---
