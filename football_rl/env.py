@@ -38,7 +38,13 @@ from football_rl.potentials import (
     PotentialState,
     compute_potentials,
 )
-from football_rl.recording import ReplayBuffer
+from football_rl.recording import LazyStepPayload, ReplayBuffer, format_breakdown, round_rows
+
+# Replay role labels: potential-field roles plus the two status overrides shown while a player is stunned or lunging.
+_STUN_ROLE_CODE = len(ROLE_LABELS)
+_LUNGE_ROLE_CODE = len(ROLE_LABELS) + 1
+_REPLAY_ROLE_LABELS = ROLE_LABELS + ("STUN", "LNGE")
+_KICKOFF_ROLE_CODES = (0, 5, 5, 5, 5, 5, 0, 5, 5, 5, 5, 5)  # GK + five COVR per team
 
 TEAM_LEFT = SIDE_LEFT
 TEAM_RIGHT = SIDE_RIGHT
@@ -446,14 +452,39 @@ class FootballParallelEnv(ParallelEnv):
 
         # Telemetry & Critic recording buffers
         self.last_v_preds: Optional[np.ndarray] = None
-        self.last_action_means: Optional[List[List[float]]] = None
-        self.last_rew_breakdown: Optional[List[Dict[str, Any]]] = None
-        self.last_role_states: List[str] = [
-            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
-            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
-        ]
-        self.last_role_targets: List[List[float]] = [[0.0, 0.0] for _ in range(self.num_players)]
-        self.last_actions: List[List[float]] = [[0.0, 0.0, 0.0, 0.0] for _ in range(self.num_players)]
+        self._reset_step_telemetry()
+
+    def _reset_step_telemetry(self) -> None:
+        """Raw per-step replay telemetry at its initial (kickoff) values."""
+        n = self.num_players
+        self._tele_actions = np.zeros((n, 4), dtype=np.float64)
+        self._tele_action_means: Optional[np.ndarray] = None
+        self._tele_breakdown: Optional[np.ndarray] = None
+        self._tele_role_codes = np.array(_KICKOFF_ROLE_CODES, dtype=np.int64)
+        self._tele_targets = np.zeros((n, 2), dtype=np.float64)
+
+    @property
+    def last_actions(self) -> List[List[float]]:
+        """Clipped actions of the last recorded step, per player, rounded to 3 decimals."""
+        return round_rows(self._tele_actions, 3)
+
+    @property
+    def last_action_means(self) -> Optional[List[List[float]]]:
+        """Policy mean actions given with the last recorded step (3 decimals), or None."""
+        return None if self._tele_action_means is None else np.round(self._tele_action_means, 3).tolist()
+
+    @property
+    def last_rew_breakdown(self) -> Optional[List[Dict[str, Any]]]:
+        """Per-player reward components of the last recorded step (4 decimals), or None before any."""
+        return None if self._tele_breakdown is None else format_breakdown(self._tele_breakdown)
+
+    @property
+    def last_role_states(self) -> List[str]:
+        return [_REPLAY_ROLE_LABELS[c] for c in self._tele_role_codes.tolist()]
+
+    @property
+    def last_role_targets(self) -> List[List[float]]:
+        return round_rows(self._tele_targets, 1)
 
     @property
     def phys_cfg(self) -> PhysicsConfig:
@@ -731,14 +762,7 @@ class FootballParallelEnv(ParallelEnv):
         self._replay_step_index = 0
         self._frame_events = []
         self.last_v_preds = None
-        self.last_action_means = None
-        self.last_rew_breakdown = None
-        self.last_role_states = [
-            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
-            "GK", "COVR", "COVR", "COVR", "COVR", "COVR",
-        ]
-        self.last_role_targets = [[0.0, 0.0] for _ in range(self.num_players)]
-        self.last_actions = [[0.0, 0.0, 0.0, 0.0] for _ in range(self.num_players)]
+        self._reset_step_telemetry()
         self.last_keeper_kick_time.fill(-999.0)
         self.shot_on_target_cd.fill(0.0)
         self.last_step_rewards.fill(0.0)
@@ -803,10 +827,8 @@ class FootballParallelEnv(ParallelEnv):
         self.raw_steer_input = act_array[:, 1].astype(np.float32)
         if self.cfg.replay.enable_recording:
             self._replay_step_index = self.rl_step_count + 1
-            self.last_actions = [[round(float(a), 3) for a in act_array[p]] for p in range(self.num_players)]
-            self.last_action_means = (
-                None if action_means is None else np.round(np.asarray(action_means, dtype=np.float64), 3).tolist()
-            )
+            self._tele_actions = np.array(act_array, dtype=np.float64)
+            self._tele_action_means = None if action_means is None else np.array(action_means, dtype=np.float64)
         if v_preds is not None:
             self.last_v_preds = np.asarray(v_preds, dtype=np.float32)
 
@@ -3080,35 +3102,22 @@ class FootballParallelEnv(ParallelEnv):
     ) -> None:
         """Store per-player role labels, role targets and the reward breakdown for replay frames."""
         n = self.num_players
-        stunned = state.stunned.tolist()
-        lunging = (self.lunge_timer > 0.0).tolist()
-        role_codes = result.role_code.tolist()
-        role_states = [ROLE_LABELS[code] for code in role_codes]
-        for i in range(n):
-            if stunned[i]:
-                role_states[i] = "STUN"
-            elif lunging[i]:
-                role_states[i] = "LNGE"
-
-        pot_delta = (
-            result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
-        ).tolist()
-        r_adv = (r_ball_adv if r_ball_adv is not None else np.zeros(n)).tolist()
-        r_sp = (r_sparse if r_sparse is not None else np.zeros(n)).tolist()
-        phi_role = result.phi_role.tolist()
-        crowd = result.crowd.tolist()
-        self.last_rew_breakdown = [
-            {
-                "r_ball_adv": round(r_adv[i], 4),
-                "r_pot_i": round(pot_delta[i], 4),
-                "phi_role": round(phi_role[i], 4),
-                "phi_crowd": round(0.0 if role_codes[i] == ROLE_GK else -crowd[i], 4),
-                "r_sparse": round(r_sp[i], 4),
-            }
-            for i in range(n)
-        ]
-        self.last_role_states = role_states
-        self.last_role_targets = [[round(x, 1), round(y, 1)] for x, y in result.target.tolist()]
+        role_codes = np.asarray(result.role_code)
+        label_codes = np.where(
+            state.stunned, _STUN_ROLE_CODE, np.where(self.lunge_timer > 0.0, _LUNGE_ROLE_CODE, role_codes)
+        )
+        pot_delta = result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
+        self._tele_breakdown = np.stack(
+            [
+                r_ball_adv if r_ball_adv is not None else np.zeros(n),
+                pot_delta,
+                result.phi_role,
+                np.where(role_codes == ROLE_GK, 0.0, -result.crowd),
+                r_sparse if r_sparse is not None else np.zeros(n),
+            ]
+        ).astype(np.float64)
+        self._tele_role_codes = label_codes.astype(np.int64)
+        self._tele_targets = np.array(result.target, dtype=np.float64)
 
     def _emit_event(
         self,
@@ -3130,19 +3139,19 @@ class FootballParallelEnv(ParallelEnv):
             }
         )
 
-    def _replay_step_payload(self) -> Dict[str, Any]:
-        """Per-RL-step telemetry shared by every replay frame recorded during that step."""
-        v_preds_data = [round(float(v), 3) for v in self.last_v_preds] if self.last_v_preds is not None else None
-        return {
-            "action_mean": self.last_action_means,
-            "player_rewards": [round(float(r), 4) for r in self.last_step_rewards],
-            "cum_rewards": [round(float(r), 2) for r in self.cum_player_rewards],
-            "v_pred": v_preds_data,
-            "rew_breakdown": self.last_rew_breakdown,
-            "role_state": (list(self.last_role_states) if self.last_role_states is not None else None),
-            "role_targets": self.last_role_targets,
-            "actions": self.last_actions,
-        }
+    def _replay_step_payload(self) -> LazyStepPayload:
+        """Per-RL-step telemetry shared by every replay frame recorded during that step (rounded on export)."""
+        return LazyStepPayload(
+            actions=self._tele_actions,
+            action_means=self._tele_action_means,
+            v_preds=None if self.last_v_preds is None else np.array(self.last_v_preds, dtype=np.float32),
+            player_rewards=self.last_step_rewards.copy(),
+            cum_rewards=self.cum_player_rewards.copy(),
+            breakdown=self._tele_breakdown,
+            role_codes=self._tele_role_codes,
+            role_labels=_REPLAY_ROLE_LABELS,
+            role_targets=self._tele_targets,
+        )
 
     def _record_replay_frame(self) -> None:
         """Copy the current 60 Hz state snapshot into the replay buffer."""

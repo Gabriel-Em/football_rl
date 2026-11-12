@@ -9,6 +9,7 @@ Verifies:
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import replace
 
 import numpy as np
@@ -459,3 +460,92 @@ def test_env_rejects_action_means_of_the_wrong_shape():
     env.reset(seed=1)
     with pytest.raises(ValueError):
         env.step_array(np.zeros((12, 4)), action_means=np.zeros((6, 4)))
+
+
+def _recording_env_with_telemetry() -> FootballParallelEnv:
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=True))
+    env = FootballParallelEnv(config=cfg)
+    env.reset(seed=42)
+    return env
+
+
+def test_recording_a_step_calls_round_at_most_twenty_times(monkeypatch):
+    """Telemetry is stored as raw arrays; per-value decimal rounding happens when a replay is exported."""
+    env = _recording_env_with_telemetry()
+    rng = np.random.default_rng(1)
+    acts = rng.uniform(-1.0, 1.0, (20, 12, 4))
+    means = rng.uniform(-1.0, 1.0, (20, 12, 4)).astype(np.float32)
+    vals = rng.uniform(-3.0, 3.0, (20, 12)).astype(np.float32)
+    calls = {"n": 0}
+    real_round = builtins.round
+
+    def counting_round(*args, **kwargs):
+        calls["n"] += 1
+        return real_round(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "round", counting_round)
+    for k in range(20):
+        env.step_array(acts[k], v_preds=vals[k], action_means=means[k])
+    monkeypatch.undo()
+    assert calls["n"] / 20 <= 20
+
+
+def test_step_telemetry_is_rounded_to_the_documented_decimals_in_frames_and_attributes():
+    """Actions and critic values round half-away-from-exact-decimal (3 places); policy means use numpy rounding."""
+    env = _recording_env_with_telemetry()
+    acts = np.zeros((12, 4))
+    acts[0] = [0.0005, 0.1234567, -0.9996, 0.0]
+    means = np.zeros((12, 4), dtype=np.float64)
+    means[0] = [0.0005, 0.12345, 0.9996, -0.1234567]
+    vals = np.zeros(12, dtype=np.float32)
+    vals[:3] = [0.12345678, -2.5, 0.0001]
+    env.step_array(acts, v_preds=vals, action_means=means)
+
+    assert env.last_actions[0] == [0.001, 0.123, -1.0, 0.0]
+    assert env.last_actions[1] == [0.0, 0.0, 0.0, 0.0]
+    assert env.last_action_means[0] == [0.0, 0.123, 1.0, -0.123]
+    assert len(env.last_actions) == len(env.last_action_means) == 12
+    frame = env.replay_frames[-1]
+    assert frame["actions"][0] == [0.001, 0.123, -1.0, 0.0]
+    assert frame["action_mean"][0] == [0.0, 0.123, 1.0, -0.123]
+    assert frame["v_pred"][:4] == [0.123, -2.5, 0.0, 0.0]
+    assert len(frame["player_rewards"]) == len(frame["cum_rewards"]) == len(frame["role_targets"]) == 12
+    assert all(isinstance(v, float) for v in frame["player_rewards"] + frame["cum_rewards"])
+    assert all(round(v, 4) == v for v in frame["player_rewards"])
+    assert all(round(v, 2) == v for v in frame["cum_rewards"])
+    assert all(round(x, 1) == x for xy in frame["role_targets"] for x in xy)
+    assert set(frame["rew_breakdown"][0]) == {"r_ball_adv", "r_pot_i", "phi_role", "phi_crowd", "r_sparse"}
+    assert all(round(v, 4) == v for b in frame["rew_breakdown"] for v in b.values())
+    assert all(label in {"GK", "COVR", "CHSE", "1stP", "2ndP", "LNGE", "STUN"} or isinstance(label, str)
+               for label in frame["role_state"])
+    assert frame["role_state"] == env.last_role_states
+    assert frame["rew_breakdown"] == env.last_rew_breakdown
+    assert frame["role_targets"] == env.last_role_targets
+    assert frame["actions"] == env.last_actions
+
+
+def test_step_telemetry_attributes_after_reset_hold_their_initial_values():
+    env = _recording_env_with_telemetry()
+    assert env.last_actions == [[0.0, 0.0, 0.0, 0.0]] * 12
+    assert env.last_action_means is None
+    assert len(env.last_rew_breakdown) == len(env.last_role_targets) == len(env.last_role_states) == 12
+    assert all(isinstance(label, str) for label in env.last_role_states)
+
+
+def test_telemetry_of_a_step_is_not_changed_by_later_steps():
+    """Lazily rounded payloads must hold values copied at their own step, not references to live arrays."""
+    env = _recording_env_with_telemetry()
+    first = np.zeros((12, 4))
+    first[0] = [0.5, 0.25, 0.0, 0.0]
+    env.step_array(first, v_preds=np.full(12, 1.5, dtype=np.float32), action_means=np.full((12, 4), 0.5, dtype=np.float32))
+    env.step_array(np.ones((12, 4)), v_preds=np.full(12, -1.5, dtype=np.float32), action_means=np.full((12, 4), -0.5, dtype=np.float32))
+    skip = DEFAULT_CONFIG.physics.frame_skip
+    f1 = env.replay_frames[1]
+    f2 = env.replay_frames[1 + skip]
+    assert f1["actions"][0] == [0.5, 0.25, 0.0, 0.0]
+    assert f1["v_pred"] == [1.5] * 12
+    assert f1["action_mean"] == [[0.5] * 4] * 12
+    assert f2["actions"] == [[1.0] * 4] * 12
+    assert f2["v_pred"] == [-1.5] * 12
+    assert f2["action_mean"] == [[-0.5] * 4] * 12
+    assert f1["cum_rewards"] != f2["cum_rewards"] or f1["player_rewards"] != f2["player_rewards"]

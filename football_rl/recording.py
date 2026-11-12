@@ -8,9 +8,79 @@ step payload and shared by the frames of that step.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+BREAKDOWN_KEYS = ("r_ball_adv", "r_pot_i", "phi_role", "phi_crowd", "r_sparse")
+
+
+def round_rows(values: np.ndarray, ndigits: int) -> List[List[float]]:
+    """Rows of `values` as Python floats rounded half-even on their exact decimal value (builtin `round`)."""
+    return [[round(x, ndigits) for x in row] for row in values.tolist()]
+
+
+def round_vector(values: np.ndarray, ndigits: int) -> List[float]:
+    return [round(x, ndigits) for x in values.tolist()]
+
+
+def format_breakdown(columns: np.ndarray) -> List[Dict[str, float]]:
+    """Per-player reward breakdown dictionaries from a `(len(BREAKDOWN_KEYS), players)` array."""
+    rounded = round_rows(columns, 4)
+    return [dict(zip(BREAKDOWN_KEYS, (col[i] for col in rounded))) for i in range(columns.shape[1])]
+
+
+class LazyStepPayload:
+    """Raw per-RL-step telemetry whose decimal rounding is deferred until the replay is materialised.
+
+    The arrays are owned by the payload (they are never modified after construction). `resolve()` builds the
+    JSON-ready dictionary once and returns the same object on every later call, so all frames of the step
+    share it.
+    """
+
+    __slots__ = (
+        "actions", "action_means", "v_preds", "player_rewards", "cum_rewards",
+        "breakdown", "role_codes", "role_labels", "role_targets", "_resolved",
+    )
+
+    def __init__(
+        self,
+        *,
+        actions: np.ndarray,
+        action_means: Optional[np.ndarray],
+        v_preds: Optional[np.ndarray],
+        player_rewards: np.ndarray,
+        cum_rewards: np.ndarray,
+        breakdown: Optional[np.ndarray],
+        role_codes: np.ndarray,
+        role_labels: Tuple[str, ...],
+        role_targets: np.ndarray,
+    ) -> None:
+        self.actions = actions
+        self.action_means = action_means
+        self.v_preds = v_preds
+        self.player_rewards = player_rewards
+        self.cum_rewards = cum_rewards
+        self.breakdown = breakdown
+        self.role_codes = role_codes
+        self.role_labels = role_labels
+        self.role_targets = role_targets
+        self._resolved: Optional[Dict[str, Any]] = None
+
+    def resolve(self) -> Dict[str, Any]:
+        if self._resolved is None:
+            self._resolved = {
+                "action_mean": None if self.action_means is None else np.round(self.action_means, 3).tolist(),
+                "player_rewards": round_vector(self.player_rewards, 4),
+                "cum_rewards": round_vector(self.cum_rewards, 2),
+                "v_pred": None if self.v_preds is None else round_vector(self.v_preds, 3),
+                "rew_breakdown": None if self.breakdown is None else format_breakdown(self.breakdown),
+                "role_state": [self.role_labels[c] for c in self.role_codes.tolist()],
+                "role_targets": round_rows(self.role_targets, 1),
+                "actions": round_rows(self.actions, 3),
+            }
+        return self._resolved
+
 
 _PLAYER_COLS = 6  # x, y, angle, flags, vx, vy
 _BALL_COLS = 5  # x, y, team colour, vx, vy
@@ -25,7 +95,7 @@ class ReplayBuffer:
         self._count = 0
         self.version = 0  # incremented on every mutation; lets callers cache materialised frames
         self._allocate(self._capacity)
-        self._steps: Dict[int, Dict[str, Any]] = {}
+        self._steps: Dict[int, Any] = {}
         self._events: Dict[int, List[Dict[str, Any]]] = {}
 
     def _allocate(self, capacity: int) -> None:
@@ -88,8 +158,8 @@ class ReplayBuffer:
             setattr(self, name, grown)
         self._capacity = new_capacity
 
-    def set_step_payload(self, step_index: int, payload: Dict[str, Any]) -> None:
-        """Attach per-RL-step telemetry that every frame recorded with this `step_index` refers to."""
+    def set_step_payload(self, step_index: int, payload: "Dict[str, Any] | LazyStepPayload") -> None:
+        """Attach per-RL-step telemetry (a ready dictionary or a `LazyStepPayload`) shared by the frames of `step_index`."""
         self._steps[int(step_index)] = payload
         self.version += 1
 
@@ -205,6 +275,8 @@ class ReplayBuffer:
             total_poss = max(1, sum(poss))
             total_frames = max(1, frame_no[i])
             payload = self._steps[step_index[i]]
+            if isinstance(payload, LazyStepPayload):
+                payload = payload.resolve()
             b = ball[i]
             frames.append(
                 {

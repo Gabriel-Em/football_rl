@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import replace
 from datetime import datetime
 import json
+import math
 import os
 import random
 import re
@@ -17,6 +18,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.normal import Normal
 import torch.optim as optim
 
@@ -42,6 +44,9 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+
+_HALF_LOG_TWO_PI = math.log(math.sqrt(2 * math.pi))
 
 
 class ActorCritic(nn.Module):
@@ -136,6 +141,44 @@ class ActorCritic(nn.Module):
         if return_mean:
             return action, log_prob, entropy, value, action_mean
         return action, log_prob, entropy, value
+
+    @torch.no_grad()
+    def sample_action_and_value(
+        self,
+        obs: torch.Tensor,
+        central_state: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        return_mean: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Inference-only `(action, log_prob, value)` for 2-D `obs`; with `return_mean` the mean action is appended.
+
+        Returns exactly what `get_action_and_value` returns for the same inputs and RNG state (same sampling call,
+        same arithmetic order for the Gaussian log-density) without building a distribution object, an entropy
+        term or an autograd graph.
+        """
+        layers = self.__dict__.get("_inference_layers")
+        if layers is None:
+            layers = (
+                self.actor_mean[0], self.actor_mean[2], self.actor_mean[4],
+                self.critic[0], self.critic[2], self.critic[4],
+            )
+            self.__dict__["_inference_layers"] = layers
+        a0, a1, a2, c0, c1, c2 = layers
+        h = torch.tanh(F.linear(obs, a0.weight, a0.bias))
+        h = torch.tanh(F.linear(h, a1.weight, a1.bias))
+        action_mean = torch.tanh(F.linear(h, a2.weight, a2.bias))
+        action_std = torch.exp(self.actor_logstd.expand_as(action_mean))
+        action = action_mean if deterministic else torch.normal(action_mean, action_std)
+        log_prob = (
+            -((action - action_mean) ** 2) / (2 * action_std**2) - action_std.log() - _HALF_LOG_TWO_PI
+        ).sum(-1)
+        critic_in = self._prepare_critic_input(obs, central_state)
+        v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
+        v = torch.tanh(F.linear(v, c1.weight, c1.bias))
+        value = F.linear(v, c2.weight, c2.bias).squeeze(-1)
+        if return_mean:
+            return action, log_prob, value, action_mean
+        return action, log_prob, value
 
 
 SNAPSHOT_INTERVAL = 50
@@ -389,6 +432,20 @@ class ParameterSharingPPOTrainer:
         self.current_obs[:] = obs_batch
         self.current_central_state[:] = central_batch
 
+    def _rollout_groups(self) -> List[Tuple[List[int], ActorCritic]]:
+        """`(agent indices, CPU policy)` groups in the order their random draws are made."""
+        if not self.separate_teams:
+            return [
+                (self.keeper_indices, self.cpu_blue_keeper_policy),
+                (self.field_indices, self.cpu_blue_field_policy),
+            ]
+        return [
+            (self.blue_keeper_indices, self.cpu_blue_keeper_policy),
+            (self.blue_field_indices, self.cpu_blue_field_policy),
+            (self.red_keeper_indices, self.cpu_red_keeper_policy),
+            (self.red_field_indices, self.cpu_red_field_policy),
+        ]
+
     @torch.no_grad()
     def _select_actions(
         self,
@@ -400,84 +457,48 @@ class ParameterSharingPPOTrainer:
         """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations.
 
         Returns `(actions, logprobs, values)`; with `with_means` the policy mean actions are appended.
+        Each role group is one forward pass and one random draw, taken in agent order.
         """
+        n = self.num_envs
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
         cen_t = (
             torch.as_tensor(central_batch, dtype=torch.float32, device=self.inference_device)
             if central_batch is not None
             else None
         )
-        actions = torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
-        logprobs = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
-        values = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.inference_device)
-        means = (
-            torch.zeros((self.num_envs, self.num_agents, ACTION_DIM), dtype=torch.float32, device=self.inference_device)
-            if with_means
-            else None
-        )
-
-        if not self.separate_teams:
-            k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
-            k_cen = (
-                cen_t[:, self.keeper_indices, :].reshape(-1, CENTRAL_STATE_DIM)
-                if cen_t is not None
-                else None
-            )
-            k_act, k_logp, _, k_val, *k_mean = self.cpu_blue_keeper_policy.get_action_and_value(
-                k_obs, deterministic=deterministic, central_state=k_cen, return_mean=with_means
-            )
-            if with_means:
-                means[:, self.keeper_indices, :] = k_mean[0].view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
-            actions[:, self.keeper_indices, :] = k_act.view(self.num_envs, len(self.keeper_indices), ACTION_DIM)
-            logprobs[:, self.keeper_indices] = k_logp.view(self.num_envs, len(self.keeper_indices))
-            values[:, self.keeper_indices] = k_val.view(self.num_envs, len(self.keeper_indices))
-
-            f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
-            f_cen = (
-                cen_t[:, self.field_indices, :].reshape(-1, CENTRAL_STATE_DIM)
-                if cen_t is not None
-                else None
-            )
-            f_act, f_logp, _, f_val, *f_mean = self.cpu_blue_field_policy.get_action_and_value(
-                f_obs, deterministic=deterministic, central_state=f_cen, return_mean=with_means
-            )
-            if with_means:
-                means[:, self.field_indices, :] = f_mean[0].view(self.num_envs, len(self.field_indices), ACTION_DIM)
-            actions[:, self.field_indices, :] = f_act.view(self.num_envs, len(self.field_indices), ACTION_DIM)
-            logprobs[:, self.field_indices] = f_logp.view(self.num_envs, len(self.field_indices))
-            values[:, self.field_indices] = f_val.view(self.num_envs, len(self.field_indices))
-        else:
-            groups = [
-                (self.blue_keeper_indices, self.cpu_blue_keeper_policy),
-                (self.blue_field_indices, self.cpu_blue_field_policy),
-                (self.red_keeper_indices, self.cpu_red_keeper_policy),
-                (self.red_field_indices, self.cpu_red_field_policy),
-            ]
-            for indices, policy in groups:
-                cnt = len(indices)
-                g_obs = obs_t[:, indices, :].reshape(-1, OBS_DIM)
-                g_cen = (
-                    cen_t[:, indices, :].reshape(-1, CENTRAL_STATE_DIM)
-                    if cen_t is not None
-                    else None
+        outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
+        for indices, policy in self._rollout_groups():
+            rows = slice(indices[0], indices[-1] + 1) if indices[-1] - indices[0] + 1 == len(indices) else indices
+            g_obs = obs_t[:, rows, :].reshape(-1, OBS_DIM)
+            g_cen = cen_t[:, rows, :].reshape(-1, CENTRAL_STATE_DIM) if cen_t is not None else None
+            outputs.append(
+                (
+                    indices,
+                    policy.sample_action_and_value(
+                        g_obs, central_state=g_cen, deterministic=deterministic, return_mean=with_means
+                    ),
                 )
-                g_act, g_logp, _, g_val, *g_mean = policy.get_action_and_value(
-                    g_obs, deterministic=deterministic, central_state=g_cen, return_mean=with_means
-                )
-                if with_means:
-                    means[:, indices, :] = g_mean[0].view(self.num_envs, cnt, ACTION_DIM)
-                actions[:, indices, :] = g_act.view(self.num_envs, cnt, ACTION_DIM)
-                logprobs[:, indices] = g_logp.view(self.num_envs, cnt)
-                values[:, indices] = g_val.view(self.num_envs, cnt)
+            )
 
-        result = (
-            actions.cpu().numpy(),
-            logprobs.cpu().numpy(),
-            values.cpu().numpy(),
-        )
-        if with_means:
-            return result + (means.cpu().numpy(),)
-        return result
+        covers_agents_in_order = [i for indices, _ in outputs for i in indices] == list(range(self.num_agents))
+        results: List[np.ndarray] = []
+        for field in range(4 if with_means else 3):
+            per_agent_dim = ACTION_DIM if field in (0, 3) else None
+            if covers_agents_in_order:
+                parts = [
+                    out[field].view(n, len(indices), ACTION_DIM)
+                    if per_agent_dim
+                    else out[field].view(n, len(indices))
+                    for indices, out in outputs
+                ]
+                results.append(torch.cat(parts, dim=1).numpy())
+            else:
+                shape = (n, self.num_agents, ACTION_DIM) if per_agent_dim else (n, self.num_agents)
+                merged = torch.zeros(shape, dtype=torch.float32, device=self.inference_device)
+                for indices, out in outputs:
+                    merged[:, indices] = out[field].view(n, len(indices), *shape[2:])
+                results.append(merged.numpy())
+        return tuple(results)
 
     @torch.no_grad()
     def _compute_values(
@@ -540,8 +561,27 @@ class ParameterSharingPPOTrainer:
                 )
         return values
 
+    def _rollout_thread_count(self) -> int:
+        """Intra-op threads for rollout inference: leave a core to each environment worker.
+
+        Idle OpenMP threads spin for a while after every operation; with more of them than spare cores they slow
+        the environment workers down. Selection output does not depend on the thread count.
+        """
+        current = torch.get_num_threads()
+        if self.num_envs <= 1:
+            return current
+        return max(1, min(current, (os.cpu_count() or 1) - self.num_envs - 1))
+
     def collect_rollouts(self, active_generation: int) -> Dict[str, Any]:
         """Collect `self.rollout_steps` across all parallel environments and compute per-agent GAE."""
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(self._rollout_thread_count())
+        try:
+            return self._collect_rollouts(active_generation)
+        finally:
+            torch.set_num_threads(previous_threads)
+
+    def _collect_rollouts(self, active_generation: int) -> Dict[str, Any]:
         T = self.rollout_steps
         N = self.num_envs
 
