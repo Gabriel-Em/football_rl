@@ -314,7 +314,7 @@ def test_observation_and_critic_bounds_invariant() -> None:
     obs_dict, _ = env.reset(seed=92)
 
     for agent, obs in obs_dict.items():
-        assert obs.shape == (76,)
+        assert obs.shape == (82,)
         assert not np.isnan(obs).any()
         assert not np.isinf(obs).any()
         assert np.all(obs >= -1.0)

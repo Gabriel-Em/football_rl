@@ -32,6 +32,7 @@ from football_rl.config import (
     TEAM_B_AGENTS,
 )
 from football_rl.potentials import (
+    _POST_KICK_WINDOW,
     ROLE_GK,
     ROLE_LABELS,
     PotentialResult,
@@ -342,6 +343,21 @@ class FootballParallelEnv(ParallelEnv):
         self._inv_max_rel_vel: float = 1.0 / (
             float(self.cfg.physics.ball_max_launch_speed) + float(self.cfg.physics.player_max_speed)
         )
+        vis_cfg = self.cfg.vision
+        self._match_state_col: int = (
+            vis_cfg.self_feature_dim + vis_cfg.num_entity_slots * vis_cfg.entity_feature_dim
+        )
+        self._inv_max_rl_steps: float = 1.0 / float(self.cfg.physics.max_rl_steps)
+        self._inv_post_kick_window: float = 1.0 / float(_POST_KICK_WINDOW)
+        self._turnover_cooldown: float = float(
+            getattr(self.cfg.mechanics, "turnover_reward_cooldown", 1.0)
+        )
+        self._inv_turnover_cooldown: float = 1.0 / max(1e-6, self._turnover_cooldown)
+        # possession_owner column per owning team: +1/-1 for holder or in-flight kick, +0.5/-0.5 for loose ball
+        self._possession_owner_rows: np.ndarray = np.array(
+            [[1.0] * 6 + [-1.0] * 6, [-1.0] * 6 + [1.0] * 6], dtype=np.float32
+        )
+        self._loose_owner_rows: np.ndarray = 0.5 * self._possession_owner_rows
 
         # Spaces
         self._obs_space = spaces.Box(
@@ -2780,10 +2796,10 @@ class FootballParallelEnv(ParallelEnv):
         )
 
     # ==========================================================================
-    # Team-Canonical Observation Builder (76 Floats, Vectorized Across 12 Agents)
+    # Team-Canonical Observation Builder (82 Floats, Vectorized Across 12 Agents)
     # ==========================================================================
     def _get_observations_array(self) -> np.ndarray:
-        """Compute the (12, 76) normalized observation matrix for all 12 agents simultaneously."""
+        """Compute the (12, 82) normalized observation matrix for all 12 agents simultaneously."""
         phys = self.cfg.physics
         mech = self.cfg.mechanics
         vis = self.cfg.vision
@@ -2978,7 +2994,8 @@ class FootballParallelEnv(ParallelEnv):
         if holder is not None:
             vis_p = np.where(self._entity_slot_matrix == holder, 1.0, vis_p)
 
-        ent_view = obs[:, vis.self_feature_dim :].reshape(
+        m0 = self._match_state_col
+        ent_view = obs[:, vis.self_feature_dim : m0].reshape(
             self.num_players, vis.num_entity_slots, vis.entity_feature_dim
         )
         ent_view[:, 0, 0] = ball_vis
@@ -2988,11 +3005,37 @@ class FootballParallelEnv(ParallelEnv):
         ent_view[:, :, 3] = (ent_vel[:, :, 0] - svx[:, None]) * self._inv_max_rel_vel
         ent_view[:, :, 4] = (ent_vel[:, :, 1] - svy[:, None]) * self._inv_max_rel_vel
 
+        # Part C: Match State (indices 76..81)
+        # [76] possession owner: +1/-1 when held or kick in flight, +0.5/-0.5 when loose after touch, 0 if none
+        in_flight = self.ball_kicked_in_flight
+        if holder is not None:
+            obs[:, m0] = self._possession_owner_rows[int(self.player_team[holder])]
+        elif self.last_ball_team is not None:
+            rows = self._possession_owner_rows if in_flight else self._loose_owner_rows
+            obs[:, m0] = rows[int(self.last_ball_team)]
+        # [77] ball in flight after a kick
+        if in_flight:
+            obs[:, m0 + 1] = 1.0
+        # [78] fraction of the match remaining
+        obs[:, m0 + 2] = max(0.0, 1.0 - self.rl_step_count * self._inv_max_rl_steps)
+        # [79] second half
+        if self.current_half == 2:
+            obs[:, m0 + 3] = 1.0
+        # [80] post-kick PBRS timer / 0.50 s (strictly mirrors PotentialState.post_kick_timer)
+        pk_timer = self.post_kick_pbrs_timer
+        if np.count_nonzero(pk_timer):
+            for i in pk_timer.nonzero()[0]:
+                obs[i, m0 + 4] = pk_timer[i] * self._inv_post_kick_window
+        # [81] global turnover-reward cooldown remaining / turnover_reward_cooldown
+        to_rem = self._turnover_cooldown - (self.match_time - self.last_turnover_reward_time)
+        if to_rem > 0.0:
+            obs[:, m0 + 5] = to_rem * self._inv_turnover_cooldown
+
         np.clip(obs, -1.0, 1.0, out=obs)
         return obs
 
     def _get_observations(self) -> Dict[str, np.ndarray]:
-        """Compute the 76-float normalized observation dictionary for all 12 agents."""
+        """Compute the 82-float normalized observation dictionary for all 12 agents."""
         obs = self._get_observations_array()
         return {
             agent_name: obs[idx]
@@ -3008,7 +3051,7 @@ class FootballParallelEnv(ParallelEnv):
         c_ball_pos: Optional[np.ndarray] = None,
         c_ball_vel: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Return the 76-float canonical observation for player `idx`."""
+        """Return the 82-float canonical observation for player `idx`."""
         return self._get_observations_array()[idx]
 
     @property

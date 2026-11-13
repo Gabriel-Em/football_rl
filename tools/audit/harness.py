@@ -164,13 +164,14 @@ class TeamPolicy:
     """A team's shared field and keeper networks with batched forward passes."""
 
     def __init__(self, directory: str, prefix: str) -> None:
-        from football_rl.train_ppo import ActorCritic
+        from football_rl.train_ppo import ActorCritic, adapt_policy_weights
 
         base = Path(directory)
         self.heads = []
         for pattern, slot in ((POLICY_FILES[1], slice(0, 1)), (POLICY_FILES[0], slice(1, 6))):
             net = ActorCritic()
-            net.load_state_dict(torch.load(base / pattern.format(prefix=prefix), map_location="cpu", weights_only=True))
+            weights = torch.load(base / pattern.format(prefix=prefix), map_location="cpu", weights_only=True)
+            net.load_state_dict(adapt_policy_weights(weights, net.obs_dim, net.central_state_dim))
             net.eval()
             for p in net.parameters():
                 p.requires_grad_(False)
@@ -250,9 +251,11 @@ def _alloc(steps: int, with_obs: bool, with_breakdown: bool) -> Dict[str, np.nda
         shapes.update({"bd": ((12, 5), f32), "role": ((12,), i8), "phi": ((12,), f32)})
     out = {k: np.zeros((steps,) + shp, dt) for k, (shp, dt) in shapes.items()}
     if with_obs:
+        from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
+
         n_obs = (steps + OBS_STRIDE - 1) // OBS_STRIDE
-        out["obs_s"] = np.zeros((n_obs, 12, 76), f32)
-        out["cen_s"] = np.zeros((n_obs, 12, 54), f32)
+        out["obs_s"] = np.zeros((n_obs, 12, OBS_DIM), f32)
+        out["cen_s"] = np.zeros((n_obs, 12, CENTRAL_STATE_DIM), f32)
     return out
 
 

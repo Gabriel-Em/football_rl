@@ -16,7 +16,7 @@ import torch
 
 from football_rl.config import ALL_AGENTS, CENTRAL_STATE_DIM, DEFAULT_CONFIG, ACTION_DIM, OBS_DIM
 from football_rl.env import FootballParallelEnv, _fast_clip
-from football_rl.train_ppo import ParameterSharingPPOTrainer
+from football_rl.train_ppo import ActorCritic, ParameterSharingPPOTrainer
 from football_rl.vec_env import (
     DummyVecFootballEnv,
     SubprocVecFootballEnv,
@@ -322,6 +322,7 @@ ROLLOUT_ORACLE_STEPS = 270
 ROLLOUT_ORACLE_BLOCK = 30
 ROLLOUT_ORACLE_BUFFERS = ("obs", "central_state", "actions", "logprobs", "values", "rewards", "dones")
 ROLLOUT_DIGEST_FILE = Path(__file__).parent / "golden" / "rollout_digests.json"
+ROLLOUT_ORACLE_OBS_DIM = 76  # observation columns the stored digests cover
 
 
 def _oracle_config(variant: str, replay_dir: Path):
@@ -336,8 +337,22 @@ def _oracle_config(variant: str, replay_dir: Path):
     )
 
 
+def _load_oracle_networks(trainer: ParameterSharingPPOTrainer) -> None:
+    """Load the recorded networks: the seed-7 initialisation of 76-input policies, zero-padded by the adapted loader.
+
+    The trainer seeds torch and then builds its four policies in this order, so repeating that with 76-input
+    networks reproduces the recorded weights and leaves torch's RNG where the recorded rollouts began sampling.
+    """
+    torch.manual_seed(trainer.seed)
+    for policy in (
+        trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy
+    ):
+        trainer._load_adapted_weights(policy, ActorCritic(obs_dim=ROLLOUT_ORACLE_OBS_DIM).state_dict())
+
+
 def collect_oracle_rollout(variant: str, workdir: Path) -> dict[str, np.ndarray]:
-    """Seeded 8-env, 270-step `collect_rollouts` on CPU; returns the seven rollout buffers (dones as `(T, N, 12)`)."""
+    """Seeded 8-env, 270-step `collect_rollouts` on CPU with the recorded networks; returns the seven rollout
+    buffers (dones as `(T, N, 12)`, observations cut to their first `ROLLOUT_ORACLE_OBS_DIM` columns)."""
     trainer = ParameterSharingPPOTrainer(
         config=_oracle_config(variant, workdir / "replays"),
         num_envs=8,
@@ -346,6 +361,7 @@ def collect_oracle_rollout(variant: str, workdir: Path) -> dict[str, np.ndarray]
         checkpoint_dir=str(workdir / "ckpt"),
         seed=7,
     )
+    _load_oracle_networks(trainer)
     dones: list[np.ndarray] = []
     inner = trainer.vec_env.step_array
 
@@ -360,6 +376,8 @@ def collect_oracle_rollout(variant: str, workdir: Path) -> dict[str, np.ndarray]
     finally:
         trainer.close()
     buffers = {name: np.array(rollout[name]) for name in ROLLOUT_ORACLE_BUFFERS if name != "dones"}
+    assert buffers["obs"].shape[-1] == OBS_DIM
+    buffers["obs"] = buffers["obs"][..., :ROLLOUT_ORACLE_OBS_DIM]
     buffers["dones"] = np.repeat(np.stack(dones)[:, :, None], 12, axis=2)
     return buffers
 

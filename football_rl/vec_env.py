@@ -314,7 +314,7 @@ class SubprocVecFootballEnv:
         options_list: Optional[List[Optional[Dict[str, Any]]]] = None,
         env_indices: Optional[List[int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Reset environments and return contiguous (K, 12, 76) obs and (K, 12, 54) central state arrays."""
+        """Reset environments and return contiguous (K, 12, OBS_DIM) obs and (K, 12, CENTRAL_STATE_DIM) central state arrays."""
         if env_indices is None:
             env_indices = list(range(self.num_envs))
         if seeds is None:
@@ -591,8 +591,8 @@ class DummyVecFootballEnv:
             options_list = [None] * len(env_indices)
 
         k = len(env_indices)
-        obs_batch = np.empty((k, 12, 76), dtype=np.float32)
-        central_batch = np.empty((k, 12, 54), dtype=np.float32)
+        obs_batch = np.empty((k, 12, OBS_DIM), dtype=np.float32)
+        central_batch = np.empty((k, 12, CENTRAL_STATE_DIM), dtype=np.float32)
         for out_i, (idx, seed, options) in enumerate(zip(env_indices, seeds, options_list)):
             self.envs[idx].reset(seed=seed, options=options)
             obs_batch[out_i] = self.envs[idx]._get_observations_array()
@@ -620,8 +620,8 @@ class DummyVecFootballEnv:
         np.ndarray,
         List[Optional[Dict[str, Any]]],
     ]:
-        obs_batch = np.empty((self.num_envs, 12, 76), dtype=np.float32)
-        central_batch = np.empty((self.num_envs, 12, 54), dtype=np.float32)
+        obs_batch = np.empty((self.num_envs, 12, OBS_DIM), dtype=np.float32)
+        central_batch = np.empty((self.num_envs, 12, CENTRAL_STATE_DIM), dtype=np.float32)
         rew_batch = np.empty((self.num_envs, 12), dtype=np.float32)
         done_batch = np.empty(self.num_envs, dtype=bool)
         ep_summaries: List[Optional[Dict[str, Any]]] = [None] * self.num_envs

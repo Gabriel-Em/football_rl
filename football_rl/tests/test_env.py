@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import copy
 import hashlib
 import json
 import math
@@ -77,7 +78,7 @@ def test_canonical_observation_symmetry_and_halftime_switch() -> None:
     obs_a_start, _ = env.reset(seed=42, options={"kickoff_team": TEAM_A})
     assert len(env.agents) == 12
     assert obs_a_start["a_atk_1"].shape == (OBS_DIM,)
-    assert OBS_DIM == 76
+    assert OBS_DIM == 82
 
     # Reset with Team B starting at kickoff in 1st half -> Team B is on Right, Team A on Left
     obs_b_start, _ = env.reset(seed=42, options={"kickoff_team": TEAM_B})
@@ -113,7 +114,12 @@ def test_canonical_observation_symmetry_and_halftime_switch() -> None:
     # Team A's keeper should now stand at (1355, 420) and Team B's keeper at (45, 420)
     np.testing.assert_allclose(env.player_pos[env.agent_to_idx["a_keeper"]], [1355.0, 420.0])
     np.testing.assert_allclose(env.player_pos[env.agent_to_idx["b_keeper"]], [45.0, 420.0])
-    np.testing.assert_allclose(obs_ht["b_atk_1"], obs_a_start["a_atk_1"], atol=1e-6)
+    # Same canonical view as the first-half kickoff, except the clock columns (78 time remaining, 79 half).
+    np.testing.assert_allclose(
+        np.delete(obs_ht["b_atk_1"], [78, 79]), np.delete(obs_a_start["a_atk_1"], [78, 79]), atol=1e-6
+    )
+    assert obs_a_start["a_atk_1"][78] == 1.0 and obs_a_start["a_atk_1"][79] == 0.0
+    assert obs_ht["b_atk_1"][78] == pytest.approx(0.5, abs=1e-6) and obs_ht["b_atk_1"][79] == 1.0
 
 
 def test_ball_friction_and_anti_wall_self_pass_cooldown() -> None:
@@ -905,7 +911,7 @@ def test_competitive_interest_score_discounts_blowouts() -> None:
 
 
 def test_observation_dimension_parity_and_vision_normalization() -> None:
-    """Verify 76-dim obs parity and entity relative angle normalization under 210-deg vision cone."""
+    """Verify 82-dim obs parity and entity relative angle normalization under 210-deg vision cone."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
     obs_dict, _ = env.reset(seed=42)
 
@@ -913,8 +919,8 @@ def test_observation_dimension_parity_and_vision_normalization() -> None:
     assert env.cfg.vision.fov_deg == 210.0
     assert math.isclose(env.cfg.vision.half_fov_rad, math.radians(105.0))
     for agent in env.possible_agents:
-        assert env.observation_space(agent).shape == (76,)
-        assert obs_dict[agent].shape == (76,)
+        assert env.observation_space(agent).shape == (82,)
+        assert obs_dict[agent].shape == (82,)
 
     # 2. Vision angle normalization strictly bounded in [-1.0, 1.0] across all entity slots
     for _ in range(50):
@@ -3143,7 +3149,7 @@ def test_pocket_ema_smoothing_and_obs_encoding() -> None:
     obs, _ = env.reset(seed=106)
 
     for agent_name in ALL_AGENTS:
-        assert obs[agent_name].shape == (76,), f"Expected obs shape (76,), got {obs[agent_name].shape}"
+        assert obs[agent_name].shape == (82,), f"Expected obs shape (82,), got {obs[agent_name].shape}"
 
     car_idx = env.agent_to_idx["a_atk_1"]
     env.ball_holder = car_idx
@@ -3444,7 +3450,7 @@ def test_multiepisodic_rollout_halftime_goals_foul_smoke() -> None:
 
         assert len(obs) == 12
         for agent_name, agent_obs in obs.items():
-            assert agent_obs.shape == (76,)
+            assert agent_obs.shape == (82,)
             assert not np.isnan(agent_obs).any(), f"NaN in obs for {agent_name} at step {step_i}"
             assert not np.isinf(agent_obs).any(), f"Inf in obs for {agent_name} at step {step_i}"
 
@@ -4267,7 +4273,7 @@ GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER = "e726782a53270dbbc008e1912e551635033b
 
 
 def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False, rewards=None) -> str:
-    """SHA-256 over observations, rewards, kinematics and possession of a seeded random-action rollout."""
+    """SHA-256 over observation columns 0..75, rewards, kinematics and possession of a seeded random-action rollout."""
     cfg = replace(
         DEFAULT_CONFIG if rewards is None else replace(DEFAULT_CONFIG, rewards=rewards),
         replay=replace(
@@ -4282,7 +4288,7 @@ def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False, rew
     h = hashlib.sha256()
     for k in range(steps):
         obs, central, rew, done, _ = env.step_array(acts[k])
-        for arr in (obs, central, rew, env.player_pos, env.player_vel, env.ball_pos):
+        for arr in (obs[:, :76], central, rew, env.player_pos, env.player_vel, env.ball_pos):
             h.update(np.ascontiguousarray(arr).tobytes())
         h.update(str(env.ball_holder).encode())
         if done:
@@ -4809,3 +4815,323 @@ def test_uniform_capture_survives_the_next_reset_and_is_independent_of_best_only
     env.reset(seed=6, options={"generation": 13, "match_id": 35})
     path = env.export_uniform_replay()
     assert path is not None and "gen0012" in Path(path).name
+
+
+# ---------------------------------------------------------------------------
+# Match-state observation features (columns 76..81)
+# ---------------------------------------------------------------------------
+POSSESSION_OWNER, BALL_IN_FLIGHT, TIME_REMAINING, HALF, OWN_KICK_LOCKOUT, TURNOVER_COOLDOWN = (
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+)
+TEAM_A_OWNS = [1.0] * 6 + [-1.0] * 6
+TEAM_B_OWNS = [-1.0] * 6 + [1.0] * 6
+TEAM_A_LOOSE_OWNS = [0.5] * 6 + [-0.5] * 6
+TEAM_B_LOOSE_OWNS = [-0.5] * 6 + [0.5] * 6
+A_ATK, B_ATK = 5, 11
+STAND_STILL = np.zeros((12, 4))
+
+
+def _kickoff_env(kickoff_team: int = TEAM_A) -> FootballParallelEnv:
+    env = FootballParallelEnv(
+        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    )
+    env.reset(seed=0, options={"kickoff_team": kickoff_team})
+    return env
+
+
+def _soft_kick(env: FootballParallelEnv, kicker: int) -> None:
+    """Release a minimum-power (160 u/s) straight kick along the kicker's facing."""
+    env._execute_kick(kicker, kick_power=0.35, step_rewards=np.zeros(env.num_players))
+
+
+def test_possession_owner_marks_the_kicking_team_for_the_whole_flight() -> None:
+    env = _kickoff_env()
+    obs = env._get_observations_array()
+    assert env.ball_holder == A_ATK
+    np.testing.assert_array_equal(obs[:, POSSESSION_OWNER], TEAM_A_OWNS)
+    np.testing.assert_array_equal(obs[:, BALL_IN_FLIGHT], np.zeros(12))
+
+    env.player_angle[A_ATK] = 0.0
+    _soft_kick(env, A_ATK)
+    obs = env._get_observations_array()
+    flight_steps = 0
+    while env.ball_kicked_in_flight:
+        assert env.ball_holder is None
+        np.testing.assert_array_equal(obs[:, POSSESSION_OWNER], TEAM_A_OWNS)
+        np.testing.assert_array_equal(obs[:, BALL_IN_FLIGHT], np.ones(12))
+        obs = env.step_array(STAND_STILL)[0]
+        flight_steps += 1
+    # 160 u/s falls below the 25 u/s flight floor after (160 - 25) / (155 / 60) = 52.3 -> 53 frames = RL step 14.
+    assert flight_steps == 14
+    assert env.ball_holder is None and env.last_ball_team == TEAM_A
+    np.testing.assert_array_equal(obs[:, POSSESSION_OWNER], TEAM_A_LOOSE_OWNS)
+    np.testing.assert_array_equal(obs[:, BALL_IN_FLIGHT], np.zeros(12))
+
+    env.last_ball_team = None
+    np.testing.assert_array_equal(env._get_observations_array()[:, POSSESSION_OWNER], np.zeros(12))
+
+
+def test_possession_owner_flips_when_an_opponent_intercepts() -> None:
+    env = _kickoff_env()
+    env.player_angle[A_ATK] = 0.0
+    env.player_pos[B_ATK] = [790.0, 420.0]  # on the kick line, 66 u ahead of the release point (724, 420)
+    env.player_vel[B_ATK] = 0.0
+    _soft_kick(env, A_ATK)
+    owners = []
+    for _ in range(10):
+        obs = env.step_array(STAND_STILL)[0]
+        owners.append(obs[:, POSSESSION_OWNER].tolist())
+        if env.ball_holder is not None:
+            break
+    assert env.ball_holder == B_ATK
+    assert len(owners) >= 2 and all(o == TEAM_A_OWNS for o in owners[:-1])
+    np.testing.assert_array_equal(obs[:, POSSESSION_OWNER], TEAM_B_OWNS)
+    np.testing.assert_array_equal(obs[:, BALL_IN_FLIGHT], np.zeros(12))
+
+
+def test_own_kick_lockout_decays_for_the_kicker_only() -> None:
+    env = _kickoff_env()
+    env.pickup_cooldown[8] = 0.3  # a pickup lockout that does not come from a kick
+    _soft_kick(env, A_ATK)
+    # 0.50 s post_kick_pbrs_timer minus 4/60 s per RL step, divided by 0.50 s.
+    expected = [max(0.0, (0.50 - k * 4.0 / 60.0) / 0.50) for k in range(9)]
+    obs = env._get_observations_array()
+    for k, want in enumerate(expected):
+        if k:
+            obs = env.step_array(STAND_STILL)[0]
+        assert obs[A_ATK, OWN_KICK_LOCKOUT] == pytest.approx(want, abs=1e-6), f"after {k} steps"
+        others = np.delete(obs[:, OWN_KICK_LOCKOUT], A_ATK)
+        np.testing.assert_array_equal(others, np.zeros(11))
+
+    # Clearing pickup/kick_cooldown via a teammate touch does not clear post_kick_pbrs_timer.
+    env.post_kick_pbrs_timer[A_ATK] = 0.25
+    env.kick_cooldown_active[A_ATK] = False
+    env.pickup_cooldown[A_ATK] = 0.0
+    assert env._get_observations_array()[A_ATK, OWN_KICK_LOCKOUT] == pytest.approx(0.5, abs=1e-6)
+
+    # Non-kick pickup_cooldown does not leak into own_kick_lockout; post_kick_pbrs_timer > 0.5 saturates at 1.
+    env.post_kick_pbrs_timer[A_ATK] = 0.0
+    env.pickup_cooldown[A_ATK] = 0.9
+    assert env._get_observations_array()[A_ATK, OWN_KICK_LOCKOUT] == 0.0
+    env.post_kick_pbrs_timer[A_ATK] = 0.9
+    assert env._get_observations_array()[A_ATK, OWN_KICK_LOCKOUT] == 1.0
+
+
+def test_time_remaining_and_half_follow_the_match_clock() -> None:
+    env = _kickoff_env()
+    obs = env._get_observations_array()
+    np.testing.assert_array_equal(obs[:, TIME_REMAINING], np.ones(12))
+    np.testing.assert_array_equal(obs[:, HALF], np.zeros(12))
+
+    for _ in range(27):
+        obs = env.step_array(STAND_STILL)[0]
+    np.testing.assert_allclose(obs[:, TIME_REMAINING], 0.99, atol=1e-6)
+    np.testing.assert_array_equal(obs[:, HALF], np.zeros(12))
+
+    env.rl_step_count = 1349
+    env.physics_frame_count = 1349 * 4
+    obs = env.step_array(STAND_STILL)[0]  # frame 5400: half-time
+    assert env.current_half == 2
+    np.testing.assert_allclose(obs[:, TIME_REMAINING], 0.5, atol=1e-6)
+    np.testing.assert_array_equal(obs[:, HALF], np.ones(12))
+
+    env.rl_step_count = 2025
+    np.testing.assert_allclose(env._get_observations_array()[:, TIME_REMAINING], 0.25, atol=1e-6)
+
+    env.rl_step_count = 2699
+    env.physics_frame_count = 2699 * 4
+    obs, _, _, done, _ = env.step_array(STAND_STILL)
+    assert done
+    np.testing.assert_array_equal(obs[:, TIME_REMAINING], np.zeros(12))
+    np.testing.assert_array_equal(obs[:, HALF], np.ones(12))
+
+    env.rl_step_count = 2701  # past full time the clock feature stays at 0
+    np.testing.assert_array_equal(env._get_observations_array()[:, TIME_REMAINING], np.zeros(12))
+
+
+def test_swapping_the_flight_team_label_flips_only_possession_owner() -> None:
+    env = _kickoff_env()
+    _soft_kick(env, A_ATK)
+    for _ in range(3):
+        env.step_array(STAND_STILL)
+    assert env.ball_kicked_in_flight and env.last_ball_team == TEAM_A
+    obs_a = env._get_observations_array().copy()
+    env.last_ball_team = TEAM_B
+    obs_b = env._get_observations_array()
+
+    np.testing.assert_array_equal(obs_a[:, POSSESSION_OWNER], TEAM_A_OWNS)
+    np.testing.assert_array_equal(obs_b[:, POSSESSION_OWNER], TEAM_B_OWNS)
+    np.testing.assert_array_equal(
+        np.delete(obs_b, POSSESSION_OWNER, axis=1), np.delete(obs_a, POSSESSION_OWNER, axis=1)
+    )
+
+    env.ball_kicked_in_flight = False
+    env.last_ball_team = TEAM_A
+    obs_loose_a = env._get_observations_array().copy()
+    env.last_ball_team = TEAM_B
+    obs_loose_b = env._get_observations_array()
+    np.testing.assert_array_equal(obs_loose_a[:, POSSESSION_OWNER], TEAM_A_LOOSE_OWNS)
+    np.testing.assert_array_equal(obs_loose_b[:, POSSESSION_OWNER], TEAM_B_LOOSE_OWNS)
+    np.testing.assert_array_equal(
+        np.delete(obs_loose_b, POSSESSION_OWNER, axis=1), np.delete(obs_loose_a, POSSESSION_OWNER, axis=1)
+    )
+
+
+def test_mirrored_kick_gives_both_teams_the_same_view() -> None:
+    env_a = _kickoff_env(TEAM_A)
+    env_b = _kickoff_env(TEAM_B)
+    _soft_kick(env_a, A_ATK)
+    _soft_kick(env_b, B_ATK)
+    for _ in range(3):
+        obs_a = env_a.step_array(STAND_STILL)[0]
+        obs_b = env_b.step_array(STAND_STILL)[0]
+    assert env_a.ball_kicked_in_flight and env_b.ball_kicked_in_flight
+
+    np.testing.assert_array_equal(obs_a[:, POSSESSION_OWNER], TEAM_A_OWNS)
+    np.testing.assert_array_equal(obs_b[:, POSSESSION_OWNER], TEAM_B_OWNS)
+    assert obs_a[A_ATK, OWN_KICK_LOCKOUT] > 0.0 and obs_b[B_ATK, OWN_KICK_LOCKOUT] > 0.0
+    # Same 180-degree canonical tolerance as the kickoff symmetry test.
+    np.testing.assert_allclose(obs_a[:6], obs_b[6:], atol=1e-6)
+    np.testing.assert_allclose(obs_a[6:], obs_b[:6], atol=1e-6)
+
+
+def test_last_ball_team_is_observable_while_it_changes_the_reward() -> None:
+    env = _kickoff_env()
+    _soft_kick(env, A_ATK)
+    for _ in range(2):
+        env.step_array(STAND_STILL)
+    twin = copy.deepcopy(env)
+    twin.last_ball_team = TEAM_B
+
+    obs_env = env._get_observations_array()
+    obs_twin = twin._get_observations_array()
+    rew_env = env.step_array(STAND_STILL)[2]
+    rew_twin = twin.step_array(STAND_STILL)[2]
+    assert not np.array_equal(rew_env, rew_twin), "the witness states must differ in reward"
+    assert not np.array_equal(obs_env, obs_twin), "states with different rewards ahead share one observation"
+
+
+def test_dead_loose_ball_last_ball_team_is_observable_while_it_changes_the_reward() -> None:
+    env = _kickoff_env()
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.ball_vel[:] = 0.0
+    env.last_ball_team = TEAM_A
+    env.ball_pos[:] = env.player_pos[B_ATK]
+    env.pickup_cooldown[B_ATK] = 0.0
+    env.last_turnover_reward_time = -999.0
+
+    twin = copy.deepcopy(env)
+    twin.last_ball_team = TEAM_B
+
+    obs_env = env._get_observations_array()
+    obs_twin = twin._get_observations_array()
+    rew_env = env.step_array(STAND_STILL)[2]
+    rew_twin = twin.step_array(STAND_STILL)[2]
+    assert env.ball_holder == B_ATK and twin.ball_holder == B_ATK
+    assert not np.array_equal(rew_env, rew_twin), "turnover reward must differ across last_ball_team"
+    np.testing.assert_array_equal(obs_env[:, POSSESSION_OWNER], TEAM_A_LOOSE_OWNS)
+    np.testing.assert_array_equal(obs_twin[:, POSSESSION_OWNER], TEAM_B_LOOSE_OWNS)
+    assert not np.array_equal(obs_env, obs_twin)
+
+
+def test_post_kick_pbrs_timer_is_observable_while_it_changes_the_reward() -> None:
+    env = _kickoff_env()
+    env.player_angle[A_ATK] = 0.0
+    a_mid_2 = 4
+    env.player_pos[a_mid_2] = [780.0, 420.0]
+    env.player_vel[a_mid_2] = 0.0
+    _soft_kick(env, A_ATK)
+    # Step until a_mid_2 picks up the ball; _on_new_player_touched_ball clears A_ATK's kick_cooldown_active
+    # and pickup_cooldown while post_kick_pbrs_timer[A_ATK] stays > 0.
+    for _ in range(10):
+        env.step_array(STAND_STILL)
+        if env.ball_holder == a_mid_2:
+            break
+    assert env.ball_holder == a_mid_2
+    assert not env.kick_cooldown_active[A_ATK] and env.pickup_cooldown[A_ATK] == 0.0
+    assert env.post_kick_pbrs_timer[A_ATK] > 0.10
+
+    twin = copy.deepcopy(env)
+    twin.post_kick_pbrs_timer[A_ATK] = 0.0
+
+    obs_env = env._get_observations_array()
+    obs_twin = twin._get_observations_array()
+    rew_env = env.step_array(STAND_STILL)[2]
+    rew_twin = twin.step_array(STAND_STILL)[2]
+    assert rew_env[A_ATK] != rew_twin[A_ATK], "post_kick_pbrs_timer must change A_ATK's potential reward"
+    assert obs_env[A_ATK, OWN_KICK_LOCKOUT] > 0.0 and obs_twin[A_ATK, OWN_KICK_LOCKOUT] == 0.0
+    assert not np.array_equal(obs_env, obs_twin)
+
+
+def test_turnover_cooldown_decays_after_a_rewarded_turnover() -> None:
+    env = _kickoff_env()
+    np.testing.assert_array_equal(env._get_observations_array()[:, TURNOVER_COOLDOWN], np.zeros(12))
+
+    # Set up a loose ball owned by TEAM_A right at B_ATK's feet so frame 1 triggers a rewarded turnover.
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.ball_vel[:] = 0.0
+    env.last_ball_team = TEAM_A
+    env.ball_pos[:] = env.player_pos[B_ATK]
+    env.pickup_cooldown[B_ATK] = 0.0
+
+    obs = env.step_array(STAND_STILL)[0]
+    assert env.ball_holder == B_ATK
+    assert env.last_turnover_reward_time == pytest.approx(0.0)
+    # 1 RL step ends at frame 4 (t = 4/60), 4/60 s after frame 0 pickup -> 56/60 remaining, hitting 0 at step 15.
+    for k in range(15):
+        want = max(0.0, 1.0 - 4.0 * (k + 1) / 60.0)
+        np.testing.assert_allclose(obs[:, TURNOVER_COOLDOWN], want, atol=1e-6, err_msg=f"step {k}")
+        obs = env.step_array(STAND_STILL)[0]
+    np.testing.assert_array_equal(obs[:, TURNOVER_COOLDOWN], np.zeros(12))
+
+
+def test_turnover_cooldown_is_observable_while_it_changes_the_reward() -> None:
+    env = _kickoff_env()
+    env.ball_holder = None
+    env.ball_kicked_in_flight = False
+    env.ball_vel[:] = 0.0
+    env.last_ball_team = TEAM_A
+    env.ball_pos[:] = env.player_pos[B_ATK]
+    env.pickup_cooldown[B_ATK] = 0.0
+    env.last_turnover_reward_time = -999.0
+
+    twin = copy.deepcopy(env)
+    twin.last_turnover_reward_time = twin.match_time
+
+    obs_env = env._get_observations_array()
+    obs_twin = twin._get_observations_array()
+    rew_env = env.step_array(STAND_STILL)[2]
+    rew_twin = twin.step_array(STAND_STILL)[2]
+    assert not np.array_equal(rew_env, rew_twin), "turnover cooldown must gate the turnover reward"
+    np.testing.assert_array_equal(obs_env[:, TURNOVER_COOLDOWN], np.zeros(12))
+    np.testing.assert_array_equal(obs_twin[:, TURNOVER_COOLDOWN], np.ones(12))
+    assert not np.array_equal(obs_env, obs_twin)
+
+
+def test_observations_stay_deterministic_and_bounded_across_both_halves() -> None:
+    def play() -> np.ndarray:
+        env = FootballParallelEnv(
+            config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+        )
+        env.reset(seed=21)
+        rng = np.random.default_rng(21)
+        frames = []
+        for start, steps in ((0, 40), (1330, 40), (2670, 30)):
+            env.rl_step_count = start
+            env.physics_frame_count = start * 4
+            for _ in range(steps):
+                frames.append(env.step_array(rng.uniform(-1.0, 1.0, size=(12, 4)))[0].copy())
+        return np.stack(frames)
+
+    first, second = play(), play()
+    assert first.shape == (110, 12, OBS_DIM)
+    np.testing.assert_array_equal(first, second)
+    assert np.isfinite(first).all()
+    assert first.min() >= -1.0 and first.max() <= 1.0

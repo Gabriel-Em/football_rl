@@ -53,8 +53,8 @@ class ActorCritic(nn.Module):
     """Continuous-action Gaussian Actor-Critic network for shared role policies.
 
     Supports CTDE (Centralized Training with Decentralized Execution):
-    - Actor policy network observes decentralized observations (obs_dim = 76).
-    - Critic value network observes augmented centralized state (critic_obs_dim = 130 = 76 + 54).
+    - Actor policy network observes decentralized observations (obs_dim = 82).
+    - Critic value network observes augmented centralized state (critic_obs_dim = 136 = 82 + 54).
     """
 
     def __init__(
@@ -232,6 +232,108 @@ def migrate_team_color_keys(history: Dict[str, Any]) -> Dict[str, Any]:
         migrated["generations"] = swapped
     migrated["team_color_schema"] = TEAM_COLOR_SCHEMA
     return migrated
+
+
+_ACTOR_INPUT_WEIGHT = "actor_mean.0.weight"
+_CRITIC_INPUT_WEIGHT = "critic.0.weight"
+
+
+def _input_column_maps(
+    weights: Dict[str, torch.Tensor], obs_dim: int, central_state_dim: int
+) -> Dict[str, torch.Tensor]:
+    """Destination column of each first-layer input column of a checkpoint in an `obs_dim`-input `ActorCritic`.
+
+    Observation column j stays column j; a critic's central-state block moves to start at column `obs_dim`.
+    Only first layers whose input width differs from the network's are listed. The checkpoint's observation
+    width is its actor's input width, else its critic's width less any central-state block. Raises
+    `ValueError` when the checkpoint observes more columns than the network, or its critic is neither
+    observation-only nor observation plus central state.
+    """
+    actor_w = weights.get(_ACTOR_INPUT_WEIGHT)
+    critic_w = weights.get(_CRITIC_INPUT_WEIGHT)
+    if actor_w is not None:
+        old_obs = int(actor_w.shape[1])
+    elif critic_w is not None:
+        width = int(critic_w.shape[1])
+        old_obs = width if width <= obs_dim else width - central_state_dim
+    else:
+        return {}
+    if old_obs > obs_dim:
+        raise ValueError(f"checkpoint observes {old_obs} columns but the network observes {obs_dim}")
+    obs_cols = torch.arange(old_obs)
+    maps: Dict[str, torch.Tensor] = {}
+    if actor_w is not None and old_obs != obs_dim:
+        maps[_ACTOR_INPUT_WEIGHT] = obs_cols
+    if critic_w is not None:
+        width = int(critic_w.shape[1])
+        if width == old_obs:
+            cols = obs_cols
+        elif width == old_obs + central_state_dim:
+            cols = torch.cat([obs_cols, torch.arange(obs_dim, obs_dim + central_state_dim)])
+        else:
+            raise ValueError(
+                f"critic input width {width} is neither {old_obs} nor {old_obs} + {central_state_dim}"
+            )
+        if width != obs_dim + central_state_dim:
+            maps[_CRITIC_INPUT_WEIGHT] = cols
+    return maps
+
+
+def _scatter_columns(src: torch.Tensor, cols: torch.Tensor, width: int) -> torch.Tensor:
+    """Zero `(rows, width)` tensor holding the columns of `src` at positions `cols`."""
+    out = src.new_zeros((src.shape[0], width))
+    out[:, cols] = src
+    return out
+
+
+def adapt_policy_weights(
+    weights: Dict[str, torch.Tensor],
+    obs_dim: int = OBS_DIM,
+    central_state_dim: int = CENTRAL_STATE_DIM,
+) -> Dict[str, torch.Tensor]:
+    """Return an `ActorCritic` state dict whose first-layer inputs are placed for an `obs_dim`-input network.
+
+    Observation columns the checkpoint lacks (those after its last one) get zero weights, as does the central
+    state of a critic trained on observations only, so the adapted actor and critic compute what the
+    checkpoint computed from the columns it knows. All other tensors are returned as given.
+    """
+    maps = _input_column_maps(weights, obs_dim, central_state_dim)
+    widths = {_ACTOR_INPUT_WEIGHT: obs_dim, _CRITIC_INPUT_WEIGHT: obs_dim + central_state_dim}
+    adapted = dict(weights)
+    for key, cols in maps.items():
+        adapted[key] = _scatter_columns(weights[key], cols, widths[key])
+    return adapted
+
+
+def adapt_optimizer_state(
+    opt_state: Dict[str, Any],
+    policy: ActorCritic,
+    weights: Optional[Dict[str, torch.Tensor]],
+) -> Dict[str, Any]:
+    """Return optimizer `opt_state` for `policy`, widening first-layer moments as `adapt_policy_weights` does.
+
+    `weights` is the policy checkpoint saved with `opt_state`; the optimizer's parameters are `policy.parameters()`
+    in order. Moment tensors shaped like a widened first-layer weight get zeros in the new columns; every other
+    entry is returned as given.
+    """
+    if weights is None:
+        return opt_state
+    maps = _input_column_maps(weights, policy.obs_dim, policy.central_state_dim)
+    if not maps:
+        return opt_state
+    widths = {_ACTOR_INPUT_WEIGHT: policy.obs_dim, _CRITIC_INPUT_WEIGHT: policy.obs_dim + policy.central_state_dim}
+    names = [name for name, _ in policy.named_parameters()]
+    ids = [pid for group in opt_state["param_groups"] for pid in group["params"]]
+    state = dict(opt_state["state"])
+    for pid, name in zip(ids, names):
+        if name not in maps or pid not in state:
+            continue
+        old_shape = weights[name].shape
+        state[pid] = {
+            k: _scatter_columns(v, maps[name], widths[name]) if torch.is_tensor(v) and v.shape == old_shape else v
+            for k, v in state[pid].items()
+        }
+    return {**opt_state, "state": state}
 
 
 class ParameterSharingPPOTrainer:
@@ -469,7 +571,8 @@ class ParameterSharingPPOTrainer:
         outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
         for indices, policy in self._rollout_groups():
             rows = slice(indices[0], indices[-1] + 1) if indices[-1] - indices[0] + 1 == len(indices) else indices
-            g_obs = obs_t[:, rows, :].reshape(-1, OBS_DIM)
+            # Contiguous rows: the CPU matmul's summation order depends on the input row stride.
+            g_obs = obs_t[:, rows, :].reshape(-1, OBS_DIM).contiguous()
             g_cen = cen_t[:, rows, :].reshape(-1, CENTRAL_STATE_DIM) if cen_t is not None else None
             outputs.append(
                 (
@@ -1215,20 +1318,10 @@ class ParameterSharingPPOTrainer:
         return summary_path
 
     def _load_adapted_weights(self, policy: ActorCritic, weights: Dict[str, torch.Tensor]) -> None:
-        """Load state dict into ActorCritic, adapting 76-dim critic weights to 130-dim if needed."""
-        target_dict = policy.state_dict()
-        adapted = {}
-        for k, v in weights.items():
-            if k == "critic.0.weight" and v.shape != target_dict[k].shape:
-                # If old critic was trained on obs_dim (76), pad extra central_state_dim (54) columns with 0
-                new_w = target_dict[k].clone()
-                old_in_dim = v.shape[1]
-                new_w[:, :old_in_dim] = v
-                new_w[:, old_in_dim:] = 0.0
-                adapted[k] = new_w
-            else:
-                adapted[k] = v
-        policy.load_state_dict(adapted, strict=False)
+        """Load a state dict into `policy`, zero-padding narrower first-layer inputs (`adapt_policy_weights`)."""
+        policy.load_state_dict(
+            adapt_policy_weights(weights, policy.obs_dim, policy.central_state_dim), strict=False
+        )
 
     def load_checkpoints(self) -> bool:
         """Load Red and Blue policies, optimizers, and cumulative generation/match state."""
@@ -1270,35 +1363,47 @@ class ParameterSharingPPOTrainer:
 
             if "blue_field_optimizer" in state:
                 try:
-                    self.blue_field_optimizer.load_state_dict(state["blue_field_optimizer"])
+                    self.blue_field_optimizer.load_state_dict(
+                        adapt_optimizer_state(state["blue_field_optimizer"], self.blue_field_policy, blue_f_weights)
+                    )
                 except Exception:
                     pass
             elif "field_optimizer" in state:
                 try:
-                    self.blue_field_optimizer.load_state_dict(state["field_optimizer"])
+                    self.blue_field_optimizer.load_state_dict(
+                        adapt_optimizer_state(state["field_optimizer"], self.blue_field_policy, blue_f_weights)
+                    )
                 except Exception:
                     pass
 
             if "blue_keeper_optimizer" in state:
                 try:
-                    self.blue_keeper_optimizer.load_state_dict(state["blue_keeper_optimizer"])
+                    self.blue_keeper_optimizer.load_state_dict(
+                        adapt_optimizer_state(state["blue_keeper_optimizer"], self.blue_keeper_policy, blue_k_weights)
+                    )
                 except Exception:
                     pass
             elif "keeper_optimizer" in state:
                 try:
-                    self.blue_keeper_optimizer.load_state_dict(state["keeper_optimizer"])
+                    self.blue_keeper_optimizer.load_state_dict(
+                        adapt_optimizer_state(state["keeper_optimizer"], self.blue_keeper_policy, blue_k_weights)
+                    )
                 except Exception:
                     pass
 
             if self.separate_teams:
                 if "red_field_optimizer" in state:
                     try:
-                        self.red_field_optimizer.load_state_dict(state["red_field_optimizer"])
+                        self.red_field_optimizer.load_state_dict(
+                            adapt_optimizer_state(state["red_field_optimizer"], self.red_field_policy, red_f_weights)
+                        )
                     except Exception:
                         pass
                 if "red_keeper_optimizer" in state:
                     try:
-                        self.red_keeper_optimizer.load_state_dict(state["red_keeper_optimizer"])
+                        self.red_keeper_optimizer.load_state_dict(
+                            adapt_optimizer_state(state["red_keeper_optimizer"], self.red_keeper_policy, red_k_weights)
+                        )
                     except Exception:
                         pass
 

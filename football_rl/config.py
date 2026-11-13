@@ -202,7 +202,7 @@ class VisionConfig:
     self_feature_dim: int = 16  # indices 0..12 + indices 13..15 one-hot [is_def, is_mid, is_atk]
     num_entity_slots: int = 12  # Slot 0: Ball, Slots 1..5: Teammates, Slots 6..10: Field Opps, Slot 11: Enemy Keeper
     entity_feature_dim: int = 5
-    obs_dim: int = 76          # 16 + (12 * 5) = 76 floats
+    obs_dim: int = 82          # 16 + (12 * 5) + 6 match-state floats (possession, flight, time, half, post-kick timer, turnover cooldown)
     action_dim: int = 4
     critic_vel_norm: float = 340.0  # Velocity normalization denominator for centralized critic state
 
@@ -366,7 +366,7 @@ MAX_RL_STEPS: int = DEFAULT_CONFIG.physics.max_rl_steps
 OBS_DIM: int = DEFAULT_CONFIG.vision.obs_dim
 ACTION_DIM: int = DEFAULT_CONFIG.vision.action_dim
 CENTRAL_STATE_DIM: int = 54
-CRITIC_STATE_DIM: int = OBS_DIM + CENTRAL_STATE_DIM  # 130 dims (76 + 54)
+CRITIC_STATE_DIM: int = OBS_DIM + CENTRAL_STATE_DIM  # 136 dims (82 + 54)
 
 
 if __name__ == "__main__":

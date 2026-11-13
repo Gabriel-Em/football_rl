@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,6 +24,7 @@ from football_rl.config import (
     DEFAULT_CONFIG,
     OBS_DIM,
 )
+from football_rl.env import FootballParallelEnv
 from football_rl.train_ppo import (
     ActorCritic,
     ParameterSharingPPOTrainer,
@@ -35,7 +37,7 @@ from football_rl.train_ppo import (
 
 
 def test_ctde_ppo_rollout_and_update() -> None:
-    """Verify CTDE PPO rollout and update with centralized critic state (130-dim) and decentralized actor (76-dim)."""
+    """Verify CTDE PPO rollout and update with centralized critic state (136-dim) and decentralized actor (82-dim)."""
     cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
     trainer = ParameterSharingPPOTrainer(
         config=cfg,
@@ -44,7 +46,8 @@ def test_ctde_ppo_rollout_and_update() -> None:
         device="cpu",
     )
 
-    # Verify network architectures: actor (76), centralized critic (130 = 76 + 54)
+    # Verify network architectures: actor (82), centralized critic (136 = 82 + 54)
+    assert (OBS_DIM, CRITIC_STATE_DIM) == (82, 136)
     assert trainer.blue_field_policy.critic[0].in_features == CRITIC_STATE_DIM
     assert trainer.blue_field_policy.actor_mean[0].in_features == OBS_DIM
     assert CRITIC_STATE_DIM == OBS_DIM + CENTRAL_STATE_DIM
@@ -74,28 +77,195 @@ def test_ctde_ppo_rollout_and_update() -> None:
 
 
 def test_adapted_weights_loader_zero_pads_legacy_critic() -> None:
-    """Verify _load_adapted_weights cleanly adapts legacy 76-dim critic weights into 130-dim model."""
+    """Verify _load_adapted_weights zero-pads the central-state columns of an observation-only critic."""
     cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
     trainer = ParameterSharingPPOTrainer(config=cfg, num_envs=1, rollout_steps=10, device="cpu")
 
-    # Create dummy legacy state dict with critic.0.weight shape (hidden, 76)
+    # Create dummy legacy state dict with critic.0.weight shape (hidden, OBS_DIM)
     target_policy = trainer.blue_field_policy
     legacy_weights = {}
     for k, v in target_policy.state_dict().items():
         if k == "critic.0.weight":
-            # 76-dim legacy input features
+            # observation-only legacy input features
             legacy_weights[k] = torch.ones((v.shape[0], OBS_DIM), dtype=torch.float32)
         else:
             legacy_weights[k] = v.clone()
 
-    # Load adapted weights into 130-dim critic
+    # Load adapted weights into the OBS_DIM + CENTRAL_STATE_DIM critic
     trainer._load_adapted_weights(target_policy, legacy_weights)
 
     loaded_critic_w = target_policy.critic[0].weight.data
-    # First 76 cols should be ones (from legacy checkpoint)
+    # First OBS_DIM cols should be ones (from legacy checkpoint)
     assert torch.allclose(loaded_critic_w[:, :OBS_DIM], torch.ones((loaded_critic_w.shape[0], OBS_DIM)))
-    # Remaining 54 cols should be zero-padded
+    # Remaining CENTRAL_STATE_DIM cols should be zero-padded
     assert torch.allclose(loaded_critic_w[:, OBS_DIM:], torch.zeros((loaded_critic_w.shape[0], CENTRAL_STATE_DIM)))
+
+
+LEGACY_OBS_DIM = 76  # observation width of checkpoints written before the match-state columns 76..81
+
+
+def _recorded_observations(n_rows: int = 1000, seed: int = 17) -> tuple[torch.Tensor, torch.Tensor]:
+    """First `n_rows` (observation, central state) rows of a seeded random-action rollout, 12 rows per step."""
+    env = FootballParallelEnv(config=_quiet_cfg())
+    env.reset(seed=seed)
+    rng = np.random.default_rng(seed)
+    obs, cen = env._get_observations_array(), env.get_centralized_state()
+    obs_rows, cen_rows = [], []
+    for step_i in range(-(-n_rows // 12)):
+        if step_i == 10:
+            # Trigger a real loose-ball turnover so column 81 (turnover cooldown) also carries signal.
+            env.ball_holder = None
+            env.ball_kicked_in_flight = False
+            env.ball_vel[:] = 0.0
+            env.last_ball_team = 0
+            env.ball_pos[:] = env.player_pos[11]
+            env.pickup_cooldown[11] = 0.0
+        obs_rows.append(obs.copy())
+        cen_rows.append(cen.copy())
+        obs, cen, _, _, _ = env.step_array(rng.uniform(-1.0, 1.0, size=(12, 4)))
+    return (
+        torch.as_tensor(np.concatenate(obs_rows)[:n_rows]),
+        torch.as_tensor(np.concatenate(cen_rows)[:n_rows]),
+    )
+
+
+def _perturbed_policy(obs_dim: int, seed: int) -> ActorCritic:
+    """An ActorCritic of input width `obs_dim` with every parameter moved off its initialisation."""
+    torch.manual_seed(seed)
+    net = ActorCritic(obs_dim=obs_dim)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    return net
+
+
+def _column_ids(width: int, rows: int = 256) -> torch.Tensor:
+    """A (rows, width) weight whose column j holds j + 1, so every column's origin is readable after a load."""
+    return (torch.arange(width, dtype=torch.float32) + 1.0).repeat(rows, 1)
+
+
+@pytest.fixture(scope="module")
+def loader_trainer(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("loader")
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp / "rep")), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(tmp / "ckpt"), seed=3,
+    )
+    yield trainer
+    trainer.close()
+
+
+@pytest.mark.parametrize("old_obs_dim", [76, 81])
+def test_adapted_loader_keeps_a_76_input_checkpoint_bit_identical(loader_trainer, old_obs_dim) -> None:
+    old = _perturbed_policy(old_obs_dim, seed=11)
+    new = ActorCritic(obs_dim=82)
+    loader_trainer._load_adapted_weights(new, old.state_dict())
+
+    obs, cen = _recorded_observations()
+    assert obs.shape == (1000, 82) and cen.shape == (1000, 54)
+    assert (obs[:, old_obs_dim:] != 0.0).any(), "the appended columns must carry signal"
+    with torch.no_grad():
+        assert torch.equal(new.actor_mean(obs), old.actor_mean(obs[:, :old_obs_dim]))
+        assert torch.equal(new.get_value(obs, cen), old.get_value(obs[:, :old_obs_dim], cen))
+    assert torch.equal(new.actor_logstd, old.actor_logstd)
+
+
+@pytest.mark.parametrize(
+    "old_obs_dim, old_critic_dim, actor_ids, critic_ids",
+    [
+        # actor 76, critic 76 + 54: the six new columns sit between the observation and the central state
+        (76, 130, list(range(1, 77)) + [0] * 6, list(range(1, 77)) + [0] * 6 + list(range(77, 131))),
+        # actor 76, observation-only critic
+        (76, 76, list(range(1, 77)) + [0] * 6, list(range(1, 77)) + [0] * 60),
+        # actor 81, critic 81 + 54: the turnover-cooldown column sits between obs 81 and central state
+        (81, 135, list(range(1, 82)) + [0], list(range(1, 82)) + [0] + list(range(82, 136))),
+        (81, 81, list(range(1, 82)) + [0], list(range(1, 82)) + [0] * 55),
+        # current widths load unchanged
+        (82, 136, list(range(1, 83)), list(range(1, 137))),
+        (82, 82, list(range(1, 83)), list(range(1, 83)) + [0] * 54),
+    ],
+)
+def test_adapted_loader_places_every_old_input_column(
+    loader_trainer, old_obs_dim, old_critic_dim, actor_ids, critic_ids
+) -> None:
+    target = ActorCritic(obs_dim=82)
+    weights = {k: v.clone() for k, v in target.state_dict().items()}
+    weights["actor_mean.0.weight"] = _column_ids(old_obs_dim)
+    weights["critic.0.weight"] = _column_ids(old_critic_dim)
+    loader_trainer._load_adapted_weights(target, weights)
+    assert torch.equal(target.actor_mean[0].weight, torch.tensor(actor_ids, dtype=torch.float32).repeat(256, 1))
+    assert torch.equal(target.critic[0].weight, torch.tensor(critic_ids, dtype=torch.float32).repeat(256, 1))
+
+
+@pytest.mark.parametrize(
+    "actor_width, critic_width",
+    [
+        (87, 141),  # wider than the network: columns cannot be dropped
+        (76, 100),  # critic is neither observation-only nor observation + central state
+        (76, 136),  # critic built for a different observation width than the actor
+        (81, 136),  # critic built for 82-dim obs while actor is 81-dim
+    ],
+)
+def test_adapted_loader_rejects_checkpoints_it_cannot_place(loader_trainer, actor_width, critic_width) -> None:
+    target = ActorCritic(obs_dim=82)
+    before = {k: v.clone() for k, v in target.state_dict().items()}
+    weights = {k: v.clone() for k, v in before.items()}
+    weights["actor_mean.0.weight"] = torch.ones(256, actor_width)
+    weights["critic.0.weight"] = torch.ones(256, critic_width)
+    with pytest.raises(ValueError):
+        loader_trainer._load_adapted_weights(target, weights)
+    assert all(torch.equal(before[k], v) for k, v in target.state_dict().items())
+
+
+@pytest.mark.parametrize("old_obs_dim", [76, 81])
+def test_resume_from_a_76_input_training_state_pads_adam_moments_and_trains(tmp_path: Path, old_obs_dim: int) -> None:
+    ckpt = tmp_path / "ckpt"
+    writer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp_path / "rep")), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(ckpt), seed=3,
+    )
+    writer.save_checkpoints()
+    writer.close()
+
+    state = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+    legacy = {}
+    for i, name in enumerate(("blue_field", "blue_keeper", "red_field", "red_keeper")):
+        net = _perturbed_policy(old_obs_dim, seed=20 + i)
+        opt = torch.optim.Adam(net.parameters(), lr=3e-4, eps=1e-5)
+        x, c = torch.randn(16, old_obs_dim), torch.randn(16, 54)
+        (net.actor_mean(x).square().sum() + net.get_value(x, c).square().sum()).backward()
+        opt.step()
+        state[f"{name}_policy"], state[f"{name}_optimizer"] = net.state_dict(), opt.state_dict()
+        legacy[name] = (net, opt)
+    for kind in ("field", "keeper"):
+        state[f"{kind}_policy"] = state[f"blue_{kind}_policy"]
+        state[f"{kind}_optimizer"] = state[f"blue_{kind}_optimizer"]
+    torch.save(state, ckpt / "training_state.pt")
+
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp_path / "rep")), num_envs=1, rollout_steps=10, device="cpu",
+        checkpoint_dir=str(ckpt), seed=4,
+    )
+    assert trainer.load_checkpoints()
+    policy, optimizer = trainer.blue_field_policy, trainer.blue_field_optimizer
+    old_net, old_opt = legacy["blue_field"]
+    assert policy.actor_mean[0].in_features == 82 and policy.critic[0].in_features == 136
+
+    new_actor = optimizer.state[policy.actor_mean[0].weight]
+    old_actor = old_opt.state[old_net.actor_mean[0].weight]
+    new_critic = optimizer.state[policy.critic[0].weight]
+    old_critic = old_opt.state[old_net.critic[0].weight]
+    for moment in ("exp_avg", "exp_avg_sq"):
+        assert torch.equal(new_actor[moment][:, :old_obs_dim], old_actor[moment])
+        assert not new_actor[moment][:, old_obs_dim:].any()
+        assert torch.equal(new_critic[moment][:, :old_obs_dim], old_critic[moment][:, :old_obs_dim])
+        assert not new_critic[moment][:, old_obs_dim:82].any()
+        assert torch.equal(new_critic[moment][:, 82:], old_critic[moment][:, old_obs_dim:])
+    assert float(new_actor["step"]) == 1.0
+
+    metrics = trainer.update_policies(trainer.collect_rollouts(active_generation=1))
+    assert "field" in metrics and "keeper" in metrics
+    trainer.close()
 
 
 def test_per_role_advantage_normalization() -> None:

@@ -598,7 +598,7 @@ class TestHarness:
         assert t["bd"].shape == (45, 12, 5)
         assert t["role"].shape == (45, 12)
         assert t["phi"].shape == (45, 12)
-        assert t["obs_s"].shape[1:] == (12, 76) and t["cen_s"].shape[1:] == (12, 54)
+        assert t["obs_s"].shape[1:] == (12, 82) and t["cen_s"].shape[1:] == (12, 54)
         plain = harness.run_matches(quick_spec(ckpt, n=1))[0]
         assert "bd" not in plain and "obs_s" not in plain
         # The breakdown run plays the same match.
@@ -640,10 +640,35 @@ class TestHarness:
 
 
 class TestTeamPolicy:
+    @pytest.mark.parametrize("old_obs_dim", [76, 81])
+    def test_a_76_input_checkpoint_loads_zero_padded(self, tmp_path, old_obs_dim):
+        d = tmp_path / "legacy"
+        d.mkdir()
+        torch.manual_seed(3)
+        legacy = {}
+        for prefix in ("blue", "red"):
+            for kind in ("field", "keeper"):
+                legacy[prefix, kind] = ActorCritic(obs_dim=old_obs_dim)
+                torch.save(legacy[prefix, kind].state_dict(), d / f"{prefix}_{kind}_policy.pt")
+        team = harness.TeamPolicy(str(d), "blue")
+        for (_, actor, critic, _), kind in zip(team.heads, ("keeper", "field")):
+            old = legacy["blue", kind]
+            actor_w, critic_w = actor[0][0], critic[0][0]
+            assert actor_w.shape[1] == 82 and critic_w.shape[1] == 136
+            assert torch.equal(actor_w[:, :old_obs_dim], old.actor_mean[0].weight)
+            assert not actor_w[:, old_obs_dim:].any()
+            assert torch.equal(critic_w[:, :old_obs_dim], old.critic[0].weight[:, :old_obs_dim])
+            assert not critic_w[:, old_obs_dim:82].any()
+            assert torch.equal(critic_w[:, 82:], old.critic[0].weight[:, old_obs_dim:])
+        obs = np.zeros((6, 82), dtype=np.float32)
+        cen = np.zeros((6, 54), dtype=np.float32)
+        actions, values, _ = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+        assert actions.shape == (6, 4) and values.shape == (6,)
+
     def test_forward_is_bit_identical_to_the_networks(self, tmp_path):
         d = write_checkpoint(tmp_path / "c", seed=7)
         rng = np.random.default_rng(0)
-        obs = rng.normal(size=(6, 76)).astype(np.float32)
+        obs = rng.normal(size=(6, 82)).astype(np.float32)
         cen = rng.normal(size=(6, 54)).astype(np.float32)
         team = harness.TeamPolicy(str(d), "blue")
         actions, values, means = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
@@ -658,7 +683,7 @@ class TestTeamPolicy:
 
     def test_noise_scales_with_the_checkpoint_sigma(self, tmp_path):
         d = write_checkpoint(tmp_path / "c", seed=7)
-        obs = np.zeros((6, 76), dtype=np.float32)
+        obs = np.zeros((6, 82), dtype=np.float32)
         cen = np.zeros((6, 54), dtype=np.float32)
         team = harness.TeamPolicy(str(d), "blue")
         a, _, m = team.act(obs, cen, "sampled", 1.0, torch.Generator().manual_seed(4))
