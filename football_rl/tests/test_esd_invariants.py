@@ -1,7 +1,9 @@
 """Unit test suite for core physical, reward, and invariant properties of the football environment."""
 
+import copy
 import math
 from dataclasses import replace
+from pathlib import Path
 import numpy as np
 import pytest
 import torch
@@ -16,6 +18,7 @@ from football_rl.config import (
     TEAM_B,
 )
 from football_rl.env import FootballParallelEnv, parallel_env
+from football_rl.potentials import PotentialState, compute_potentials
 from football_rl.train_ppo import ParameterSharingPPOTrainer
 
 
@@ -28,7 +31,9 @@ def _zero_actions(env: FootballParallelEnv) -> dict:
 
 def test_closed_loop_pbrs_zero_gain_invariant() -> None:
     """Moving the ball along a closed spatial trajectory without scoring must yield net non-positive cumulative discounted shaping reward."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env = FootballParallelEnv(
+        replace(DEFAULT_CONFIG, rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"))
+    )
     env.reset(seed=42)
 
     # Disable other influences by placing all players at fixed positions
@@ -325,3 +330,333 @@ def test_observation_and_critic_bounds_invariant() -> None:
     assert not np.isnan(central_state).any()
     assert not np.isinf(central_state).any()
     assert np.all(central_state >= -1.0)
+
+
+def _short_all_mode_config(tmp_path: Path, shaping_mode: str = "all", gamma: float = 0.995):
+    return replace(
+        DEFAULT_CONFIG,
+        physics=replace(
+            DEFAULT_CONFIG.physics,
+            half_physics_frames=140,
+            max_rl_steps=50,
+            max_physics_frames=200,
+        ),
+        rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode=shaping_mode),
+        ppo=replace(DEFAULT_CONFIG.ppo, gamma=gamma),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            enable_recording=True,
+            save_dir=str(tmp_path / "replays"),
+            interest_threshold=float("inf"),
+        ),
+    )
+
+
+def _scripted_goal_halftime_actions(step_idx: int) -> np.ndarray:
+    acts = np.zeros((12, 4), dtype=np.float32)
+    # Team B keeper and striker turn 90 deg and run off the y=420 lane; a_atk_1 turns from kickoff angle to 0 and shoots
+    if step_idx < 5:
+        acts[6] = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        acts[11] = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        acts[6] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        acts[11] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    if step_idx < 8:
+        acts[5] = np.array([0.0, -1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        acts[5] = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    return acts
+
+
+def test_pbrs_t5_episode_identity_with_goal_halftime_and_fulltime(tmp_path: Path) -> None:
+    """T5: In all mode, discounted sum of last_shaping_rewards over goal, halftime and fulltime equals -Phi_total(s_0)."""
+    cfg = _short_all_mode_config(tmp_path, shaping_mode="all", gamma=0.995)
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    w_adv = cfg.rewards.team_advance_pbrs_weight
+    phi_ball_0 = np.array(
+        [w_adv * env._compute_ball_potential(TEAM_A)] * 6
+        + [w_adv * env._compute_ball_potential(TEAM_B)] * 6,
+        dtype=np.float64,
+    )
+    phi_total_0 = phi_ball_0 + env.prev_tactical_potential.copy()
+
+    gamma = cfg.ppo.gamma
+    total_shaping = np.zeros(12, dtype=np.float64)
+    goal_step = None
+    halftime_seen = False
+    done = False
+
+    for t in range(cfg.physics.max_rl_steps):
+        _, _, _, done, _ = env.step_array(_scripted_goal_halftime_actions(t))
+        assert env.last_shaping_rewards.dtype == np.float64
+        assert env.last_shaping_rewards.shape == (12,)
+        total_shaping += (gamma ** t) * env.last_shaping_rewards
+        if goal_step is None and env.stats["goals"] >= 1:
+            goal_step = t
+        if env.current_half == 2:
+            halftime_seen = True
+        if done:
+            break
+
+    assert goal_step is not None and goal_step < 30
+    assert halftime_seen
+    assert done
+    assert any(ev.get("type") == "FULLTIME!" for ev in env.replay_frames[-1]["events"])
+    np.testing.assert_allclose(total_shaping, -phi_total_0, rtol=0.0, atol=1e-9)
+
+    # Verify replay breakdown pot_delta + r_ball_adv reflects paid shaping
+    last_bd = env.replay_frames[-1]["rew_breakdown"]
+    paid_from_bd = np.array([b["r_ball_adv"] + b["r_pot_i"] for b in last_bd], dtype=np.float64)
+    np.testing.assert_allclose(paid_from_bd, env.last_shaping_rewards, rtol=0.0, atol=5e-4)
+
+
+def test_pbrs_t6_no_standing_wage_in_env(tmp_path: Path) -> None:
+    """T6: Fixed inert state for 50 steps yields legacy - all == (1 - gamma^50) * Phi_total(s_0)."""
+    def _setup_inert(shaping_mode: str):
+        cfg = replace(
+            DEFAULT_CONFIG,
+            physics=replace(DEFAULT_CONFIG.physics, half_physics_frames=1000, max_rl_steps=200, max_physics_frames=800),
+            rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode=shaping_mode),
+            replay=replace(DEFAULT_CONFIG.replay, enable_recording=False, save_dir=str(tmp_path / "r")),
+        )
+        env = FootballParallelEnv(cfg)
+        env.reset(seed=7)
+        # Stationary loose ball in open midfield (no wall/box/5s rule triggers within 50 steps)
+        env.ball_holder = None
+        env.ball_kicked_in_flight = False
+        env.ball_pos = np.array([900.0, 420.0], dtype=np.float64)
+        env.ball_vel = np.zeros(2, dtype=np.float64)
+        env.kickoff_protection_timer = 0.0
+        env.stun_timer[:] = 0.0
+        env.ghost_timer[:] = 0.0
+        env.is_ghost[:] = False
+        env.pickup_cooldown[:] = 0.0
+        # Place all players >= 100u from ball and >= 150u apart, zero velocity
+        coords = [
+            (45.0, 420.0), (250.0, 200.0), (250.0, 640.0), (500.0, 200.0), (500.0, 640.0), (800.0, 420.0),
+            (1355.0, 420.0), (1150.0, 200.0), (1150.0, 640.0), (1050.0, 120.0), (1050.0, 720.0), (700.0, 120.0),
+        ]
+        for i, xy in enumerate(coords):
+            env.player_pos[i] = np.array(xy, dtype=np.float64)
+            env.player_vel[i] = 0.0
+        env._compute_potential_shaping(np.zeros(12, dtype=np.float64), pay=False)
+        w = cfg.rewards.team_advance_pbrs_weight
+        phi_ball_0 = np.array(
+            [w * env._compute_ball_potential(TEAM_A)] * 6 + [w * env._compute_ball_potential(TEAM_B)] * 6,
+            dtype=np.float64,
+        )
+        phi_total_0 = phi_ball_0 + env.prev_tactical_potential.copy()
+        gamma = cfg.ppo.gamma
+        zeros = np.zeros((12, 4), dtype=np.float32)
+        discounted = np.zeros(12, dtype=np.float64)
+        for t in range(50):
+            env.step_array(zeros)
+            discounted += (gamma ** t) * env.last_shaping_rewards
+        return discounted, phi_total_0, gamma
+
+    disc_legacy, phi_0_leg, gamma = _setup_inert("legacy")
+    disc_all, phi_0_all, _ = _setup_inert("all")
+    np.testing.assert_allclose(phi_0_leg, phi_0_all, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(disc_legacy, 0.0, rtol=0.0, atol=1e-12)
+    expected_excess = (1.0 - (gamma ** 50)) * phi_0_all
+    assert expected_excess[5] > 0.0
+    np.testing.assert_allclose(disc_legacy - disc_all, expected_excess, rtol=0.0, atol=1e-10)
+
+
+def test_pbrs_t7_gamma_source_and_trainer_worker_propagation(tmp_path: Path) -> None:
+    """T7: Stepping identical states with gamma=0.99 vs 0.995 differs by 0.005 * Phi(s'); trainer workers inherit gamma."""
+    def _cfg(gamma: float) -> object:
+        return replace(
+            DEFAULT_CONFIG,
+            ppo=replace(DEFAULT_CONFIG.ppo, gamma=gamma),
+            replay=replace(DEFAULT_CONFIG.replay, enable_recording=False, save_dir=str(tmp_path / f"r_{gamma}")),
+        )
+
+    env_99 = FootballParallelEnv(_cfg(0.99))
+    env_995 = FootballParallelEnv(_cfg(0.995))
+    env_99.reset(seed=17)
+    env_995.reset(seed=17)
+
+    acts = np.random.default_rng(17).uniform(-1.0, 1.0, size=(12, 4)).astype(np.float32)
+    env_99.step_array(acts)
+    env_995.step_array(acts)
+
+    w = DEFAULT_CONFIG.rewards.team_advance_pbrs_weight
+    phi_ball_next = np.array(
+        [w * env_995._compute_ball_potential(TEAM_A)] * 6
+        + [w * env_995._compute_ball_potential(TEAM_B)] * 6,
+        dtype=np.float64,
+    )
+    phi_total_next = phi_ball_next + env_995._phi_curr
+    diff = env_995.last_shaping_rewards - env_99.last_shaping_rewards
+    assert np.any(np.abs(diff) > 1e-4)
+    np.testing.assert_allclose(diff, 0.005 * phi_total_next, rtol=0.0, atol=1e-12)
+
+    # Trainer worker env propagation check (DummyVecFootballEnv and SubprocVecFootballEnv)
+    t_dummy = ParameterSharingPPOTrainer(
+        config=_cfg(0.99), num_envs=1, rollout_steps=8, device="cpu", checkpoint_dir=str(tmp_path / "c1"), seed=3
+    )
+    try:
+        assert t_dummy.vec_env.envs[0].cfg.ppo.gamma == 0.99
+    finally:
+        t_dummy.close()
+
+    t_99 = ParameterSharingPPOTrainer(
+        config=_cfg(0.99), num_envs=2, rollout_steps=8, device="cpu", checkpoint_dir=str(tmp_path / "c2"), seed=3
+    )
+    t_995 = ParameterSharingPPOTrainer(
+        config=_cfg(0.995), num_envs=2, rollout_steps=8, device="cpu", checkpoint_dir=str(tmp_path / "c3"), seed=3
+    )
+    try:
+        t_99.vec_env.reset_array(seeds=[21, 22])
+        t_995.vec_env.reset_array(seeds=[21, 22])
+        batch_acts = np.stack([acts, acts], axis=0)
+        _, _, rew_99, _, _ = t_99.vec_env.step_array(batch_acts)
+        _, _, rew_995, _, _ = t_995.vec_env.step_array(batch_acts)
+        worker_diff = rew_995[0].astype(np.float64) - rew_99[0].astype(np.float64)
+        # Note: env_995 used seed 17 while worker 0 used seed 21; check with same seed 17:
+        t_99.vec_env.reset_array(seeds=[17, 17])
+        t_995.vec_env.reset_array(seeds=[17, 17])
+        _, _, rew_99_s, _, _ = t_99.vec_env.step_array(batch_acts)
+        _, _, rew_995_s, _, _ = t_995.vec_env.step_array(batch_acts)
+        worker_diff = rew_995_s[0].astype(np.float64) - rew_99_s[0].astype(np.float64)
+        np.testing.assert_allclose(worker_diff, 0.005 * phi_total_next, rtol=0.0, atol=1e-5)
+    finally:
+        t_99.close()
+        t_995.close()
+
+
+@pytest.mark.parametrize("shaping_mode", ["ball", "all"])
+def test_ball_shaping_zero_sum_guard_across_teleports_and_terminal(tmp_path: Path, shaping_mode: str) -> None:
+    """[GUARD] Ball-territory shaping summed across all 12 players is 0 to 1e-12 on every step."""
+    cfg = _short_all_mode_config(tmp_path, shaping_mode=shaping_mode, gamma=0.995)
+    env = FootballParallelEnv(cfg)
+    env.reset(seed=42)
+
+    goal_seen = False
+    halftime_seen = False
+    done = False
+    for t in range(cfg.physics.max_rl_steps):
+        _, _, _, done, _ = env.step_array(_scripted_goal_halftime_actions(t))
+        assert abs(float(env._tele_breakdown[0].sum())) <= 1e-12
+        if env.stats["goals"] >= 1:
+            goal_seen = True
+        if env.current_half == 2:
+            halftime_seen = True
+        if done:
+            break
+    assert goal_seen and halftime_seen and done
+
+
+def test_potential_state_markov_witness_guard() -> None:
+    """[GUARD] Any PotentialState field change that alters Phi must also alter observations."""
+    def _eval(env: FootballParallelEnv):
+        stunned = env.stun_timer > 0.0
+        state = PotentialState(
+            pos=env.player_pos,
+            angle=env.player_angle,
+            ball=env.ball_pos,
+            holder=-1 if env.ball_holder is None else env.ball_holder,
+            ball_in_flight=env.ball_kicked_in_flight,
+            last_ball_team=-1 if env.last_ball_team is None else env.last_ball_team,
+            team_side=env.team_side,
+            disabled=stunned | env.is_ghost,
+            stunned=stunned,
+            post_kick_timer=env.post_kick_pbrs_timer,
+            depth_bias=env._tactical_depth_bias,
+            flank_bias=env._tactical_flank_bias,
+            active_box_radius=env.active_box_radius,
+        )
+        res = compute_potentials(state, env.cfg.rewards, env.cfg.physics)
+        obs = env._get_observations_array()
+        return res.phi, obs
+
+    def _base_env() -> FootballParallelEnv:
+        env = FootballParallelEnv(replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False)))
+        env.reset(seed=11)
+        env.ball_holder = None
+        env.ball_kicked_in_flight = False
+        env.last_ball_team = TEAM_A
+        env.ball_pos = np.array([700.0, 420.0], dtype=np.float64)
+        env.stun_timer[:] = 0.0
+        env.ghost_timer[:] = 0.0
+        env.is_ghost[:] = False
+        env.post_kick_pbrs_timer[:] = 0.0
+        return env
+
+    failures = []
+    cases = []
+
+    # 1. holder
+    b = _base_env()
+    t = copy.deepcopy(b)
+    t.ball_holder = 5
+    cases.append(("holder", b, t))
+
+    # 2. ball_in_flight
+    b = _base_env()
+    t = copy.deepcopy(b)
+    t.ball_kicked_in_flight = True
+    cases.append(("ball_in_flight", b, t))
+
+    # 3. last_ball_team (with ball_in_flight=True)
+    b = _base_env()
+    b.ball_kicked_in_flight = True
+    b.last_ball_team = TEAM_A
+    t = copy.deepcopy(b)
+    t.last_ball_team = TEAM_B
+    cases.append(("last_ball_team", b, t))
+
+    # 4. disabled (via ghosting without stunned; player 3 near ball and player 4 nearby)
+    b = _base_env()
+    b.player_pos[3] = np.array([650.0, 420.0], dtype=np.float64)
+    b.player_pos[4] = np.array([640.0, 420.0], dtype=np.float64)
+    t = copy.deepcopy(b)
+    t.is_ghost[3] = True
+    t.ghost_timer[3] = 1.0
+    cases.append(("disabled", b, t))
+
+    # 5. stunned (on non-ghosted player)
+    t = copy.deepcopy(b)
+    t.stun_timer[3] = 0.5
+    cases.append(("stunned", b, t))
+
+    # 6. post_kick_timer (with ball_in_flight=True, last_ball_team=TEAM_A; non-chaser teammate)
+    b = _base_env()
+    b.ball_kicked_in_flight = True
+    b.last_ball_team = TEAM_A
+    b.player_pos[5] = np.array([650.0, 420.0], dtype=np.float64)
+    b.player_pos[1] = np.array([200.0, 200.0], dtype=np.float64)
+    t = copy.deepcopy(b)
+    t.post_kick_pbrs_timer[1] = 0.4
+    cases.append(("post_kick_timer", b, t))
+
+    # 7. active_box_radius (loose ball inside 195u left box, outside 100u box; keeper closer than outfielders)
+    b = _base_env()
+    b.ball_pos = np.array([150.0, 420.0], dtype=np.float64)
+    b.player_pos[0] = np.array([110.0, 420.0], dtype=np.float64)
+    b.player_pos[1] = np.array([250.0, 420.0], dtype=np.float64)
+    b.active_box_radius = np.array([195.0, 195.0], dtype=np.float64)
+    t = copy.deepcopy(b)
+    t.active_box_radius = np.array([100.0, 195.0], dtype=np.float64)
+    cases.append(("active_box_radius", b, t))
+
+    # 8. angle (keeper angle when keeper bisector applies)
+    b = _base_env()
+    b.ball_pos = np.array([300.0, 300.0], dtype=np.float64)
+    t = copy.deepcopy(b)
+    t.player_angle[0] = math.pi / 2.0
+    cases.append(("angle", b, t))
+
+    for field_name, base_e, twin_e in cases:
+        phi0, obs0 = _eval(base_e)
+        phi1, obs1 = _eval(twin_e)
+        phi_changed = np.where(np.abs(phi0 - phi1) > 1e-12)[0]
+        assert len(phi_changed) > 0, f"Test setup for {field_name} did not alter Phi"
+        for idx in phi_changed:
+            if np.allclose(obs0[idx], obs1[idx], atol=1e-12):
+                failures.append(f"{field_name}[agent={idx}]")
+
+    assert failures == [], f"Markov witness failed for fields: {failures}"

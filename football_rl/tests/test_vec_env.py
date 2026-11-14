@@ -333,6 +333,7 @@ def _oracle_config(variant: str, replay_dir: Path):
     return replace(
         DEFAULT_CONFIG,
         physics=physics,
+        rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"),
         replay=replace(DEFAULT_CONFIG.replay, save_dir=str(replay_dir), enable_recording=True),
     )
 

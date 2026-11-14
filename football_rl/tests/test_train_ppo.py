@@ -1138,7 +1138,7 @@ def test_update_policies_matches_golden_digest(tmp_path: Path) -> None:
             f"running torch {torch.__version__} x{torch.get_num_threads()}"
         )
     trainer = ParameterSharingPPOTrainer(
-        config=_quiet_cfg(),
+        config=replace(_quiet_cfg(), rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy")),
         num_envs=golden["num_envs"],
         rollout_steps=golden["rollout_steps"],
         device="cpu",

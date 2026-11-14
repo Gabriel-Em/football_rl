@@ -33,7 +33,9 @@ from football_rl.train_ppo import ParameterSharingPPOTrainer
 
 def test_pbrs_strict_non_negativity_and_cross_turnover_telescoping() -> None:
     """Assert uncrowded potentials Phi(s) >= 0 and closed state-space loops with turnovers telescope to 0."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env = FootballParallelEnv(
+        dataclasses.replace(DEFAULT_CONFIG, rewards=dataclasses.replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"))
+    )
     env.reset(seed=42)
 
     gamma = 1.0  # Undiscounted potential difference for zero stationary leak
@@ -142,7 +144,9 @@ def test_zero_sum_adversarial_turnover_and_scrum_cooldown_invariants() -> None:
 
 def test_two_player_ping_pong_oscillation_zero_gain_invariant() -> None:
     """Verify 2-player A <-> B pass oscillation cannot farm pressure-relief or progression rewards."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env = FootballParallelEnv(
+        dataclasses.replace(DEFAULT_CONFIG, rewards=dataclasses.replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"))
+    )
     env.reset(seed=23)
 
     a1 = env.agent_to_idx["a_def_1"]

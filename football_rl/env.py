@@ -38,6 +38,7 @@ from football_rl.potentials import (
     PotentialResult,
     PotentialState,
     compute_potentials,
+    pbrs_shaping,
 )
 from football_rl.recording import LazyStepPayload, ReplayBuffer, format_breakdown, round_rows
 
@@ -403,6 +404,7 @@ class FootballParallelEnv(ParallelEnv):
         self.last_keeper_kick_time: np.ndarray = np.full(2, -999.0, dtype=np.float64)
         self.shot_on_target_cd: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.last_step_rewards: np.ndarray = np.zeros(self.num_players, dtype=np.float32)
+        self.last_shaping_rewards: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
         self.cum_player_rewards: np.ndarray = np.zeros(self.num_players, dtype=np.float32)
         self.ball_kick_was_shot_on_target: bool = False
         self.post_kick_pbrs_timer: np.ndarray = np.zeros(self.num_players, dtype=np.float64)
@@ -782,6 +784,7 @@ class FootballParallelEnv(ParallelEnv):
         self.last_keeper_kick_time.fill(-999.0)
         self.shot_on_target_cd.fill(0.0)
         self.last_step_rewards.fill(0.0)
+        self.last_shaping_rewards.fill(0.0)
         self.cum_player_rewards.fill(0.0)
         self.ball_kick_was_shot_on_target = False
         self.ball_kick_flight_timer = 0.0
@@ -805,7 +808,7 @@ class FootballParallelEnv(ParallelEnv):
         # Set initial kickoff formation and initialize Markovian potentials
         self._setup_kickoff(starting_team=self.first_half_kickoff_team)
         self._compute_potential_shaping(
-            np.zeros(self.num_players, dtype=np.float64), any_teleport=True
+            np.zeros(self.num_players, dtype=np.float64), pay=False
         )
 
         # Record initial frame (t = 0.0s) if recording enabled
@@ -876,28 +879,51 @@ class FootballParallelEnv(ParallelEnv):
 
         self.rl_step_count += 1
 
+        # Episode termination / truncation at t = 180.0s (max_rl_steps)
+        is_truncated = self.rl_step_count >= self.cfg.physics.max_rl_steps
+        is_terminated = False
+        is_terminal = is_truncated or is_terminated
+
         r_sparse = step_rewards.copy()
 
-        # Tier 2: Strict Policy-Invariant PBRS (Ball Threat & Off-Ball Positioning)
+        # Tier 2: Policy-Invariant PBRS (Ball Threat & Off-Ball Positioning)
         phi_ball_end_a = self._compute_ball_potential(TEAM_A)
         phi_ball_end_b = self._compute_ball_potential(TEAM_B)
-        r_ball_adv = np.zeros(self.num_players, dtype=np.float64)
-        if not any_teleport:
-            rew = self.cfg.rewards
+        rew = self.cfg.rewards
+        shaping_mode = rew.shaping_mode
+        if shaping_mode == "legacy":
+            r_ball_adv = np.zeros(self.num_players, dtype=np.float64)
+            if not any_teleport:
+                w_adv = rew.team_advance_pbrs_weight
+                adv_a = w_adv * (phi_ball_end_a - phi_ball_start_a)
+                adv_b = w_adv * (phi_ball_end_b - phi_ball_start_b)
+
+                if abs(adv_a) > 1e-12:
+                    step_rewards[:6] += adv_a
+                    r_ball_adv[:6] = adv_a
+                if abs(adv_b) > 1e-12:
+                    step_rewards[6:] += adv_b
+                    r_ball_adv[6:] = adv_b
+        else:
+            gamma = self.cfg.ppo.gamma
             w_adv = rew.team_advance_pbrs_weight
-            adv_a = w_adv * (phi_ball_end_a - phi_ball_start_a)
-            adv_b = w_adv * (phi_ball_end_b - phi_ball_start_b)
+            adv_a = w_adv * pbrs_shaping(phi_ball_start_a, phi_ball_end_a, gamma, is_terminal)
+            adv_b = w_adv * pbrs_shaping(phi_ball_start_b, phi_ball_end_b, gamma, is_terminal)
+            step_rewards[:6] += adv_a
+            step_rewards[6:] += adv_b
+            r_ball_adv = np.empty(self.num_players, dtype=np.float64)
+            r_ball_adv[:6] = adv_a
+            r_ball_adv[6:] = adv_b
 
-            if abs(adv_a) > 1e-12:
-                step_rewards[:6] += adv_a
-                r_ball_adv[:6] = adv_a
-            if abs(adv_b) > 1e-12:
-                step_rewards[6:] += adv_b
-                r_ball_adv[6:] = adv_b
-
-        self._compute_potential_shaping(
-            step_rewards, any_teleport, r_sparse=r_sparse, r_ball_adv=r_ball_adv
+        r_role = self._compute_potential_shaping(
+            step_rewards,
+            any_teleport,
+            r_sparse=r_sparse,
+            r_ball_adv=r_ball_adv,
+            pay=True,
+            terminal=is_terminal,
         )
+        np.add(r_ball_adv, r_role, out=self.last_shaping_rewards)
 
         # Update reward tracking arrays for visual feedback & replay recording
         self.last_step_rewards = step_rewards.astype(np.float32)
@@ -905,11 +931,7 @@ class FootballParallelEnv(ParallelEnv):
         if self.cfg.replay.enable_recording and self._replay_buffer is not None:
             self._replay_buffer.set_step_payload(self._replay_step_index, self._replay_step_payload())
 
-        # Episode termination / truncation at t = 180.0s (2,700 RL steps)
-        is_truncated = self.rl_step_count >= self.cfg.physics.max_rl_steps
-        is_terminated = False
-
-        if is_truncated or is_terminated:
+        if is_terminal:
             self._resolve_pending_kick_as_other()
             self._emit_event(
                 "FULLTIME!",
@@ -3104,8 +3126,18 @@ class FootballParallelEnv(ParallelEnv):
         any_teleport: bool = False,
         r_sparse: Optional[np.ndarray] = None,
         r_ball_adv: Optional[np.ndarray] = None,
-    ) -> None:
-        """Evaluate the potential field and apply potential-based shaping: `step_rewards += Phi(s') - Phi(s)`."""
+        *,
+        pay: bool = True,
+        terminal: bool = False,
+    ) -> np.ndarray:
+        """Evaluate the tactical potential field and apply potential-based shaping to ``step_rewards``.
+
+        In ``"all"`` mode (with ``pay=True``), adds discounted PBRS ``gamma * Phi(s') - Phi(s)`` across
+        every transition (teleports included) using ``cfg.ppo.gamma``, with ``Phi(terminal) = 0``.
+        In ``"legacy"`` and ``"ball"`` modes, adds undiscounted ``Phi(s') - Phi(s)`` only when
+        ``not any_teleport``. When ``pay=False`` (e.g. ``reset()``), initializes
+        ``prev_tactical_potential`` without modifying ``step_rewards`` and returns zeros.
+        """
         stunned = self.stun_timer > 0.0
         holder = self.ball_holder
         last_team = self.last_ball_team
@@ -3128,12 +3160,29 @@ class FootballParallelEnv(ParallelEnv):
         phi_curr = result.phi
         self._phi_curr = phi_curr
 
-        if self.cfg.replay.enable_recording:
-            self._record_potential_telemetry(state, result, any_teleport, r_sparse, r_ball_adv)
+        if not pay:
+            pot_delta = np.zeros_like(phi_curr)
+        elif self.cfg.rewards.shaping_mode == "all":
+            pot_delta = pbrs_shaping(
+                self.prev_tactical_potential,
+                phi_curr,
+                self.cfg.ppo.gamma,
+                terminal,
+            )
+            step_rewards += pot_delta
+        elif not any_teleport:
+            pot_delta = phi_curr - self.prev_tactical_potential
+            step_rewards += pot_delta
+        else:
+            pot_delta = np.zeros_like(phi_curr)
 
-        if not any_teleport:
-            step_rewards += phi_curr - self.prev_tactical_potential
+        if self.cfg.replay.enable_recording:
+            self._record_potential_telemetry(
+                state, result, any_teleport, r_sparse, r_ball_adv, pot_delta=pot_delta
+            )
+
         self.prev_tactical_potential[:] = phi_curr
+        return pot_delta
 
     def _record_potential_telemetry(
         self,
@@ -3142,6 +3191,7 @@ class FootballParallelEnv(ParallelEnv):
         any_teleport: bool,
         r_sparse: Optional[np.ndarray],
         r_ball_adv: Optional[np.ndarray],
+        pot_delta: Optional[np.ndarray] = None,
     ) -> None:
         """Store per-player role labels, role targets and the reward breakdown for replay frames."""
         n = self.num_players
@@ -3149,7 +3199,8 @@ class FootballParallelEnv(ParallelEnv):
         label_codes = np.where(
             state.stunned, _STUN_ROLE_CODE, np.where(self.lunge_timer > 0.0, _LUNGE_ROLE_CODE, role_codes)
         )
-        pot_delta = result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
+        if pot_delta is None:
+            pot_delta = result.phi - self.prev_tactical_potential if not any_teleport else np.zeros_like(result.phi)
         self._tele_breakdown = np.stack(
             [
                 r_ball_adv if r_ball_adv is not None else np.zeros(n),
