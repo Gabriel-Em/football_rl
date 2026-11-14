@@ -1,0 +1,29 @@
+{
+  "torch": "2.6.0+cu124",
+  "torch_threads": 6,
+  "seed": 7,
+  "num_envs": 1,
+  "rollout_steps": 16,
+  "policies": {
+    "blue_field": {
+      "actor": "88c20a6c77022cdce807ba48b6bfcdb6382d91bf789446f31253c0f1b6b6bc00",
+      "critic": "fee361957b96979853fa5b6db7ffff389cfa255f8ac8c07afdd0399226130396",
+      "all": "aba53d417b26eb6210d1bc9f0e7a3e295971c2513d66657deb504e5dd1f6d031"
+    },
+    "blue_keeper": {
+      "actor": "d465e4bb1170ae3ff8299ccccef9d466090090a49fc964419edf8b9f8039c727",
+      "critic": "3a236fa526517ea7bcd42856fdbea83aa33f96859bf90698869714794adbb00f",
+      "all": "eeaf5304face0c7caebebcef409e478369fe380d3151b8b43fd1061340b55c04"
+    },
+    "red_field": {
+      "actor": "a47e973b9bbf2348a2a32e0a0bb32e2f8c3a59fde166ecffdd404c0882f8f13e",
+      "critic": "30084cf72e9411c347e2200021acb12e68cd0fe0c5fbff1b968787ebcb6bd539",
+      "all": "f9c05f52d2d7f027640dd02900d61dc62325c0e0fdb291d313afc836767c79de"
+    },
+    "red_keeper": {
+      "actor": "840125f231d87000d14e6a67c2b1798d7ab9cbbafee1e2f01c28f847681ec0d8",
+      "critic": "30b592b54f322a8d9530baab4d839f28fe8511456a241eeba57b9571f0df6b71",
+      "all": "e681a0f01785769d446677f7d831fcf346f3bdaf6dd0e74943f5a812c44f0727"
+    }
+  }
+}

@@ -1080,3 +1080,368 @@ def test_collect_rollouts_alone_exports_no_uniform_replay(tmp_path: Path) -> Non
     assert not (tmp_path / "rep").exists() or list((tmp_path / "rep").glob("*.json")) == []
     trainer.train(total_updates=1)
     assert len(list((tmp_path / "rep").glob("match_*_uniform_*.json"))) == 1
+
+
+# ==============================================================================
+# Critic-only warm-up, critic-fit correlations, seed provenance & update digest
+# ==============================================================================
+UPDATE_DIGEST_FILE = Path(__file__).parent / "golden" / "update_digests.json"
+
+
+def _hash_tensors(tensors) -> str:
+    h = hashlib.sha256()
+    for t in tensors:
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def _policy_groups(trainer: ParameterSharingPPOTrainer) -> list[tuple[str, torch.nn.Module, torch.optim.Optimizer]]:
+    return [
+        ("blue_field", trainer.blue_field_policy, trainer.blue_field_optimizer),
+        ("blue_keeper", trainer.blue_keeper_policy, trainer.blue_keeper_optimizer),
+        ("red_field", trainer.red_field_policy, trainer.red_field_optimizer),
+        ("red_keeper", trainer.red_keeper_policy, trainer.red_keeper_optimizer),
+    ]
+
+
+def _snapshot_actor_and_adam(
+    trainer: ParameterSharingPPOTrainer,
+) -> tuple[dict[tuple[str, str], bytes], dict[tuple[str, str, str], bytes], dict[tuple[str, str], bytes]]:
+    actor_bytes: dict[tuple[str, str], bytes] = {}
+    adam_bytes: dict[tuple[str, str, str], bytes] = {}
+    critic_bytes: dict[tuple[str, str], bytes] = {}
+    for role, pol, opt in _policy_groups(trainer):
+        for name, param in pol.named_parameters():
+            raw = param.detach().cpu().contiguous().numpy().tobytes()
+            if name.startswith("actor_"):
+                actor_bytes[(role, name)] = raw
+                st = opt.state.get(param, {})
+                for k in ("exp_avg", "exp_avg_sq", "step"):
+                    if k in st:
+                        val = st[k]
+                        adam_bytes[(role, name, k)] = (
+                            val.detach().cpu().contiguous().numpy().tobytes()
+                            if isinstance(val, torch.Tensor)
+                            else repr(val).encode("utf-8")
+                        )
+            elif name.startswith("critic."):
+                critic_bytes[(role, name)] = raw
+    return actor_bytes, adam_bytes, critic_bytes
+
+
+def test_update_policies_matches_golden_digest(tmp_path: Path) -> None:
+    """[GUARD] With N=0, weights after one seeded update_policies match the pre-edit SHA-256."""
+    golden = json.loads(UPDATE_DIGEST_FILE.read_text(encoding="utf-8"))
+    if golden["torch"] != torch.__version__ or golden["torch_threads"] != torch.get_num_threads():
+        pytest.skip(
+            f"digests recorded with torch {golden['torch']} x{golden['torch_threads']} threads; "
+            f"running torch {torch.__version__} x{torch.get_num_threads()}"
+        )
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=golden["num_envs"],
+        rollout_steps=golden["rollout_steps"],
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        seed=golden["seed"],
+    )
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        trainer.update_policies(rollout)
+        for role, pol, _ in _policy_groups(trainer):
+            sd = pol.state_dict()
+            actor_keys = [k for k in sd if k.startswith("actor_")]
+            critic_keys = [k for k in sd if k.startswith("critic.")]
+            assert _hash_tensors([sd[k] for k in actor_keys]) == golden["policies"][role]["actor"]
+            assert _hash_tensors([sd[k] for k in critic_keys]) == golden["policies"][role]["critic"]
+            assert _hash_tensors(list(sd.values())) == golden["policies"][role]["all"]
+    finally:
+        trainer.close()
+
+
+def test_critic_only_generation_freezes_actors_and_adam_state_and_updates_critics(tmp_path: Path) -> None:
+    """[RED] A critic-only generation keeps all 4 actors and their Adam state byte-identical while updating critics."""
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        seed=5,
+        critic_only_until_gen=2,
+    )
+    try:
+        # Run one direct update first so Adam state (exp_avg, exp_avg_sq, step) is populated and non-zero.
+        trainer.update_policies(trainer.collect_rollouts(active_generation=1))
+        with torch.no_grad():
+            # Set logstd outside [-1.25, -0.35] to verify critic-only skips logstd clamping too.
+            trainer.blue_field_policy.actor_logstd.fill_(-2.0)
+
+        actor_before, adam_before, critic_before = _snapshot_actor_and_adam(trainer)
+        assert len(adam_before) > 0
+
+        trainer.train(total_updates=1)  # gen 1 <= 2
+        actor_after, adam_after, critic_after = _snapshot_actor_and_adam(trainer)
+
+        assert actor_after == actor_before
+        assert adam_after == adam_before
+        for role in ("blue_field", "blue_keeper", "red_field", "red_keeper"):
+            assert any(
+                critic_after[(role, name)] != critic_before[(role, name)]
+                for (r, name) in critic_before
+                if r == role
+            ), f"{role} critic did not update"
+        assert trainer.generation_history[-1]["critic_only"] is True
+    finally:
+        trainer.close()
+
+
+def test_generation_after_critic_only_warmup_updates_actors(tmp_path: Path) -> None:
+    """[RED] Generation N + 1 updates actor weights for all four policies."""
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        seed=5,
+        critic_only_until_gen=1,
+    )
+    try:
+        trainer.train(total_updates=1)  # gen 1: critic-only
+        actor_after_1, _, _ = _snapshot_actor_and_adam(trainer)
+
+        trainer.train(total_updates=1)  # gen 2 = N + 1: normal update
+        actor_after_2, _, _ = _snapshot_actor_and_adam(trainer)
+
+        for role in ("blue_field", "blue_keeper", "red_field", "red_keeper"):
+            assert any(
+                actor_after_2[(role, name)] != actor_after_1[(role, name)]
+                for (r, name) in actor_after_1
+                if r == role
+            ), f"{role} actor did not update at gen N+1"
+        assert trainer.generation_history[-1]["critic_only"] is False
+    finally:
+        trainer.close()
+
+
+def test_resume_inside_critic_only_warmup_completes_remaining_warmup_then_unfreezes(tmp_path: Path) -> None:
+    """[RED] With N=3 interrupted after gen 2, resumed gen 3 is critic-only and gen 4 updates actors."""
+    ckpt = tmp_path / "ckpt"
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(ckpt),
+        seed=5,
+        critic_only_until_gen=3,
+    )
+    orig_collect = trainer.collect_rollouts
+
+    def interrupt_on_gen3(active_generation: int):
+        if active_generation == 3:
+            raise KeyboardInterrupt
+        return orig_collect(active_generation=active_generation)
+
+    trainer.collect_rollouts = interrupt_on_gen3
+    trainer.train(total_updates=4)
+    assert trainer.current_generation == 2
+    trainer.close()
+
+    resumed = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(ckpt),
+        seed=5,
+        critic_only_until_gen=3,
+    )
+    try:
+        assert resumed.load_checkpoints()
+        assert resumed.current_generation == 2
+        actor_before_g3, adam_before_g3, critic_before_g3 = _snapshot_actor_and_adam(resumed)
+
+        resumed.train(total_updates=1)  # gen 3 <= 3
+        actor_after_g3, adam_after_g3, critic_after_g3 = _snapshot_actor_and_adam(resumed)
+        assert actor_after_g3 == actor_before_g3
+        assert adam_after_g3 == adam_before_g3
+        assert critic_after_g3 != critic_before_g3
+        assert resumed.generation_history[-1]["generation"] == 3
+        assert resumed.generation_history[-1]["critic_only"] is True
+
+        resumed.train(total_updates=1)  # gen 4 > 3
+        actor_after_g4, _, _ = _snapshot_actor_and_adam(resumed)
+        for role in ("blue_field", "blue_keeper", "red_field", "red_keeper"):
+            assert any(
+                actor_after_g4[(role, name)] != actor_after_g3[(role, name)]
+                for (r, name) in actor_after_g3
+                if r == role
+            )
+        assert resumed.generation_history[-1]["generation"] == 4
+        assert resumed.generation_history[-1]["critic_only"] is False
+    finally:
+        resumed.close()
+
+
+def test_critic_only_generations_skip_coevolution_sync_and_window(tmp_path: Path, capsys) -> None:
+    """[RED] Dominating scores during critic-only generations cause no sync and never enter later windows."""
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=8,
+        rollout_steps=8,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        seed=3,
+        critic_only_until_gen=3,
+    )
+    try:
+        with torch.no_grad():
+            for p in list(trainer.blue_field_policy.parameters()) + list(trainer.blue_keeper_policy.parameters()):
+                p.fill_(1.0)
+            for p in list(trainer.red_field_policy.parameters()) + list(trainer.red_keeper_policy.parameters()):
+                p.fill_(0.0)
+
+        orig_collect = trainer.collect_rollouts
+        gen_scores = {
+            1: (3, 0), 2: (3, 0), 3: (3, 0),  # 24 matches of 3-0 during warm-up
+            4: (0, 0),
+            5: (0, 3), 6: (0, 3),            # with gen 4: 0-48 over 24 matches -> sync Team A on gen 6
+        }
+
+        def spy_collect(active_generation: int):
+            out = orig_collect(active_generation=active_generation)
+            a, b = gen_scores[active_generation]
+            for idx in range(8):
+                trainer.match_history.append(
+                    {"generation": active_generation, "score": [a, b], "match_id": active_generation * 10 + idx}
+                )
+            return out
+
+        trainer.collect_rollouts = spy_collect
+
+        trainer.train(total_updates=3)  # gens 1..3
+        assert "Co-Evolution Sync" not in capsys.readouterr().out
+        assert len(trainer.recent_match_scores) == 0
+        # Team B actor weights remain exact 0.0 (no soft-blend occurred).
+        assert float(trainer.red_field_policy.actor_mean[0].weight.abs().max()) == 0.0
+
+        trainer.train(total_updates=1)  # gen 4
+        assert list(trainer.recent_match_scores) == [(0, 0)] * 8
+
+        trainer.train(total_updates=2)  # gens 5..6 -> triggers sync using only gens 4..6
+        assert "Co-Evolution Sync" in capsys.readouterr().out
+        assert len(trainer.recent_match_scores) == 0
+    finally:
+        trainer.close()
+
+
+def test_v_corr_mc_hand_values_and_segments(tmp_path: Path) -> None:
+    """[RED] Monte-Carlo returns and correlations match hand-solved values across segments and degenerate inputs."""
+    from football_rl.train_ppo import compute_mc_returns, pearson_correlation
+
+    # Single segment: rewards [1, 0, 0, 2], gamma = 0.5 -> G = [1.25, 0.5, 1.0, 2.0]
+    rewards_1 = np.array([1.0, 0.0, 0.0, 2.0], dtype=np.float32)
+    dones_1 = np.zeros(4, dtype=np.float32)
+    g1 = compute_mc_returns(rewards_1, dones_1, gamma=0.5)
+    assert np.allclose(g1, np.array([1.25, 0.5, 1.0, 2.0]))
+    assert pearson_correlation(2.0 * g1 + 3.0, g1) == pytest.approx(1.0)
+    assert pearson_correlation(-g1, g1) == pytest.approx(-1.0)
+
+    # Two segments: [1, 1 | 1, 1] with done at t = 1, gamma = 0.5 -> G = [1.5, 1.0, 1.5, 1.0]
+    rewards_2 = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    dones_2 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    g2 = compute_mc_returns(rewards_2, dones_2, gamma=0.5)
+    assert np.allclose(g2, np.array([1.5, 1.0, 1.5, 1.0]))
+
+    # Degenerate zero-variance and single-element inputs
+    assert pearson_correlation(np.ones(4), g1) == 0.0
+    assert pearson_correlation(np.array([1.0]), np.array([2.0])) == 0.0
+
+    # End-to-end through update_policies with cfg.ppo.gamma = 0.5
+    cfg = replace(
+        DEFAULT_CONFIG,
+        ppo=replace(DEFAULT_CONFIG.ppo, gamma=0.5),
+        replay=replace(DEFAULT_CONFIG.replay, enable_recording=False),
+    )
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg, num_envs=1, rollout_steps=4, device="cpu", checkpoint_dir=str(tmp_path / "ckpt"), seed=3
+    )
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        rollout["dones"] = np.zeros((4, 1, 12), dtype=np.float32)
+        rollout["rewards"][:, 0, 0] = rewards_1
+        rollout["values"][:, 0, 0] = 2.0 * g1 + 3.0
+        rollout["rewards"][:, 0, 6] = rewards_1
+        rollout["values"][:, 0, 6] = -g1
+        metrics = trainer.update_policies(rollout)
+        assert metrics["blue_keeper"]["v_corr_mc"] == pytest.approx(1.0)
+        assert metrics["red_keeper"]["v_corr_mc"] == pytest.approx(-1.0)
+    finally:
+        trainer.close()
+
+
+def test_generation_record_and_state_persist_v_corr_critic_only_and_seed(tmp_path: Path, capsys) -> None:
+    """[RED] v_corr_*, critic_only, and seed persist to JSON and PT; resuming with a different seed logs once."""
+    import football_rl.train_ppo as tp
+
+    parser = tp.build_arg_parser()
+    assert parser.parse_args([]).critic_only_until_gen == 0
+    assert parser.parse_args(["--critic-only-until-gen", "1070"]).critic_only_until_gen == 1070
+
+    ckpt = tmp_path / "ckpt"
+    trainer = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(ckpt),
+        seed=42,
+        critic_only_until_gen=1,
+    )
+    try:
+        trainer.train(total_updates=1)
+    finally:
+        trainer.close()
+
+    history = json.loads((ckpt / "training_history.json").read_text(encoding="utf-8"))
+    rec = history["generations"][0]
+    assert rec["critic_only"] is True
+    assert rec["seed"] == 42
+    for key in ("v_corr_lambda", "v_corr_mc"):
+        assert key in rec
+        assert set(rec[key].keys()) == {"blue_field", "blue_keeper", "red_field", "red_keeper"}
+        for val in rec[key].values():
+            assert isinstance(val, float) and math.isfinite(val) and -1.0 <= val <= 1.0
+
+    state = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["seed"] == 42
+
+    resumed = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(),
+        num_envs=1,
+        rollout_steps=16,
+        device="cpu",
+        checkpoint_dir=str(ckpt),
+        seed=43,
+        critic_only_until_gen=1,
+    )
+    try:
+        capsys.readouterr()
+        assert resumed.load_checkpoints() is True
+        out = capsys.readouterr().out.strip().splitlines()
+        assert len(out) == 1
+        assert "42" in out[0] and "43" in out[0]
+        assert resumed.seed == 43
+
+        resumed.train(total_updates=1)
+    finally:
+        resumed.close()
+
+    history2 = json.loads((ckpt / "training_history.json").read_text(encoding="utf-8"))
+    rec2 = history2["generations"][1]
+    assert rec2["seed"] == 43
+    assert rec2["critic_only"] is False
+    state2 = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state2["seed"] == 43

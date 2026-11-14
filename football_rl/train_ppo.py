@@ -201,6 +201,48 @@ def uniform_env_index(seed: int, generation: int, num_envs: int) -> int:
     return int(np.random.default_rng(int(seed) + int(generation)).integers(int(num_envs)))
 
 
+def compute_mc_returns(
+    rewards: np.ndarray, dones: Optional[np.ndarray], gamma: float
+) -> np.ndarray:
+    """Compute backwards Monte-Carlo discounted returns inside each rollout episode segment.
+
+    A segment ends at a step where `dones` is non-zero or at the end of the buffer.
+    """
+    rew = np.asarray(rewards, dtype=np.float64)
+    if rew.shape[0] == 0:
+        return np.empty_like(rew, dtype=np.float64)
+    if dones is None:
+        nonterminal = np.ones_like(rew, dtype=np.float64)
+    else:
+        done_arr = np.asarray(dones, dtype=np.float64)
+        while done_arr.ndim < rew.ndim:
+            done_arr = done_arr[..., None]
+        nonterminal = 1.0 - done_arr
+    returns_mc = np.empty_like(rew, dtype=np.float64)
+    running = np.zeros(rew.shape[1:], dtype=np.float64)
+    for t in range(rew.shape[0] - 1, -1, -1):
+        running = rew[t] + gamma * running * nonterminal[t]
+        returns_mc[t] = running
+    return returns_mc
+
+
+def pearson_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    """Return the Pearson correlation between flattened `x` and `y`, or 0.0 when undefined."""
+    ax = np.asarray(x, dtype=np.float64).reshape(-1)
+    ay = np.asarray(y, dtype=np.float64).reshape(-1)
+    if ax.size < 2 or ay.size != ax.size:
+        return 0.0
+    dx = ax - ax.mean()
+    dy = ay - ay.mean()
+    denom = float(np.sqrt(np.dot(dx, dx) * np.dot(dy, dy)))
+    if denom <= 1e-12 or not np.isfinite(denom):
+        return 0.0
+    corr = float(np.dot(dx, dy) / denom)
+    if not np.isfinite(corr):
+        return 0.0
+    return max(-1.0, min(1.0, corr))
+
+
 TEAM_COLOR_SCHEMA = 2
 
 
@@ -355,6 +397,7 @@ class ParameterSharingPPOTrainer:
         separate_teams: bool = True,
         save_best_only: bool = False,
         write_root_summary: bool = False,
+        critic_only_until_gen: int = 0,
     ) -> None:
         self.cfg = config
         self.num_envs = num_envs
@@ -365,6 +408,7 @@ class ParameterSharingPPOTrainer:
         self.seed = seed
         self.separate_teams = separate_teams
         self.write_root_summary = write_root_summary
+        self.critic_only_until_gen = int(critic_only_until_gen)
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
         if self.save_best_only != self.cfg.replay.save_best_only:
             self.cfg = replace(
@@ -845,6 +889,7 @@ class ParameterSharingPPOTrainer:
             "returns": returns,
             "values": buf_val,
             "rewards": buf_rew,
+            "dones": buf_done,
             "completed_episodes": completed_episodes,
             "max_interest": max_interest,
             "exported_replays": exported_replays,
@@ -872,6 +917,7 @@ class ParameterSharingPPOTrainer:
         b_returns: torch.Tensor,
         b_values: torch.Tensor,
         b_central: Optional[torch.Tensor] = None,
+        critic_only: bool = False,
     ) -> Dict[str, float]:
         """Run multi-epoch minibatch PPO update on pooled role transitions."""
         batch_size = b_obs.shape[0]
@@ -880,7 +926,8 @@ class ParameterSharingPPOTrainer:
         clip_coef = self.cfg.ppo.clip_coef
 
         # Normalize once across the full rollout batch for the team unit
-        b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
+        if not critic_only:
+            b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
 
         pg_losses: List[float] = []
         v_losses: List[float] = []
@@ -912,6 +959,26 @@ class ParameterSharingPPOTrainer:
                     mb_returns = b_returns
                     mb_values = b_values
                     cen_mb = b_central
+
+                if critic_only:
+                    newvalue = policy.get_value(mb_obs, central_state=cen_mb)
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values + torch.clamp(
+                        newvalue - mb_values, -clip_coef, clip_coef
+                    )
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    loss = v_loss * self.cfg.ppo.vf_coef
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(policy.parameters(), self.cfg.ppo.max_grad_norm)
+                    optimizer.step()
+
+                    pg_losses.append(0.0)
+                    v_losses.append(float(v_loss.item()))
+                    entropy_losses.append(0.0)
+                    continue
 
                 _, newlogprob, entropy, newvalue = policy.get_action_and_value(
                     mb_obs, mb_actions, central_state=cen_mb
@@ -956,7 +1023,9 @@ class ParameterSharingPPOTrainer:
             "entropy": float(np.mean(entropy_losses)),
         }
 
-    def update_policies(self, rollout: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    def update_policies(
+        self, rollout: Dict[str, Any], critic_only: bool = False
+    ) -> Dict[str, Dict[str, float]]:
         """Update Red and Blue role networks independently (or pooled if `separate_teams=False`)."""
         obs = rollout["obs"]
         central_state = rollout.get("central_state")
@@ -965,6 +1034,22 @@ class ParameterSharingPPOTrainer:
         advantages = rollout["advantages"]
         returns = rollout["returns"]
         values = rollout["values"]
+        rewards = rollout.get("rewards")
+        mc_returns = (
+            compute_mc_returns(rewards, rollout.get("dones"), self.cfg.ppo.gamma)
+            if rewards is not None
+            else None
+        )
+
+        def _attach_v_corr(role_metrics: Dict[str, float], role_indices: List[int]) -> None:
+            role_val = values[:, :, role_indices]
+            role_ret = returns[:, :, role_indices]
+            role_metrics["v_corr_lambda"] = pearson_correlation(role_val, role_ret)
+            role_metrics["v_corr_mc"] = (
+                pearson_correlation(role_val, mc_returns[:, :, role_indices])
+                if mc_returns is not None
+                else 0.0
+            )
 
         def _extract_role_tensors(
             role_indices: List[int],
@@ -1017,14 +1102,18 @@ class ParameterSharingPPOTrainer:
                 self.blue_field_optimizer,
                 f_tensors[0], f_tensors[1], f_tensors[2], f_tensors[3], f_tensors[4], f_tensors[5],
                 b_central=f_tensors[6],
+                critic_only=critic_only,
             )
+            _attach_v_corr(field_metrics, self.field_indices)
             k_tensors = _extract_role_tensors(self.keeper_indices)
             keeper_metrics = self._ppo_update_role(
                 self.blue_keeper_policy,
                 self.blue_keeper_optimizer,
                 k_tensors[0], k_tensors[1], k_tensors[2], k_tensors[3], k_tensors[4], k_tensors[5],
                 b_central=k_tensors[6],
+                critic_only=critic_only,
             )
+            _attach_v_corr(keeper_metrics, self.keeper_indices)
             metrics = {
                 "field": field_metrics,
                 "keeper": keeper_metrics,
@@ -1042,28 +1131,36 @@ class ParameterSharingPPOTrainer:
             self.blue_field_optimizer,
             bf_tensors[0], bf_tensors[1], bf_tensors[2], bf_tensors[3], bf_tensors[4], bf_tensors[5],
             b_central=bf_tensors[6],
+            critic_only=critic_only,
         )
+        _attach_v_corr(blue_field_m, self.blue_field_indices)
         bk_tensors = _extract_role_tensors(self.blue_keeper_indices)
         blue_keeper_m = self._ppo_update_role(
             self.blue_keeper_policy,
             self.blue_keeper_optimizer,
             bk_tensors[0], bk_tensors[1], bk_tensors[2], bk_tensors[3], bk_tensors[4], bk_tensors[5],
             b_central=bk_tensors[6],
+            critic_only=critic_only,
         )
+        _attach_v_corr(blue_keeper_m, self.blue_keeper_indices)
         rf_tensors = _extract_role_tensors(self.red_field_indices)
         red_field_m = self._ppo_update_role(
             self.red_field_policy,
             self.red_field_optimizer,
             rf_tensors[0], rf_tensors[1], rf_tensors[2], rf_tensors[3], rf_tensors[4], rf_tensors[5],
             b_central=rf_tensors[6],
+            critic_only=critic_only,
         )
+        _attach_v_corr(red_field_m, self.red_field_indices)
         rk_tensors = _extract_role_tensors(self.red_keeper_indices)
         red_keeper_m = self._ppo_update_role(
             self.red_keeper_policy,
             self.red_keeper_optimizer,
             rk_tensors[0], rk_tensors[1], rk_tensors[2], rk_tensors[3], rk_tensors[4], rk_tensors[5],
             b_central=rk_tensors[6],
+            critic_only=critic_only,
         )
+        _attach_v_corr(red_keeper_m, self.red_keeper_indices)
         metrics = {
             "field": blue_field_m,
             "keeper": blue_keeper_m,
@@ -1098,6 +1195,7 @@ class ParameterSharingPPOTrainer:
             {
                 "current_generation": self.current_generation,
                 "total_env_steps": self.total_env_steps,
+                "seed": int(self.seed),
                 "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
                 "field_policy": self.blue_field_policy.state_dict(),
@@ -1331,6 +1429,9 @@ class ParameterSharingPPOTrainer:
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location=self.device, weights_only=False)
+            saved_seed = state.get("seed")
+            if saved_seed is not None and int(saved_seed) != int(self.seed):
+                print(f"[Resume] Checkpoint seed was {int(saved_seed)}; continuing with seed={int(self.seed)}.")
             self.current_generation = int(state.get("current_generation", 0))
             self.total_env_steps = int(state.get("total_env_steps", 0))
             self.match_history = list(state.get("match_history", []))
@@ -1503,7 +1604,8 @@ class ParameterSharingPPOTrainer:
                 if recording:
                     uniform_replay = self.vec_env.export_uniform_replay(uniform_env)
                     self.vec_env.set_uniform_capture(None)
-                metrics = self.update_policies(rollout)
+                critic_only = gen <= self.critic_only_until_gen
+                metrics = self.update_policies(rollout, critic_only=critic_only)
                 elapsed = max(1e-6, time.time() - start_time)
 
                 step_delta = self.rollout_steps * self.num_envs
@@ -1521,30 +1623,42 @@ class ParameterSharingPPOTrainer:
                 )
 
                 # Exploration LogStd Clamp (prevent action noise explosion / collapse)
-                if self.separate_teams:
-                    for pol in (
-                        self.blue_field_policy,
-                        self.blue_keeper_policy,
-                        self.red_field_policy,
-                        self.red_keeper_policy,
-                    ):
-                        torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
-                else:
-                    for pol in (self.blue_field_policy, self.blue_keeper_policy):
-                        torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                if not critic_only:
+                    if self.separate_teams:
+                        for pol in (
+                            self.blue_field_policy,
+                            self.blue_keeper_policy,
+                            self.red_field_policy,
+                            self.red_keeper_policy,
+                        ):
+                            torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                    else:
+                        for pol in (self.blue_field_policy, self.blue_keeper_policy):
+                            torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
                 self._sync_cpu_policies()
 
                 # Balanced Co-Evolution & Underdog Soft-Sync (over the rolling window of completed matches)
-                self._coevolution_step(self.match_history[matches_before:])
+                if not critic_only:
+                    self._coevolution_step(self.match_history[matches_before:])
 
                 gen_record = {
                     "generation": gen,
                     "total_env_steps": self.total_env_steps,
                     "sps": sps,
+                    "seed": int(self.seed),
+                    "critic_only": bool(critic_only),
                     "red_mean_reward": round(team_a_rew, 5),
                     "blue_mean_reward": round(team_b_rew, 5),
                     "mean_field_reward": round(mean_field_rew, 5),
                     "mean_keeper_reward": round(mean_keeper_rew, 5),
+                    "v_corr_lambda": {
+                        role: metrics[role]["v_corr_lambda"]
+                        for role in ("blue_field", "blue_keeper", "red_field", "red_keeper")
+                    },
+                    "v_corr_mc": {
+                        role: metrics[role]["v_corr_mc"]
+                        for role in ("blue_field", "blue_keeper", "red_field", "red_keeper")
+                    },
                     "max_interest": round(float(rollout["max_interest"]), 2),
                     "completed_matches_in_gen": int(rollout["completed_episodes"]),
                     "num_envs": self.num_envs,
@@ -1968,6 +2082,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Compute device (`cpu` or `cuda`).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--critic-only-until-gen",
+        type=int,
+        default=0,
+        help="Update only critics (freeze actors and skip co-evolution sync) for generations <= N (default: 0).",
+    )
 
     # Lifecycle & Batch Management Flags
     parser.add_argument(
@@ -2072,6 +2192,7 @@ def main() -> None:
         separate_teams=not args.shared_teams,
         save_best_only=args.save_best_only,
         write_root_summary=True,
+        critic_only_until_gen=args.critic_only_until_gen,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")
