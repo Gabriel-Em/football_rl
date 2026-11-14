@@ -700,3 +700,328 @@ class TestCensusEndToEnd:
         assert all(0.0 <= m["hold_share_A"] <= 1.0 for m in per_match)
         text = census.report(per_match, title="synthetic")
         assert "n_within(100)" in text and "kick outcome" in text and "n=2" in text
+
+
+# ----------------------------------------------------------------------------
+# E1: Kick propensity
+# ----------------------------------------------------------------------------
+class TestKickPropensity:
+    def test_four_decision_kick_plus_two_decision_tackle_is_one_sixth(self):
+        tr = make_trace(20)
+        tr["holder"][2:6] = 3
+        set_kick(tr, 5, 3)
+        tr["holder"][10:12] = 3
+        kp = census.kick_propensity(tr)
+        assert kp["A"] == pytest.approx(1.0 / 6.0)
+        assert kp["pooled"] == pytest.approx(1.0 / 6.0)
+        assert kp["M"] == pytest.approx(1.0 / 6.0)
+        assert kp["B"] is None
+
+    def test_one_decision_spell_ending_in_kick_is_one(self):
+        tr = make_trace(10)
+        tr["holder"][4] = 5
+        set_kick(tr, 4, 5)
+        kp = census.kick_propensity(tr)
+        assert kp["A"] == pytest.approx(1.0)
+        assert kp["ST"] == pytest.approx(1.0)
+        assert kp["pooled"] == pytest.approx(1.0)
+
+    def test_no_holding_returns_none_not_zero_or_nan(self):
+        tr = make_trace(10)
+        kp = census.kick_propensity(tr)
+        for key in ("A", "B", "pooled", "GK", "D", "M", "ST"):
+            assert kp[key] is None
+
+    def test_role_groups_and_teams_aggregate_independently(self):
+        tr = make_trace(30)
+        tr["holder"][1:3] = 0
+        set_kick(tr, 2, 0)         # A GK: 1/2
+        tr["holder"][5:9] = 7      # B D1: 0/4
+        tr["holder"][12:14] = 11   # B ST: 1/2
+        set_kick(tr, 13, 11)
+        kp = census.kick_propensity(tr)
+        assert kp["A"] == pytest.approx(0.5)
+        assert kp["B"] == pytest.approx(1.0 / 6.0)
+        assert kp["pooled"] == pytest.approx(2.0 / 8.0)
+        assert kp["GK"] == pytest.approx(0.5)
+        assert kp["D"] == pytest.approx(0.0)
+        assert kp["ST"] == pytest.approx(0.5)
+        assert kp["M"] is None
+
+
+# ----------------------------------------------------------------------------
+# E1: Per-keeper geometry
+# ----------------------------------------------------------------------------
+class TestGkGeometry:
+    def test_hand_solved_distance_inbox_and_goalline(self):
+        tr = make_trace(4)
+        tr["pos"][0:3, 0] = (10.0, 420.0)
+        tr["pos"][3, 0] = (200.0, 420.0)
+        geo = census.gk_geometry(tr)
+        assert geo["gk_dist_goal_A"] == pytest.approx(57.5)
+        assert geo["gk_in_box_A"] == pytest.approx(0.75)
+        assert geo["gk_goal_line_A"] == pytest.approx(0.75)
+
+    def test_exact_boundary_values_are_inclusive(self):
+        tr = make_trace(2)
+        tr["pos"][0, 0] = (19.5, 420.0)
+        tr["pos"][1, 0] = (195.0, 420.0)
+        tr["pos"][0, 6] = (1400.0 - 19.5, 420.0)
+        tr["pos"][1, 6] = (1400.0 - 195.0, 420.0)
+        geo = census.gk_geometry(tr)
+        assert geo["gk_goal_line_A"] == pytest.approx(0.5)
+        assert geo["gk_in_box_A"] == pytest.approx(1.0)
+        assert geo["gk_goal_line_B"] == pytest.approx(0.5)
+        assert geo["gk_in_box_B"] == pytest.approx(1.0)
+        assert geo["gk_in_box_pooled"] == pytest.approx(1.0)
+
+    def test_ignores_dynamic_box_and_follows_side_swap(self):
+        tr = make_trace(2)
+        tr["box"][:] = 100.0
+        tr["side"][:, 0] = 1
+        tr["side"][:, 1] = 0
+        tr["pos"][:, 0] = (1400.0 - 150.0, 420.0)
+        tr["pos"][:, 6] = (195.1, 420.0)
+        geo = census.gk_geometry(tr)
+        assert geo["gk_in_box_A"] == pytest.approx(1.0)
+        assert geo["gk_in_box_B"] == pytest.approx(0.0)
+        assert geo["gk_dist_goal_A"] == pytest.approx(150.0)
+
+
+# ----------------------------------------------------------------------------
+# E1: Per-team hold/spell/cluster/n_within/inversion & summary
+# ----------------------------------------------------------------------------
+class TestPerTeamAndSummary:
+    def test_b6_formation_team_a_and_spread_team_b(self):
+        tr = team_a_geometry(TestNWithin.OFFSETS, T=3, ball=(0.0, 0.0))
+        for idx, slot in enumerate(range(7, 12)):
+            tr["pos"][:, slot] = (200.0 + 150.0 * idx, 0.0)
+        nw = census.n_within(tr, 100.0)
+        assert nw[0] == pytest.approx(2.0)
+        assert nw[1] == pytest.approx(0.0)
+        m = census.match_metrics(tr)
+        assert m["n_within_100_A"] == pytest.approx(2.0)
+        assert m["n_within_100_B"] == pytest.approx(0.0)
+        assert m["n_within_100_pooled"] == pytest.approx(1.0)
+
+    def test_per_team_hold_spell_cluster_inversion_and_scoreless_in_summary(self):
+        tr = make_trace(10)
+        tr["holder"][0:3] = 2
+        tr["holder"][4:9] = 8
+        m = census.match_metrics(tr)
+        assert m["hold_share_A"] == pytest.approx(0.3)
+        assert m["hold_share_B"] == pytest.approx(0.5)
+        assert m["hold_share_pooled"] == pytest.approx(0.8)
+        assert m["spells_n_A"] == 1
+        assert m["spells_sum_A"] == pytest.approx(3 * STEP_S)
+        assert m["spells_n_B"] == 1
+        assert m["spells_sum_B"] == pytest.approx(5 * STEP_S)
+        assert m["scoreless"] == 1.0
+        s = census.summarize([m])["metrics"]
+        assert s["hold_share_pooled"]["mean"] == pytest.approx(0.8)
+        assert s["holder_spell_s_A"]["mean"] == pytest.approx(3 * STEP_S)
+        assert s["holder_spell_s_B"]["mean"] == pytest.approx(5 * STEP_S)
+        assert s["holder_spell_s_pooled"]["mean"] == pytest.approx(4 * STEP_S)
+        assert s["scoreless"]["mean"] == pytest.approx(1.0)
+
+
+# ----------------------------------------------------------------------------
+# E1: Time-binned metrics (last 225 decisions vs rest)
+# ----------------------------------------------------------------------------
+class TestTimeBinnedMetrics:
+    def test_defender_mean_canonical_x_300_decisions(self):
+        tr = make_trace(300)
+        tr["s_shots"] = np.zeros((300, 2), dtype=np.int32)
+        tr["s_field_5s_violations"] = np.zeros(300, dtype=np.int32)
+        tr["s_keeper_5s_violations"] = np.zeros(300, dtype=np.int32)
+        tr["pos"][:75, 1:3, 0] = 300.0
+        tr["pos"][75:, 1:3, 0] = 500.0
+        tb = census.time_binned_metrics(tr)
+        assert tb["early_def_x_A"] == pytest.approx(300.0)
+        assert tb["late_def_x_A"] == pytest.approx(500.0)
+
+    def test_all_time_binned_submetrics_hand_solved(self):
+        tr = make_trace(300)
+        tr["s_shots"] = np.zeros((300, 2), dtype=np.int32)
+        tr["s_field_5s_violations"] = np.zeros(300, dtype=np.int32)
+        tr["s_keeper_5s_violations"] = np.zeros(300, dtype=np.int32)
+        # Early [0:75] (5 s = 1/12 min), Late [75:300] (15 s = 1/4 min).
+        # GK A holds 3 steps in early (kicks at step 2 -> within 0.5 s), 10 steps in late (kicks at step 109 -> >0.5 s).
+        tr["holder"][0:3] = 0
+        set_kick(tr, 2, 0)
+        tr["holder"][100:110] = 0
+        set_kick(tr, 109, 0)
+        # Inversion in early: 0; in late: all 225 steps inverted for team A.
+        tr["pos"][:, 5, 0] = 400.0
+        tr["pos"][:75, 1:3, 0] = 300.0
+        tr["pos"][75:, 1:3, 0] = 500.0
+        # Shots: 1 by A in early (12/min), 3 by A in late (12/min); 0 by B.
+        tr["s_shots"][30:, 0] = 1
+        tr["s_shots"][200:, 0] = 4
+        # 5s violations: 1 field violation in late (4/min).
+        tr["s_field_5s_violations"][250:] = 1
+        # Outfield kick-to-self: 1 kick in early -> teammate, 2 kicks in late -> 1 self, 1 opponent (0.5).
+        tr["holder"][10] = 3
+        set_kick(tr, 10, 3)
+        tr["holder"][20] = 4
+        tr["holder"][150] = 3
+        set_kick(tr, 150, 3)
+        tr["holder"][160] = 3
+        tr["holder"][180] = 4
+        set_kick(tr, 180, 4)
+        tr["holder"][190] = 7
+
+        tb = census.time_binned_metrics(tr)
+        assert tb["early_gk_hold_s_A"] == pytest.approx(3 * STEP_S)
+        assert tb["late_gk_hold_s_A"] == pytest.approx(10 * STEP_S)
+        assert tb["early_gk_quick_kick_share_A"] == pytest.approx(1.0)
+        assert tb["late_gk_quick_kick_share_A"] == pytest.approx(0.0)
+        assert tb["early_role_inversion_A"] == pytest.approx(0.0)
+        assert tb["late_role_inversion_A"] == pytest.approx(1.0)
+        assert tb["early_shots_per_min_A"] == pytest.approx(12.0)
+        assert tb["late_shots_per_min_A"] == pytest.approx(12.0)
+        assert tb["early_kick_self_share_A"] == pytest.approx(0.0)
+        assert tb["late_kick_self_share_A"] == pytest.approx(0.5)
+        assert tb["early_violations_5s_per_min_both"] == pytest.approx(0.0)
+        assert tb["late_violations_5s_per_min_both"] == pytest.approx(4.0)
+
+    def test_short_trace_under_225_steps_has_none_early_metrics(self):
+        tr = make_trace(100)
+        tr["s_shots"] = np.zeros((100, 2), dtype=np.int32)
+        tr["s_field_5s_violations"] = np.zeros(100, dtype=np.int32)
+        tr["s_keeper_5s_violations"] = np.zeros(100, dtype=np.int32)
+        tb = census.time_binned_metrics(tr)
+        assert tb["early_def_x_A"] is None
+        assert tb["early_shots_per_min_both"] is None
+        assert tb["late_def_x_A"] == pytest.approx(700.0)
+
+
+# ----------------------------------------------------------------------------
+# E1: Gates
+# ----------------------------------------------------------------------------
+def _fake_census_point(**overrides):
+    metrics = {
+        "hold_share_pooled": {"mean": 0.19, "se": 0.002, "n": 96},
+        "hold_share_A": {"mean": 0.095, "se": 0.002, "n": 96},
+        "hold_share_B": {"mean": 0.095, "se": 0.002, "n": 96},
+        "holder_spell_s_pooled": {"mean": 0.27, "se": 0.004, "n": 96},
+        "gk_in_box_A": {"mean": 0.99, "se": 0.002, "n": 96},
+        "gk_in_box_B": {"mean": 0.99, "se": 0.002, "n": 96},
+        "gk_dist_goal_A": {"mean": 75.0, "se": 1.0, "n": 96},
+        "gk_dist_goal_B": {"mean": 75.0, "se": 1.0, "n": 96},
+        "gk_goal_line_A": {"mean": 0.20, "se": 0.01, "n": 96},
+        "gk_goal_line_B": {"mean": 0.15, "se": 0.01, "n": 96},
+        "n_within_100_pooled": {"mean": 0.50, "se": 0.01, "n": 96},
+        "cluster_ge4_pooled": {"mean": 0.06, "se": 0.003, "n": 96},
+        "cluster_ge4_A": {"mean": 0.08, "se": 0.004, "n": 96},
+        "cluster_ge4_B": {"mean": 0.04, "se": 0.003, "n": 96},
+        "role_inversion_pooled": {"mean": 0.14, "se": 0.005, "n": 96},
+        "role_inversion_A": {"mean": 0.14, "se": 0.005, "n": 96},
+        "role_inversion_B": {"mean": 0.14, "se": 0.005, "n": 96},
+        "goals_total": {"mean": 2.2, "se": 0.1, "n": 96},
+        "scoreless": {"mean": 0.10, "se": 0.03, "n": 96},
+        "kick_propensity_pooled": {"mean": 0.245, "se": 0.003, "n": 96},
+    }
+    for k, v in overrides.items():
+        if isinstance(v, tuple):
+            metrics[k] = {"mean": v[0], "se": v[1], "n": 96}
+        else:
+            metrics[k] = {"mean": v, "se": metrics[k]["se"], "n": 96}
+    return {"summary": {"n_matches": 96, "metrics": metrics}}
+
+
+class TestGates:
+    def test_delta_se_and_significance_star(self):
+        from tools.audit import gates
+
+        res = gates.delta_stat(0.091, 0.003, 0.054, 0.002)
+        assert res["delta"] == pytest.approx(0.037)
+        assert res["se"] == pytest.approx(math.sqrt(0.003 ** 2 + 0.002 ** 2))
+        assert res["se"] == pytest.approx(0.00360555, rel=1e-4)
+        assert res["significant"] is True
+
+        non_sig = gates.delta_stat(0.091, 0.01, 0.085, 0.01)
+        assert non_sig["significant"] is False
+
+    def test_two_consecutive_exceedances_rule_on_cluster_ge4(self):
+        from tools.audit import gates
+
+        pass_arm = {"s1": {
+            "1050": {"self_sampled": _fake_census_point(cluster_ge4_A=0.12)},
+            "1100": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
+            "1150": {"self_sampled": _fake_census_point(cluster_ge4_A=0.14)},
+            "1200": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
+        }}
+        fail_arm = {"s1": {
+            "1100": {"self_sampled": _fake_census_point(cluster_ge4_A=0.12)},
+            "1150": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
+            "1200": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
+        }}
+        assert gates.evaluate_gates(pass_arm)["gates"]["G3"]["passed"] is True
+        assert gates.evaluate_gates(fail_arm)["gates"]["G3"]["passed"] is False
+
+    def test_g9_prime_b_and_seed_ranges(self):
+        from tools.audit import gates
+
+        b3 = {
+            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.245)}},
+            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.240)}},
+        }
+        b4_pass = {
+            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.205)}},
+            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.200)}},
+        }
+        b4_fail = {
+            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.205)}},
+            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.242)}},
+        }
+        res_pass = gates.evaluate_gates(b4_pass, comparator=b3, gens=["1200"])
+        assert res_pass["gates"]["G9_prime_b"]["passed"] is True
+        assert res_pass["gates"]["G9_prime_b"]["points"]["1200"]["arm_range"] == pytest.approx([0.200, 0.205])
+        assert res_pass["gates"]["G9_prime_b"]["points"]["1200"]["comp_range"] == pytest.approx([0.240, 0.245])
+        md = gates.format_markdown(res_pass)
+        assert "0.200..0.205" in md or "0.200" in md
+
+        res_fail = gates.evaluate_gates(b4_fail, comparator=b3, gens=["1200"])
+        assert res_fail["gates"]["G9_prime_b"]["passed"] is False
+
+
+# ----------------------------------------------------------------------------
+# E1: evaluate_arm
+# ----------------------------------------------------------------------------
+class TestEvaluateArm:
+    def test_determinism_two_runs_byte_identical_census_json(self, ckpt, tmp_path):
+        from tools.audit import evaluate_arm
+
+        snap = tmp_path / "gen1200"
+        snap.mkdir()
+        for p in ckpt.iterdir():
+            (snap / p.name).write_bytes(p.read_bytes())
+
+        out1 = tmp_path / "out1"
+        out2 = tmp_path / "out2"
+        evaluate_arm.evaluate_arm(
+            [snap], out1, workers=1, frozen_dir=snap, n_override=2, max_steps=30,
+        )
+        evaluate_arm.evaluate_arm(
+            [snap], out2, workers=1, frozen_dir=snap, n_override=2, max_steps=30,
+        )
+        for tag in ("self_sampled", "self_mixed", "vs_scripted_sampled", "vs_frozen"):
+            p1 = out1 / "gen1200" / tag / "census.json"
+            p2 = out2 / "gen1200" / tag / "census.json"
+            assert p1.is_file() and p2.is_file()
+            assert p1.read_bytes() == p2.read_bytes()
+
+    def test_no_writes_to_checkpoint_or_replays(self, tmp_path, monkeypatch):
+        from tools.audit import evaluate_arm
+
+        snap = write_checkpoint(tmp_path / "checkpoints" / "gen1200", seed=9)
+        replays = tmp_path / "replays"
+        replays.mkdir()
+        before = dir_digest(snap)
+        monkeypatch.chdir(tmp_path)
+        evaluate_arm.evaluate_arm(
+            [snap], tmp_path / "eval_out", workers=1, n_override=2, max_steps=20, tags=["self_sampled"],
+        )
+        assert dir_digest(snap) == before
+        assert list(replays.iterdir()) == []
