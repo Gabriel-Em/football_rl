@@ -470,6 +470,7 @@ def test_pbrs_t7_gamma_source_and_trainer_worker_propagation(tmp_path: Path) -> 
     def _cfg(gamma: float) -> object:
         return replace(
             DEFAULT_CONFIG,
+            rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="all"),
             ppo=replace(DEFAULT_CONFIG.ppo, gamma=gamma),
             replay=replace(DEFAULT_CONFIG.replay, enable_recording=False, save_dir=str(tmp_path / f"r_{gamma}")),
         )

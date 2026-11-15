@@ -1445,3 +1445,397 @@ def test_generation_record_and_state_persist_v_corr_critic_only_and_seed(tmp_pat
     assert rec2["critic_only"] is False
     state2 = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
     assert state2["seed"] == 43
+
+
+# --------------------------------------------------------------------------------------
+# Run-config overrides and provenance
+# --------------------------------------------------------------------------------------
+
+
+def _override_trainer(tmp_path: Path, specs, name: str = "ckpt", num_envs: int = 1, **kwargs):
+    import football_rl.train_ppo as tp
+
+    cfg, applied = tp.parse_config_overrides(specs, _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}")))
+    return ParameterSharingPPOTrainer(
+        config=cfg,
+        num_envs=num_envs,
+        rollout_steps=8,
+        device="cpu",
+        checkpoint_dir=str(tmp_path / name),
+        seed=3,
+        config_overrides=applied,
+        **kwargs,
+    )
+
+
+def _phi_total_next(env: FootballParallelEnv) -> np.ndarray:
+    w = env.cfg.rewards.team_advance_pbrs_weight
+    ball = np.array(
+        [w * env._compute_ball_potential(0)] * 6 + [w * env._compute_ball_potential(1)] * 6, dtype=np.float64
+    )
+    return ball + env._phi_curr
+
+
+def test_cli_accepts_repeated_config_override_and_accept_flag() -> None:
+    import football_rl.train_ppo as tp
+
+    parser = tp.build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.config_overrides == [] and defaults.accept_config_change is False
+    args = parser.parse_args(
+        ["--config-override", "rewards.shaping_mode=legacy", "--config-override", "ppo.gamma=0.99",
+         "--accept-config-change"]
+    )
+    assert args.config_overrides == ["rewards.shaping_mode=legacy", "ppo.gamma=0.99"]
+    assert args.accept_config_change is True
+
+
+def test_shaping_override_reaches_trainer_config_and_worker_envs(tmp_path: Path) -> None:
+    """[RED] `rewards.shaping_mode=legacy` reaches the trainer and every worker env.
+
+    Hand value: no teleport on the first step, so legacy pays Phi(s') - Phi(s) and `all` pays
+    0.995 * Phi(s') - Phi(s); the difference all - legacy is -0.005 * Phi(s').
+    """
+    acts = np.random.default_rng(17).uniform(-1.0, 1.0, size=(12, 4)).astype(np.float32)
+    t_leg = _override_trainer(tmp_path, ["rewards.shaping_mode=legacy"], "leg")
+    t_all = _override_trainer(tmp_path, ["rewards.shaping_mode=all"], "all")
+    try:
+        assert t_leg.cfg.rewards.shaping_mode == "legacy"
+        assert t_leg.vec_env.envs[0].cfg.rewards.shaping_mode == "legacy"
+        assert t_all.vec_env.envs[0].cfg.rewards.shaping_mode == "all"
+        t_leg.vec_env.reset_array(seeds=[17])
+        t_all.vec_env.reset_array(seeds=[17])
+        _, _, rew_leg, _, _ = t_leg.vec_env.step_array(acts[None])
+        _, _, rew_all, _, _ = t_all.vec_env.step_array(acts[None])
+        env_leg, env_all = t_leg.vec_env.envs[0], t_all.vec_env.envs[0]
+        phi = _phi_total_next(env_all)
+        assert np.max(np.abs(phi)) > 0.05
+        np.testing.assert_allclose(
+            env_all.last_shaping_rewards - env_leg.last_shaping_rewards, -0.005 * phi, rtol=0.0, atol=1e-12
+        )
+        assert np.max(np.abs(rew_all[0] - rew_leg[0])) > 1e-4
+    finally:
+        t_leg.close()
+        t_all.close()
+
+    t_sub = _override_trainer(tmp_path, ["rewards.shaping_mode=legacy"], "sub", num_envs=2)
+    t_sub_all = _override_trainer(tmp_path, ["rewards.shaping_mode=all"], "suball", num_envs=2)
+    try:
+        for t in (t_sub, t_sub_all):
+            t.vec_env.reset_array(seeds=[17, 18])
+        batch = np.stack([acts, acts], axis=0)
+        _, _, r_sub, _, _ = t_sub.vec_env.step_array(batch)
+        _, _, r_all, _, _ = t_sub_all.vec_env.step_array(batch)
+        assert np.max(np.abs(r_sub[0] - r_all[0])) > 1e-4
+    finally:
+        t_sub.close()
+        t_sub_all.close()
+
+
+def test_override_values_are_coerced_to_the_field_type() -> None:
+    """[RED] float field given `0` becomes 0.0; int field stays int; str stays str; keys come back sorted."""
+    import football_rl.train_ppo as tp
+
+    cfg, applied = tp.parse_config_overrides(
+        ["rewards.successful_tackle_team=0", "ppo.update_epochs=2", "rewards.shaping_mode=ball", "ppo.gamma=0.99"]
+    )
+    assert cfg.rewards.successful_tackle_team == 0.0 and type(cfg.rewards.successful_tackle_team) is float
+    assert cfg.ppo.update_epochs == 2 and type(cfg.ppo.update_epochs) is int
+    assert cfg.rewards.shaping_mode == "ball"
+    assert cfg.ppo.gamma == 0.99
+    assert applied == {
+        "ppo.gamma": 0.99,
+        "ppo.update_epochs": 2,
+        "rewards.shaping_mode": "ball",
+        "rewards.successful_tackle_team": 0.0,
+    }
+    assert list(applied) == sorted(applied)
+    assert type(applied["rewards.successful_tackle_team"]) is float
+    assert type(applied["ppo.update_epochs"]) is int
+
+    base_cfg, base_applied = tp.parse_config_overrides([])
+    assert base_cfg == DEFAULT_CONFIG and base_applied == {}
+
+
+@pytest.mark.parametrize(
+    "raw,annotation,expected",
+    [("true", "bool", True), ("false", "bool", False), ("True", "bool", True), ("FALSE", "bool", False),
+     ("7", "int", 7), ("-3", "int", -3), ("1e-3", "float", 0.001), ("x=y", "str", "x=y")],
+)
+def test_coerce_override_value_hand_values(raw, annotation, expected) -> None:
+    import football_rl.train_ppo as tp
+
+    got = tp.coerce_override_value(raw, annotation)
+    assert got == expected and type(got) is type(expected)
+
+
+@pytest.mark.parametrize(
+    "raw,annotation", [("yes", "bool"), ("1", "bool"), ("", "bool"), ("2.5", "int"), ("", "int"),
+                       ("abc", "float"), ("", "float"), ("nan", "float"), ("inf", "float"), ("1", "Tuple[int, int]")]
+)
+def test_coerce_override_value_rejects_unparseable_values(raw, annotation) -> None:
+    import football_rl.train_ppo as tp
+
+    with pytest.raises(ValueError):
+        tp.coerce_override_value(raw, annotation)
+
+
+def test_gamma_override_shifts_shaping_by_the_hand_value() -> None:
+    """[RED] `ppo.gamma=0.99` vs 0.995 on one seeded step: shaping differs by 0.005 * Phi(s') per player."""
+    import football_rl.train_ppo as tp
+
+    def stepped(gamma_spec: str) -> FootballParallelEnv:
+        cfg, _ = tp.parse_config_overrides(
+            [gamma_spec, "rewards.shaping_mode=all"],
+            replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False)),
+        )
+        env = FootballParallelEnv(cfg)
+        env.reset(seed=17)
+        env.step_array(np.random.default_rng(17).uniform(-1.0, 1.0, size=(12, 4)).astype(np.float32))
+        return env
+
+    env_99, env_995 = stepped("ppo.gamma=0.99"), stepped("ppo.gamma=0.995")
+    phi = _phi_total_next(env_995)
+    assert np.max(np.abs(phi)) > 0.05
+    np.testing.assert_allclose(
+        env_995.last_shaping_rewards - env_99.last_shaping_rewards, 0.005 * phi, rtol=0.0, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize(
+    "spec,named",
+    [
+        ("physics.dt=0.1", "physics"),
+        ("rewards.nope=1", "rewards.nope"),
+        ("ppo.gamma=abc", "ppo.gamma=abc"),
+        ("rewards.shaping_mode=bogus", "bogus"),
+        ("ppo.update_epochs=2.5", "ppo.update_epochs=2.5"),
+        ("ppo.hidden_dims=64", "ppo.hidden_dims"),
+        ("ppo.gamma", "ppo.gamma"),
+        ("gamma=0.9", "gamma=0.9"),
+        ("=1", "=1"),
+        (".gamma=1", ".gamma=1"),
+        ("rewards.=1", "rewards.=1"),
+        ("replay.save_dir=/tmp/x", "replay"),
+    ],
+)
+def test_invalid_override_is_rejected_and_names_the_item(spec: str, named: str) -> None:
+    """[RED] Unknown/disallowed section, unknown key, unparseable value and failed validation each raise ValueError."""
+    import football_rl.train_ppo as tp
+
+    with pytest.raises(ValueError) as exc:
+        tp.parse_config_overrides(["ppo.update_epochs=2", spec])
+    assert named in str(exc.value)
+
+
+def test_duplicate_override_key_is_rejected() -> None:
+    import football_rl.train_ppo as tp
+
+    with pytest.raises(ValueError, match="ppo.gamma"):
+        tp.parse_config_overrides(["ppo.gamma=0.9", "ppo.gamma=0.8"])
+
+
+@pytest.mark.parametrize("from_scratch", [False, True])
+def test_main_rejects_bad_override_before_touching_disk(tmp_path: Path, monkeypatch, from_scratch: bool) -> None:
+    """[RED] A bad override aborts `main()` before checkpoints are created or wiped (even with --from-scratch)."""
+    import football_rl.train_ppo as tp
+
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "checkpoints" / "marker.txt"
+    if from_scratch:
+        marker.parent.mkdir()
+        marker.write_text("keep", encoding="utf-8")
+    argv = ["train_ppo", "--config-override", "rewards.nope=1", "--total-updates", "1"]
+    if from_scratch:
+        argv.append("--from-scratch")
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(ValueError, match="rewards.nope"):
+        tp.main()
+    if from_scratch:
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+        assert not (tmp_path / "replays").exists()
+    else:
+        assert not (tmp_path / "checkpoints").exists() and not (tmp_path / "replays").exists()
+
+
+def _train_one_generation(trainer: ParameterSharingPPOTrainer) -> None:
+    try:
+        trainer.train(total_updates=1)
+    finally:
+        trainer.close()
+
+
+def test_overrides_persist_in_state_and_every_generation_record(tmp_path: Path) -> None:
+    """[RED] The sorted dict appears in training_state.pt and each generation record; none means `{}`."""
+    specs = ["rewards.shaping_mode=legacy", "ppo.update_epochs=1"]
+    trainer = _override_trainer(tmp_path, specs, "ckpt")
+    try:
+        trainer.train(total_updates=2)
+    finally:
+        trainer.close()
+    expected = {"ppo.update_epochs": 1, "rewards.shaping_mode": "legacy"}
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["config_overrides"] == expected and list(state["config_overrides"]) == sorted(expected)
+    history = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+    assert len(history["generations"]) == 2
+    assert all(g["config_overrides"] == expected for g in history["generations"])
+
+    plain = _override_trainer(tmp_path, [], "plain")
+    _train_one_generation(plain)
+    state = torch.load(tmp_path / "plain" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["config_overrides"] == {}
+    history = json.loads((tmp_path / "plain" / "training_history.json").read_text(encoding="utf-8"))
+    assert history["generations"][0]["config_overrides"] == {}
+
+
+def test_resume_with_different_overrides_raises_and_names_both_sides(tmp_path: Path) -> None:
+    """[RED] Stored vs requested overrides must match on resume."""
+    first = _override_trainer(tmp_path, ["ppo.update_epochs=1"], "ckpt")
+    _train_one_generation(first)
+
+    for specs in (["ppo.update_epochs=2"], [], ["ppo.update_epochs=1", "rewards.shaping_mode=legacy"]):
+        resumed = _override_trainer(tmp_path, specs, "ckpt")
+        try:
+            with pytest.raises(ValueError) as exc:
+                resumed.load_checkpoints()
+            msg = str(exc.value)
+            assert "ppo.update_epochs" in msg and "stored" in msg and "requested" in msg
+            assert resumed.current_generation == 0
+        finally:
+            resumed.close()
+
+    same = _override_trainer(tmp_path, ["ppo.update_epochs=1"], "ckpt")
+    try:
+        assert same.load_checkpoints() is True
+        assert same.current_generation == 1
+    finally:
+        same.close()
+
+
+def test_accept_config_change_prints_one_line_and_proceeds(tmp_path: Path, capsys) -> None:
+    """[RED] `--accept-config-change` downgrades the mismatch to one printed line; the new dict is then stored."""
+    first = _override_trainer(tmp_path, ["ppo.update_epochs=1"], "ckpt")
+    _train_one_generation(first)
+
+    resumed = _override_trainer(tmp_path, ["ppo.update_epochs=2"], "ckpt", accept_config_change=True)
+    try:
+        capsys.readouterr()
+        assert resumed.load_checkpoints() is True
+        out = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(out) == 1 and "ppo.update_epochs" in out[0]
+        assert resumed.current_generation == 1
+        resumed.train(total_updates=1)
+    finally:
+        resumed.close()
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["config_overrides"] == {"ppo.update_epochs": 2}
+    history = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+    assert [g["config_overrides"] for g in history["generations"]] == [{"ppo.update_epochs": 1}, {"ppo.update_epochs": 2}]
+
+
+def test_state_without_overrides_key_resumes_with_no_overrides(tmp_path: Path, capsys) -> None:
+    """[RED] A state saved before the key existed reads as `{}`: resumes silently with no overrides, raises with some."""
+    first = _override_trainer(tmp_path, [], "ckpt")
+    _train_one_generation(first)
+    state_path = tmp_path / "ckpt" / "training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    del state["config_overrides"]
+    torch.save(state, state_path)
+
+    resumed = _override_trainer(tmp_path, [], "ckpt")
+    try:
+        capsys.readouterr()
+        assert resumed.load_checkpoints() is True
+        assert capsys.readouterr().out.strip() == ""
+        assert resumed.current_generation == 1
+    finally:
+        resumed.close()
+
+    mismatched = _override_trainer(tmp_path, ["ppo.update_epochs=1"], "ckpt")
+    try:
+        with pytest.raises(ValueError, match="ppo.update_epochs"):
+            mismatched.load_checkpoints()
+    finally:
+        mismatched.close()
+
+
+def _fake_git(monkeypatch, rev, status, calls=None):
+    import football_rl.train_ppo as tp
+
+    def fake(args):
+        if calls is not None:
+            calls.append(tuple(args))
+        if tuple(args) == ("rev-parse", "--short", "HEAD"):
+            return rev
+        if tuple(args) == ("status", "--porcelain"):
+            return status
+        raise AssertionError(f"unexpected git invocation {args}")
+
+    monkeypatch.setattr(tp, "_run_git", fake)
+    return tp
+
+
+@pytest.mark.parametrize(
+    "rev,status,expected",
+    [("abc1234\n", "", "abc1234"), ("abc1234\n", " M football_rl/env.py\n", "abc1234-dirty"),
+     ("abc1234\n", "?? new.txt\n", "abc1234-dirty"), (None, None, "unknown"), (None, "", "unknown"),
+     ("", "", "unknown"), ("abc1234\n", None, "unknown")],
+)
+def test_current_git_commit_clean_dirty_and_unavailable(monkeypatch, rev, status, expected) -> None:
+    """[RED] `git rev-parse --short HEAD` plus `-dirty` when `git status --porcelain` is non-empty; else `unknown`."""
+    tp = _fake_git(monkeypatch, rev, status)
+    assert tp.current_git_commit() == expected
+
+
+def test_current_git_commit_real_process_returns_a_short_hash_or_unknown() -> None:
+    import football_rl.train_ppo as tp
+
+    assert re.fullmatch(r"([0-9a-f]{7,}(-dirty)?|unknown)", tp.current_git_commit())
+
+
+def test_git_commit_in_state_and_every_generation_record_with_one_call_per_process(tmp_path: Path, monkeypatch) -> None:
+    """[RED] `git_commit` is stored in both files; git runs once at trainer construction, not per generation."""
+    calls: list = []
+    _fake_git(monkeypatch, "abc1234\n", " M x.py\n", calls)
+    trainer = _override_trainer(tmp_path, [], "ckpt")
+    assert len(calls) == 2
+    try:
+        trainer.train(total_updates=2)
+    finally:
+        trainer.close()
+    assert len(calls) == 2
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["git_commit"] == "abc1234-dirty"
+    history = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+    assert [g["git_commit"] for g in history["generations"]] == ["abc1234-dirty"] * 2
+
+    _fake_git(monkeypatch, None, None)
+    unavailable = _override_trainer(tmp_path, [], "ckpt2")
+    _train_one_generation(unavailable)
+    state = torch.load(tmp_path / "ckpt2" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["git_commit"] == "unknown"
+
+
+def test_main_applies_overrides_stores_them_and_enforces_them_on_resume(tmp_path: Path, monkeypatch) -> None:
+    """[RED] End to end through `main()`: override reaches the stored state, and resume without it is refused."""
+    import football_rl.train_ppo as tp
+
+    monkeypatch.chdir(tmp_path)
+    base = ["train_ppo", "--num-envs", "1", "--rollout-steps", "8", "--total-updates", "1", "--device", "cpu"]
+    monkeypatch.setattr("sys.argv", base + ["--config-override", "rewards.shaping_mode=legacy"])
+    tp.main()
+    state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["config_overrides"] == {"rewards.shaping_mode": "legacy"}
+    assert state["current_generation"] == 1
+
+    monkeypatch.setattr("sys.argv", base)
+    with pytest.raises(ValueError, match="rewards.shaping_mode"):
+        tp.main()
+    state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["current_generation"] == 1
+
+    monkeypatch.setattr("sys.argv", base + ["--accept-config-change"])
+    tp.main()
+    state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["config_overrides"] == {} and state["current_generation"] == 2

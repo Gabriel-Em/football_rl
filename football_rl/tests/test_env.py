@@ -4310,9 +4310,14 @@ def test_rollout_matches_golden_digest():
     assert rollout_digest(rewards=rewards) == GOLDEN_ROLLOUT_DIGEST
 
 
+def test_default_shaping_mode():
+    """The default reward shaping is the legacy increment; discounted potential-based shaping is selected explicitly."""
+    assert DEFAULT_CONFIG.rewards.shaping_mode == "legacy"
+
+
 def test_rollout_all_mode_matches_golden_digest():
-    """[GUARD] Seeded rollout digest under default discounted PBRS ('all' mode)."""
-    digest = rollout_digest()
+    """[GUARD] Seeded rollout digest under discounted PBRS ('all' mode)."""
+    digest = rollout_digest(rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="all"))
     assert digest == GOLDEN_ROLLOUT_DIGEST_ALL
     assert digest != GOLDEN_ROLLOUT_DIGEST
 

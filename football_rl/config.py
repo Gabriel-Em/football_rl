@@ -240,7 +240,7 @@ class RewardConfig:
     intercepted_team: float = -0.25
 
     # Tier 2: Policy-Invariant PBRS Weights (each Phi is bounded above by its weight; the crowd and line-order penalties can make Phi negative)
-    shaping_mode: str = "all"  # "legacy": undiscounted increments, teleports skipped; "ball": discounted PBRS for ball term only; "all": discounted PBRS for both ball and role terms
+    shaping_mode: str = "legacy"  # "legacy": undiscounted increments, teleports skipped; "ball": discounted PBRS for ball term only; "all": discounted PBRS for both ball and role terms
     team_advance_pbrs_weight: float = 6.0
     support_potential_weight: float = 0.85
     def_press_potential_weight: float = 0.65
