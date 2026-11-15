@@ -19,6 +19,7 @@ from football_rl.potentials import (
     ROLE_SECOND_PRESS,
     PotentialState,
     compute_potentials,
+    pbrs_shaping,
     potential_gradient,
 )
 
@@ -840,3 +841,53 @@ def test_gradient_leaves_the_state_unmodified_and_is_repeatable():
     assert np.all(np.isfinite(first))
     for a, b in zip(before, state):
         np.testing.assert_array_equal(a, b)
+
+
+def test_pbrs_shaping_t1_terminal_telescoping():
+    """T1: Phi = [0.2, 0.5, 0.1] then terminal with gamma=0.9 yields exact increments and -Phi_0."""
+    gamma = 0.9
+    phis = [0.2, 0.5, 0.1]
+    inc = [
+        pbrs_shaping(phis[0], phis[1], gamma, False),
+        pbrs_shaping(phis[1], phis[2], gamma, False),
+        pbrs_shaping(phis[2], 999.0, gamma, True),
+    ]
+    np.testing.assert_allclose(inc, [0.25, -0.41, -0.10], rtol=0.0, atol=1e-12)
+    discounted = sum((gamma ** t) * f for t, f in enumerate(inc))
+    assert discounted == pytest.approx(-0.200, abs=1e-12)
+
+
+def test_pbrs_shaping_t2_mid_episode_teleport_telescoping():
+    """T2: Phi = [0.2, 0.5, 0.3 (kickoff), 0.4] then terminal with gamma=0.9 telescopes to -Phi_0."""
+    gamma = 0.9
+    phis = [0.2, 0.5, 0.3, 0.4]
+    inc = [
+        pbrs_shaping(phis[0], phis[1], gamma, False),
+        pbrs_shaping(phis[1], phis[2], gamma, False),
+        pbrs_shaping(phis[2], phis[3], gamma, False),
+        pbrs_shaping(phis[3], 123.0, gamma, True),
+    ]
+    np.testing.assert_allclose(inc, [0.25, -0.23, 0.06, -0.40], rtol=0.0, atol=1e-12)
+    discounted = sum((gamma ** t) * f for t, f in enumerate(inc))
+    assert discounted == pytest.approx(-0.200, abs=1e-12)
+
+
+def test_pbrs_shaping_t3_no_standing_wage():
+    """T3: Phi = [0, 0.5, 0.5, 0.5, 0.5] then terminal with gamma=0.9 sums to 0.0."""
+    gamma = 0.9
+    phi_prev = np.array([0.0, 0.5, 0.5, 0.5, 0.5], dtype=np.float64)
+    phi_next = np.array([0.5, 0.5, 0.5, 0.5, 999.0], dtype=np.float64)
+    terminal = np.array([False, False, False, False, True], dtype=bool)
+    inc = pbrs_shaping(phi_prev, phi_next, gamma, terminal)
+    np.testing.assert_allclose(inc, [0.45, -0.05, -0.05, -0.05, -0.50], rtol=0.0, atol=1e-12)
+    discounted = float(np.sum((gamma ** np.arange(5)) * inc))
+    assert discounted == pytest.approx(0.0, abs=1e-12)
+
+
+def test_pbrs_shaping_t4_closed_loop_negative_potential():
+    """T4: 3-step loop from Phi(s_0) = -0.3 back to s_0 with gamma=0.9 nets +0.0813."""
+    gamma = 0.9
+    phis = [-0.3, 0.1, -0.2, -0.3]
+    inc = pbrs_shaping(np.array(phis[:-1]), np.array(phis[1:]), gamma, False)
+    discounted = float(np.sum((gamma ** np.arange(3)) * inc))
+    assert discounted == pytest.approx(0.0813, abs=1e-12)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict, deque
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime
 import json
 import math
@@ -12,8 +12,9 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import time
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -30,6 +31,8 @@ from football_rl.config import (
     DEFAULT_CONFIG,
     EnvConfig,
     OBS_DIM,
+    PPOHyperparams,
+    RewardConfig,
 )
 from football_rl.env import FootballParallelEnv, parallel_env
 from football_rl.vec_env import make_vec_football_env, SubprocVecFootballEnv, DummyVecFootballEnv
@@ -378,6 +381,106 @@ def adapt_optimizer_state(
     return {**opt_state, "state": state}
 
 
+CONFIG_OVERRIDE_SECTIONS = {"ppo": PPOHyperparams, "rewards": RewardConfig}
+
+
+def coerce_override_value(raw: str, annotation: Any) -> Any:
+    """Parse the text ``raw`` as the dataclass field type ``annotation`` (``float``, ``int``, ``str`` or ``bool``).
+
+    Booleans are spelled ``true``/``false`` (case-insensitive); floats must be finite. Anything else raises ValueError.
+    """
+    name = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", str(annotation))
+    if name == "bool":
+        lowered = raw.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+        raise ValueError(f"expected 'true' or 'false', got {raw!r}")
+    if name == "int":
+        return int(raw)
+    if name == "float":
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"expected a finite number, got {raw!r}")
+        return value
+    if name == "str":
+        return raw
+    raise ValueError(f"field type {name} cannot be set from the command line")
+
+
+def parse_config_overrides(
+    specs: Sequence[str], base: EnvConfig = DEFAULT_CONFIG
+) -> Tuple[EnvConfig, Dict[str, Any]]:
+    """Apply ``SECTION.KEY=VALUE`` overrides (sections ``rewards`` and ``ppo``) to ``base``.
+
+    Returns the new config and the applied overrides as a dict sorted by ``SECTION.KEY`` with values coerced
+    to the field types. Any malformed spec, unknown section or key, duplicate, unparseable value or
+    failed dataclass validation raises ValueError naming the offending item.
+    """
+    values: Dict[str, Dict[str, Any]] = {section: {} for section in CONFIG_OVERRIDE_SECTIONS}
+    sources: Dict[str, List[str]] = {section: [] for section in CONFIG_OVERRIDE_SECTIONS}
+    applied: Dict[str, Any] = {}
+    for spec in specs:
+        target, eq, raw = spec.partition("=")
+        section, dot, key = target.partition(".")
+        if not eq or not dot or not section or not key:
+            raise ValueError(f"--config-override {spec!r}: expected SECTION.KEY=VALUE")
+        cls = CONFIG_OVERRIDE_SECTIONS.get(section)
+        if cls is None:
+            raise ValueError(
+                f"--config-override {spec!r}: unknown section {section!r} "
+                f"(allowed: {', '.join(sorted(CONFIG_OVERRIDE_SECTIONS))})"
+            )
+        field_types = {f.name: f.type for f in fields(cls)}
+        if key not in field_types:
+            raise ValueError(f"--config-override {spec!r}: {section!r} has no key {key!r}")
+        if target in applied:
+            raise ValueError(f"--config-override {spec!r}: {target} is set more than once")
+        try:
+            value = coerce_override_value(raw, field_types[key])
+        except ValueError as exc:
+            raise ValueError(f"--config-override {spec!r}: cannot read {raw!r} as {field_types[key]}: {exc}") from exc
+        applied[target] = value
+        values[section][key] = value
+        sources[section].append(spec)
+
+    cfg = base
+    for section, changes in values.items():
+        if not changes:
+            continue
+        try:
+            cfg = replace(cfg, **{section: replace(getattr(cfg, section), **changes)})
+        except ValueError as exc:
+            raise ValueError(f"--config-override {', '.join(sources[section])}: {exc}") from exc
+    return cfg, dict(sorted(applied.items()))
+
+
+def _run_git(args: Sequence[str]) -> Optional[str]:
+    """Run ``git <args>`` in the package directory; return stdout, or None when git is unavailable or fails."""
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def current_git_commit() -> str:
+    """Short HEAD hash of the package checkout, suffixed ``-dirty`` when the tree has changes; ``unknown`` without git."""
+    rev = _run_git(["rev-parse", "--short", "HEAD"])
+    if rev is None or not rev.strip():
+        return "unknown"
+    status = _run_git(["status", "--porcelain"])
+    if status is None:
+        return "unknown"
+    return rev.strip() + ("-dirty" if status.strip() else "")
+
+
 class ParameterSharingPPOTrainer:
     """MARL PPO trainer with independent Red (`TEAM_A`) vs. Blue (`TEAM_B`) role policies by default.
 
@@ -398,6 +501,8 @@ class ParameterSharingPPOTrainer:
         save_best_only: bool = False,
         write_root_summary: bool = False,
         critic_only_until_gen: int = 0,
+        config_overrides: Optional[Dict[str, Any]] = None,
+        accept_config_change: bool = False,
     ) -> None:
         self.cfg = config
         self.num_envs = num_envs
@@ -409,6 +514,9 @@ class ParameterSharingPPOTrainer:
         self.separate_teams = separate_teams
         self.write_root_summary = write_root_summary
         self.critic_only_until_gen = int(critic_only_until_gen)
+        self.config_overrides: Dict[str, Any] = dict(sorted((config_overrides or {}).items()))
+        self.accept_config_change = bool(accept_config_change)
+        self.git_commit: str = current_git_commit()
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
         if self.save_best_only != self.cfg.replay.save_best_only:
             self.cfg = replace(
@@ -1196,6 +1304,8 @@ class ParameterSharingPPOTrainer:
                 "current_generation": self.current_generation,
                 "total_env_steps": self.total_env_steps,
                 "seed": int(self.seed),
+                "config_overrides": dict(self.config_overrides),
+                "git_commit": self.git_commit,
                 "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
                 "field_policy": self.blue_field_policy.state_dict(),
@@ -1429,6 +1539,17 @@ class ParameterSharingPPOTrainer:
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location=self.device, weights_only=False)
+            stored_overrides = dict(sorted((state.get("config_overrides") or {}).items()))
+            if stored_overrides != self.config_overrides:
+                if not self.accept_config_change:
+                    raise ValueError(
+                        f"Config overrides differ from the checkpoint: stored {stored_overrides!r}, "
+                        f"requested {self.config_overrides!r}. Pass --accept-config-change to resume anyway."
+                    )
+                print(
+                    f"[Resume] Config overrides changed: stored {stored_overrides!r}, "
+                    f"requested {self.config_overrides!r}; continuing with the requested overrides."
+                )
             saved_seed = state.get("seed")
             if saved_seed is not None and int(saved_seed) != int(self.seed):
                 print(f"[Resume] Checkpoint seed was {int(saved_seed)}; continuing with seed={int(self.seed)}.")
@@ -1646,6 +1767,8 @@ class ParameterSharingPPOTrainer:
                     "total_env_steps": self.total_env_steps,
                     "sps": sps,
                     "seed": int(self.seed),
+                    "config_overrides": dict(self.config_overrides),
+                    "git_commit": self.git_commit,
                     "critic_only": bool(critic_only),
                     "red_mean_reward": round(team_a_rew, 5),
                     "blue_mean_reward": round(team_b_rew, 5),
@@ -2088,6 +2211,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Update only critics (freeze actors and skip co-evolution sync) for generations <= N (default: 0).",
     )
+    parser.add_argument(
+        "--config-override",
+        dest="config_overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="Override one `rewards` or `ppo` config field, e.g. `rewards.shaping_mode=legacy` (repeatable). "
+        "Applied overrides are stored with the checkpoint and must match on resume.",
+    )
+    parser.add_argument(
+        "--accept-config-change",
+        action="store_true",
+        help="Resume even when --config-override values differ from those stored in the checkpoint.",
+    )
 
     # Lifecycle & Batch Management Flags
     parser.add_argument(
@@ -2169,19 +2306,24 @@ def main() -> None:
         print_active_status(ckpt_dir, rep_dir)
         return
 
-    # 2. Handle `--from-scratch` vs automatic/explicit `--resume`
+    # 2. Build the run config first so a bad override aborts before anything on disk changes
+    cfg, applied_overrides = parse_config_overrides(
+        args.config_overrides,
+        replace(
+            DEFAULT_CONFIG,
+            replay=replace(
+                DEFAULT_CONFIG.replay,
+                interest_threshold=args.interest_threshold,
+                save_best_only=args.save_best_only,
+            ),
+        ),
+    )
+
+    # 3. Handle `--from-scratch` vs automatic/explicit `--resume`
     if args.from_scratch:
         print("Starting a NEW training batch from scratch (clearing active `checkpoints/` and `replays/`)...")
         reset_active_batch(ckpt_dir, rep_dir)
 
-    cfg = replace(
-        DEFAULT_CONFIG,
-        replay=replace(
-            DEFAULT_CONFIG.replay,
-            interest_threshold=args.interest_threshold,
-            save_best_only=args.save_best_only,
-        ),
-    )
     trainer = ParameterSharingPPOTrainer(
         config=cfg,
         num_envs=args.num_envs,
@@ -2193,6 +2335,8 @@ def main() -> None:
         save_best_only=args.save_best_only,
         write_root_summary=True,
         critic_only_until_gen=args.critic_only_until_gen,
+        config_overrides=applied_overrides,
+        accept_config_change=args.accept_config_change,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")

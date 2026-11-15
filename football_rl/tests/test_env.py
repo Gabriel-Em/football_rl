@@ -242,7 +242,11 @@ def test_field_5s_violation_ghost_mode_and_other_player_reset() -> None:
 def test_keeper_5s_foul_teleport_and_zero_advance_spike() -> None:
     """Verify Keeper 5-second hold drops the ball, nudges it radially out of the box, and applies violation cooldown."""
     env = parallel_env(
-        config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+        config=replace(
+            DEFAULT_CONFIG,
+            rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"),
+            replay=replace(DEFAULT_CONFIG.replay, enable_recording=False),
+        )
     )
     env.reset(seed=33)
 
@@ -1485,7 +1489,9 @@ def test_dynamic_vertical_lane_assignment_prevents_role_inversion() -> None:
 
 def test_asymmetric_crowding_exemptions_and_box_cutback_angles() -> None:
     """Verify carrier potential is zero while non-carrier crowding (< 125u) reduces potential."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env = FootballParallelEnv(
+        replace(DEFAULT_CONFIG, rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"))
+    )
     env.reset(seed=42)
 
     atk_idx = env.agent_to_idx["a_atk_1"]
@@ -1608,7 +1614,9 @@ def test_enlarged_goal_and_semicircle_geometry_and_scaled_buffers() -> None:
 
 def test_stationary_receiver_earns_zero_chase_reward_and_active_receiver_earns_bonus() -> None:
     """Verify stationary pass chaser earns non-positive PBRS while closing distance to in-flight pass earns positive PBRS."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
+    env = FootballParallelEnv(
+        replace(DEFAULT_CONFIG, rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy"))
+    )
     env.reset(seed=42)
 
     passer_idx = env.agent_to_idx["a_def_1"]
@@ -4270,6 +4278,7 @@ def test_field_hold_foul_charges_violator_and_team_while_only_5s_stat_is_kept() 
 
 GOLDEN_ROLLOUT_DIGEST = "a975ea438aa843ea120651b05ce4773fce294a0f1694c23f33d605b0f0051f6c"
 GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER = "e726782a53270dbbc008e1912e551635033b95a6583dc78c7c946adaf7b339ae"
+GOLDEN_ROLLOUT_DIGEST_ALL = "9f3583c8179ee73c77d344feefd63785f454b9e02b33c672eb12fec425aba9bd"
 
 
 def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False, rewards=None) -> str:
@@ -4297,13 +4306,26 @@ def rollout_digest(steps: int = 600, seed: int = 1234, record: bool = False, rew
 
 
 def test_rollout_matches_golden_digest():
-    assert rollout_digest() == GOLDEN_ROLLOUT_DIGEST
+    rewards = replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy")
+    assert rollout_digest(rewards=rewards) == GOLDEN_ROLLOUT_DIGEST
+
+
+def test_default_shaping_mode():
+    """The default reward shaping is the legacy increment; discounted potential-based shaping is selected explicitly."""
+    assert DEFAULT_CONFIG.rewards.shaping_mode == "legacy"
+
+
+def test_rollout_all_mode_matches_golden_digest():
+    """[GUARD] Seeded rollout digest under discounted PBRS ('all' mode)."""
+    digest = rollout_digest(rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="all"))
+    assert digest == GOLDEN_ROLLOUT_DIGEST_ALL
+    assert digest != GOLDEN_ROLLOUT_DIGEST
 
 
 def test_rollout_without_line_order_penalty_matches_golden_digest():
-    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0)
+    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0, shaping_mode="legacy")
     assert rollout_digest(rewards=rewards) == GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER
-    assert rollout_digest() != GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER
+    assert rollout_digest(rewards=replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy")) != GOLDEN_ROLLOUT_DIGEST_WITHOUT_LINE_ORDER
 
 
 def test_rollout_digest_is_seed_sensitive_and_repeatable():
@@ -4340,16 +4362,18 @@ def replay_digest(steps: int = 300, seed: int = 1234, with_value_predictions: bo
 
 
 def test_replay_frames_match_golden_digest():
-    assert replay_digest() == GOLDEN_REPLAY_DIGEST
+    rewards = replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy")
+    assert replay_digest(rewards=rewards) == GOLDEN_REPLAY_DIGEST
 
 
 def test_full_match_replay_frames_match_golden_digest():
     """Covers half-time, full-time events and intermittent critic values over all 10,801 frames."""
-    assert replay_digest(steps=2700, with_value_predictions=True) == GOLDEN_FULL_MATCH_REPLAY_DIGEST
+    rewards = replace(DEFAULT_CONFIG.rewards, shaping_mode="legacy")
+    assert replay_digest(steps=2700, with_value_predictions=True, rewards=rewards) == GOLDEN_FULL_MATCH_REPLAY_DIGEST
 
 
 def test_replay_frames_without_line_order_penalty_match_golden_digests():
-    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0)
+    rewards = replace(DEFAULT_CONFIG.rewards, line_order_weight=0.0, shaping_mode="legacy")
     assert replay_digest(rewards=rewards) == GOLDEN_REPLAY_DIGEST
     full = replay_digest(steps=2700, with_value_predictions=True, rewards=rewards)
     assert full == GOLDEN_FULL_MATCH_REPLAY_DIGEST_WITHOUT_LINE_ORDER

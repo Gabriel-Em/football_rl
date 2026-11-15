@@ -200,6 +200,25 @@ def assign_cover(cover_xy: np.ndarray, cov_pts: np.ndarray, weights: np.ndarray)
     return perms[int(np.argmin(totals))]
 
 
+def pbrs_shaping(
+    phi_prev: np.ndarray | float,
+    phi_next: np.ndarray | float,
+    gamma: float,
+    terminal: bool | np.ndarray = False,
+) -> np.ndarray | float:
+    """Return potential-based shaping increment ``gamma * phi_next - phi_prev`` with ``Phi(terminal) = 0``."""
+    if not isinstance(phi_prev, (float, int, np.floating, np.integer, np.ndarray)):
+        phi_prev = np.asarray(phi_prev, dtype=np.float64)
+    if not isinstance(phi_next, (float, int, np.floating, np.integer, np.ndarray)):
+        phi_next = np.asarray(phi_next, dtype=np.float64)
+    if isinstance(terminal, (bool, np.bool_)):
+        return -phi_prev if terminal else (gamma * phi_next - phi_prev)
+    term_arr = np.asarray(terminal, dtype=bool)
+    return np.where(term_arr, 0.0, gamma * np.asarray(phi_next, dtype=np.float64)) - np.asarray(
+        phi_prev, dtype=np.float64
+    )
+
+
 def compute_potentials(
     state: PotentialState,
     rew: RewardConfig,
