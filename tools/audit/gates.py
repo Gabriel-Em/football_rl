@@ -18,6 +18,7 @@ import json
 import math
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -27,6 +28,9 @@ if __package__ in (None, ""):
 from tools.audit import census  # noqa: E402
 
 __all__ = [
+    "PROTOCOLS",
+    "TargetSpec",
+    "parse_target_spec",
     "delta_stat",
     "check_consecutive_failures",
     "normalize_gen",
@@ -36,7 +40,39 @@ __all__ = [
     "main",
 ]
 
+PROTOCOLS = ("resume150", "fresh300")
 _GEN_RE = re.compile(r"(\d+)$")
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """One EBE target comparison: `KEY@TAG:higher|lower:DELTA`."""
+
+    key: str
+    tag: str
+    direction: str
+    delta: float
+
+
+def parse_target_spec(spec: str | TargetSpec) -> TargetSpec:
+    """Parse `KEY@TAG:higher|lower:DELTA` into a `TargetSpec`."""
+    if isinstance(spec, TargetSpec):
+        return spec
+    if "@" not in spec:
+        raise ValueError(f"target must match KEY@TAG:higher|lower:DELTA, got {spec!r}")
+    key, rest = spec.split("@", 1)
+    parts = rest.rsplit(":", 2)
+    if len(parts) != 3:
+        raise ValueError(f"target must match KEY@TAG:higher|lower:DELTA, got {spec!r}")
+    tag, direction, delta_str = parts
+    if not key or not tag:
+        raise ValueError(f"target key and tag must be non-empty, got {spec!r}")
+    if direction not in ("higher", "lower"):
+        raise ValueError(f"target direction must be 'higher' or 'lower', got {direction!r}")
+    delta = float(delta_str)
+    if not math.isfinite(delta) or delta < 0.0:
+        raise ValueError(f"target delta must be finite and non-negative, got {delta_str!r}")
+    return TargetSpec(key=key, tag=tag, direction=direction, delta=delta)
 
 
 def normalize_gen(gen: str | int) -> str:
@@ -109,7 +145,14 @@ def load_arm_dir(root: Path | str, tag: Optional[str] = None) -> Dict[str, Dict[
                 continue
             cj = tag_dir / "census.json"
             if cj.is_file():
-                tags_map[tag_dir.name] = json.loads(cj.read_text(encoding="utf-8"))
+                payload = json.loads(cj.read_text(encoding="utf-8"))
+                ij = tag_dir / "internals.json"
+                if ij.is_file():
+                    int_payload = json.loads(ij.read_text(encoding="utf-8"))
+                    c_metrics = _extract_metrics_dict(payload)
+                    for k, v in _extract_metrics_dict(int_payload).items():
+                        c_metrics.setdefault(k, v)
+                tags_map[tag_dir.name] = payload
         if tags_map:
             out[gen_key] = tags_map
     return out
@@ -146,12 +189,13 @@ def _aggregate_seeds(
         if entry.get("se") is not None:
             ses.append(float(entry["se"]))
     if not means:
-        return {"mean": None, "se": None, "range": None, "per_seed": per_seed}
+        return {"mean": None, "se": None, "sd": None, "range": None, "per_seed": per_seed}
     k = len(means)
     mean = sum(means) / k
     se = (math.sqrt(sum(s ** 2 for s in ses)) / k) if len(ses) == k else None
+    sd = math.sqrt(sum((m - mean) ** 2 for m in means) / (k - 1)) if k >= 2 else None
     rng = [min(means), max(means)] if k >= 2 else None
-    return {"mean": mean, "se": se, "range": rng, "per_seed": per_seed}
+    return {"mean": mean, "se": se, "sd": sd, "range": rng, "per_seed": per_seed}
 
 
 def _seed_series(
@@ -240,15 +284,21 @@ def _point_record(
     metric: str,
 ) -> Dict[str, Any]:
     a = _aggregate_seeds(arm_norm, gen, tag, metric)
-    c = _aggregate_seeds(comp_norm, gen, tag, metric) if comp_norm else {"mean": None, "se": None, "range": None, "per_seed": {}}
+    c = (
+        _aggregate_seeds(comp_norm, gen, tag, metric)
+        if comp_norm
+        else {"mean": None, "se": None, "sd": None, "range": None, "per_seed": {}}
+    )
     d = delta_stat(a["mean"], a["se"], c["mean"], c["se"])
     return {
         "arm_mean": a["mean"],
         "arm_se": a["se"],
+        "arm_sd": a["sd"],
         "arm_range": a["range"],
         "arm_per_seed": a["per_seed"],
         "comp_mean": c["mean"],
         "comp_se": c["se"],
+        "comp_sd": c["sd"],
         "comp_range": c["range"],
         "comp_per_seed": c["per_seed"],
         "delta": d["delta"],
@@ -257,13 +307,86 @@ def _point_record(
     }
 
 
+def _evaluate_ebe_target(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    gen: Optional[str],
+    spec: TargetSpec,
+) -> Dict[str, Any]:
+    if gen is None:
+        return {
+            "key": spec.key,
+            "tag": spec.tag,
+            "direction": spec.direction,
+            "delta": spec.delta,
+            "gen": None,
+            "arm_per_seed": {},
+            "comp_per_seed": {},
+            "arm_mean": None,
+            "comp_mean": None,
+            "mean_diff": None,
+            "verdict": "NEUTRAL",
+            "note": "no generation available",
+        }
+    a = _aggregate_seeds(arm_norm, gen, spec.tag, spec.key)
+    c = (
+        _aggregate_seeds(comp_norm, gen, spec.tag, spec.key)
+        if comp_norm
+        else {"mean": None, "per_seed": {}}
+    )
+    a_vals = [v for v in a["per_seed"].values() if v is not None]
+    c_vals = [v for v in c["per_seed"].values() if v is not None]
+    arm_mean = a["mean"]
+    comp_mean = c["mean"]
+    mean_diff = (arm_mean - comp_mean) if (arm_mean is not None and comp_mean is not None) else None
+
+    note = ""
+    if len(a_vals) < 2 or len(c_vals) < 2:
+        verdict = "NEUTRAL"
+        note = f"fewer than 2 seeds (arm={len(a_vals)}, comparator={len(c_vals)})"
+    elif spec.direction == "higher":
+        if min(a_vals) > max(c_vals) and (arm_mean - comp_mean) >= spec.delta:
+            verdict = "BEATS"
+        elif min(c_vals) > max(a_vals) and (comp_mean - arm_mean) >= spec.delta:
+            verdict = "LOSES"
+        else:
+            verdict = "NEUTRAL"
+    else:
+        if max(a_vals) < min(c_vals) and (comp_mean - arm_mean) >= spec.delta:
+            verdict = "BEATS"
+        elif max(c_vals) < min(a_vals) and (arm_mean - comp_mean) >= spec.delta:
+            verdict = "LOSES"
+        else:
+            verdict = "NEUTRAL"
+
+    return {
+        "key": spec.key,
+        "tag": spec.tag,
+        "direction": spec.direction,
+        "delta": spec.delta,
+        "gen": gen,
+        "arm_per_seed": a["per_seed"],
+        "comp_per_seed": c["per_seed"],
+        "arm_mean": arm_mean,
+        "comp_mean": comp_mean,
+        "mean_diff": mean_diff,
+        "verdict": verdict,
+        "note": note,
+    }
+
+
 def evaluate_gates(
     arm: Dict[str, Dict[str, Dict[str, Any]]],
     comparator: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     tag: str = "self_sampled",
     gens: Optional[Sequence[str]] = None,
+    protocol: str = "resume150",
+    targets: Optional[Sequence[str | TargetSpec]] = None,
 ) -> Dict[str, Any]:
     """Evaluate guard and target gates over `arm` (and optional `comparator`)."""
+    if protocol not in PROTOCOLS:
+        raise ValueError(f"protocol must be one of {PROTOCOLS}, got {protocol!r}")
+    parsed_targets = [parse_target_spec(t) for t in (targets or ())]
     arm_norm = _normalize_arm(arm)
     comp_norm = _normalize_arm(comparator) if comparator else None
 
@@ -283,8 +406,9 @@ def evaluate_gates(
             has_any = False
             for seed in sorted(arm_norm):
                 vals = _seed_series(arm_norm, seed, eval_gens, tag, metric)
-                flags = [False if v is None else (not pred(v)) for v in vals]
-                if any(v is not None for v in vals):
+                window = vals if protocol == "resume150" else vals[-consec:]
+                flags = [False if v is None else (not pred(v)) for v in window]
+                if any(v is not None for v in window):
                     has_any = True
                 if check_consecutive_failures(flags, consecutive=consec):
                     metric_pass = False
@@ -299,43 +423,49 @@ def evaluate_gates(
             passed_all = None
         gates_out[gate_id] = {"description": desc, "consecutive": consec, "passed": passed_all, "metrics": metrics_out}
 
-    # G9'(b) and G9'(c) at generation 1200
-    target_gen = "1200"
-    kp_pt = _point_record(arm_norm, comp_norm, target_gen, tag, "kick_propensity_pooled")
-    hs_pt = _point_record(arm_norm, comp_norm, target_gen, tag, "hold_share_pooled")
+    if protocol == "resume150":
+        # G9'(b) and G9'(c) at generation 1200
+        target_gen = "1200"
+        kp_pt = _point_record(arm_norm, comp_norm, target_gen, tag, "kick_propensity_pooled")
+        hs_pt = _point_record(arm_norm, comp_norm, target_gen, tag, "hold_share_pooled")
 
-    g9b_pass: Optional[bool] = None
-    if kp_pt["arm_mean"] is not None and kp_pt["comp_mean"] is not None:
-        a_vals = [v for v in kp_pt["arm_per_seed"].values() if v is not None]
-        c_vals = [v for v in kp_pt["comp_per_seed"].values() if v is not None]
-        g9b_pass = bool(
-            kp_pt["arm_mean"] <= kp_pt["comp_mean"] - 0.03
-            and a_vals
-            and c_vals
-            and max(a_vals) < min(c_vals)
-        )
-    gates_out["G9_prime_b"] = {
-        "description": "kick_propensity_pooled at 1200: arm <= comp - 0.03 and each arm seed < each comp seed",
-        "passed": g9b_pass,
-        "points": {target_gen: kp_pt},
-    }
+        g9b_pass: Optional[bool] = None
+        if kp_pt["arm_mean"] is not None and kp_pt["comp_mean"] is not None:
+            a_vals = [v for v in kp_pt["arm_per_seed"].values() if v is not None]
+            c_vals = [v for v in kp_pt["comp_per_seed"].values() if v is not None]
+            g9b_pass = bool(
+                kp_pt["arm_mean"] <= kp_pt["comp_mean"] - 0.03
+                and a_vals
+                and c_vals
+                and max(a_vals) < min(c_vals)
+            )
+        gates_out["G9_prime_b"] = {
+            "description": "kick_propensity_pooled at 1200: arm <= comp - 0.03 and each arm seed < each comp seed",
+            "passed": g9b_pass,
+            "points": {target_gen: kp_pt},
+        }
 
-    g9c_pass: Optional[bool] = None
-    if hs_pt["arm_mean"] is not None and hs_pt["comp_mean"] is not None:
-        g9c_pass = bool(hs_pt["arm_mean"] >= hs_pt["comp_mean"])
-    gates_out["G9_prime_c"] = {
-        "description": "hold_share_pooled at 1200: arm >= comp",
-        "passed": g9c_pass,
-        "points": {target_gen: hs_pt},
-    }
+        g9c_pass: Optional[bool] = None
+        if hs_pt["arm_mean"] is not None and hs_pt["comp_mean"] is not None:
+            g9c_pass = bool(hs_pt["arm_mean"] >= hs_pt["comp_mean"])
+        gates_out["G9_prime_c"] = {
+            "description": "hold_share_pooled at 1200: arm >= comp",
+            "passed": g9c_pass,
+            "points": {target_gen: hs_pt},
+        }
 
-    return {
+    out: Dict[str, Any] = {
+        "protocol": protocol,
         "tag": tag,
         "gens": eval_gens,
         "arm_seeds": sorted(arm_norm),
         "comparator_seeds": sorted(comp_norm) if comp_norm else [],
         "gates": gates_out,
     }
+    if parsed_targets:
+        last_gen = eval_gens[-1] if eval_gens else None
+        out["targets"] = [_evaluate_ebe_target(arm_norm, comp_norm, last_gen, spec) for spec in parsed_targets]
+    return out
 
 
 def _fmt_val(mean: Optional[float], se: Optional[float], rng: Optional[Sequence[float]], nd: int = 3) -> str:
@@ -362,9 +492,18 @@ def _status_str(passed: Optional[bool]) -> str:
     return "PASS" if passed else "FAIL"
 
 
+def _fmt_seeds(per_seed: Dict[str, Optional[float]], nd: int = 3) -> str:
+    if not per_seed:
+        return "-"
+    parts = [f"{s}={('-' if v is None else f'{v:.{nd}f}')}" for s, v in sorted(per_seed.items())]
+    return ", ".join(parts)
+
+
 def format_markdown(result: Dict[str, Any]) -> str:
     """Render gate evaluation `result` as Markdown summary + per-point tables."""
-    lines = [f"# Gate Report (tag={result['tag']}, gens={','.join(result['gens'])})", ""]
+    proto = result.get("protocol", "resume150")
+    proto_suffix = f", protocol={proto}" if proto != "resume150" else ""
+    lines = [f"# Gate Report (tag={result['tag']}, gens={','.join(result['gens'])}{proto_suffix})", ""]
     lines.append("| Gate | Description | Status |")
     lines.append("|---|---|---|")
     for gid, g in result["gates"].items():
@@ -390,10 +529,33 @@ def format_markdown(result: Dict[str, Any]) -> str:
                     f"{_fmt_val(pt['comp_mean'], pt['comp_se'], pt['comp_range'])} | "
                     f"{_fmt_delta(pt)} |"
                 )
+
+    if len(result.get("arm_seeds", [])) >= 2 and result.get("gens"):
+        last_gen = result["gens"][-1]
+        lines.extend(["", f"## Between-seed SD at gen {last_gen}", "", "| Gate | Metric | Arm SD | Comp SD |", "|---|---|---|---|"])
+        for gid, g in result["gates"].items():
+            if "metrics" not in g:
+                continue
+            for metric, mdata in g["metrics"].items():
+                pt = mdata["points"].get(last_gen, {})
+                asd = "-" if pt.get("arm_sd") is None else f"{pt['arm_sd']:.4f}"
+                csd = "-" if pt.get("comp_sd") is None else f"{pt['comp_sd']:.4f}"
+                lines.append(f"| {gid} | {metric} | {asd} | {csd} |")
+
+    if result.get("targets"):
+        lines.extend(["", "## Targets", "", "| Target | Gen | Dir | Delta min | Arm seeds | Comp seeds | Mean diff | Verdict | Note |", "|---|---|---|---|---|---|---|---|---|"])
+        for t in result["targets"]:
+            mdiff = "-" if t["mean_diff"] is None else f"{t['mean_diff']:+.3f}"
+            lines.append(
+                f"| {t['key']}@{t['tag']} | {t['gen'] or '-'} | {t['direction']} | {t['delta']:.3f} | "
+                f"{_fmt_seeds(t['arm_per_seed'])} | {_fmt_seeds(t['comp_per_seed'])} | "
+                f"{mdiff} | {t['verdict']} | {t['note']} |"
+            )
+
     return "\n".join(lines)
 
 
-def _parse_seed_dirs(items: Sequence[str], tag: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def _parse_seed_dirs(items: Sequence[str], tag: Optional[str]) -> Dict[str, Dict[str, Dict[str, Any]]]:
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for idx, item in enumerate(items):
         if "=" in item:
@@ -410,13 +572,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--comparator", nargs="*", default=None, help="optional [SEED=]DIR comparator entries")
     ap.add_argument("--tag", default="self_sampled")
     ap.add_argument("--gens", nargs="*", default=None, help="generations to evaluate (e.g. 1100 1150 1200)")
+    ap.add_argument("--protocol", choices=PROTOCOLS, default="resume150", help="gate protocol")
+    ap.add_argument("--target", action="append", default=None, help="EBE target KEY@TAG:higher|lower:DELTA (repeatable)")
     ap.add_argument("--json", default=None, help="write JSON gate report here")
     ap.add_argument("--md", default=None, help="write Markdown gate report here")
     args = ap.parse_args(argv)
 
-    arm_data = _parse_seed_dirs(args.arm, args.tag)
-    comp_data = _parse_seed_dirs(args.comparator, args.tag) if args.comparator else None
-    result = evaluate_gates(arm_data, comparator=comp_data, tag=args.tag, gens=args.gens)
+    load_tag = None if args.target else args.tag
+    arm_data = _parse_seed_dirs(args.arm, load_tag)
+    comp_data = _parse_seed_dirs(args.comparator, load_tag) if args.comparator else None
+    result = evaluate_gates(
+        arm_data,
+        comparator=comp_data,
+        tag=args.tag,
+        gens=args.gens,
+        protocol=args.protocol,
+        targets=args.target,
+    )
     md = format_markdown(result)
     print(md)
     if args.json:

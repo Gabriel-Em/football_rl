@@ -1,9 +1,9 @@
 """Evaluate snapshot checkpoints across the harness evaluation tags and write census outputs.
 
 Runs `self_sampled` (n=96, seed 11), `self_mixed` (n=48, seed 12), `vs_scripted_sampled` (n=48,
-seed 13), and `vs_frozen` (n=48, seed 15, requires `--frozen-dir`) via `tools/audit/harness.py`
-and `tools/audit/census.py`, writing traces (`m*.npz`), `census.json`, and `report.txt` under
-`OUT/<gen>/<tag>/`.
+seed 13), and `vs_frozen` (n=48, seed 15, requires `--frozen-dir`) via `tools/audit/harness.py`,
+`tools/audit/census.py`, and `tools/audit/internals.py`, writing traces (`m*.npz`), `census.json`,
+`report.txt`, and `internals.json` (for `self_sampled`) under `OUT/<gen>/<tag>/`.
 
 Usage:
   python tools/audit/evaluate_arm.py --snapshots DIR [DIR ...] --out OUT
@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.audit import census, harness  # noqa: E402
+from tools.audit import census, harness, internals  # noqa: E402
 
 __all__ = ["TAG_SPECS", "evaluate_snapshot", "evaluate_arm", "main"]
 
@@ -94,9 +94,12 @@ def evaluate_snapshot(
         )
         tag_dir = harness.check_output_dir(Path(out_dir) / gen / tag, spec.policy_dirs())
         per_match: List[Dict[str, Any]] = []
+        per_match_internals: List[Dict[str, Any]] = []
         for idx, trace, _ in harness.iter_matches(spec):
             harness.save_trace(trace, tag_dir, idx)
             per_match.append(census.match_metrics(trace))
+            if tag == "self_sampled":
+                per_match_internals.append(internals.match_internals(trace))
 
         payload = {
             "gen": gen,
@@ -110,6 +113,19 @@ def evaluate_snapshot(
         rep = census.report(per_match, title=f"{gen}/{tag}")
         (tag_dir / "report.txt").write_text(rep + "\n", encoding="utf-8")
         print(rep)
+        if tag == "self_sampled":
+            int_payload = {
+                "gen": gen,
+                "tag": tag,
+                "mode": spec.mode,
+                "n": spec.n,
+                "seed": spec.seed,
+                **internals.internals_payload(per_match_internals),
+            }
+            (tag_dir / "internals.json").write_text(
+                json.dumps(int_payload, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            print(internals.report(per_match_internals, title=f"{gen}/{tag}"))
         results[tag] = payload
     return results
 
