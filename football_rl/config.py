@@ -325,6 +325,22 @@ class ReplayConfig:
     auto_focus_carrier: bool = False
 
 
+def _gaussian4_fire_rate(threshold: float, bias: float) -> float:
+    """P(N(tanh(bias), exp(-0.5)) > threshold): the initial gaussian4 firing rate of a head."""
+    return 0.5 * math.erfc((threshold - math.tanh(bias)) / math.exp(-0.5) / math.sqrt(2.0))
+
+
+def _initial_fire_logit(rate: float, floor: float, bound: float, name: str) -> float:
+    """Bias `z` with `fire_probability(z, floor, bound) = rate`."""
+    share = (rate - floor) / (1.0 - 2.0 * floor)
+    if not 0.0 < share < 1.0:
+        raise ValueError(f"fire_prob_floor={floor} leaves no room for the initial {name} rate {rate:.4f}")
+    ratio = math.log(share / (1.0 - share)) / bound
+    if abs(ratio) >= 1.0:
+        raise ValueError(f"fire_logit_bound={bound} cannot represent the initial {name} rate {rate:.4f}")
+    return bound * math.atanh(ratio)
+
+
 @dataclass(frozen=True)
 class PPOHyperparams:
     """Reference PPO with Parameter Sharing hyperparameters (`field_policy` & `keeper_policy`)."""
@@ -340,6 +356,36 @@ class PPOHyperparams:
     num_minibatches: int = 8
     update_epochs: int = 4
     hidden_dims: Tuple[int, int] = (256, 256)
+    # Policy head: "gaussian4" samples all four env action components from Gaussians; "hybrid5" samples throttle,
+    # steer and kick power from Gaussians and fires kick and special through bounded Bernoulli heads.
+    policy_head: str = "gaussian4"
+    # Range the Gaussian log standard deviations are clamped to after every update.
+    logstd_min: float = -1.25
+    logstd_max: float = -0.35
+    # hybrid5 fire probabilities lie in [floor + (1 - 2*floor)*sigmoid(-bound), 1 - that]; the logit is bounded by `fire_logit_bound`.
+    fire_prob_floor: float = 0.005
+    fire_logit_bound: float = 6.0
+
+    def __post_init__(self) -> None:
+        if self.policy_head not in ("gaussian4", "hybrid5"):
+            raise ValueError(f"policy_head must be 'gaussian4' or 'hybrid5', got {self.policy_head!r}")
+        if not (math.isfinite(self.logstd_min) and math.isfinite(self.logstd_max) and self.logstd_min < self.logstd_max):
+            raise ValueError(
+                f"logstd_min and logstd_max must be finite with logstd_min < logstd_max, "
+                f"got {self.logstd_min} and {self.logstd_max}"
+            )
+        if not (0.0 <= self.fire_prob_floor < 0.5):
+            raise ValueError(f"fire_prob_floor must be in [0, 0.5), got {self.fire_prob_floor}")
+        if not (math.isfinite(self.fire_logit_bound) and self.fire_logit_bound > 0.0):
+            raise ValueError(f"fire_logit_bound must be finite and > 0, got {self.fire_logit_bound}")
+        if self.policy_head == "hybrid5":
+            # The head starts at the gaussian4 kick and special fire rates; refuse a floor / bound pair that cannot.
+            _initial_fire_logit(
+                _gaussian4_fire_rate(0.35, -0.35), self.fire_prob_floor, self.fire_logit_bound, "kick"
+            )
+            _initial_fire_logit(
+                _gaussian4_fire_rate(0.5, -0.8), self.fire_prob_floor, self.fire_logit_bound, "special"
+            )
 
 
 @dataclass(frozen=True)

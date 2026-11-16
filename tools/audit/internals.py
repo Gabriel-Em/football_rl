@@ -3,20 +3,26 @@
 Every metric is computed per match from one trace and aggregated across matches as mean +- SE with n
 (skipping matches where a denominator is zero). Field players are slots 1..5 and 7..11.
 
+Policy heads: the trace's optional `head` field gives each team's head (0 = gaussian4, the default when the field
+is absent; 1 = hybrid5). A hybrid5 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
+p = (mean + 1) / 2 > 0.5; a gaussian4 seat's intent is mean > 0.35 (kick) or mean > 0.5 (special). `sat99_*` and
+`grad_scale_*` of the kick and special columns are computed over gaussian4 field players only (a probability
+column has no tanh gradient scale) and are None when no such decision exists.
+
 Metrics
   sat99_<head>            share of field-player decisions with |mean| > 0.99 (throttle, steer, kick, special).
   grad_scale_<head>       mean of 1 - mean^2 over field-player decisions (local tanh gradient scale).
   p_kick_obs              share of eligible outfield holding decisions (hold_t >= pickup_kick_grace) with act_kick > 0.35.
-  p_kick_intent           share of eligible holding decisions with mean_kick > 0.35.
-  kick_from_intent        share of eligible kicks whose mean_kick > 0.35.
-  p_kick_given_intent     kick rate on eligible holding decisions with mean_kick > 0.35.
-  p_kick_given_no_intent  kick rate on eligible holding decisions with mean_kick <= 0.35.
+  p_kick_intent           share of eligible holding decisions with kick intent (see above).
+  kick_from_intent        share of eligible kicks taken on a decision with kick intent.
+  p_kick_given_intent     kick rate on eligible holding decisions with kick intent.
+  p_kick_given_no_intent  kick rate on eligible holding decisions without kick intent.
   power_mean, power_sd    mean and sd of clip((act_kick - 0.35) / 0.65, 0, 1) over eligible kicks.
   full_power_share        share of eligible kicks with act_kick >= 0.999.
   aim_teammate_share_*    share of eligible kicks whose direction (angle + steer * 35 deg) is within 12 deg of
                           the bearing to an outfield teammate strictly 85..500 u away (sampled and mean steer).
   special_rate            share of field-player decisions with act_special > 0.5.
-  special_from_intent     share of field-player special fires whose mean_special > 0.5.
+  special_from_intent     share of field-player special fires taken on a decision with special intent.
 
 Usage:
   python tools/audit/internals.py TRACE_DIR [TRACE_DIR ...] [--json OUT]
@@ -54,6 +60,7 @@ FIELD_PLAYERS = (1, 2, 3, 4, 5, 7, 8, 9, 10, 11)
 TEAM_OUTFIELD_OFFSETS = np.arange(1, 6, dtype=np.int64)
 HEAD_COLS = (("throttle", 0), ("steer", 1), ("kick", 2), ("special", 3))
 TRACE_KEYS = ("mean", "act", "holder", "hold_t", "pos", "ang")
+OPTIONAL_TRACE_KEYS = ("head",)
 
 KICK_THR = float(DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
 SPECIAL_THR = float(DEFAULT_CONFIG.mechanics.special_trigger_threshold)
@@ -63,6 +70,7 @@ MIN_PASS_DIST = float(DEFAULT_CONFIG.mechanics.min_pass_distance)
 AIM_MAX_DIST = 500.0
 AIM_CONE_RAD = math.radians(12.0)
 SAT_THRESHOLD = 0.99
+FIRE_PROB_THR = 0.5
 FULL_POWER_ACTION_THR = 0.999
 
 METRIC_KEYS = (
@@ -119,10 +127,20 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     pos = np.asarray(trace["pos"], dtype=np.float64)
     ang = np.asarray(trace["ang"], dtype=np.float64)
 
+    team_head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
+    seat_hybrid = np.repeat(team_head == 1, census.TEAM_SIZE)
+    field_hybrid = seat_hybrid[list(FIELD_PLAYERS)]
+
     rec = {"n_steps": n_steps}
     field_mean = mean[:, FIELD_PLAYERS, :]
     for head, col in HEAD_COLS:
         m_col = field_mean[:, :, col]
+        if col >= 2:
+            m_col = m_col[:, ~field_hybrid]
+        if m_col.size == 0:
+            rec[f"sat99_{head}"] = None
+            rec[f"grad_scale_{head}"] = None
+            continue
         rec[f"sat99_{head}"] = float((np.abs(m_col) > SAT_THRESHOLD).mean())
         rec[f"grad_scale_{head}"] = float((1.0 - m_col * m_col).mean())
 
@@ -151,7 +169,7 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
         mk = mean[idx, pl, 2]
         ak = act[idx, pl, 2]
         kicked = ak > KICK_THR
-        intent = mk > KICK_THR
+        intent = np.where(seat_hybrid[pl], (mk + 1.0) / 2.0 > FIRE_PROB_THR, mk > KICK_THR)
         n_kicks = int(kicked.sum())
         n_intent = int(intent.sum())
         n_no_intent = n_eligible - n_intent
@@ -185,9 +203,10 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     sp_m = field_mean[:, :, 3]
     fire = sp_a > SPECIAL_THR
     n_fires = int(fire.sum())
+    sp_intent = np.where(field_hybrid[None, :], (sp_m + 1.0) / 2.0 > FIRE_PROB_THR, sp_m > SPECIAL_THR)
     rec["n_special_fires"] = n_fires
     rec["special_rate"] = float(fire.mean())
-    rec["special_from_intent"] = float((sp_m[fire] > SPECIAL_THR).mean()) if n_fires > 0 else None
+    rec["special_from_intent"] = float(sp_intent[fire].mean()) if n_fires > 0 else None
     return rec
 
 
@@ -244,7 +263,7 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
 def _iter_internal_traces(directory: Path | str) -> Iterator[Dict[str, np.ndarray]]:
     for path in census._trace_paths(directory):
         with np.load(path) as z:
-            yield {k: z[k] for k in TRACE_KEYS}
+            yield {k: z[k] for k in TRACE_KEYS + tuple(k for k in OPTIONAL_TRACE_KEYS if k in z.files)}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

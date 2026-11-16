@@ -1362,3 +1362,258 @@ class TestEvaluateArmE2:
         assert dir_digest(snap) == before
         assert list(replays.iterdir()) == []
 
+
+
+# ----------------------------------------------------------------------------
+# X1: decoupled action heads in the harness and in policy internals
+# ----------------------------------------------------------------------------
+def write_head_checkpoint(directory: Path, heads: dict, seed: int = 0, spread: float = 0.3) -> Path:
+    """Checkpoint whose `blue_*` / `red_*` networks use the head named in `heads`; hybrid5 outputs depend on the observation."""
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head=heads[prefix])
+            if heads[prefix] == "hybrid5":
+                with torch.no_grad():
+                    net.actor_mean[4].weight.normal_(0.0, spread)
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+def write_constant_hybrid_checkpoint(directory: Path, z_kick: float, z_spec: float, floor: float = 0.005) -> Path:
+    """Hybrid5 checkpoint with observation-independent outputs: throttle 0.7, steer -0.2, power 0.4 (pre-tanh)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head="hybrid5", fire_prob_floor=floor)
+            with torch.no_grad():
+                net.actor_mean[4].weight.zero_()
+                net.actor_mean[4].bias.copy_(torch.tensor([0.7, -0.2, 0.4, z_kick, z_spec]))
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+# tanh(0.7), tanh(-0.2); power mean (tanh(0.4) + 1) / 2 = 0.689974 -> kick action 0.35 + 0.65 * 0.689974.
+CONST_THR, CONST_STEER, CONST_KICK_ACTION = 0.6043678, -0.1973753, 0.7984834
+# floor 0.005, bound 6: p(z = +3) = 0.9367710 -> 2p - 1 = 0.8735419.
+CONST_FIRE_MEAN = 0.8735419
+
+
+def _obs_cen(seed: int = 0):
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(6, 82)).astype(np.float32), rng.normal(size=(6, 54)).astype(np.float32)
+
+
+class TestHybridHarness:
+    def test_team_policy_detects_the_head_from_the_output_width(self, tmp_path):
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "gaussian4", "red": "hybrid5"})
+        assert harness.TeamPolicy(str(d), "blue").head == 0
+        assert harness.TeamPolicy(str(d), "red").head == 1
+
+    def test_gaussian4_teams_keep_their_four_tuple_heads_and_default_head_field(self, ckpt):
+        team = harness.TeamPolicy(str(ckpt), "blue")
+        assert all(len(h) == 4 for h in team.heads)
+        trace = harness.play_match(quick_spec(ckpt, opponent="scripted", max_steps=3), 0)
+        assert trace["head"].tolist() == [0, 0] and trace["head"].dtype == np.int8
+
+    def test_a_hybrid5_checkpoint_is_deterministic(self, tmp_path):
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "hybrid5", "red": "hybrid5"}, seed=3)
+        a = harness.run_matches(quick_spec(d, max_steps=40))
+        b = harness.run_matches(quick_spec(d, max_steps=40))
+        for ta, tb in zip(a, b):
+            assert set(ta) == set(tb) and "head" in ta
+            for key in ta:
+                assert np.array_equal(ta[key], tb[key]), key
+
+    @pytest.mark.parametrize(
+        "opponent,swap,expected",
+        [
+            ("self", False, [0, 1]),
+            ("self", True, [1, 0]),
+            ("scripted", False, [0, 0]),
+            ("scripted", True, [1, 0]),
+            ("scripted2", False, [0, 0]),
+            ("frozen", False, [0, 0]),
+            ("frozen", True, [1, 0]),
+        ],
+    )
+    def test_head_records_the_seats_with_and_without_swap(self, tmp_path, opponent, swap, expected):
+        # blue_* = gaussian4, red_* = hybrid5; the frozen directory is a gaussian4 checkpoint.
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "gaussian4", "red": "hybrid5"})
+        frozen = write_head_checkpoint(tmp_path / "f", {"blue": "gaussian4", "red": "gaussian4"}, seed=1)
+        opp = f"frozen:{frozen}" if opponent == "frozen" else opponent
+        spec = quick_spec(d, opponent=opp, swap=swap, n=1, max_steps=4)
+        trace = harness.play_match(spec, 0)
+        assert trace["head"].tolist() == expected
+
+    @pytest.mark.parametrize("swap,expected", [(False, [0, 1]), (True, [1, 0])])
+    def test_cli_swap_writes_the_seat_heads_into_the_traces(self, tmp_path, swap, expected):
+        # blue_* = gaussian4, red_* = hybrid5; `--swap` hands team A the red_* policies.
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "gaussian4", "red": "hybrid5"})
+        out = tmp_path / "out"
+        argv = ["--checkpoint-dir", str(d), "--opp", "self", "--n", "2", "--seed", "3", "--workers", "1",
+                "--max-steps", "4", "--out-dir", str(out)]
+        assert harness.main(argv + (["--swap"] if swap else [])) == 0
+        files = sorted(out.glob("m*.npz"))
+        assert [f.name for f in files] == ["m000.npz", "m001.npz"]
+        for f in files:
+            with np.load(f) as trace:
+                assert trace["head"].tolist() == expected
+
+    def test_a_hybrid5_arm_plays_a_gaussian4_frozen_opponent(self, tmp_path):
+        arm = write_head_checkpoint(tmp_path / "arm", {"blue": "hybrid5", "red": "hybrid5"})
+        frozen = write_head_checkpoint(tmp_path / "f", {"blue": "gaussian4", "red": "gaussian4"}, seed=1)
+        for swap in (False, True):
+            trace = harness.play_match(quick_spec(arm, opponent=f"frozen:{frozen}", swap=swap, max_steps=30), 0)
+            assert trace["head"].tolist() == [1, 0]
+            assert trace["act"].shape[1:] == (12, 4) and np.isfinite(trace["act"]).all()
+        # A gaussian4 learner against a hybrid5 frozen opponent: heads [0, 1].
+        g_arm = write_head_checkpoint(tmp_path / "g", {"blue": "gaussian4", "red": "gaussian4"}, seed=2)
+        h_frozen = write_head_checkpoint(tmp_path / "h", {"blue": "hybrid5", "red": "hybrid5"}, seed=3)
+        assert harness.play_match(quick_spec(g_arm, opponent=f"frozen:{h_frozen}", max_steps=3), 0)["head"].tolist() == [0, 1]
+
+    def test_hybrid5_trace_rows_are_env_decoded_and_means_hold_fire_probabilities(self, tmp_path):
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "hybrid5", "red": "hybrid5"}, seed=4)
+        traces = harness.run_matches(quick_spec(d, max_steps=60))
+        act = np.concatenate([t["act"] for t in traces])
+        mean = np.concatenate([t["mean"] for t in traces])
+        kick, special = act[:, :, 2], act[:, :, 3]
+        assert ((kick == -1.0) | (kick > 0.35)).all() and ((special == -1.0) | (special == 1.0)).all()
+        assert (kick > 0.35).any() and (kick == -1.0).any()
+        # 2p - 1 with p in [0.005 + 0.99 * sigmoid(-6), 0.995 - 0.99 * sigmoid(-6)] = [0.007448, 0.992552].
+        assert (np.abs(mean[:, :, 2:]) <= 0.98511).all()
+
+    def test_mixed_mode_leaves_throttle_and_steer_at_their_means(self, tmp_path):
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "hybrid5", "red": "hybrid5"}, seed=5)
+        team = harness.TeamPolicy(str(d), "blue")
+        obs, cen = _obs_cen()
+        actions, _, means = team.act(obs, cen, "mixed", 1.0, torch.Generator().manual_seed(1))
+        np.testing.assert_array_equal(actions[:, :2], means[:, :2])
+        sampled, _, _ = team.act(obs, cen, "sampled", 1.0, torch.Generator().manual_seed(1))
+        assert np.abs(sampled[:, :2] - means[:, :2]).max() > 0.0
+
+    def test_mixed_mode_fires_kicks_at_the_deterministic_power_mean(self, tmp_path):
+        # Constant head: power mean (tanh(0.4) + 1) / 2 = 0.689974 -> kick action CONST_KICK_ACTION; kick fires with
+        # p = 0.9368, so six slots under one seeded generator contain fired kicks.
+        team = harness.TeamPolicy(str(write_constant_hybrid_checkpoint(tmp_path / "c", 3.0, 0.0)), "blue")
+        obs, cen = _obs_cen()
+        mixed, _, _ = team.act(obs, cen, "mixed", 1.0, torch.Generator().manual_seed(1))
+        fired = mixed[:, 2] != -1.0
+        assert fired.sum() >= 3
+        np.testing.assert_allclose(mixed[fired, 2], CONST_KICK_ACTION, atol=1e-6)
+        # The sampled mode moves the fired power off the mean, so the assertion above can fail.
+        sampled, _, _ = team.act(obs, cen, "sampled", 1.0, torch.Generator().manual_seed(1))
+        assert np.abs(sampled[sampled[:, 2] != -1.0, 2] - CONST_KICK_ACTION).max() > 1e-3
+
+    def test_greedy_uses_the_means_and_fires_above_one_half(self, tmp_path):
+        obs, cen = _obs_cen()
+        fires = harness.TeamPolicy(str(write_constant_hybrid_checkpoint(tmp_path / "on", 3.0, -3.0)), "blue")
+        a, _, m = fires.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+        np.testing.assert_allclose(a, [[CONST_THR, CONST_STEER, CONST_KICK_ACTION, -1.0]] * 6, atol=1e-6)
+        np.testing.assert_allclose(m, [[CONST_THR, CONST_STEER, CONST_FIRE_MEAN, -CONST_FIRE_MEAN]] * 6, atol=1e-6)
+        silent = harness.TeamPolicy(str(write_constant_hybrid_checkpoint(tmp_path / "off", -3.0, 3.0)), "blue")
+        a, _, _ = silent.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+        np.testing.assert_allclose(a, [[CONST_THR, CONST_STEER, -1.0, 1.0]] * 6, atol=1e-6)
+
+    def test_sigma_scale_moves_the_gaussian_heads_only(self, tmp_path):
+        team = harness.TeamPolicy(str(write_constant_hybrid_checkpoint(tmp_path / "c", 0.0, 0.0)), "blue")
+        obs, cen = _obs_cen()
+        zero, _, _ = team.act(obs, cen, "sampled", 0.0, torch.Generator().manual_seed(3))
+        one, _, _ = team.act(obs, cen, "sampled", 1.0, torch.Generator().manual_seed(3))
+        two, _, _ = team.act(obs, cen, "sampled", 2.0, torch.Generator().manual_seed(3))
+        np.testing.assert_allclose(zero[:, :2], [[CONST_THR, CONST_STEER]] * 6, atol=1e-6)
+        np.testing.assert_allclose(two[:, :2] - zero[:, :2], 2.0 * (one[:, :2] - zero[:, :2]), rtol=1e-4, atol=1e-6)
+        # Same generator state: the Bernoulli draws are the same whatever the scale, and sigma = 0 still fires at random.
+        np.testing.assert_array_equal(zero[:, 2:] > 0.35, one[:, 2:] > 0.35)
+        fired = np.concatenate(
+            [team.act(obs, cen, "sampled", 0.0, torch.Generator().manual_seed(s))[0][:, 2] for s in range(60)]
+        )
+        assert (fired > 0.35).any() and (fired == -1.0).any()
+
+    def test_fire_bounds_come_from_the_checkpoint_not_from_defaults(self, tmp_path):
+        """A checkpoint trained with floor 0.01 evaluates with floor 0.01, not the default 0.005."""
+        d = write_constant_hybrid_checkpoint(tmp_path / "c", -1e6, -1e6, floor=0.01)
+        team = harness.TeamPolicy(str(d), "blue")
+        obs, cen = _obs_cen()
+        _, _, m = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+        # p = 0.01 + 0.98 * 0.0024726 = 0.0124232 -> 2p - 1 = -0.9751536 (the default floor 0.005 would give -0.985104).
+        np.testing.assert_allclose(m[:, 2], -0.9751536, atol=1e-6)
+
+
+class TestInternalsHybridHead:
+    @staticmethod
+    def _trace(head):
+        from tools.audit import internals  # noqa: F401
+
+        tr = make_internals_trace(8)
+        if head is not None:
+            tr["head"] = np.array(head, dtype=np.int8)
+        # Team A holder 3 (rows 0-3) with kick means 2p - 1; team B holder 8 (rows 4-7).
+        for t, (m, a) in enumerate(zip([0.2, 0.2, -0.2, -0.2], [0.8, -1.0, -1.0, 0.5])):
+            tr["holder"][t], tr["hold_t"][t] = 3, 0.10
+            tr["mean"][t, 3, 2], tr["act"][t, 3, 2] = m, a
+        for t, (m, a) in zip(range(4, 8), zip([0.2, 0.2, 0.9, 0.9], [-1.0, -1.0, 0.8, -1.0])):
+            tr["holder"][t], tr["hold_t"][t] = 8, 0.10
+            tr["mean"][t, 8, 2], tr["act"][t, 8, 2] = m, a
+        return tr
+
+    def test_intent_is_p_above_one_half_for_hybrid_seats_and_mean_above_0_35_for_gaussian_seats(self):
+        from tools.audit import internals
+
+        m = internals.match_internals(self._trace([1, 0]))
+        # Intent rows: team A rows 0, 1 (mean 0.2 > 0); team B rows 6, 7 (mean 0.9 > 0.35); rows 4, 5 (0.2) are not.
+        assert m["p_kick_obs"] == pytest.approx(3 / 8)
+        assert m["p_kick_intent"] == pytest.approx(4 / 8)
+        assert m["kick_from_intent"] == pytest.approx(2 / 3)
+        assert m["p_kick_given_intent"] == pytest.approx(2 / 4)
+        assert m["p_kick_given_no_intent"] == pytest.approx(1 / 4)
+
+    def test_traces_without_a_head_field_read_as_gaussian4(self):
+        from tools.audit import internals
+
+        m = internals.match_internals(self._trace(None))
+        assert m["p_kick_intent"] == pytest.approx(2 / 8)          # only the two 0.9 rows exceed 0.35
+        assert internals.match_internals(self._trace([0, 0])) == m
+
+    def test_special_intent_uses_each_seats_own_threshold(self):
+        from tools.audit import internals
+
+        tr = self._trace([1, 0])
+        for t, m in enumerate([0.2, -0.2, 0.2]):                    # player 2, team A, hybrid: intent when mean > 0
+            tr["act"][t, 2, 3], tr["mean"][t, 2, 3] = 1.0, m
+        for t, m in enumerate([0.2, 0.9]):                          # player 9, team B, gaussian: intent when mean > 0.5
+            tr["act"][t, 9, 3], tr["mean"][t, 9, 3] = 1.0, m
+        r = internals.match_internals(tr)
+        assert r["n_special_fires"] == 5
+        assert r["special_from_intent"] == pytest.approx(3 / 5)     # 2 hybrid + 1 gaussian
+        assert r["special_rate"] == pytest.approx(5 / (8 * 10))
+
+    def test_saturation_and_grad_scale_skip_probability_heads(self):
+        from tools.audit import internals
+
+        r = internals.match_internals(self._trace([1, 0]))
+        # Throttle and steer are tanh means for every seat (all -1 -> saturated, gradient scale 0).
+        assert r["sat99_throttle"] == 1.0 and r["grad_scale_steer"] == 0.0
+        # Kick and special: only team B's field players (gaussian) count.
+        # Player 8 kick means: rows 0-3 -1 (sat), 4-5 0.2, 6-7 0.9 -> 4 sat of 8; the other four B players are always -1.
+        assert r["sat99_kick"] == pytest.approx((4 + 4 * 8) / 40)
+        assert r["grad_scale_kick"] == pytest.approx((2 * 0.96 + 2 * 0.19) / 40)
+        both = internals.match_internals(self._trace([1, 1]))
+        assert both["sat99_kick"] is None and both["grad_scale_kick"] is None
+        assert both["sat99_special"] is None and both["grad_scale_special"] is None
+        assert both["sat99_throttle"] == 1.0
+
+    def test_head_field_is_read_from_stored_traces(self, tmp_path):
+        from tools.audit import internals
+
+        d = tmp_path / "t"
+        d.mkdir()
+        tr = self._trace([1, 0])
+        np.savez_compressed(d / "m000.npz", **tr)
+        loaded = list(internals._iter_internal_traces(d))
+        assert loaded[0]["head"].tolist() == [1, 0]
+        assert internals.match_internals(loaded[0])["p_kick_intent"] == pytest.approx(4 / 8)
+        old = self._trace(None)
+        np.savez_compressed(d / "m000.npz", **old)
+        assert "head" not in next(iter(internals._iter_internal_traces(d)))

@@ -33,6 +33,8 @@ from football_rl.config import (
     OBS_DIM,
     PPOHyperparams,
     RewardConfig,
+    _gaussian4_fire_rate,
+    _initial_fire_logit,
 )
 from football_rl.env import FootballParallelEnv, parallel_env
 from football_rl.vec_env import make_vec_football_env, SubprocVecFootballEnv, DummyVecFootballEnv
@@ -51,13 +53,93 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 
 
 _HALF_LOG_TWO_PI = math.log(math.sqrt(2 * math.pi))
 
+POLICY_HEADS = ("gaussian4", "hybrid5")
+# Fire telemetry is read from every this-many-th decision of a role's rollout batch. The subsample adds sampling noise
+# to the saturation shares: at most about 3 percentage points of standard error for a keeper batch (300 sampled rows
+# at 8 environments x 300 decisions) and about 1 for a field batch (1500 sampled rows).
+FIRE_STATS_STRIDE = 8
+# hybrid5 policy action: [throttle, steer, power sample u, kick fire K, special fire S].
+HYBRID_ACTION_DIM = 5
+# Initial hybrid5 power-head bias: the mean power (1 + tanh(bias)) / 2 is 0.4666.
+HYBRID_POWER_BIAS = -0.067
+
+
+def policy_head_of_weights(weights: Dict[str, torch.Tensor]) -> Optional[str]:
+    """Head of an `ActorCritic` state dict from the width of its output layer (4 -> gaussian4, 5 -> hybrid5), else None."""
+    out = weights.get("actor_mean.4.weight")
+    if out is None or out.dim() != 2:
+        return None
+    return {ACTION_DIM: "gaussian4", HYBRID_ACTION_DIM: "hybrid5"}.get(int(out.shape[0]))
+
+
+def fire_probability(z: torch.Tensor, floor: Any, bound: Any) -> torch.Tensor:
+    """Bounded Bernoulli probability `floor + (1 - 2*floor) * sigmoid(bound * tanh(z / bound))`, inside [floor, 1 - floor]."""
+    return floor + (1.0 - 2.0 * floor) * torch.sigmoid(bound * torch.tanh(z / bound))
+
+
+def to_env_actions(policy_actions: np.ndarray, kick_threshold: float) -> np.ndarray:
+    """Decode hybrid5 policy actions `[thr, steer, u, K, S]` into the env's `[thr, steer, kick, special]`.
+
+    Kick is `-1` unless K = 1, then `thr + (1 - thr) * max(power, 0.001)` with `thr = kick_threshold` and
+    `power = clip((u + 1) / 2, 0, 1)`, so a fired kick is always strictly above the env threshold. Special is
+    `+1` when S = 1 and `-1` otherwise. Throttle and steer pass through unchanged.
+    """
+    pol = np.asarray(policy_actions)
+    if pol.shape[-1] != HYBRID_ACTION_DIM:
+        raise ValueError(f"expected {HYBRID_ACTION_DIM} policy action components, got {pol.shape[-1]}")
+    out = np.empty(pol.shape[:-1] + (ACTION_DIM,), dtype=pol.dtype)
+    out[..., 0] = pol[..., 0]
+    out[..., 1] = pol[..., 1]
+    power = np.maximum(np.clip((pol[..., 2] + 1.0) / 2.0, 0.0, 1.0), 0.001)
+    out[..., 2] = np.where(pol[..., 3] > 0.5, kick_threshold + (1.0 - kick_threshold) * power, -1.0)
+    out[..., 3] = np.where(pol[..., 4] > 0.5, 1.0, -1.0)
+    return out
+
+
+def _hybrid_log_prob(mean: torch.Tensor, logstd: torch.Tensor, p: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    """Log-probability of a hybrid5 `action`; `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities."""
+    kick = action[..., 3]
+    log_n = -0.5 * ((action[..., :3] - mean) * torch.exp(-logstd)) ** 2 - logstd - _HALF_LOG_TWO_PI
+    log_fire = torch.log(torch.where(action[..., 3:] > 0.5, p, 1.0 - p)).sum(-1)
+    return log_n[..., 0] + log_n[..., 1] + kick * log_n[..., 2] + log_fire
+
+
+def _hybrid_entropy(logstd: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """Entropy of the hybrid5 head distribution: two Gaussians, two Bernoullis and `p_kick` times the power Gaussian."""
+    h_n = 0.5 + _HALF_LOG_TWO_PI + logstd
+    h_b = -(p * torch.log(p) + (1.0 - p) * torch.log1p(-p)).sum(-1)
+    return h_n[..., 0] + h_n[..., 1] + h_b + p[..., 0] * h_n[..., 2]
+
+
+def hybrid_log_prob_entropy(
+    mean: torch.Tensor,
+    logstd: torch.Tensor,
+    p_kick: torch.Tensor,
+    p_spec: torch.Tensor,
+    action: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Log-probability of a hybrid5 `action` and the entropy of the head distribution.
+
+    `mean` and `logstd` hold the throttle, steer and power Gaussians (last dimension 3); `p_kick` and `p_spec` are
+    the fire probabilities. The power Gaussian counts only when a kick fired: log-probability adds `K * logN(u)`
+    and entropy adds `p_kick * H_N(power)`.
+    """
+    p = torch.stack([p_kick, p_spec], dim=-1)
+    return _hybrid_log_prob(mean, logstd, p, action), _hybrid_entropy(logstd, p)
+
 
 class ActorCritic(nn.Module):
-    """Continuous-action Gaussian Actor-Critic network for shared role policies.
+    """Actor-Critic network for shared role policies, with a Gaussian or a hybrid action head.
 
     Supports CTDE (Centralized Training with Decentralized Execution):
     - Actor policy network observes decentralized observations (obs_dim = 82).
     - Critic value network observes augmented centralized state (critic_obs_dim = 136 = 82 + 54).
+
+    `policy_head="gaussian4"`: four Gaussian components (throttle, steer, kick, special) around `tanh` means.
+    `policy_head="hybrid5"`: the output layer has five logits `[z_thr, z_steer, z_pow, z_kick, z_spec]`; throttle,
+    steer and power are Gaussians around `tanh(z)`, kick and special fire as Bernoulli draws with probabilities
+    `fire_probability(z)`. The policy action is `[thr, steer, u, K, S]` (see `to_env_actions`). Its fire bounds
+    are stored in the state dict as buffers.
     """
 
     def __init__(
@@ -66,8 +148,15 @@ class ActorCritic(nn.Module):
         action_dim: int = ACTION_DIM,
         hidden_dims: Tuple[int, int] = (256, 256),
         central_state_dim: int = CENTRAL_STATE_DIM,
+        policy_head: str = "gaussian4",
+        fire_prob_floor: float = 0.005,
+        fire_logit_bound: float = 6.0,
     ) -> None:
         super().__init__()
+        if policy_head not in POLICY_HEADS:
+            raise ValueError(f"policy_head must be one of {POLICY_HEADS}, got {policy_head!r}")
+        self.policy_head = policy_head
+        self.hybrid = policy_head == "hybrid5"
         h1, h2 = hidden_dims
         self.obs_dim = obs_dim
         self.central_state_dim = central_state_dim
@@ -80,8 +169,23 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(h2, 1), std=1.0),
         )
-        out_layer = layer_init(nn.Linear(h2, action_dim), std=0.01)
-        if action_dim == 4:
+        out_layer = layer_init(nn.Linear(h2, HYBRID_ACTION_DIM if self.hybrid else action_dim), std=0.01)
+        if self.hybrid:
+            # Initial priors reproduce the gaussian4 start: throttle logit 0.35, steer 0, mean power 0.4666, and
+            # kick / special fire rates of 0.1289 / 0.0275 at a zero observation.
+            kick_bias = _initial_fire_logit(
+                _gaussian4_fire_rate(0.35, -0.35), fire_prob_floor, fire_logit_bound, "kick"
+            )
+            spec_bias = _initial_fire_logit(
+                _gaussian4_fire_rate(0.5, -0.8), fire_prob_floor, fire_logit_bound, "special"
+            )
+            with torch.no_grad():
+                out_layer.bias.copy_(
+                    torch.tensor([0.35, 0.0, HYBRID_POWER_BIAS, kick_bias, spec_bias], dtype=torch.float32)
+                )
+            self.register_buffer("fire_prob_floor", torch.tensor(float(fire_prob_floor), dtype=torch.float32))
+            self.register_buffer("fire_logit_bound", torch.tensor(float(fire_logit_bound), dtype=torch.float32))
+        elif action_dim == 4:
             # Sensible initial action priors before Tanh:
             # [0] throttle = +0.35 (move forward), [1] steer = 0.0 (unbiased),
             # [2] kick = -0.35 (hold & dribble ball by default until intentionally kicking > 0.35),
@@ -89,15 +193,18 @@ class ActorCritic(nn.Module):
             with torch.no_grad():
                 out_layer.bias.copy_(torch.tensor([0.35, 0.0, -0.35, -0.8], dtype=torch.float32))
 
-        self.actor_mean = nn.Sequential(
+        actor_layers: List[nn.Module] = [
             layer_init(nn.Linear(obs_dim, h1)),
             nn.Tanh(),
             layer_init(nn.Linear(h1, h2)),
             nn.Tanh(),
             out_layer,
-            nn.Tanh(),  # Bound mean to [-1.0, 1.0]
-        )
-        self.actor_logstd = nn.Parameter(torch.full((1, action_dim), -0.5))
+        ]
+        if not self.hybrid:
+            actor_layers.append(nn.Tanh())  # Bound mean to [-1.0, 1.0]
+        self.actor_mean = nn.Sequential(*actor_layers)
+        self.actor_logstd = nn.Parameter(torch.full((1, 3 if self.hybrid else action_dim), -0.5))
+        self.action_dim = HYBRID_ACTION_DIM if self.hybrid else action_dim
 
     def _prepare_critic_input(
         self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
@@ -129,6 +236,8 @@ class ActorCritic(nn.Module):
     ) -> Tuple[torch.Tensor, ...]:
         """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended."""
         actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
+        if self.hybrid:
+            return self._hybrid_action_and_value(actor_obs, action, deterministic, central_state, return_mean)
         action_mean = self.actor_mean(actor_obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
@@ -144,6 +253,89 @@ class ActorCritic(nn.Module):
         if return_mean:
             return action, log_prob, entropy, value, action_mean
         return action, log_prob, entropy, value
+
+    def _hybrid_split(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """`(Gaussian means (n, 3), fire probabilities (n, 2))` from the five output logits."""
+        return torch.tanh(z[..., :3]), fire_probability(z[..., 3:], self.fire_prob_floor, self.fire_logit_bound)
+
+    def _hybrid_from_logits(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(Gaussian means (n, 3), p_kick (n,), p_spec (n,))` from the five output logits."""
+        mean3, p = self._hybrid_split(z)
+        return mean3, p[..., 0], p[..., 1]
+
+    @staticmethod
+    def _hybrid_mode_action(mean3: torch.Tensor, p_kick: torch.Tensor, p_spec: torch.Tensor) -> torch.Tensor:
+        """Deterministic hybrid5 action: the Gaussian means, and a fire when its probability exceeds one half."""
+        return torch.cat([mean3, (p_kick > 0.5).to(mean3.dtype).unsqueeze(-1), (p_spec > 0.5).to(mean3.dtype).unsqueeze(-1)], dim=-1)
+
+    @staticmethod
+    def _hybrid_env_mean(mean3: torch.Tensor, p_kick: torch.Tensor, p_spec: torch.Tensor) -> torch.Tensor:
+        """Env-space mean action `[tanh(z_thr), tanh(z_steer), 2 p_kick - 1, 2 p_spec - 1]`."""
+        return torch.cat([mean3[..., :2], (2.0 * p_kick - 1.0).unsqueeze(-1), (2.0 * p_spec - 1.0).unsqueeze(-1)], dim=-1)
+
+    def hybrid_heads(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(Gaussian means (n, 3), p_kick (n,), p_spec (n,))` of a hybrid5 network for observations `obs`."""
+        actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
+        return self._hybrid_from_logits(self.actor_mean(actor_obs))
+
+    @torch.no_grad()
+    def fire_stats(self, obs: torch.Tensor) -> Tuple[float, float, float, float]:
+        """`(kick saturation, special saturation, mean p_kick, mean p_spec)` over the rows of `obs` (hybrid5 only).
+
+        Saturation is the share of rows whose bounded logit `L * tanh(z / L)` exceeds `0.9 * L` in magnitude.
+        """
+        actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
+        z = self.actor_mean(actor_obs)
+        bound = self.fire_logit_bound
+        sat = (torch.abs(bound * torch.tanh(z[..., 3:5] / bound)) > 0.9 * bound).to(torch.float32).mean(dim=0)
+        _, p_kick, p_spec = self._hybrid_from_logits(z)
+        return float(sat[0]), float(sat[1]), float(p_kick.mean()), float(p_spec.mean())
+
+    def _hybrid_action_and_value(
+        self,
+        actor_obs: torch.Tensor,
+        action: Optional[torch.Tensor],
+        deterministic: bool,
+        central_state: Optional[torch.Tensor],
+        return_mean: bool,
+    ) -> Tuple[torch.Tensor, ...]:
+        mean3, p = self._hybrid_split(self.actor_mean(actor_obs))
+        logstd = self.actor_logstd
+        if action is None:
+            if deterministic:
+                action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+            else:
+                action = torch.cat(
+                    [Normal(mean3, torch.exp(logstd).expand_as(mean3)).sample(), torch.bernoulli(p)], dim=-1
+                )
+        log_prob = _hybrid_log_prob(mean3, logstd, p, action)
+        entropy = _hybrid_entropy(logstd, p)
+        critic_in = self._prepare_critic_input(actor_obs, central_state)
+        value = self.critic(critic_in).squeeze(-1)
+        if return_mean:
+            return action, log_prob, entropy, value, self._hybrid_env_mean(mean3, p[..., 0], p[..., 1])
+        return action, log_prob, entropy, value
+
+    @torch.no_grad()
+    def hybrid_logits_and_value(
+        self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Inference-only `(output logits (n, 5), value (n,))` of a hybrid5 network for 2-D `obs`."""
+        layers = self.__dict__.get("_inference_layers")
+        if layers is None:
+            layers = (
+                self.actor_mean[0], self.actor_mean[2], self.actor_mean[4],
+                self.critic[0], self.critic[2], self.critic[4],
+            )
+            self.__dict__["_inference_layers"] = layers
+        a0, a1, a2, c0, c1, c2 = layers
+        h = torch.tanh(F.linear(obs, a0.weight, a0.bias))
+        h = torch.tanh(F.linear(h, a1.weight, a1.bias))
+        z = F.linear(h, a2.weight, a2.bias)
+        critic_in = self._prepare_critic_input(obs, central_state)
+        v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
+        v = torch.tanh(F.linear(v, c1.weight, c1.bias))
+        return z, F.linear(v, c2.weight, c2.bias).squeeze(-1)
 
     @torch.no_grad()
     def sample_action_and_value(
@@ -169,6 +361,21 @@ class ActorCritic(nn.Module):
         a0, a1, a2, c0, c1, c2 = layers
         h = torch.tanh(F.linear(obs, a0.weight, a0.bias))
         h = torch.tanh(F.linear(h, a1.weight, a1.bias))
+        if self.hybrid:
+            mean3, p = self._hybrid_split(F.linear(h, a2.weight, a2.bias))
+            logstd = self.actor_logstd
+            if deterministic:
+                action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+            else:
+                action = torch.cat([torch.normal(mean3, torch.exp(logstd).expand_as(mean3)), torch.bernoulli(p)], dim=-1)
+            log_prob = _hybrid_log_prob(mean3, logstd, p, action)
+            critic_in = self._prepare_critic_input(obs, central_state)
+            v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
+            v = torch.tanh(F.linear(v, c1.weight, c1.bias))
+            value = F.linear(v, c2.weight, c2.bias).squeeze(-1)
+            if return_mean:
+                return action, log_prob, value, self._hybrid_env_mean(mean3, p[..., 0], p[..., 1])
+            return action, log_prob, value
         action_mean = torch.tanh(F.linear(h, a2.weight, a2.bias))
         action_std = torch.exp(self.actor_logstd.expand_as(action_mean))
         action = action_mean if deterministic else torch.normal(action_mean, action_std)
@@ -517,6 +724,8 @@ class ParameterSharingPPOTrainer:
         self.config_overrides: Dict[str, Any] = dict(sorted((config_overrides or {}).items()))
         self.accept_config_change = bool(accept_config_change)
         self.git_commit: str = current_git_commit()
+        self.policy_head: str = self.cfg.ppo.policy_head
+        self.policy_action_dim: int = HYBRID_ACTION_DIM if self.policy_head == "hybrid5" else ACTION_DIM
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
         if self.save_best_only != self.cfg.replay.save_best_only:
             self.cfg = replace(
@@ -552,16 +761,8 @@ class ParameterSharingPPOTrainer:
         self.field_indices = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
         # Red Team (TEAM_A) Policies (on self.device, e.g. CUDA)
-        self.blue_field_policy = ActorCritic(
-            obs_dim=OBS_DIM,
-            action_dim=ACTION_DIM,
-            hidden_dims=self.cfg.ppo.hidden_dims,
-        ).to(self.device)
-        self.blue_keeper_policy = ActorCritic(
-            obs_dim=OBS_DIM,
-            action_dim=ACTION_DIM,
-            hidden_dims=self.cfg.ppo.hidden_dims,
-        ).to(self.device)
+        self.blue_field_policy = self._new_policy(self.device)
+        self.blue_keeper_policy = self._new_policy(self.device)
 
         self.blue_field_optimizer = optim.Adam(
             self.blue_field_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5
@@ -572,16 +773,8 @@ class ParameterSharingPPOTrainer:
 
         # Blue Team (TEAM_B) Policies (independent weights & optimizers when separate_teams=True)
         if self.separate_teams:
-            self.red_field_policy = ActorCritic(
-                obs_dim=OBS_DIM,
-                action_dim=ACTION_DIM,
-                hidden_dims=self.cfg.ppo.hidden_dims,
-            ).to(self.device)
-            self.red_keeper_policy = ActorCritic(
-                obs_dim=OBS_DIM,
-                action_dim=ACTION_DIM,
-                hidden_dims=self.cfg.ppo.hidden_dims,
-            ).to(self.device)
+            self.red_field_policy = self._new_policy(self.device)
+            self.red_keeper_policy = self._new_policy(self.device)
             self.red_field_optimizer = optim.Adam(
                 self.red_field_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5
             )
@@ -596,27 +789,11 @@ class ParameterSharingPPOTrainer:
 
         # CPU shadow policies for fast rollout inference (when device == 'cuda')
         if self.device.type == "cuda":
-            self.cpu_blue_field_policy = ActorCritic(
-                obs_dim=OBS_DIM,
-                action_dim=ACTION_DIM,
-                hidden_dims=self.cfg.ppo.hidden_dims,
-            ).to(self.inference_device)
-            self.cpu_blue_keeper_policy = ActorCritic(
-                obs_dim=OBS_DIM,
-                action_dim=ACTION_DIM,
-                hidden_dims=self.cfg.ppo.hidden_dims,
-            ).to(self.inference_device)
+            self.cpu_blue_field_policy = self._new_policy(self.inference_device)
+            self.cpu_blue_keeper_policy = self._new_policy(self.inference_device)
             if self.separate_teams:
-                self.cpu_red_field_policy = ActorCritic(
-                    obs_dim=OBS_DIM,
-                    action_dim=ACTION_DIM,
-                    hidden_dims=self.cfg.ppo.hidden_dims,
-                ).to(self.inference_device)
-                self.cpu_red_keeper_policy = ActorCritic(
-                    obs_dim=OBS_DIM,
-                    action_dim=ACTION_DIM,
-                    hidden_dims=self.cfg.ppo.hidden_dims,
-                ).to(self.inference_device)
+                self.cpu_red_field_policy = self._new_policy(self.inference_device)
+                self.cpu_red_keeper_policy = self._new_policy(self.inference_device)
             else:
                 self.cpu_red_field_policy = self.cpu_blue_field_policy
                 self.cpu_red_keeper_policy = self.cpu_blue_keeper_policy
@@ -634,6 +811,18 @@ class ParameterSharingPPOTrainer:
             (num_envs, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32
         )
         self._reset_all_envs(initial=True)
+
+    def _new_policy(self, device: torch.device) -> ActorCritic:
+        """A freshly initialised role network with the configured policy head."""
+        ppo = self.cfg.ppo
+        return ActorCritic(
+            obs_dim=OBS_DIM,
+            action_dim=ACTION_DIM,
+            hidden_dims=ppo.hidden_dims,
+            policy_head=ppo.policy_head,
+            fire_prob_floor=ppo.fire_prob_floor,
+            fire_logit_bound=ppo.fire_logit_bound,
+        ).to(device)
 
     def _sync_cpu_policies(self) -> None:
         """Synchronize training weights from CUDA to the CPU rollout inference policies."""
@@ -711,7 +900,8 @@ class ParameterSharingPPOTrainer:
         """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations.
 
         Returns `(actions, logprobs, values)`; with `with_means` the policy mean actions are appended.
-        Each role group is one forward pass and one random draw, taken in agent order.
+        Each role group is one forward pass and one random draw, taken in agent order; under `hybrid5` the groups'
+        forward passes are followed by one draw for all groups together.
         """
         n = self.num_envs
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.inference_device)
@@ -721,11 +911,17 @@ class ParameterSharingPPOTrainer:
             else None
         )
         outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
+        hybrid = self.policy_head == "hybrid5"
+        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor]] = []
         for indices, policy in self._rollout_groups():
             rows = slice(indices[0], indices[-1] + 1) if indices[-1] - indices[0] + 1 == len(indices) else indices
             # Contiguous rows: the CPU matmul's summation order depends on the input row stride.
             g_obs = obs_t[:, rows, :].reshape(-1, OBS_DIM).contiguous()
             g_cen = cen_t[:, rows, :].reshape(-1, CENTRAL_STATE_DIM) if cen_t is not None else None
+            if hybrid:
+                z, value = policy.hybrid_logits_and_value(g_obs, central_state=g_cen)
+                pending.append((indices, policy, z, value))
+                continue
             outputs.append(
                 (
                     indices,
@@ -734,26 +930,64 @@ class ParameterSharingPPOTrainer:
                     ),
                 )
             )
+        if hybrid:
+            outputs = self._sample_hybrid_groups(pending, deterministic, with_means)
 
         covers_agents_in_order = [i for indices, _ in outputs for i in indices] == list(range(self.num_agents))
         results: List[np.ndarray] = []
         for field in range(4 if with_means else 3):
-            per_agent_dim = ACTION_DIM if field in (0, 3) else None
+            # Actions have the policy's width; the means are env-space (ACTION_DIM wide).
+            per_agent_dim = self.policy_action_dim if field == 0 else ACTION_DIM if field == 3 else None
             if covers_agents_in_order:
                 parts = [
-                    out[field].view(n, len(indices), ACTION_DIM)
+                    out[field].view(n, len(indices), per_agent_dim)
                     if per_agent_dim
                     else out[field].view(n, len(indices))
                     for indices, out in outputs
                 ]
                 results.append(torch.cat(parts, dim=1).numpy())
             else:
-                shape = (n, self.num_agents, ACTION_DIM) if per_agent_dim else (n, self.num_agents)
+                shape = (n, self.num_agents, per_agent_dim) if per_agent_dim else (n, self.num_agents)
                 merged = torch.zeros(shape, dtype=torch.float32, device=self.inference_device)
                 for indices, out in outputs:
                     merged[:, indices] = out[field].view(n, len(indices), *shape[2:])
                 results.append(merged.numpy())
         return tuple(results)
+
+    @torch.no_grad()
+    def _sample_hybrid_groups(
+        self,
+        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor]],
+        deterministic: bool,
+        with_means: bool,
+    ) -> List[Tuple[List[int], Tuple[torch.Tensor, ...]]]:
+        """Sample hybrid5 actions for all role groups at once from their output logits.
+
+        The fire probabilities, one Gaussian draw, one Bernoulli draw and the log-probabilities are computed on the
+        rows of every group stacked in group order, each row with its own policy's `actor_logstd`; the results are
+        split back per group as `(action, log_prob, value[, env-space mean])`.
+        """
+        first = pending[0][1]
+        counts = [z.shape[0] for _, _, z, _ in pending]
+        z = torch.cat([z for _, _, z, _ in pending])
+        logstd = torch.cat([pol.actor_logstd.expand(c, 3) for (_, pol, _, _), c in zip(pending, counts)])
+        mean3, p = first._hybrid_split(z)
+        if deterministic:
+            action = first._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+        else:
+            action = torch.cat([torch.normal(mean3, torch.exp(logstd)), torch.bernoulli(p)], dim=-1)
+        log_prob = _hybrid_log_prob(mean3, logstd, p, action)
+        env_mean = first._hybrid_env_mean(mean3, p[..., 0], p[..., 1]) if with_means else None
+        outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
+        start = 0
+        for (indices, _, _, value), count in zip(pending, counts):
+            part = slice(start, start + count)
+            fields: Tuple[torch.Tensor, ...] = (action[part], log_prob[part], value)
+            if env_mean is not None:
+                fields = fields + (env_mean[part],)
+            outputs.append((indices, fields))
+            start += count
+        return outputs
 
     @torch.no_grad()
     def _compute_values(
@@ -842,7 +1076,7 @@ class ParameterSharingPPOTrainer:
 
         buf_obs = np.zeros((T, N, self.num_agents, OBS_DIM), dtype=np.float32)
         buf_central = np.zeros((T, N, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32)
-        buf_act = np.zeros((T, N, self.num_agents, ACTION_DIM), dtype=np.float32)
+        buf_act = np.zeros((T, N, self.num_agents, self.policy_action_dim), dtype=np.float32)
         buf_logp = np.zeros((T, N, self.num_agents), dtype=np.float32)
         buf_rew = np.zeros((T, N, self.num_agents), dtype=np.float32)
         buf_done = np.zeros((T, N, self.num_agents), dtype=np.float32)
@@ -872,7 +1106,12 @@ class ParameterSharingPPOTrainer:
             buf_logp[t] = logprobs
             buf_val[t] = values
 
-            act_clipped = np.clip(actions, -1.0, 1.0)
+            env_actions = (
+                actions
+                if self.policy_head == "gaussian4"
+                else to_env_actions(actions, self.cfg.mechanics.kick_trigger_threshold)
+            )
+            act_clipped = np.clip(env_actions, -1.0, 1.0)
             obs_batch, central_batch, rew_batch, done_batch, ep_summaries = (
                 self.vec_env.step_array(act_clipped, values, action_means=action_means)
             )
@@ -1033,6 +1272,17 @@ class ParameterSharingPPOTrainer:
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
 
+        # Fire statistics of the policy that produced this batch, taken before any update.
+        fire_metrics: Dict[str, float] = {}
+        if self.policy_head == "hybrid5":
+            sat_kick, sat_spec, p_kick_mean, p_spec_mean = policy.fire_stats(b_obs[::FIRE_STATS_STRIDE])
+            fire_metrics = {
+                "fire_sat_kick": sat_kick,
+                "fire_sat_spec": sat_spec,
+                "p_kick": p_kick_mean,
+                "p_spec": p_spec_mean,
+            }
+
         # Normalize once across the full rollout batch for the team unit
         if not critic_only:
             b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
@@ -1129,6 +1379,7 @@ class ParameterSharingPPOTrainer:
             "pg_loss": float(np.mean(pg_losses)),
             "v_loss": float(np.mean(v_losses)),
             "entropy": float(np.mean(entropy_losses)),
+            **fire_metrics,
         }
 
     def update_policies(
@@ -1177,7 +1428,7 @@ class ParameterSharingPPOTrainer:
                 else None
             )
             r_act = torch.as_tensor(
-                actions[:, :, role_indices, :].reshape(-1, ACTION_DIM),
+                actions[:, :, role_indices, :].reshape(-1, self.policy_action_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -1308,6 +1559,7 @@ class ParameterSharingPPOTrainer:
                 "git_commit": self.git_commit,
                 "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
+                "policy_head": self.policy_head,
                 "field_policy": self.blue_field_policy.state_dict(),
                 "keeper_policy": self.blue_keeper_policy.state_dict(),
                 "field_optimizer": self.blue_field_optimizer.state_dict(),
@@ -1526,7 +1778,16 @@ class ParameterSharingPPOTrainer:
         return summary_path
 
     def _load_adapted_weights(self, policy: ActorCritic, weights: Dict[str, torch.Tensor]) -> None:
-        """Load a state dict into `policy`, zero-padding narrower first-layer inputs (`adapt_policy_weights`)."""
+        """Load a state dict into `policy`, zero-padding narrower first-layer inputs (`adapt_policy_weights`).
+
+        Raises ValueError when the checkpoint's policy head differs from the network's; heads are not convertible.
+        """
+        saved_head = policy_head_of_weights(weights)
+        if saved_head is not None and saved_head != policy.policy_head:
+            raise ValueError(
+                f"Checkpoint holds {saved_head!r} policies but the configured policy head is {policy.policy_head!r}; "
+                "heads cannot be converted."
+            )
         policy.load_state_dict(
             adapt_policy_weights(weights, policy.obs_dim, policy.central_state_dim), strict=False
         )
@@ -1539,6 +1800,12 @@ class ParameterSharingPPOTrainer:
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location=self.device, weights_only=False)
+            stored_head = state.get("policy_head", "gaussian4")
+            if stored_head != self.policy_head:
+                raise ValueError(
+                    f"Checkpoint was trained with policy head {stored_head!r} but the configured policy head is "
+                    f"{self.policy_head!r}; heads cannot be converted."
+                )
             stored_overrides = dict(sorted((state.get("config_overrides") or {}).items()))
             if stored_overrides != self.config_overrides:
                 if not self.accept_config_change:
@@ -1745,6 +2012,7 @@ class ParameterSharingPPOTrainer:
 
                 # Exploration LogStd Clamp (prevent action noise explosion / collapse)
                 if not critic_only:
+                    logstd_min, logstd_max = self.cfg.ppo.logstd_min, self.cfg.ppo.logstd_max
                     if self.separate_teams:
                         for pol in (
                             self.blue_field_policy,
@@ -1752,10 +2020,10 @@ class ParameterSharingPPOTrainer:
                             self.red_field_policy,
                             self.red_keeper_policy,
                         ):
-                            torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                            torch.clamp_(pol.actor_logstd.data, logstd_min, logstd_max)
                     else:
                         for pol in (self.blue_field_policy, self.blue_keeper_policy):
-                            torch.clamp_(pol.actor_logstd.data, -1.25, -0.35)
+                            torch.clamp_(pol.actor_logstd.data, logstd_min, logstd_max)
                 self._sync_cpu_policies()
 
                 # Balanced Co-Evolution & Underdog Soft-Sync (over the rolling window of completed matches)
@@ -1790,6 +2058,14 @@ class ParameterSharingPPOTrainer:
                     "uniform_env": uniform_env,
                     "uniform_replay": uniform_replay,
                 }
+                if self.policy_head == "hybrid5":
+                    roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+                    gen_record["fire_sat"] = {
+                        role: {"kick": metrics[role]["fire_sat_kick"], "spec": metrics[role]["fire_sat_spec"]}
+                        for role in roles
+                    }
+                    gen_record["p_kick"] = {role: metrics[role]["p_kick"] for role in roles}
+                    gen_record["p_spec"] = {role: metrics[role]["p_spec"] for role in roles}
                 self.generation_history.append(gen_record)
                 self.current_generation = gen
 

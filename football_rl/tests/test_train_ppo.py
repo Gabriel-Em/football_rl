@@ -1839,3 +1839,756 @@ def test_main_applies_overrides_stores_them_and_enforces_them_on_resume(tmp_path
     tp.main()
     state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
     assert state["config_overrides"] == {} and state["current_generation"] == 2
+
+
+# ==============================================================================
+# Decoupled action heads (`ppo.policy_head = "hybrid5"`)
+# ==============================================================================
+from football_rl import train_ppo as tp  # noqa: E402
+
+# z with floor 0 and logit bound 6 such that P(fire) = 0.25 exactly: 6 * atanh(ln(1/3) / 6).
+Z_FOR_QUARTER = -1.1111428236846903
+GAUSS = -0.9189385332046727  # ln N(0 | 0, 1)
+ROLE_KEYS = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+
+
+def _hybrid_cfg(recording: bool = False, save_dir: str = "replays", max_rl_steps: int | None = None, **ppo):
+    cfg = _quiet_cfg(save_dir=save_dir, recording=recording)
+    cfg = replace(cfg, ppo=replace(cfg.ppo, policy_head="hybrid5", **ppo))
+    if max_rl_steps is not None:
+        cfg = replace(cfg, physics=replace(cfg.physics, max_rl_steps=max_rl_steps))
+    return cfg
+
+
+def _head_trainer(tmp_path: Path, head: str = "hybrid5", name: str = "ckpt", num_envs: int = 1,
+                  rollout_steps: int = 8, seed: int = 3, **ppo) -> ParameterSharingPPOTrainer:
+    cfg = _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}"))
+    cfg = replace(cfg, ppo=replace(cfg.ppo, policy_head=head, **ppo))
+    return ParameterSharingPPOTrainer(
+        config=cfg, num_envs=num_envs, rollout_steps=rollout_steps, device="cpu",
+        checkpoint_dir=str(tmp_path / name), seed=seed,
+    )
+
+
+def _constant_hybrid_net(bias, logstd=(0.0, 0.0, 0.0), floor: float = 0.0, bound: float = 6.0) -> ActorCritic:
+    """Hybrid network whose outputs ignore the observation: final-layer weights are zero, biases are `bias`."""
+    net = ActorCritic(policy_head="hybrid5", fire_prob_floor=floor, fire_logit_bound=bound)
+    with torch.no_grad():
+        net.actor_mean[4].weight.zero_()
+        net.actor_mean[4].bias.copy_(torch.tensor(bias, dtype=torch.float32))
+        net.actor_logstd.copy_(torch.tensor([list(logstd)], dtype=torch.float32))
+    return net
+
+
+# ------------------------------------------------------------------ configuration
+def test_policy_head_config_defaults_are_todays_policy_and_literals() -> None:
+    """[GUARD] The defaults select the existing Gaussian policy and today's clamp literals."""
+    ppo = DEFAULT_CONFIG.ppo
+    assert (ppo.policy_head, ppo.logstd_min, ppo.logstd_max) == ("gaussian4", -1.25, -0.35)
+    assert (ppo.fire_prob_floor, ppo.fire_logit_bound) == (0.005, 6.0)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"policy_head": "hybrid6"},
+        {"policy_head": ""},
+        {"logstd_min": -0.35},                       # equal bounds
+        {"logstd_min": -0.3},                        # inverted bounds
+        {"logstd_min": float("nan")},
+        {"logstd_max": float("inf")},
+        {"logstd_min": float("-inf")},
+        {"fire_prob_floor": -0.001},
+        {"fire_prob_floor": 0.5},
+        {"fire_prob_floor": float("nan")},
+        {"fire_logit_bound": 0.0},
+        {"fire_logit_bound": -6.0},
+        {"fire_logit_bound": float("inf")},
+        {"fire_logit_bound": float("nan")},
+    ],
+)
+def test_policy_head_config_rejects_invalid_values(changes) -> None:
+    """[RED] Each invalid head setting is refused by the dataclass."""
+    with pytest.raises(ValueError):
+        replace(DEFAULT_CONFIG.ppo, **changes)
+
+
+def test_policy_head_config_accepts_boundary_values() -> None:
+    """[RED] Floor 0, floor just under 0.5, a tiny positive bound and a tight but ordered logstd range are valid."""
+    for changes in (
+        {"fire_prob_floor": 0.0},
+        {"fire_prob_floor": 0.4999},
+        {"fire_logit_bound": 1e-3},
+        {"logstd_min": -1.0, "logstd_max": -0.999},
+        {"policy_head": "hybrid5"},
+    ):
+        replace(DEFAULT_CONFIG.ppo, **changes)
+
+
+def test_head_settings_are_reachable_through_config_overrides() -> None:
+    """[RED] `--config-override ppo.<key>=<value>` sets every head field with the field's type."""
+    cfg, applied = tp.parse_config_overrides(
+        [
+            "ppo.policy_head=hybrid5", "ppo.logstd_min=-1.6", "ppo.logstd_max=-0.9",
+            "ppo.fire_prob_floor=0.01", "ppo.fire_logit_bound=8",
+        ]
+    )
+    ppo = cfg.ppo
+    assert (ppo.policy_head, ppo.logstd_min, ppo.logstd_max, ppo.fire_prob_floor, ppo.fire_logit_bound) == (
+        "hybrid5", -1.6, -0.9, 0.01, 8.0,
+    )
+    assert isinstance(ppo.fire_logit_bound, float) and applied["ppo.fire_logit_bound"] == 8.0
+    with pytest.raises(ValueError, match="ppo.policy_head=bogus"):
+        tp.parse_config_overrides(["ppo.policy_head=bogus"])
+    with pytest.raises(ValueError, match="logstd_min"):
+        tp.parse_config_overrides(["ppo.logstd_min=-0.2"])
+
+
+# ------------------------------------------------------------------ env-action decode
+def test_to_env_actions_hand_values() -> None:
+    """[RED] Kick = thr + (1 - thr) * max(power, 0.001) when K = 1 else -1; special = +1 / -1; thr = 0.35."""
+    # Columns: throttle, steer, u, K, S.
+    pol = np.array(
+        [
+            [0.2, -0.3, 0.0, 1.0, 1.0],     # power 0.5  -> kick 0.675, special +1
+            [0.0, 0.0, 1.0, 1.0, 0.0],      # power 1.0  -> kick 1.0
+            [0.0, 0.0, -1.0, 1.0, 0.0],     # power 0    -> floor 0.001 -> 0.35065
+            [0.5, 0.5, 1.0, 0.0, 0.0],      # no kick for any u
+            [0.5, 0.5, -1.0, 0.0, 1.0],
+            [0.5, 0.5, 7.0, 1.0, 0.0],      # u far above range -> power clipped to 1
+            [0.5, 0.5, -7.0, 1.0, 0.0],     # u far below range -> power clipped to 0
+        ],
+        dtype=np.float32,
+    )
+    env = tp.to_env_actions(pol, 0.35)
+    assert env.shape == (7, 4) and env.dtype == np.float32
+    np.testing.assert_allclose(env[:, 2], [0.675, 1.0, 0.35065, -1.0, -1.0, 1.0, 0.35065], atol=1e-6)
+    np.testing.assert_allclose(env[:, 3], [1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0])
+    np.testing.assert_array_equal(env[:, :2], pol[:, :2])
+
+
+def test_to_env_actions_every_fired_kick_exceeds_the_env_threshold() -> None:
+    """[RED] For any u, K = 1 gives a value strictly above 0.35 and K = 0 gives exactly -1."""
+    u = np.linspace(-5.0, 5.0, 101, dtype=np.float32)
+    fired = np.stack([np.zeros_like(u), np.zeros_like(u), u, np.ones_like(u), np.zeros_like(u)], axis=1)
+    silent = fired.copy()
+    silent[:, 3] = 0.0
+    assert (tp.to_env_actions(fired, 0.35)[:, 2] > 0.35).all()
+    assert (tp.to_env_actions(silent, 0.35)[:, 2] == -1.0).all()
+    assert (tp.to_env_actions(fired, 0.35)[:, 2] <= 1.0).all()
+
+
+def test_to_env_actions_contract_edges() -> None:
+    """[RED] Leading dimensions survive, inputs are not mutated, throttle/steer are untouched, threshold is a parameter."""
+    pol = np.zeros((2, 12, 5), dtype=np.float32)
+    pol[..., 0] = 1.7            # outside [-1, 1]: the env clips, the decode leaves it alone
+    pol[..., 1] = -2.5
+    pol[..., 3] = 1.0
+    before = pol.copy()
+    env = tp.to_env_actions(pol, 0.35)
+    assert env.shape == (2, 12, 4)
+    np.testing.assert_array_equal(pol, before)
+    assert (env[..., 0] == np.float32(1.7)).all() and (env[..., 1] == np.float32(-2.5)).all()
+    # Threshold 0.5, power 0.5: 0.5 + 0.5 * 0.5 = 0.75.
+    assert tp.to_env_actions(pol[:1, :1], 0.5)[0, 0, 2] == pytest.approx(0.75)
+    with pytest.raises(ValueError):
+        tp.to_env_actions(np.zeros((3, 4), dtype=np.float32), 0.35)
+    assert tp.to_env_actions(np.zeros((0, 5), dtype=np.float32), 0.35).shape == (0, 4)
+
+
+# ------------------------------------------------------------------ fire probability
+def test_fire_probability_bounds_and_midpoint_hand_values() -> None:
+    """[RED] Floor 0.005, L = 6: z -> -inf gives 0.005 + 0.99 * sigmoid(-6) = 0.007448; +inf gives 0.992552; 0 gives 0.5."""
+    p = tp.fire_probability(torch.tensor([-1e6, 1e6, 0.0], dtype=torch.float64), 0.005, 6.0)
+    np.testing.assert_allclose(p.numpy(), [0.007448, 0.992552, 0.5], atol=1e-5)
+    # Floor 0: sigmoid(+-6) = 0.0024726 / 0.9975274.
+    p0 = tp.fire_probability(torch.tensor([-1e6, 1e6], dtype=torch.float64), 0.0, 6.0)
+    np.testing.assert_allclose(p0.numpy(), [0.0024726, 0.9975274], atol=1e-6)
+    # Floor 0 and z solved for 0.25.
+    assert float(tp.fire_probability(torch.tensor([Z_FOR_QUARTER], dtype=torch.float64), 0.0, 6.0)) == pytest.approx(
+        0.25, abs=1e-9
+    )
+
+
+def test_fire_probability_is_monotone_symmetric_and_finite_at_extremes() -> None:
+    """[RED] Strictly increasing on a grid, p(z) + p(-z) = 1, finite and inside the bounds for float32 extremes."""
+    z = torch.linspace(-30.0, 30.0, 121, dtype=torch.float64)
+    p = tp.fire_probability(z, 0.005, 6.0)
+    assert (p[1:] > p[:-1]).all()
+    np.testing.assert_allclose((p + tp.fire_probability(-z, 0.005, 6.0)).numpy(), 1.0, atol=1e-12)
+    extreme = tp.fire_probability(torch.tensor([-3e38, -1e30, 1e30, 3e38], dtype=torch.float32), 0.005, 6.0)
+    assert torch.isfinite(extreme).all()
+    assert (extreme >= 0.00744).all() and (extreme <= 0.99256).all()
+
+
+# ------------------------------------------------------------------ log-probability and entropy
+def _hand_inputs(k: float, s: float, u: float = 0.0):
+    mean = torch.zeros(1, 3, dtype=torch.float64)
+    logstd = torch.zeros(1, 3, dtype=torch.float64)           # sigma = 1 on all three Gaussian heads
+    p_kick = torch.tensor([0.25], dtype=torch.float64)
+    p_spec = torch.tensor([0.5], dtype=torch.float64)
+    action = torch.tensor([[0.0, 0.0, u, k, s]], dtype=torch.float64)
+    return mean, logstd, p_kick, p_spec, action
+
+
+def test_hybrid_log_prob_and_entropy_hand_values() -> None:
+    """[RED] K=1,S=0: 3*ln N(0) + ln 0.25 + ln 0.5 = -4.836257. K=0,S=0: 2*ln N(0) + ln 0.75 + ln 0.5 = -2.818706.
+    Entropy: 2*1.418939 + H_B(0.25) + H_B(0.5) + 0.25 * 1.418939 = 4.448094."""
+    lp1, ent = tp.hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0))
+    lp0, ent0 = tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0))
+    assert float(lp1) == pytest.approx(-4.836257, abs=1e-5)
+    assert float(lp0) == pytest.approx(-2.818706, abs=1e-5)
+    assert float(ent) == pytest.approx(4.448094, abs=1e-5)
+    assert float(ent0) == pytest.approx(4.448094, abs=1e-5)       # entropy does not depend on the sampled K
+
+
+def test_hybrid_power_term_counts_only_when_a_kick_fired() -> None:
+    """[RED] u = +1 adds -0.5 to ln N when K = 1 (-5.336257) and changes nothing when K = 0."""
+    assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0, u=1.0))[0]) == pytest.approx(-5.336257, abs=1e-5)
+    for u in (-3.0, 0.0, 2.5):
+        assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0, u=u))[0]) == pytest.approx(-2.818706, abs=1e-5)
+    # Special fired: ln 0.5 either way; S=1,K=0 equals S=0,K=0.
+    assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 1.0))[0]) == pytest.approx(-2.818706, abs=1e-5)
+
+
+def test_network_log_prob_and_entropy_match_the_hand_values() -> None:
+    """[RED] A network with p_kick = 0.25, p_spec = 0.5, sigma = 1 and zero means reproduces the hand values from raw actions."""
+    net = _constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0])
+    obs = torch.randn(3, OBS_DIM)
+    fire = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]] * 3)
+    silent = torch.zeros(3, 5)
+    _, lp1, ent, _ = net.get_action_and_value(obs, fire)
+    _, lp0, _, _ = net.get_action_and_value(obs, silent)
+    np.testing.assert_allclose(lp1.detach().numpy(), -4.836257, atol=1e-5)
+    np.testing.assert_allclose(lp0.detach().numpy(), -2.818706, atol=1e-5)
+    np.testing.assert_allclose(ent.detach().numpy(), 4.448094, atol=1e-5)
+
+
+def test_stored_log_prob_equals_the_update_recomputation_from_the_five_float_action() -> None:
+    """[RED] Sampling log-probs match `get_action_and_value` on the stored action, for every row and both K values."""
+    torch.manual_seed(0)
+    net = ActorCritic(policy_head="hybrid5")
+    with torch.no_grad():
+        net.actor_mean[4].weight.normal_(0.0, 0.5)      # make p_kick / p_spec / means depend on the observation
+    obs = torch.randn(512, OBS_DIM)
+    action, logp, _ = net.sample_action_and_value(obs)
+    assert action.shape == (512, 5)
+    assert 0 < int(action[:, 3].sum()) < 512             # both K = 0 and K = 1 occur
+    _, recomputed, _, _ = net.get_action_and_value(obs, action)
+    torch.testing.assert_close(recomputed, logp, rtol=0.0, atol=1e-5)
+
+
+def test_sampling_log_prob_of_unfired_kicks_does_not_depend_on_the_power_sample() -> None:
+    """[RED] With constant heads, every K = 0 row has the same log-prob although u differs row to row."""
+    net = _constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0])
+    torch.manual_seed(1)
+    action, logp, _ = net.sample_action_and_value(torch.zeros(2000, OBS_DIM))
+    no_kick = action[:, 3] == 0
+    assert 1000 < int(no_kick.sum()) < 1900
+    assert float(action[no_kick, 2].std()) > 0.5                 # u really varies
+    # S=0: ln0.5 ; S=1: ln0.5 ; K=0: ln0.75 ; two Gaussian heads at the sampled values.
+    thr_steer = -0.5 * (action[:, 0] ** 2 + action[:, 1] ** 2) + 2 * GAUSS
+    expected = thr_steer + math.log(0.75) + math.log(0.5)
+    torch.testing.assert_close(logp[no_kick], expected[no_kick], rtol=0.0, atol=1e-5)
+
+
+def test_deterministic_action_uses_the_means_and_fires_above_one_half() -> None:
+    """[RED] Deterministic mode returns [tanh(z) x3, p_kick > 0.5, p_spec > 0.5]."""
+    net = _constant_hybrid_net([0.5, -0.5, 0.25, 2.0, -2.0], floor=0.005)
+    action, _, _, _ = net.get_action_and_value(torch.zeros(2, OBS_DIM), deterministic=True)
+    np.testing.assert_allclose(action.detach().numpy(), [[math.tanh(0.5), math.tanh(-0.5), math.tanh(0.25), 1.0, 0.0]] * 2, atol=1e-6)
+    sampled, _, _ = net.sample_action_and_value(torch.zeros(2, OBS_DIM), deterministic=True)
+    torch.testing.assert_close(sampled, action)
+
+
+def test_hybrid_outputs_are_finite_for_extreme_observations() -> None:
+    """[RED] Observations of +-1e6 saturate the heads; log-prob, entropy and the bounded probabilities stay finite."""
+    torch.manual_seed(2)
+    net = ActorCritic(policy_head="hybrid5")
+    obs = torch.cat([torch.full((4, OBS_DIM), 1e6), torch.full((4, OBS_DIM), -1e6), torch.zeros(1, OBS_DIM)])
+    action, logp, value = net.sample_action_and_value(obs)
+    _, lp2, ent, _ = net.get_action_and_value(obs, action)
+    for t in (action, logp, value, lp2, ent):
+        assert torch.isfinite(t).all()
+    _, p_kick, p_spec = net.hybrid_heads(obs)
+    assert ((p_kick >= 0.00744) & (p_kick <= 0.99256) & (p_spec >= 0.00744) & (p_spec <= 0.99256)).all()
+
+
+# ------------------------------------------------------------------ initialisation
+def test_hybrid_initial_rates_and_biases_reproduce_todays_policy() -> None:
+    """[RED] Zero observation: P(kick) 0.1289, P(special) 0.0275, power mean 0.4666, throttle bias 0.35, steer bias 0."""
+    torch.manual_seed(0)
+    net = ActorCritic(policy_head="hybrid5")
+    mean3, p_kick, p_spec = net.hybrid_heads(torch.zeros(1, OBS_DIM))
+    assert float(p_kick) == pytest.approx(0.129, abs=1e-3)
+    assert float(p_spec) == pytest.approx(0.0275, abs=5e-4)
+    assert float((1.0 + mean3[0, 2]) / 2.0) == pytest.approx(0.4666, abs=1e-3)
+    bias = net.actor_mean[4].bias
+    assert float(bias[0]) == pytest.approx(0.35) and float(bias[1]) == 0.0 and float(bias[2]) == pytest.approx(-0.067)
+    assert net.actor_mean[4].weight.shape == (5, 256)
+    np.testing.assert_allclose(torch.linalg.norm(net.actor_mean[4].weight, dim=1).detach().numpy(), 0.01, atol=1e-5)
+    assert net.actor_logstd.shape == (1, 3) and bool((net.actor_logstd == -0.5).all())
+
+
+def test_hybrid_sampled_initial_fire_rates_match_the_analytic_values() -> None:
+    """[RED] 200k seeded draws at a zero observation fire kicks 12.9% and specials 2.75% of the time."""
+    torch.manual_seed(5)
+    net = ActorCritic(policy_head="hybrid5")
+    action, _, _ = net.sample_action_and_value(torch.zeros(200_000, OBS_DIM))
+    assert float(action[:, 3].mean()) == pytest.approx(0.1289, abs=0.004)
+    assert float(action[:, 4].mean()) == pytest.approx(0.0275, abs=0.002)
+
+
+@pytest.mark.parametrize("floor,bound", [(0.0, 4.0), (0.0, 6.0), (0.0, 12.0), (0.01, 6.0), (0.01, 12.0)])
+def test_hybrid_initial_rates_hold_for_other_floors_and_bounds(floor: float, bound: float) -> None:
+    """[RED] The biases are solved from the configured floor and bound, so the initial rates do not move."""
+    net = ActorCritic(policy_head="hybrid5", fire_prob_floor=floor, fire_logit_bound=bound)
+    _, p_kick, p_spec = net.hybrid_heads(torch.zeros(1, OBS_DIM))
+    assert float(p_kick) == pytest.approx(0.1289, abs=1e-3)
+    assert float(p_spec) == pytest.approx(0.0275, abs=5e-4)
+
+
+def test_hybrid_rejects_settings_that_cannot_reproduce_the_initial_rates() -> None:
+    """[RED] A floor at or above today's initial special rate (0.0275), or a logit bound whose smallest probability
+    exceeds it (floor 0 and bound 3: sigmoid(-3) = 0.047; floor 0.01 and bound 4: 0.01 + 0.98 * sigmoid(-4) = 0.0277),
+    cannot start at the gaussian4 rates and is refused with the field named."""
+    with pytest.raises(ValueError, match="fire_prob_floor"):
+        ActorCritic(policy_head="hybrid5", fire_prob_floor=0.03)
+    with pytest.raises(ValueError, match="fire_logit_bound"):
+        ActorCritic(policy_head="hybrid5", fire_logit_bound=3.0)
+    with pytest.raises(ValueError, match="fire_logit_bound"):
+        ActorCritic(policy_head="hybrid5", fire_prob_floor=0.01, fire_logit_bound=4.0)
+
+
+@pytest.mark.parametrize(
+    "overrides, field",
+    [
+        (["ppo.fire_prob_floor=0.05"], "fire_prob_floor"),
+        (["ppo.fire_prob_floor=0.03"], "fire_prob_floor"),
+        (["ppo.fire_logit_bound=3"], "fire_logit_bound"),
+        (["ppo.fire_prob_floor=0.01", "ppo.fire_logit_bound=4"], "fire_logit_bound"),
+    ],
+)
+def test_main_rejects_unreachable_fire_priors_before_wiping_the_batch(
+    tmp_path: Path, monkeypatch, overrides, field
+) -> None:
+    """[RED] A hybrid5 floor / bound pair that cannot reach the initial fire rates aborts `main(--from-scratch)`
+    with the field named, and the active `checkpoints/` marker file survives."""
+    import football_rl.train_ppo as tp
+
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "checkpoints" / "marker.txt"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    argv = ["train_ppo", "--from-scratch", "--total-updates", "1", "--config-override", "ppo.policy_head=hybrid5"]
+    for item in overrides:
+        argv += ["--config-override", item]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(ValueError, match=field):
+        tp.main()
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+    assert not (tmp_path / "replays").exists()
+
+
+@pytest.mark.parametrize(
+    "changes, field",
+    [
+        ({"fire_prob_floor": 0.0275}, "fire_prob_floor"),  # equals the initial special rate: no room
+        ({"fire_prob_floor": 0.4999}, "fire_prob_floor"),
+        ({"fire_logit_bound": 3.0}, "fire_logit_bound"),
+        ({"fire_prob_floor": 0.01, "fire_logit_bound": 4.0}, "fire_logit_bound"),
+    ],
+)
+def test_hybrid_config_rejects_unreachable_fire_priors(changes, field) -> None:
+    """[RED] `PPOHyperparams` refuses an unreachable hybrid5 pair itself; the same values under gaussian4 stay valid."""
+    with pytest.raises(ValueError, match=field):
+        replace(DEFAULT_CONFIG.ppo, policy_head="hybrid5", **changes)
+    replace(DEFAULT_CONFIG.ppo, policy_head="gaussian4", **changes)
+
+
+def test_hybrid_config_accepts_the_reachable_edge_of_the_fire_priors() -> None:
+    """[GUARD] Floor 0.02 with the default bound, and floor 0 with bound 4 (sigmoid(-4) = 0.018 < 0.0275), are valid."""
+    replace(DEFAULT_CONFIG.ppo, policy_head="hybrid5", fire_prob_floor=0.02)
+    replace(DEFAULT_CONFIG.ppo, policy_head="hybrid5", fire_prob_floor=0.0, fire_logit_bound=4.0)
+
+
+def test_state_dict_layouts() -> None:
+    """[GUARD] gaussian4 keeps today's keys and shapes; hybrid5 adds its two bounds as buffers and a 5-wide head."""
+    g = ActorCritic()
+    assert set(g.state_dict()) == {
+        "actor_logstd",
+        *(f"actor_mean.{i}.{p}" for i in (0, 2, 4) for p in ("weight", "bias")),
+        *(f"critic.{i}.{p}" for i in (0, 2, 4) for p in ("weight", "bias")),
+    }
+    assert g.actor_logstd.shape == (1, 4) and g.actor_mean[4].weight.shape == (4, 256)
+    h = ActorCritic(policy_head="hybrid5", fire_prob_floor=0.01, fire_logit_bound=8.0)
+    assert set(h.state_dict()) - set(g.state_dict()) == {"fire_prob_floor", "fire_logit_bound"}
+    assert float(h.state_dict()["fire_prob_floor"]) == pytest.approx(0.01)
+    assert float(h.state_dict()["fire_logit_bound"]) == pytest.approx(8.0)
+    assert h.actor_logstd.shape == (1, 3) and h.actor_mean[4].weight.shape == (5, 256)
+    assert tp.policy_head_of_weights(g.state_dict()) == "gaussian4"
+    assert tp.policy_head_of_weights(h.state_dict()) == "hybrid5"
+    assert tp.policy_head_of_weights({"critic.0.weight": torch.zeros(1, 1)}) is None
+
+
+# ------------------------------------------------------------------ gradients
+def _surrogate_grads(net: ActorCritic, action: torch.Tensor, ent_coef: float):
+    obs = torch.randn(32, OBS_DIM)
+    adv = torch.randn(32)
+    _, logp, entropy, _ = net.get_action_and_value(obs, action)
+    loss = -(adv * logp).mean() - ent_coef * entropy.mean()
+    net.zero_grad()
+    loss.backward()
+
+
+def test_power_head_receives_no_gradient_from_a_batch_without_kicks() -> None:
+    """[RED] With K = 0 everywhere the power row, bias and sigma get exactly zero policy-gradient; the other heads do not."""
+    torch.manual_seed(4)
+    net = ActorCritic(policy_head="hybrid5")
+    with torch.no_grad():
+        net.actor_mean[4].weight.normal_(0.0, 0.3)
+    action = torch.randn(32, 5)
+    action[:, 3] = 0.0
+    action[:, 4] = torch.bernoulli(torch.full((32,), 0.5))
+    _surrogate_grads(net, action, ent_coef=0.0)
+    w, b = net.actor_mean[4].weight.grad, net.actor_mean[4].bias.grad
+    assert not w[2].any() and float(b[2]) == 0.0 and float(net.actor_logstd.grad[0, 2]) == 0.0
+    for row in (0, 1, 3, 4):
+        assert w[row].abs().max() > 0 and float(b[row]) != 0.0
+    assert float(net.actor_logstd.grad[0, 0]) != 0.0 and float(net.actor_logstd.grad[0, 1]) != 0.0
+    # With any kick present the power head learns.
+    action[0, 3] = 1.0
+    _surrogate_grads(net, action, ent_coef=0.0)
+    assert net.actor_mean[4].weight.grad[2].abs().max() > 0 and float(net.actor_logstd.grad[0, 2]) != 0.0
+
+
+def test_entropy_bonus_reaches_the_power_sigma_only_through_p_kick() -> None:
+    """[RED] d(-ent_coef * p_kick * H_N)/d logstd_power = -ent_coef * p_kick = -0.005 * 0.25; the power mean row stays at zero."""
+    net = _constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0])
+    action = torch.zeros(32, 5)
+    _surrogate_grads(net, action, ent_coef=0.005)
+    assert float(net.actor_logstd.grad[0, 2]) == pytest.approx(-0.005 * 0.25, abs=1e-7)
+    assert not net.actor_mean[4].weight.grad[2].any() and float(net.actor_mean[4].bias.grad[2]) == 0.0
+
+
+# ------------------------------------------------------------------ one-state bandit
+BANDIT_UPDATE_CALLS = 20
+
+
+def _bandit_policy(trainer: ParameterSharingPPOTrainer):
+    obs = torch.linspace(-1.0, 1.0, OBS_DIM).unsqueeze(0)
+    return trainer.blue_field_policy, trainer.blue_field_optimizer, obs
+
+
+def _p_kick(policy: ActorCritic, obs: torch.Tensor) -> float:
+    with torch.no_grad():
+        return float(policy.hybrid_heads(obs)[1])
+
+
+def _bandit_calls(trainer, policy, opt, obs, sign: float, calls: int, stop) -> int:
+    """Run update calls of 512 sampled decisions each; reward = sign when K = 1 else 0. Return the calls used."""
+    batch = obs.repeat(512, 1)
+    for used in range(1, calls + 1):
+        with torch.no_grad():
+            action, logp, value = policy.sample_action_and_value(batch)
+        reward = sign * action[:, 3]
+        trainer._ppo_update_role(policy, opt, batch, action, logp, reward - reward.mean(), reward, value)
+        if stop(_p_kick(policy, obs)):
+            return used
+    return calls
+
+
+def test_hybrid_bandit_learns_to_fire_and_to_stop_firing(tmp_path: Path) -> None:
+    """[RED] Reward +1 for K=1: P(kick) > 0.9 inside the budget. Then reward -1 for K=1: P(kick) < 0.05 inside the same budget."""
+    torch.manual_seed(0)
+    trainer = _head_trainer(tmp_path)
+    try:
+        policy, opt, obs = _bandit_policy(trainer)
+        up = _bandit_calls(trainer, policy, opt, obs, +1.0, BANDIT_UPDATE_CALLS, lambda p: p > 0.9)
+        assert _p_kick(policy, obs) > 0.9, f"P(kick)={_p_kick(policy, obs):.3f} after {up} calls"
+        down = _bandit_calls(trainer, policy, opt, obs, -1.0, BANDIT_UPDATE_CALLS, lambda p: p < 0.05)
+        assert _p_kick(policy, obs) < 0.05, f"P(kick)={_p_kick(policy, obs):.3f} after {down} calls"
+        print(f"bandit update calls needed: rise {up}, fall {down}, budget {BANDIT_UPDATE_CALLS}")
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ rollout wiring
+def test_gaussian4_trainer_keeps_four_wide_actions(tmp_path: Path) -> None:
+    """[GUARD] The default trainer stores and returns 4-wide actions."""
+    trainer = _head_trainer(tmp_path, head="gaussian4", num_envs=2)
+    try:
+        acts, lps, vals, means = trainer._select_actions(
+            trainer.current_obs, trainer.current_central_state, with_means=True
+        )
+        assert acts.shape == (2, 12, 4) and means.shape == (2, 12, 4) and lps.shape == vals.shape == (2, 12)
+    finally:
+        trainer.close()
+
+
+def test_hybrid_select_actions_shapes_and_binary_fires(tmp_path: Path) -> None:
+    """[RED] Policy actions are 5 wide with K and S in {0, 1}; the replay means stay 4 wide and in env space."""
+    trainer = _head_trainer(tmp_path, num_envs=2)
+    try:
+        acts, lps, vals, means = trainer._select_actions(
+            trainer.current_obs, trainer.current_central_state, with_means=True
+        )
+        assert acts.shape == (2, 12, 5) and means.shape == (2, 12, 4) and lps.shape == vals.shape == (2, 12)
+        assert set(np.unique(acts[..., 3:])) <= {0.0, 1.0}
+        assert (np.abs(means[..., 2:]) <= 1.0).all() and np.isfinite(lps).all()
+    finally:
+        trainer.close()
+
+
+def test_hybrid_rollout_feeds_the_env_decoded_actions_and_stores_policy_actions(tmp_path: Path) -> None:
+    """[RED] The env receives `to_env_actions` of the stored 5-float actions; the buffer keeps the 5 floats."""
+    trainer = _head_trainer(tmp_path, num_envs=2, rollout_steps=6)
+    seen = []
+    real_step = trainer.vec_env.step_array
+
+    def spy(actions, values, action_means=None):
+        seen.append(np.array(actions, copy=True))
+        return real_step(actions, values, action_means=action_means)
+
+    trainer.vec_env.step_array = spy
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        stored = rollout["actions"]
+        assert stored.shape == (6, 2, 12, 5) and len(seen) == 6
+        decoded = np.clip(tp.to_env_actions(stored, 0.35), -1.0, 1.0)
+        np.testing.assert_array_equal(np.stack(seen), decoded)
+        assert ((np.stack(seen)[..., 2] > 0.35) == (stored[..., 3] == 1.0)).all()
+        assert ((np.stack(seen)[..., 3] > 0.5) == (stored[..., 4] == 1.0)).all()
+    finally:
+        trainer.close()
+
+
+def test_hybrid_rollout_log_probs_equal_the_update_recomputation(tmp_path: Path) -> None:
+    """[RED] For every role group, the log-probs stored during the rollout equal the update-time recomputation (ratio 1)."""
+    trainer = _head_trainer(tmp_path, num_envs=2, rollout_steps=8)
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        for indices, policy in trainer._rollout_groups():
+            obs = torch.as_tensor(rollout["obs"][:, :, indices, :].reshape(-1, OBS_DIM))
+            act = torch.as_tensor(rollout["actions"][:, :, indices, :].reshape(-1, 5))
+            cen = torch.as_tensor(rollout["central_state"][:, :, indices, :].reshape(-1, CENTRAL_STATE_DIM))
+            _, newlogp, _, _ = policy.get_action_and_value(obs, act, central_state=cen)
+            stored = torch.as_tensor(rollout["logprobs"][:, :, indices].reshape(-1))
+            torch.testing.assert_close(newlogp, stored, rtol=0.0, atol=1e-5)
+    finally:
+        trainer.close()
+
+
+def test_hybrid_update_changes_the_actor_and_stays_finite(tmp_path: Path) -> None:
+    """[RED] One seeded generation updates all four policies without NaNs."""
+    trainer = _head_trainer(tmp_path, num_envs=2, rollout_steps=16)
+    try:
+        before = {n: p.detach().clone() for n, p in trainer.blue_field_policy.named_parameters()}
+        rollout = trainer.collect_rollouts(active_generation=1)
+        metrics = trainer.update_policies(rollout)
+        after = dict(trainer.blue_field_policy.named_parameters())
+        assert any(not torch.equal(before[n], after[n]) for n in before if n.startswith("actor_"))
+        for role in ROLE_KEYS:
+            assert all(math.isfinite(v) for v in metrics[role].values()), role
+        for p in trainer.blue_field_policy.parameters():
+            assert torch.isfinite(p).all()
+    finally:
+        trainer.close()
+
+
+def test_hybrid_seeded_rollouts_are_reproducible(tmp_path: Path) -> None:
+    """[RED] Two trainers with the same seed draw identical actions and log-probs."""
+    outs = []
+    for name in ("a", "b"):
+        trainer = _head_trainer(tmp_path, name=name, num_envs=2, rollout_steps=6, seed=11)
+        try:
+            outs.append(trainer.collect_rollouts(active_generation=1))
+        finally:
+            trainer.close()
+    for key in ("actions", "logprobs", "rewards"):
+        np.testing.assert_array_equal(outs[0][key], outs[1][key])
+
+
+def test_hybrid_replay_frames_record_four_wide_env_space_actions_and_means(tmp_path: Path) -> None:
+    """[RED] Uniform replay frames hold (12, 4) `actions` and `action_mean`; fired kicks are > 0.35, others -1."""
+    cfg = _hybrid_cfg(recording=True, save_dir=str(tmp_path / "rep"), max_rl_steps=6)
+    cfg = replace(cfg, replay=replace(cfg.replay, interest_threshold=float("inf")))
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg, num_envs=1, rollout_steps=6, device="cpu", checkpoint_dir=str(tmp_path / "ckpt"), seed=3
+    )
+    try:
+        trainer.train(total_updates=1)
+        frames = json.loads(Path(trainer.generation_history[0]["uniform_replay"]).read_text(encoding="utf-8"))["frames"]
+        for f in frames[1:]:
+            assert len(f["actions"]) == 12 and all(len(r) == 4 for r in f["actions"])
+            assert len(f["action_mean"]) == 12 and all(len(r) == 4 for r in f["action_mean"])
+            assert all(r[2] == -1.0 or r[2] > 0.35 for r in f["actions"])
+            assert all(r[3] in (-1.0, 1.0) for r in f["actions"])
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ logstd clamp and telemetry
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+@pytest.mark.parametrize("bounds", [(-1.25, -0.35), (-1.0, -0.8)])
+def test_logstd_clamp_reads_the_configured_range(tmp_path: Path, head: str, bounds) -> None:
+    """[GUARD] After a generation every actor sigma sits inside [logstd_min, logstd_max]; far-out values land on the edges."""
+    trainer = _head_trainer(tmp_path, head=head, logstd_min=bounds[0], logstd_max=bounds[1])
+    try:
+        pols = (trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy)
+        for i, pol in enumerate(pols):
+            with torch.no_grad():
+                pol.actor_logstd.fill_(2.0 if i % 2 == 0 else -4.0)
+        trainer.train(total_updates=1)
+        width = 4 if head == "gaussian4" else 3
+        for i, pol in enumerate(pols):
+            assert pol.actor_logstd.shape == (1, width)
+            edge = bounds[1] if i % 2 == 0 else bounds[0]
+            assert bool((pol.actor_logstd == torch.tensor(edge, dtype=torch.float32)).all())
+    finally:
+        trainer.close()
+
+
+def test_generation_record_carries_fire_telemetry_for_hybrid5_only(tmp_path: Path) -> None:
+    """[RED] hybrid5: per role `fire_sat` {kick, spec}, `p_kick`, `p_spec` of the rollout policy; gaussian4: none of them.
+    Constant heads z_kick = +100, z_spec = 0 give saturation 1 / 0 and probabilities 0.9925521 / 0.5 before the update."""
+    trainer = _head_trainer(tmp_path)
+    try:
+        for pol in (trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy):
+            with torch.no_grad():
+                pol.actor_mean[4].weight.zero_()
+                pol.actor_mean[4].bias.copy_(torch.tensor([0.0, 0.0, 0.0, 100.0, 0.0]))
+        trainer.train(total_updates=1)
+        rec = trainer.generation_history[0]
+        for role in ROLE_KEYS:
+            assert rec["fire_sat"][role]["kick"] == pytest.approx(1.0) and rec["fire_sat"][role]["spec"] == pytest.approx(0.0)
+            assert rec["p_kick"][role] == pytest.approx(0.9925521, abs=1e-5)
+            assert rec["p_spec"][role] == pytest.approx(0.5, abs=1e-6)
+        persisted = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+        assert persisted["generations"][0]["fire_sat"] == rec["fire_sat"]
+    finally:
+        trainer.close()
+    plain = _head_trainer(tmp_path, head="gaussian4", name="plain")
+    try:
+        plain.train(total_updates=1)
+        rec = plain.generation_history[0]
+        assert not {"fire_sat", "p_kick", "p_spec"} & set(rec)
+    finally:
+        plain.close()
+
+
+# ------------------------------------------------------------------ persistence
+def test_hybrid_state_round_trips_and_stores_the_head(tmp_path: Path) -> None:
+    """[RED] `training_state.pt` stores `policy_head`; a hybrid5 trainer reloads weights, bounds and Adam state exactly."""
+    a = _head_trainer(tmp_path, name="a", num_envs=1, rollout_steps=8, fire_prob_floor=0.01, fire_logit_bound=8.0)
+    try:
+        a.train(total_updates=1)
+        state = torch.load(tmp_path / "a" / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["policy_head"] == "hybrid5"
+    finally:
+        a.close()
+    b = _head_trainer(tmp_path, name="a", num_envs=1, rollout_steps=8, fire_prob_floor=0.01, fire_logit_bound=8.0)
+    try:
+        assert b.load_checkpoints() is True
+        assert b.current_generation == 1
+        for name, tensor in a.blue_field_policy.state_dict().items():
+            assert torch.equal(tensor, b.blue_field_policy.state_dict()[name]), name
+        assert float(b.blue_field_policy.fire_prob_floor) == pytest.approx(0.01)
+    finally:
+        b.close()
+    plain = _head_trainer(tmp_path, head="gaussian4", name="g")
+    try:
+        plain.train(total_updates=1)
+        assert torch.load(tmp_path / "g" / "training_state.pt", map_location="cpu", weights_only=False)["policy_head"] == "gaussian4"
+    finally:
+        plain.close()
+
+
+@pytest.mark.parametrize("saved,configured", [("hybrid5", "gaussian4"), ("gaussian4", "hybrid5")])
+def test_loading_a_checkpoint_of_the_other_head_raises_and_names_both(tmp_path: Path, saved: str, configured: str) -> None:
+    """[RED] No conversion between heads: the error names both, through the state file and through bare policy files."""
+    src = _head_trainer(tmp_path, head=saved, name="src")
+    try:
+        src.train(total_updates=1)
+    finally:
+        src.close()
+    for bare in (False, True):
+        if bare:
+            (tmp_path / "src" / "training_state.pt").unlink()
+        dst = _head_trainer(tmp_path, head=configured, name="src")
+        try:
+            with pytest.raises(ValueError, match=rf"(?s)(?=.*{saved})(?=.*{configured})"):
+                dst.load_checkpoints()
+            assert dst.current_generation == 0 and dst.match_history == [] and dst.generation_history == []
+        finally:
+            dst.close()
+
+
+def test_state_without_a_head_key_is_a_gaussian4_checkpoint(tmp_path: Path) -> None:
+    """[GUARD] Older states have no `policy_head`: they load into gaussian4 trainers and are refused by hybrid5 ones."""
+    src = _head_trainer(tmp_path, head="gaussian4", name="old")
+    try:
+        src.train(total_updates=1)
+    finally:
+        src.close()
+    path = tmp_path / "old" / "training_state.pt"
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    del state["policy_head"]
+    torch.save(state, path)
+    ok = _head_trainer(tmp_path, head="gaussian4", name="old")
+    try:
+        assert ok.load_checkpoints() is True and ok.current_generation == 1
+    finally:
+        ok.close()
+    refused = _head_trainer(tmp_path, head="hybrid5", name="old")
+    try:
+        with pytest.raises(ValueError, match="gaussian4"):
+            refused.load_checkpoints()
+    finally:
+        refused.close()
+
+
+def test_hybrid_batched_selection_matches_the_per_group_networks(tmp_path: Path) -> None:
+    """[RED] Deterministic selection returns, per role group, what each network's own `sample_action_and_value` returns."""
+    trainer = _head_trainer(tmp_path, num_envs=2)
+    try:
+        torch.manual_seed(7)
+        for pol in (trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy):
+            with torch.no_grad():
+                pol.actor_mean[4].weight.normal_(0.0, 0.4)
+        obs = np.random.default_rng(0).normal(size=(2, 12, OBS_DIM)).astype(np.float32)
+        cen = np.random.default_rng(1).normal(size=(2, 12, CENTRAL_STATE_DIM)).astype(np.float32)
+        acts, lps, vals, means = trainer._select_actions(obs, cen, deterministic=True, with_means=True)
+        for indices, policy in trainer._rollout_groups():
+            g_obs = torch.as_tensor(obs[:, indices, :].reshape(-1, OBS_DIM))
+            g_cen = torch.as_tensor(cen[:, indices, :].reshape(-1, CENTRAL_STATE_DIM))
+            a, lp, v, m = policy.sample_action_and_value(g_obs, central_state=g_cen, deterministic=True, return_mean=True)
+            np.testing.assert_allclose(acts[:, indices].reshape(-1, 5), a.numpy(), atol=1e-6)
+            np.testing.assert_allclose(lps[:, indices].reshape(-1), lp.numpy(), atol=1e-5)
+            np.testing.assert_allclose(vals[:, indices].reshape(-1), v.numpy(), atol=1e-5)
+            np.testing.assert_allclose(means[:, indices].reshape(-1, 4), m.numpy(), atol=1e-6)
+    finally:
+        trainer.close()
+
+
+def test_hybrid_batched_sampling_uses_each_groups_own_sigma(tmp_path: Path) -> None:
+    """[RED] With a different sigma per role policy, sampled log-probs still equal the update recomputation of every group."""
+    trainer = _head_trainer(tmp_path, num_envs=2, rollout_steps=6)
+    try:
+        pols = (trainer.blue_keeper_policy, trainer.blue_field_policy, trainer.red_keeper_policy, trainer.red_field_policy)
+        for i, pol in enumerate(pols):
+            with torch.no_grad():
+                pol.actor_logstd.copy_(torch.tensor([[-0.3 - 0.3 * i, -0.4 - 0.2 * i, -0.5 + 0.1 * i]]))
+        rollout = trainer.collect_rollouts(active_generation=1)
+        for indices, policy in trainer._rollout_groups():
+            obs = torch.as_tensor(rollout["obs"][:, :, indices, :].reshape(-1, OBS_DIM))
+            act = torch.as_tensor(rollout["actions"][:, :, indices, :].reshape(-1, 5))
+            cen = torch.as_tensor(rollout["central_state"][:, :, indices, :].reshape(-1, CENTRAL_STATE_DIM))
+            _, newlogp, _, _ = policy.get_action_and_value(obs, act, central_state=cen)
+            torch.testing.assert_close(newlogp, torch.as_tensor(rollout["logprobs"][:, :, indices].reshape(-1)), rtol=0.0, atol=1e-5)
+        # The sampled noise really differs by group: deviations of the throttle sample scale with each group's sigma.
+        sd = [float((rollout["actions"][:, :, idx, 0]).std()) for idx, _ in trainer._rollout_groups()]
+        assert len(set(round(x, 3) for x in sd)) > 1
+    finally:
+        trainer.close()
