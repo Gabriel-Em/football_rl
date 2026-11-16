@@ -13,6 +13,7 @@ Players 0..5 are team A (GK, D1, D2, M1, M2, ST), 6..11 team B.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sys
 from pathlib import Path
@@ -1025,3 +1026,339 @@ class TestEvaluateArm:
         )
         assert dir_digest(snap) == before
         assert list(replays.iterdir()) == []
+
+
+# ----------------------------------------------------------------------------
+# E2: Policy internals (tools/audit/internals.py)
+# ----------------------------------------------------------------------------
+def make_internals_trace(T: int) -> dict:
+    tr = make_trace(T)
+    tr["ang"] = np.zeros((T, 12), dtype=np.float32)
+    tr["hold_t"] = np.zeros(T, dtype=np.float32)
+    tr["act"] = np.full((T, 12, 4), -1.0, dtype=np.float32)
+    tr["mean"] = np.full((T, 12, 4), -1.0, dtype=np.float32)
+    return tr
+
+
+class TestInternals:
+    def test_saturation_and_grad_scale_hand_values(self):
+        from tools.audit import internals
+
+        tr = make_internals_trace(4)
+        vals = np.array([0.995, -1.0, 0.5, 0.0], dtype=np.float32)
+        for col in range(4):
+            tr["mean"][:, 1:6, col] = vals[:, None]
+            tr["mean"][:, 7:12, col] = vals[:, None]
+        # Keepers sit at 0.0; they must not enter field-player averages.
+        tr["mean"][:, [0, 6], :] = 0.0
+        m = internals.match_internals(tr)
+        for head in ("throttle", "steer", "kick", "special"):
+            assert m[f"sat99_{head}"] == pytest.approx(0.5)
+            assert m[f"grad_scale_{head}"] == pytest.approx(0.43999375)
+
+    def test_kick_decomposition_hand_values(self):
+        from tools.audit import internals
+
+        tr = make_internals_trace(10)
+        means = [0.9, 0.9, 0.9, -0.9, -0.9, -0.9, -0.9, -0.9]
+        # Rows 0..7 are eligible outfield holds; row 8 fails hold_t grace; row 9 is GK hold.
+        for t, km in enumerate(means):
+            tr["holder"][t] = 3
+            tr["hold_t"][t] = 0.10
+            tr["mean"][t, 3, 2] = km
+            tr["act"][t, 3, 2] = 0.8 if t in (0, 1, 7) else -0.5
+        tr["holder"][8] = 3
+        tr["hold_t"][8] = 0.04
+        tr["mean"][8, 3, 2] = 0.9
+        tr["act"][8, 3, 2] = 0.9
+        tr["holder"][9] = 0
+        tr["hold_t"][9] = 0.20
+        tr["mean"][9, 0, 2] = 0.9
+        tr["act"][9, 0, 2] = 0.9
+
+        m = internals.match_internals(tr)
+        assert m["p_kick_obs"] == pytest.approx(0.375)
+        assert m["p_kick_intent"] == pytest.approx(0.375)
+        assert m["kick_from_intent"] == pytest.approx(2.0 / 3.0)
+        assert m["p_kick_given_intent"] == pytest.approx(2.0 / 3.0)
+        assert m["p_kick_given_no_intent"] == pytest.approx(0.2)
+
+    def test_kick_decomposition_no_eligible_decisions_returns_none(self):
+        from tools.audit import internals
+
+        tr = make_internals_trace(4)
+        tr["holder"][0] = 3
+        tr["hold_t"][0] = 0.05  # below 0.08 grace
+        tr["holder"][1] = 0     # keeper
+        tr["hold_t"][1] = 0.50
+        m = internals.match_internals(tr)
+        for key in (
+            "p_kick_obs", "p_kick_intent", "kick_from_intent",
+            "p_kick_given_intent", "p_kick_given_no_intent",
+            "power_mean", "power_sd", "full_power_share",
+            "aim_teammate_share_sampled", "aim_teammate_share_mean",
+        ):
+            assert m[key] is None
+
+    def test_power_hand_values(self):
+        from tools.audit import internals
+
+        tr = make_internals_trace(3)
+        actions = [1.0, 0.675, 0.415]
+        for t, a in enumerate(actions):
+            tr["holder"][t] = 4
+            tr["hold_t"][t] = 0.10
+            tr["act"][t, 4, 2] = a
+        m = internals.match_internals(tr)
+        expected = np.array([1.0, 0.5, 0.1])
+        assert m["power_mean"] == pytest.approx(0.5333333333)
+        assert m["power_sd"] == pytest.approx(float(expected.std()))
+        assert m["full_power_share"] == pytest.approx(1.0 / 3.0)
+
+    def test_aim_teammate_share_hand_cases(self):
+        from tools.audit import internals
+
+        def one_kick(teammate_xy, steer_act, steer_mean=0.0):
+            tr = make_internals_trace(1)
+            tr["holder"][0] = 1
+            tr["hold_t"][0] = 0.10
+            tr["act"][0, 1, 2] = 0.9
+            tr["act"][0, 1, 1] = steer_act
+            tr["mean"][0, 1, 1] = steer_mean
+            tr["pos"][0, 1] = (0.0, 0.0)
+            tr["ang"][0, 1] = 0.0
+            tr["pos"][0, 2] = teammate_xy
+            return internals.match_internals(tr)
+
+        assert one_kick((200.0, 0.0), 0.0)["aim_teammate_share_sampled"] == pytest.approx(1.0)
+        assert one_kick((200.0, 60.0), 0.0)["aim_teammate_share_sampled"] == pytest.approx(0.0)
+        assert one_kick((200.0, 60.0), 0.5, steer_mean=0.0)["aim_teammate_share_sampled"] == pytest.approx(1.0)
+        assert one_kick((200.0, 60.0), 0.5, steer_mean=0.0)["aim_teammate_share_mean"] == pytest.approx(0.0)
+        assert one_kick((50.0, 0.0), 0.0)["aim_teammate_share_sampled"] == pytest.approx(0.0)
+
+    def test_special_rate_and_intent_hand_values(self):
+        from tools.audit import internals
+
+        tr = make_internals_trace(2)
+        # 2 steps * 10 field players = 20 field decisions; fire on 3, 2 of which have mean > 0.5.
+        tr["act"][0, 1, 3] = 0.8
+        tr["mean"][0, 1, 3] = 0.7
+        tr["act"][0, 2, 3] = 0.6
+        tr["mean"][0, 2, 3] = 0.6
+        tr["act"][1, 7, 3] = 0.9
+        tr["mean"][1, 7, 3] = -0.2
+        tr["act"][:, 0, 3] = 1.0  # keeper fire ignored
+        m = internals.match_internals(tr)
+        assert m["special_rate"] == pytest.approx(3.0 / 20.0)
+        assert m["special_from_intent"] == pytest.approx(2.0 / 3.0)
+
+    def test_cli_writes_json_and_prints_text(self, tmp_path, capsys):
+        from tools.audit import internals
+
+        tr1 = make_internals_trace(2)
+        tr1["holder"][:] = 1
+        tr1["hold_t"][:] = 0.1
+        tr1["act"][0, 1, 2] = 1.0
+        tr2 = make_internals_trace(2)
+        tr2["holder"][:] = 1
+        tr2["hold_t"][:] = 0.1
+        tr2["act"][:, 1, 2] = 1.0
+        d = tmp_path / "traces"
+        d.mkdir()
+        np.savez_compressed(d / "m000.npz", **tr1)
+        np.savez_compressed(d / "m001.npz", **tr2)
+        out_json = tmp_path / "internals.json"
+        rc = internals.main([str(d), "--json", str(out_json)])
+        assert rc == 0
+        txt = capsys.readouterr().out
+        assert "sat99" in txt and "kick" in txt and "n=2" in txt
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        met = data[str(d)]["summary"]["metrics"]
+        assert met["p_kick_obs"]["mean"] == pytest.approx(0.75)
+        assert met["p_kick_obs"]["se"] == pytest.approx(0.25)
+        assert met["p_kick_obs"]["n"] == 2
+
+
+# ----------------------------------------------------------------------------
+# E2: goal_diff in census.py
+# ----------------------------------------------------------------------------
+class TestGoalDiff:
+    def test_goal_diff_mean_and_se_hand_values(self):
+        t1 = make_trace(2)
+        t1["final_score"] = np.array([1, 3], dtype=np.int32)
+        t2 = make_trace(2)
+        t2["final_score"] = np.array([2, 2], dtype=np.int32)
+        per_match = [census.match_metrics(t1), census.match_metrics(t2)]
+        assert [m["goal_diff"] for m in per_match] == [-2.0, 0.0]
+        gd = census.summarize(per_match)["metrics"]["goal_diff"]
+        assert gd["mean"] == pytest.approx(-1.0)
+        assert gd["se"] == pytest.approx(1.0)
+        assert gd["n"] == 2
+
+
+# ----------------------------------------------------------------------------
+# E2: fresh300 gates, EBE targets, and between-seed SD (tools/audit/gates.py)
+# ----------------------------------------------------------------------------
+class TestGatesE2:
+    def test_fresh300_g1_checks_last_gen_only(self):
+        from tools.audit import gates
+
+        arm_pass = {"s42": {
+            "200": {"self_sampled": _fake_census_point(hold_share_pooled=0.16)},
+            "300": {"self_sampled": _fake_census_point(hold_share_pooled=0.18)},
+        }}
+        arm_fail = {"s42": {
+            "200": {"self_sampled": _fake_census_point(hold_share_pooled=0.18)},
+            "300": {"self_sampled": _fake_census_point(hold_share_pooled=0.16)},
+        }}
+        res_pass = gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="fresh300")
+        res_fail = gates.evaluate_gates(arm_fail, gens=["200", "300"], protocol="fresh300")
+        assert res_pass["gates"]["G1"]["passed"] is True
+        assert res_fail["gates"]["G1"]["passed"] is False
+        assert "G9_prime_b" not in res_pass["gates"]
+        # Under resume150, 0.16 at gen 200 fails G1.
+        assert gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="resume150")["gates"]["G1"]["passed"] is False
+
+    def test_fresh300_g3_checks_last_two_gens(self):
+        from tools.audit import gates
+
+        arm_pass = {"s42": {
+            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
+            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.09)},
+        }}
+        arm_fail = {"s42": {
+            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
+            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.11)},
+        }}
+        arm_recovered = {"s42": {
+            "100": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
+            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
+            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.09)},
+        }}
+        assert gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is True
+        assert gates.evaluate_gates(arm_fail, gens=["200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is False
+        assert gates.evaluate_gates(arm_recovered, gens=["100", "200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is True
+
+    def _two_seed_target_arm(self, tag: str, key: str, v42: float, v43: float):
+        return {
+            "s42": {"300": {"self_sampled": _fake_census_point(), tag: _fake_census_point(**{key: (v42, 0.4)})}},
+            "s43": {"300": {"self_sampled": _fake_census_point(), tag: _fake_census_point(**{key: (v43, 0.4)})}},
+        }
+
+    def test_ebe_targets_hand_cases(self):
+        from tools.audit import gates
+
+        comp = self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -10.5, -11.0)
+        spec = "goals_A@vs_scripted_sampled:higher:2.0"
+
+        beats = gates.evaluate_gates(
+            self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -7.5),
+            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
+        )["targets"][0]
+        assert beats["verdict"] == "BEATS"
+        assert beats["mean_diff"] == pytest.approx(3.0)
+
+        split = gates.evaluate_gates(
+            self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -10.8),
+            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
+        )["targets"][0]
+        assert split["verdict"] == "NEUTRAL"
+
+        small_diff = gates.evaluate_gates(
+            self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -9.9, -9.6),
+            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
+        )["targets"][0]
+        assert small_diff["verdict"] == "NEUTRAL"
+        assert small_diff["mean_diff"] == pytest.approx(1.0)
+
+        arm_high = self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -7.5)
+        loses = gates.evaluate_gates(
+            self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -10.5, -11.0),
+            comparator=arm_high, gens=["300"], protocol="fresh300", targets=[spec],
+        )["targets"][0]
+        assert loses["verdict"] == "LOSES"
+
+        one_seed = {"s42": {"300": {"self_sampled": _fake_census_point(), "vs_scripted_sampled": _fake_census_point(goals_A=(-5.0, 0.4))}}}
+        under = gates.evaluate_gates(
+            one_seed, comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
+        )["targets"][0]
+        assert under["verdict"] == "NEUTRAL"
+        assert under["note"]
+
+        # Lower-is-better direction
+        lower_beats = gates.evaluate_gates(
+            self._two_seed_target_arm("vs_scripted_sampled", "goals_B", 4.0, 5.0),
+            comparator=self._two_seed_target_arm("vs_scripted_sampled", "goals_B", 8.0, 9.0),
+            gens=["300"], protocol="fresh300", targets=["goals_B@vs_scripted_sampled:lower:2.0"],
+        )["targets"][0]
+        assert lower_beats["verdict"] == "BEATS"
+
+    def test_between_seed_sample_sd_at_last_gen(self):
+        from tools.audit import gates
+
+        arm = {
+            "s42": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=0.1906)}},
+            "s43": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=0.1739)}},
+        }
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh300")
+        sd = res["gates"]["G1"]["metrics"]["hold_share_pooled"]["points"]["300"]["arm_sd"]
+        assert sd == pytest.approx(0.01180868, abs=1e-5)
+        md = gates.format_markdown(res)
+        assert "0.0118" in md
+
+    def test_cli_fresh300_with_multi_tag_target(self, tmp_path, capsys):
+        from tools.audit import gates
+
+        for seed, gd, hs in (("s42", -8.0, 0.19), ("s43", -7.5, 0.18)):
+            for tag, pt in (("self_sampled", _fake_census_point(hold_share_pooled=hs)),
+                            ("vs_scripted_sampled", {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": gd, "se": 0.4, "n": 48}}}})):
+                p = tmp_path / "arm" / seed / "gen300" / tag
+                p.mkdir(parents=True)
+                (p / "census.json").write_text(json.dumps(pt), encoding="utf-8")
+        for seed, gd, hs in (("s42", -10.5, 0.18), ("s43", -11.0, 0.18)):
+            for tag, pt in (("self_sampled", _fake_census_point(hold_share_pooled=hs)),
+                            ("vs_scripted_sampled", {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": gd, "se": 0.4, "n": 48}}}})):
+                p = tmp_path / "comp" / seed / "gen300" / tag
+                p.mkdir(parents=True)
+                (p / "census.json").write_text(json.dumps(pt), encoding="utf-8")
+
+        rc = gates.main([
+            "--arm", f"s42={tmp_path}/arm/s42", f"s43={tmp_path}/arm/s43",
+            "--comparator", f"s42={tmp_path}/comp/s42", f"s43={tmp_path}/comp/s43",
+            "--protocol", "fresh300", "--gens", "300",
+            "--target", "goal_diff@vs_scripted_sampled:higher:2.0",
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "BEATS" in out and "+3.000" in out
+
+
+# ----------------------------------------------------------------------------
+# E2: evaluate_arm writes internals.json for self_sampled
+# ----------------------------------------------------------------------------
+class TestEvaluateArmE2:
+    def test_internals_json_written_deterministic_and_no_writes(self, tmp_path, monkeypatch):
+        from tools.audit import evaluate_arm
+
+        snap = write_checkpoint(tmp_path / "checkpoints" / "gen1200", seed=11)
+        replays = tmp_path / "replays"
+        replays.mkdir()
+        before = dir_digest(snap)
+        monkeypatch.chdir(tmp_path)
+
+        out1 = tmp_path / "out1"
+        out2 = tmp_path / "out2"
+        evaluate_arm.evaluate_arm(
+            [snap], out1, workers=1, n_override=2, max_steps=20, tags=["self_sampled", "self_mixed"],
+        )
+        evaluate_arm.evaluate_arm(
+            [snap], out2, workers=1, n_override=2, max_steps=20, tags=["self_sampled", "self_mixed"],
+        )
+        i1 = out1 / "gen1200" / "self_sampled" / "internals.json"
+        i2 = out2 / "gen1200" / "self_sampled" / "internals.json"
+        assert i1.is_file() and i2.is_file()
+        assert i1.read_bytes() == i2.read_bytes()
+        assert not (out1 / "gen1200" / "self_mixed" / "internals.json").exists()
+        assert dir_digest(snap) == before
+        assert list(replays.iterdir()) == []
+

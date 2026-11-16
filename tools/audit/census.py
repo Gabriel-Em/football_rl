@@ -597,6 +597,7 @@ def match_metrics(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     final = np.asarray(trace["final_score"]) if "final_score" in trace else np.asarray(trace["s_score"])[-1]
     m["goals_A"], m["goals_B"] = float(final[0]), float(final[1])
     m["goals_total"] = m["goals_A"] + m["goals_B"]
+    m["goal_diff"] = m["goals_A"] - m["goals_B"]
     m["scoreless"] = 1.0 if m["goals_total"] == 0 else 0.0
     hs = hold_share(trace)
     m["hold_share_A"], m["hold_share_B"] = float(hs[0]), float(hs[1])
@@ -697,7 +698,7 @@ def summarize(per_match: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     metrics: Dict[str, Dict[str, Any]] = {}
 
     scalar_keys = (
-        "goals_A", "goals_B", "goals_total", "scoreless",
+        "goals_A", "goals_B", "goals_total", "goal_diff", "scoreless",
         "hold_share_A", "hold_share_B", "hold_share_pooled", "loose_share",
         "n_within_100_A", "n_within_100_B", "n_within_100_pooled",
         "n_within_150_A", "n_within_150_B", "n_within_150_pooled",
@@ -780,8 +781,8 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
     met = s["metrics"]
     lines = [f"===== {title}  n={n} matches"]
     lines.append(
-        "goals A / B / total / scoreless: "
-        + " / ".join(_fmt_d(met[k], 3) for k in ("goals_A", "goals_B", "goals_total", "scoreless"))
+        "goals A / B / total / diff / scoreless: "
+        + " / ".join(_fmt_d(met[k], 3) for k in ("goals_A", "goals_B", "goals_total", "goal_diff", "scoreless"))
     )
     lines.append(
         "hold_share A / B / pooled, loose: "
