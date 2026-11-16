@@ -3128,3 +3128,157 @@ class TestRedTagSpecs:
         assert r["n"] == 48 and r["seed"] == seed
         assert r["swap"] is True
         assert not b.get("swap", False)
+
+
+_POOL_TAG_B = {"frozen_team": "B", "member_gen": 50}
+_POOL_TAG_A = {"frozen_team": "A", "member_gen": 100}
+
+
+def _pool_history(self_goals_by_gen: dict, pool_goals_by_gen: dict) -> dict:
+    """History with self-play matches (`pool` null, as the trainer writes it) and pool matches (`pool` set) per generation."""
+    matches = []
+    for gen in sorted(set(self_goals_by_gen) | set(pool_goals_by_gen)):
+        for goals in self_goals_by_gen.get(gen, []):
+            matches.append({"match_id": len(matches), "generation": gen, "goals": goals, "pool": None})
+        for goals in pool_goals_by_gen.get(gen, []):
+            matches.append({"match_id": len(matches), "generation": gen, "goals": goals, "pool": dict(_POOL_TAG_B)})
+    return {"matches": matches}
+
+
+class TestPoolMatchExclusion:
+    """Training-progress statistics and the takeoff generation read self-play matches only; pool matches (frozen seats
+    from the opponent snapshot pool, match record `pool` set) are counted per bucket and excluded."""
+
+    MIXED_HISTORY = {"matches": [
+        {"generation": 1, "interest_score": 10.0, "goals": 1, "completed_passes": 2, "successful_tackles": 3, "pool": None},
+        {"generation": 1, "interest_score": 30.0, "goals": 3, "completed_passes": 4, "successful_tackles": 1, "pool": None},
+        {"generation": 1, "interest_score": 90.0, "goals": 9, "completed_passes": 20, "successful_tackles": 9, "pool": _POOL_TAG_B},
+        {"generation": 2, "interest_score": 20.0, "goals": 2, "completed_passes": 0, "successful_tackles": 2},
+        {"generation": 2, "interest_score": 80.0, "goals": 8, "completed_passes": 10, "successful_tackles": 8, "pool": _POOL_TAG_A},
+        {"generation": 2, "interest_score": 80.0, "goals": 8, "completed_passes": 10, "successful_tackles": 8, "pool": _POOL_TAG_A},
+    ]}
+
+    def test_bucket_means_use_self_play_matches_only(self):
+        """[RED] Hand values over the three self-play matches (goals 1, 3, 2; interest 10, 30, 20); pooling all six would
+        give goals 31/6 and interest max 90."""
+        from tools.audit import training_progress
+
+        (row,) = training_progress.bucket_progress(self.MIXED_HISTORY, bucket=2)
+        assert (row["gen_start"], row["gen_end"], row["n"], row["n_pooled"]) == (1, 2, 3, 3)
+        assert row["goals"] == pytest.approx(2.0)
+        assert row["passes"] == pytest.approx(2.0)
+        assert row["tackles"] == pytest.approx(2.0)
+        assert (row["interest_mean"], row["interest_median"], row["interest_max"]) == (20.0, 20.0, 30.0)
+
+    def test_per_generation_rows_count_pool_matches_per_generation(self):
+        """[RED] gen 1: 2 self-play + 1 pool, mean goals 2.0; gen 2: 1 self-play + 2 pool, goals 2.0."""
+        from tools.audit import training_progress
+
+        rows = training_progress.per_generation(self.MIXED_HISTORY, last_gens=2)
+        assert [(r["gen_start"], r["n"], r["n_pooled"]) for r in rows] == [(1, 2, 1), (2, 1, 2)]
+        assert [r["goals"] for r in rows] == [pytest.approx(2.0), pytest.approx(2.0)]
+
+    def test_history_without_pool_matches_counts_zero(self):
+        """[RED] Both encodings of self-play (no `pool` key, `pool: null`) count as self-play."""
+        from tools.audit import training_progress
+
+        rows = training_progress.bucket_progress(TestTrainingProgressOutput.GUARD_HISTORY, bucket=2)
+        assert [(r["n"], r["n_pooled"]) for r in rows] == [(3, 0), (1, 0)]
+        rows = training_progress.bucket_progress(_pool_history({1: [1.0, 2.0]}, {}), bucket=1)
+        assert [(r["n"], r["n_pooled"], r["goals"]) for r in rows] == [(2, 0, 1.5)]
+
+    def test_bucket_with_only_pool_matches_has_no_statistics(self):
+        """[RED] A bucket whose matches are all pool matches keeps its row: n 0, the pool count, every statistic None."""
+        from tools.audit import training_progress
+
+        rows = training_progress.bucket_progress(_pool_history({1: [1.0]}, {2: [5.0, 7.0]}), bucket=1)
+        assert [(r["gen_start"], r["gen_end"], r["n"], r["n_pooled"]) for r in rows] == [(1, 1, 1, 0), (2, 2, 0, 2)]
+        empty = rows[1]
+        for key in ("interest_mean", "interest_median", "interest_max", "goals", "passes", "shots", "tackles", "saves",
+                    "loose_pct", "stationary_frames"):
+            assert empty[key] is None, key
+
+    def test_stdout_reports_the_excluded_pool_matches(self, tmp_path, capsys):
+        """[RED] Header and bucket lines state the pool counts; an all-pool bucket prints its own line."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", self.MIXED_HISTORY)
+        assert training_progress.main(["--history", h, "--bucket", "2"]) == 0
+        assert capsys.readouterr().out == (
+            "training_progress: 3 matches in 1 bucket(s) of 2 gens (3 pool matches excluded)\n"
+            "  gens     1-    2 n=   3 interest= 20.0 (med  20.0 max  30.0) goals=2.00 passes=2.0 shots=0.0 tackles=2.0 saves=0.00 loose%=- stat=0 pooled=3\n"
+        )
+        h = _write_history(tmp_path / "h2.json", _pool_history({1: [1.0]}, {2: [5.0]}))
+        assert training_progress.main(["--history", h, "--bucket", "1"]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith("training_progress: 1 matches in 2 bucket(s) of 1 gens (1 pool matches excluded)\n")
+        assert out.endswith("  gens     2-    2 n=   0 (no self-play match) pooled=1\n")
+
+    def test_json_rows_carry_the_pool_count(self, tmp_path):
+        """[RED] Every JSON bucket row has `n_pooled`; the top-level keys are unchanged."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", self.MIXED_HISTORY)
+        out_json = tmp_path / "o.json"
+        assert training_progress.main(["--history", h, "--bucket", "2", "--last-gens", "2", "--json", str(out_json)]) == 0
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert set(data) == {"buckets", "last_generations"}
+        assert [b["n_pooled"] for b in data["buckets"]] == [3]
+        assert [b["n_pooled"] for b in data["last_generations"]] == [1, 2]
+
+    def test_pool_matches_cannot_cause_an_early_takeoff(self):
+        """[RED] Self-play goals 1.0 (6 per gen) and pool goals 9.0 (2 per gen), gens 1-30: no takeoff. Pooled per-generation
+        means would be 3.0 and give takeoff at 25."""
+        from tools.audit import training_progress
+
+        hist = _pool_history({g: [1.0] * 6 for g in range(1, 31)}, {g: [9.0] * 2 for g in range(1, 31)})
+        assert training_progress.takeoff_summary(hist) == {"gen": None, "goals": 1.5, "window": 25, "first_gen": 1, "last_gen": 30}
+
+    def test_pool_matches_cannot_delay_the_takeoff(self):
+        """[RED] Card E4's step history (self-play 1.0 for gens 1-30, 2.0 for 31-60) gives 43 with two 0-goal pool matches per
+        generation added. Pooled means (0.75, then 1.5) would give 55."""
+        from tools.audit import training_progress
+
+        self_goals = {g: [1.0 if g <= 30 else 2.0] * 6 for g in range(1, 61)}
+        hist = _pool_history(self_goals, {g: [0.0, 0.0] for g in range(1, 61)})
+        assert training_progress.takeoff_generation(hist) == 43
+
+    def test_generation_with_only_pool_matches_is_an_error(self):
+        """[RED] Takeoff needs a self-play match in every generation; a generation with pool matches only is named."""
+        from tools.audit import training_progress
+
+        hist = _pool_history({g: [1.0] for g in range(1, 31) if g != 5}, {5: [3.0]})
+        with pytest.raises(ValueError, match=r"generation 5 has only pool matches"):
+            training_progress.takeoff_generation(hist)
+        with pytest.raises(ValueError, match=r"no self-play match"):
+            training_progress.takeoff_generation(_pool_history({}, {g: [3.0] for g in range(1, 31)}))
+
+    def test_takeoff_cli_states_the_exclusion(self, tmp_path, capsys):
+        """[RED] With pool matches, `--takeoff` prints one extra line with the excluded count; the JSON block keeps its keys."""
+        from tools.audit import training_progress
+
+        hist = _pool_history({g: [1.0] * 6 for g in range(1, 31)}, {g: [9.0] * 2 for g in range(1, 31)})
+        h = _write_history(tmp_path / "h.json", hist)
+        out_json = tmp_path / "o.json"
+        assert training_progress.main(["--history", h, "--bucket", "100", "--takeoff", "--json", str(out_json)]) == 0
+        out = capsys.readouterr().out
+        assert "takeoff_gen=none (not reached by gen 30)\ntakeoff: self-play matches only (60 pool matches excluded)\n" in out
+        assert json.loads(out_json.read_text(encoding="utf-8"))["takeoff"] == {
+            "gen": None, "goals": 1.5, "window": 25, "first_gen": 1, "last_gen": 30}
+        h = _write_history(tmp_path / "h2.json", _flat_history(1, 30, 2.0))
+        assert training_progress.main(["--history", h, "--takeoff"]) == 0
+        assert "pool matches excluded" not in capsys.readouterr().out
+
+    def test_g6_reads_self_play_takeoff(self):
+        """[RED] Four arm seeds whose self-play never takes off but whose pool matches would lift the pooled mean to 3.0:
+        G6 sees four seeds without takeoff and fails."""
+        from tools.audit import gates
+
+        hist = _pool_history({g: [1.0] * 6 for g in range(1, 61)}, {g: [9.0] * 2 for g in range(1, 61)})
+        seeds = ("42", "43", "44", "45")
+        arm = {s: _fresh_arm_seed({"300": {}}) for s in seeds}
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(),
+                                   histories={s: hist for s in seeds})
+        g6 = res["gates"]["G6"]
+        assert g6["per_seed"] == {s: None for s in seeds}
+        assert g6["passed"] is False

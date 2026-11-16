@@ -9,6 +9,7 @@ from dataclasses import replace
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2592,3 +2593,792 @@ def test_hybrid_batched_sampling_uses_each_groups_own_sigma(tmp_path: Path) -> N
         assert len(set(round(x, 3) for x in sd)) > 1
     finally:
         trainer.close()
+
+
+# ==============================================================================
+# Opponent snapshot pool (`pool_envs`)
+# ==============================================================================
+POOL_ROLES = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+TANH_HALF = 0.46211715726000974  # tanh(0.5)
+TANH_QUARTER = 0.24491866240370913  # tanh(0.25)
+
+
+def _pool_trainer(tmp_path: Path, head: str = "gaussian4", name: str = "ckpt", num_envs: int = 2,
+                  pool_envs: int = 1, pool_size: int = 10, rollout_steps: int = 8, seed: int = 3,
+                  max_rl_steps: int | None = None, recording: bool = False, ppo: dict | None = None,
+                  **kwargs) -> ParameterSharingPPOTrainer:
+    cfg = _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}"), recording=recording)
+    cfg = replace(cfg, ppo=replace(cfg.ppo, policy_head=head, **(ppo or {})))
+    if max_rl_steps is not None:
+        cfg = replace(cfg, physics=replace(cfg.physics, max_rl_steps=max_rl_steps))
+    return ParameterSharingPPOTrainer(
+        config=cfg, num_envs=num_envs, rollout_steps=rollout_steps, device="cpu",
+        checkpoint_dir=str(tmp_path / name), seed=seed, pool_envs=pool_envs, pool_size=pool_size, **kwargs,
+    )
+
+
+def _seeded_net(head: str, seed: int) -> ActorCritic:
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        return ActorCritic(policy_head=head)
+
+
+def _constant_net(head: str, bias, logstd: float) -> ActorCritic:
+    """Network whose action distribution ignores the observation: zero output weights, output bias `bias`."""
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        net = ActorCritic(policy_head=head, fire_prob_floor=0.0, fire_logit_bound=6.0) if head == "hybrid5" else ActorCritic()
+    with torch.no_grad():
+        net.actor_mean[4].weight.zero_()
+        net.actor_mean[4].bias.copy_(torch.tensor(bias, dtype=torch.float32))
+        net.actor_logstd.fill_(logstd)
+    return net
+
+
+def _write_member(ckpt: Path, gen: int, head: str = "gaussian4", seed: int = 100, net: ActorCritic | None = None) -> Path:
+    """A snapshot directory `snapshots/genNNNN` holding the four role policies (one `net` for all, else seeded ones)."""
+    directory = ckpt / "snapshots" / f"gen{gen:04d}"
+    directory.mkdir(parents=True)
+    for i, role in enumerate(POOL_ROLES):
+        torch.save((net if net is not None else _seeded_net(head, seed + i)).state_dict(), directory / f"{role}_policy.pt")
+    return directory
+
+
+def _spy_env_actions(trainer: ParameterSharingPPOTrainer) -> dict:
+    seen: dict = {"actions": [], "values": [], "means": []}
+    orig = trainer.vec_env.step_array
+
+    def spy(actions, values, action_means=None):
+        seen["actions"].append(np.array(actions, copy=True))
+        seen["values"].append(np.array(values, copy=True))
+        seen["means"].append(None if action_means is None else np.array(action_means, copy=True))
+        return orig(actions, values, action_means=action_means)
+
+    trainer.vec_env.step_array = spy
+    return seen
+
+
+def _seeded_collect(trainer: ParameterSharingPPOTrainer, generation: int, torch_seed: int = 1234) -> dict:
+    """`collect_rollouts` from a freshly seeded global torch stream, so two trainers can be compared draw for draw."""
+    torch.manual_seed(torch_seed)
+    return trainer.collect_rollouts(active_generation=generation)
+
+
+def _train_to_generation(trainer: ParameterSharingPPOTrainer, completed: int) -> None:
+    """Make `completed` the last completed generation by playing the next one (it writes the snapshot when due)."""
+    trainer.current_generation = completed - 1
+    trainer.train(total_updates=1)
+    assert trainer.current_generation == completed
+
+
+# ------------------------------------------------------------------ listing and schedule (pure functions)
+def _make_snapshot_dirs(ckpt: Path, names) -> None:
+    for name in names:
+        (ckpt / "snapshots" / name).mkdir(parents=True)
+
+
+@pytest.mark.parametrize(
+    "last_completed, pool_size, expected",
+    [
+        (500, 3, [400, 450, 500]),   # newest three of gen0050..gen0600, bounded above by the last completed generation
+        (499, 3, [350, 400, 450]),   # the bound is inclusive at 500 and exclusive at 499 -> 450 is the newest
+        (120, 10, [50, 100]),        # fewer snapshots than the pool size
+        (50, 10, [50]),              # inclusive bound
+        (49, 10, []),                # nothing completed yet
+        (0, 10, []),
+        (600, 1, [600]),
+        (600, 12, list(range(50, 650, 50))),
+    ],
+)
+def test_list_pool_generations_hand_values(tmp_path: Path, last_completed: int, pool_size: int, expected) -> None:
+    """[RED] The pool is the newest `pool_size` snapshot generations that are <= the last completed generation."""
+    _make_snapshot_dirs(tmp_path, [f"gen{g:04d}" for g in range(50, 650, 50)])
+    assert tp.list_pool_generations(str(tmp_path), last_completed, pool_size) == expected
+
+
+def test_list_pool_generations_ignores_staging_and_foreign_entries_and_a_missing_root(tmp_path: Path) -> None:
+    """[RED] `genNNNN.tmp` staging directories, unrelated names and plain files are not members; no root -> empty pool."""
+    assert tp.list_pool_generations(str(tmp_path / "nowhere"), 500, 10) == []
+    _make_snapshot_dirs(tmp_path, ["gen0050", "gen0100.tmp", "notes", "gen12x", "gen"])
+    (tmp_path / "snapshots" / "gen0150").write_text("a file, not a snapshot", encoding="utf-8")
+    assert tp.list_pool_generations(str(tmp_path), 500, 10) == [50]
+    _make_snapshot_dirs(tmp_path, ["gen10000"])  # five-digit generations are listed
+    assert tp.list_pool_generations(str(tmp_path), 20000, 10) == [50, 10000]
+
+
+def test_pool_schedule_degenerate_inputs_give_an_empty_schedule() -> None:
+    """[RED] No pool envs, or an empty pool listing, schedules nothing."""
+    assert tp.pool_schedule(7, 60, 8, 0, [50, 100]) == []
+    assert tp.pool_schedule(7, 60, 8, 2, []) == []
+
+
+def test_pool_schedule_rejects_more_pool_envs_than_envs() -> None:
+    with pytest.raises(ValueError, match="pool_envs"):
+        tp.pool_schedule(7, 60, 4, 5, [50])
+    assert len(tp.pool_schedule(7, 60, 4, 4, [50])) == 4  # the boundary: every env is a pool env
+
+
+@pytest.mark.parametrize("generation, expected_sides", [(51, ["A", "B", "A", "B"]), (52, ["B", "A", "B", "A"])])
+def test_pool_schedule_sides_alternate_with_generation_and_position(generation: int, expected_sides) -> None:
+    """[RED] The k-th pool env freezes B when (g + k) is even and A otherwise (hand-listed for g = 51 and 52)."""
+    sched = tp.pool_schedule(7, generation, 8, 4, [50, 100, 150])
+    assert [e["frozen_team"] for e in sched] == expected_sides
+    envs = [e["env"] for e in sched]
+    assert len(set(envs)) == 4 and all(isinstance(i, int) and 0 <= i < 8 for i in envs)
+    assert all(e["member_gen"] in (50, 100, 150) for e in sched)
+    assert all(set(e) == {"env", "frozen_team", "member_gen"} for e in sched)
+
+
+def test_pool_schedule_with_two_pool_envs_freezes_each_side_once_in_every_generation() -> None:
+    """[RED] N = 2: one env freezes A and the other B, in each of 100 generations."""
+    for g in range(51, 151):
+        sched = tp.pool_schedule(5, g, 8, 2, [50])
+        assert sorted(e["frozen_team"] for e in sched) == ["A", "B"], g
+
+
+def test_pool_schedule_is_a_pure_function_that_touches_no_global_random_stream() -> None:
+    """[RED] Same arguments, same schedule; calling it leaves numpy's and torch's global generators where they were."""
+    np.random.seed(123)
+    torch.manual_seed(456)
+    np_state, torch_state = np.random.get_state(), torch.get_rng_state()
+    first = tp.pool_schedule(9, 77, 8, 3, [50, 100, 150, 200])
+    second = tp.pool_schedule(9, 77, 8, 3, [50, 100, 150, 200])
+    assert first == second
+    after = np.random.get_state()
+    assert np_state[0] == after[0] and np.array_equal(np_state[1], after[1]) and np_state[2:] == after[2:]
+    assert torch.equal(torch_state, torch.get_rng_state())
+    # A different listing changes only which members can be drawn.
+    assert [e["env"] for e in tp.pool_schedule(9, 77, 8, 3, [50])] == [e["env"] for e in first]
+
+
+def test_pool_schedule_differs_between_seeds_over_fifty_generations() -> None:
+    """[RED] Seeds 1 and 2 give different schedules in more than half of generations 51..100."""
+    differing = sum(
+        tp.pool_schedule(1, g, 8, 2, [50, 100]) != tp.pool_schedule(2, g, 8, 2, [50, 100]) for g in range(51, 101)
+    )
+    assert differing > 25
+
+
+def test_pool_schedule_env_and_member_frequencies_are_uniform_within_three_binomial_sds() -> None:
+    """[RED] Over 400 generations with N = 2 of 8 envs each env is chosen 100 +- 3 sd times (sd = sqrt(400 * 1/4 * 3/4)
+    = 8.66); with four members, each member is drawn 200 +- 3 sd of 800 draws (sd = sqrt(800 * 1/4 * 3/4) = 12.25)."""
+    env_counts = np.zeros(8)
+    member_counts = {50: 0, 100: 0, 150: 0, 200: 0}
+    for g in range(51, 451):
+        for e in tp.pool_schedule(42, g, 8, 2, [50, 100, 150, 200]):
+            env_counts[e["env"]] += 1
+            member_counts[e["member_gen"]] += 1
+    assert np.all(np.abs(env_counts - 100.0) <= 3 * 8.66), env_counts
+    assert all(abs(c - 200.0) <= 3 * 12.25 for c in member_counts.values()), member_counts
+
+
+# ------------------------------------------------------------------ settings, CLI, persistence
+def test_pool_cli_defaults_and_flags() -> None:
+    """[RED] `--pool-envs` defaults to 0 (today's behaviour) and `--pool-size` to 10."""
+    parser = tp.build_arg_parser()
+    args = parser.parse_args([])
+    assert (args.pool_envs, args.pool_size) == (0, 10)
+    args = parser.parse_args(["--pool-envs", "2", "--pool-size", "5"])
+    assert (args.pool_envs, args.pool_size) == (2, 5)
+
+
+def test_trainer_pool_settings_default_off_and_are_validated(tmp_path: Path) -> None:
+    """[RED] Defaults: pool off, size 10. Rejected: negative or oversized pool_envs, size < 1 with a pool, a shared-team
+    trainer with a pool, a negative seed with a pool; boundaries pool_envs = num_envs and pool_size = 1 are accepted."""
+    off = ParameterSharingPPOTrainer(
+        config=_quiet_cfg(save_dir=str(tmp_path / "r0")), num_envs=1, rollout_steps=4, device="cpu",
+        checkpoint_dir=str(tmp_path / "c0"), seed=3,
+    )
+    try:
+        assert (off.pool_envs, off.pool_size) == (0, 10)
+    finally:
+        off.close()
+    for bad, match in (
+        (dict(pool_envs=-1), "pool_envs"),
+        (dict(pool_envs=3), "pool_envs"),
+        (dict(pool_envs=1, pool_size=0), "pool_size"),
+        (dict(pool_envs=1, separate_teams=False), "shared"),
+        (dict(pool_envs=1, seed=-1), "seed"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            _pool_trainer(tmp_path, name="bad", num_envs=2, **bad)
+    ok = _pool_trainer(tmp_path, name="edge", num_envs=2, pool_envs=2, pool_size=1)
+    try:
+        assert (ok.pool_envs, ok.pool_size) == (2, 1)
+    finally:
+        ok.close()
+    zero = _pool_trainer(tmp_path, name="zero", pool_envs=0, pool_size=0)
+    zero.close()
+
+
+@pytest.mark.parametrize("extra", [["--pool-envs", "9"], ["--pool-envs", "1", "--pool-size", "0"], ["--pool-envs", "-1"]])
+def test_main_rejects_bad_pool_settings_before_wiping_the_batch(tmp_path: Path, monkeypatch, extra) -> None:
+    """[RED] Bad pool settings abort `main(--from-scratch)` with the field named; the active batch survives."""
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "checkpoints" / "marker.txt"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["train_ppo", "--from-scratch", "--total-updates", "1"] + extra)
+    with pytest.raises(ValueError, match="pool_"):
+        tp.main()
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+    assert not (tmp_path / "replays").exists()
+
+
+def test_pool_settings_persist_in_state_and_every_generation_record(tmp_path: Path) -> None:
+    """[RED] `training_state.pt` and each generation record carry pool_envs, pool_size and the (here empty) schedule."""
+    trainer = _pool_trainer(tmp_path, pool_envs=1, pool_size=4)
+    try:
+        trainer.train(total_updates=2)  # generations 1 and 2: no snapshot yet -> empty pool
+    finally:
+        trainer.close()
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert (state["pool_envs"], state["pool_size"]) == (1, 4)
+    history = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+    for rec in history["generations"]:
+        assert (rec["pool_envs"], rec["pool_size"], rec["pool_schedule"]) == (1, 4, [])
+    assert all(m["pool"] is None for m in history["matches"])
+
+
+def test_resume_with_different_pool_settings_raises_and_names_both_sides(tmp_path: Path) -> None:
+    """[RED] Stored vs requested pool settings must match on resume, as config overrides must."""
+    first = _pool_trainer(tmp_path, pool_envs=1, pool_size=4)
+    try:
+        first.train(total_updates=1)
+    finally:
+        first.close()
+    for changes in (dict(pool_envs=2, pool_size=4), dict(pool_envs=1, pool_size=5), dict(pool_envs=0, pool_size=4)):
+        resumed = _pool_trainer(tmp_path, **changes)
+        try:
+            with pytest.raises(ValueError) as exc:
+                resumed.load_checkpoints()
+            msg = str(exc.value)
+            assert "pool_envs" in msg and "stored" in msg and "requested" in msg and "--accept-config-change" in msg
+            assert resumed.current_generation == 0
+        finally:
+            resumed.close()
+    same = _pool_trainer(tmp_path, pool_envs=1, pool_size=4)
+    try:
+        assert same.load_checkpoints() is True and same.current_generation == 1
+    finally:
+        same.close()
+
+
+def test_accept_config_change_downgrades_a_pool_mismatch_to_one_line(tmp_path: Path, capsys) -> None:
+    """[RED] With `accept_config_change` a pool mismatch prints one line and the requested values are stored next."""
+    first = _pool_trainer(tmp_path, pool_envs=1, pool_size=4)
+    try:
+        first.train(total_updates=1)
+    finally:
+        first.close()
+    resumed = _pool_trainer(tmp_path, pool_envs=2, pool_size=6, accept_config_change=True)
+    try:
+        capsys.readouterr()
+        assert resumed.load_checkpoints() is True
+        out = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(out) == 1 and "pool_envs" in out[0]
+        resumed.train(total_updates=1)
+    finally:
+        resumed.close()
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert (state["pool_envs"], state["pool_size"]) == (2, 6)
+
+
+def test_state_without_pool_keys_reads_as_pool_off_and_pool_size_is_moot_when_off(tmp_path: Path, capsys) -> None:
+    """[RED] A state saved before the keys existed resumes silently with pool_envs = 0 (any pool_size) and raises with a pool."""
+    first = _pool_trainer(tmp_path, pool_envs=0)
+    try:
+        first.train(total_updates=1)
+    finally:
+        first.close()
+    state_path = tmp_path / "ckpt" / "training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert (state["pool_envs"], state["pool_size"]) == (0, 10)
+    del state["pool_envs"], state["pool_size"]
+    torch.save(state, state_path)
+
+    for size in (10, 3):
+        resumed = _pool_trainer(tmp_path, pool_envs=0, pool_size=size)
+        try:
+            capsys.readouterr()
+            assert resumed.load_checkpoints() is True
+            assert capsys.readouterr().out.strip() == ""
+        finally:
+            resumed.close()
+    mismatched = _pool_trainer(tmp_path, pool_envs=1)
+    try:
+        with pytest.raises(ValueError, match="pool_envs"):
+            mismatched.load_checkpoints()
+    finally:
+        mismatched.close()
+
+
+# ------------------------------------------------------------------ rollout behaviour
+ROLLOUT_ARRAYS = ("obs", "central_state", "actions", "logprobs", "advantages", "returns", "values", "rewards", "dones")
+
+
+def test_trainer_schedule_uses_its_pool_size_and_listing_up_to_the_previous_generation(tmp_path: Path) -> None:
+    """[RED] The schedule for generation g draws from the newest `pool_size` snapshots completed before g."""
+    trainer = _pool_trainer(tmp_path, pool_envs=2, pool_size=2)
+    try:
+        for g in (50, 100, 150):
+            _write_member(tmp_path / "ckpt", g)
+        assert trainer.pool_schedule_for(50) == []                       # gen0050 is not completed before generation 50
+        assert {e["member_gen"] for e in trainer.pool_schedule_for(51)} == {50}
+        members = {e["member_gen"] for g in range(152, 252) for e in trainer.pool_schedule_for(g)}
+        assert members == {100, 150}                                     # pool_size = 2 keeps the newest two
+        assert {e["member_gen"] for e in trainer.pool_schedule_for(101)} <= {50, 100}
+        assert {e["member_gen"] for e in trainer.pool_schedule_for(151)} <= {100, 150}
+    finally:
+        trainer.close()
+
+
+def test_schedule_is_the_same_in_two_trainers_and_after_save_and_load(tmp_path: Path) -> None:
+    """[RED] Two trainer instances on the same checkpoint directory, and a resumed copy, reproduce the schedule,
+    the generation record's schedule and the match tags."""
+    first = _pool_trainer(tmp_path, name="a", pool_envs=1, max_rl_steps=4)
+    try:
+        _train_to_generation(first, 50)
+        shutil.copytree(tmp_path / "a", tmp_path / "b")
+        twin = _pool_trainer(tmp_path, name="a", pool_envs=1, max_rl_steps=4)
+        resumed = _pool_trainer(tmp_path, name="b", pool_envs=1, max_rl_steps=4)
+        try:
+            assert resumed.load_checkpoints() and resumed.current_generation == 50
+            for g in range(51, 71):
+                assert first.pool_schedule_for(g) == twin.pool_schedule_for(g) == resumed.pool_schedule_for(g)
+            first.train(total_updates=1)
+            resumed.train(total_updates=1)
+        finally:
+            twin.close()
+            resumed.close()
+        rec_first, rec_resumed = first.generation_history[-1], resumed.generation_history[-1]
+        assert rec_first["pool_schedule"] == rec_resumed["pool_schedule"] != []
+        assert [m["pool"] for m in first.match_history[-4:]] == [m["pool"] for m in resumed.match_history[-4:]]
+    finally:
+        first.close()
+
+
+def test_a_generation_with_an_empty_pool_equals_the_n0_rollout(tmp_path: Path) -> None:
+    """[RED] With no snapshot yet, a pool trainer's rollout buffers are bit-identical to a pool_envs = 0 trainer's."""
+    plain = _pool_trainer(tmp_path, name="plain", pool_envs=0)
+    pooled = _pool_trainer(tmp_path, name="pooled", pool_envs=2)
+    try:
+        a = _seeded_collect(plain, 1)
+        b = _seeded_collect(pooled, 1)
+        for key in ROLLOUT_ARRAYS:
+            assert np.array_equal(a[key], b[key]), key
+        assert b["pool_schedule"] == [] and (b["frozen_seats"] is None or not np.any(b["frozen_seats"]))
+        assert a["pool_schedule"] == [] and a["frozen_seats"] is None
+    finally:
+        plain.close()
+        pooled.close()
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_pool_sampling_never_touches_the_trainers_own_random_stream(tmp_path: Path, head: str) -> None:
+    """[RED] With a pool env active (and a member loaded, and frozen seats sampled), every non-pool env's buffers are
+    bit-identical to a pool_envs = 0 trainer's: loading and sampling use no draw of the trainer's generators."""
+    plain = _pool_trainer(tmp_path, head=head, name="plain", pool_envs=0)
+    pooled = _pool_trainer(tmp_path, head=head, name="pooled", pool_envs=1)
+    try:
+        _write_member(tmp_path / "pooled", 50, head=head)
+        sched = pooled.pool_schedule_for(52)
+        pool_env = sched[0]["env"]
+        other = 1 - pool_env
+        a = _seeded_collect(plain, 52)
+        b = _seeded_collect(pooled, 52)
+        for key in ROLLOUT_ARRAYS:
+            assert np.array_equal(a[key][:, other], b[key][:, other]), key
+        assert not np.array_equal(a["actions"][:, pool_env, 6:], b["actions"][:, pool_env, 6:])  # pool env really differs
+    finally:
+        plain.close()
+        pooled.close()
+
+
+@pytest.mark.parametrize("generation, frozen_seats, free_seats", [(51, range(0, 6), range(6, 12)), (52, range(6, 12), range(0, 6))])
+def test_frozen_seats_play_the_pool_members_policy_gaussian4(tmp_path: Path, generation, frozen_seats, free_seats) -> None:
+    """[RED] A constant member (action mean tanh([.5, -.5, .25, -.25]), sigma e^-20) fixes the frozen team's env actions
+    to the hand values; g = 51 freezes team A (seats 0-5), g = 52 team B (seats 6-11); the other team is not affected."""
+    trainer = _pool_trainer(tmp_path, pool_envs=1)
+    try:
+        _write_member(tmp_path / "ckpt", 50, net=_constant_net("gaussian4", [0.5, -0.5, 0.25, -0.25], -20.0))
+        pool_env = trainer.pool_schedule_for(generation)[0]["env"]
+        seen = _spy_env_actions(trainer)
+        rollout = trainer.collect_rollouts(active_generation=generation)
+        acts = np.stack(seen["actions"])  # (T, 2, 12, 4) as sent to the environments
+        want = np.array([TANH_HALF, -TANH_HALF, TANH_QUARTER, -TANH_QUARTER])
+        for seat in frozen_seats:
+            np.testing.assert_allclose(acts[:, pool_env, seat], np.broadcast_to(want, (8, 4)), atol=1e-5)
+        assert np.abs(acts[:, pool_env, list(free_seats)] - want).max() > 0.05
+        assert np.abs(acts[:, 1 - pool_env] - want).max() > 0.05
+        expected_mask = np.zeros((2, 12), dtype=bool)
+        expected_mask[pool_env, list(frozen_seats)] = True
+        assert np.array_equal(rollout["frozen_seats"], expected_mask)
+        assert rollout["pool_schedule"] == [{"env": pool_env, "frozen_team": "A" if generation == 51 else "B", "member_gen": 50}]
+    finally:
+        trainer.close()
+
+
+def _frozen_hybrid_run(tmp_path: Path, name: str, seed: int):
+    trainer = _pool_trainer(tmp_path, head="hybrid5", name=name, pool_envs=1, seed=seed)
+    try:
+        _write_member(tmp_path / name, 50, net=_constant_net("hybrid5", [0.5, -0.5, 0.0, 0.0, 0.0], -20.0))
+        pool_env = trainer.pool_schedule_for(52)[0]["env"]
+        seen = _spy_env_actions(trainer)
+        trainer.collect_rollouts(active_generation=52)
+        return pool_env, np.stack(seen["actions"])[:, pool_env, 6:]  # team B is frozen at g = 52
+    finally:
+        trainer.close()
+
+
+def test_hybrid5_frozen_seats_play_env_space_actions_and_repeat_for_the_same_seed(tmp_path: Path) -> None:
+    """[RED] A hybrid5 trainer with N = 1 and a hybrid5 member: the frozen seats' env actions are in env space (kick is -1
+    or the decoded power 0.35 + 0.65 * 0.5 = 0.675, special +-1, throttle / steer tanh(+-0.5)); two runs with the same seed
+    give identical frozen actions and another seed does not."""
+    _, run_a = _frozen_hybrid_run(tmp_path, "a", seed=3)
+    _, run_b = _frozen_hybrid_run(tmp_path, "b", seed=3)
+    _, run_c = _frozen_hybrid_run(tmp_path, "c", seed=4)
+    assert np.array_equal(run_a, run_b)
+    assert not np.array_equal(run_a, run_c)
+    kick, special = run_a[..., 2], run_a[..., 3]
+    assert run_a.shape == (8, 6, 4)
+    assert np.all(np.isclose(kick, -1.0, atol=1e-6) | np.isclose(kick, 0.675, atol=1e-5))
+    assert np.all((kick == -1.0) | (kick > 0.35))
+    assert np.any(np.isclose(kick, -1.0)) and np.any(np.isclose(kick, 0.675, atol=1e-5))  # p = 1/2 over 48 draws
+    assert set(np.unique(special)) == {-1.0, 1.0}
+    assert np.isclose(run_a[..., 0], TANH_HALF, atol=1e-6).all() and np.isclose(run_a[..., 1], -TANH_HALF, atol=1e-6).all()
+
+
+def test_pool_generations_with_recording_pass_the_members_means_and_values(tmp_path: Path) -> None:
+    """[RED] With recording on, the frozen seats' replay means are the member's env-space means (tanh(bias) for a constant
+    gaussian4 member) and their values come from the member's critic, not the trainer's."""
+    trainer = _pool_trainer(tmp_path, pool_envs=1, recording=True)
+    try:
+        member = _constant_net("gaussian4", [0.5, -0.5, 0.25, -0.25], -20.0)
+        _write_member(tmp_path / "ckpt", 50, net=member)
+        pool_env = trainer.pool_schedule_for(51)[0]["env"]
+        obs0, cen0 = trainer.current_obs.copy(), trainer.current_central_state.copy()
+        own_values = trainer._compute_values(obs0, cen0)[pool_env, :6]
+        seen = _spy_env_actions(trainer)
+        trainer.collect_rollouts(active_generation=51)  # team A frozen
+        means = np.stack(seen["means"])[:, pool_env, :6]
+        np.testing.assert_allclose(means, np.broadcast_to([TANH_HALF, -TANH_HALF, TANH_QUARTER, -TANH_QUARTER], (8, 6, 4)), atol=1e-6)
+        member_values = member.get_value(torch.as_tensor(obs0[pool_env, :6]), central_state=torch.as_tensor(cen0[pool_env, :6])).detach().numpy()
+        first_step = np.stack(seen["values"])[0, pool_env, :6]
+        np.testing.assert_allclose(first_step, member_values, atol=1e-5)
+        assert not np.allclose(first_step, own_values, atol=1e-5)
+    finally:
+        trainer.close()
+
+
+def _optimizer_state_bytes(policy: torch.nn.Module, optimizer: torch.optim.Optimizer) -> dict[tuple[str, str], bytes]:
+    """Every Adam state entry of every parameter of `policy` (actor and critic), keyed by (parameter name, state key)."""
+    out: dict[tuple[str, str], bytes] = {}
+    for name, param in policy.named_parameters():
+        for key, val in optimizer.state.get(param, {}).items():
+            out[(name, key)] = (
+                val.detach().cpu().contiguous().numpy().tobytes() if isinstance(val, torch.Tensor) else repr(val).encode("utf-8")
+            )
+    return out
+
+
+@pytest.mark.parametrize("generation, frozen_roles, learner_roles", [
+    (52, ("red_field", "red_keeper"), ("blue_field", "blue_keeper")),   # team B frozen
+    (51, ("blue_field", "blue_keeper"), ("red_field", "red_keeper")),   # team A frozen
+])
+def test_frozen_seats_do_not_learn(tmp_path: Path, generation, frozen_roles, learner_roles) -> None:
+    """[RED] 1 env, N = 1: after `update_policies` the frozen team's two policies and their Adam states are byte-identical
+    and the other team's two policies changed. The Adam comparison covers every parameter, critic included."""
+    trainer = _pool_trainer(tmp_path, num_envs=1, pool_envs=1)
+    try:
+        trainer.update_policies(trainer.collect_rollouts(active_generation=1))  # populate every Adam state
+        _write_member(tmp_path / "ckpt", 50)
+        rollout = trainer.collect_rollouts(active_generation=generation)
+        assert rollout["frozen_seats"] is not None and rollout["frozen_seats"].shape == (1, 12)
+        before = _snapshot_actor_and_adam(trainer)
+        weights_before = {role: _hash_tensors(list(pol.state_dict().values())) for role, pol, _ in _policy_groups(trainer)}
+        adam_before = {role: _optimizer_state_bytes(pol, opt) for role, pol, opt in _policy_groups(trainer)}
+        metrics = trainer.update_policies(rollout)
+        after = _snapshot_actor_and_adam(trainer)
+        weights_after = {role: _hash_tensors(list(pol.state_dict().values())) for role, pol, _ in _policy_groups(trainer)}
+        adam_after = {role: _optimizer_state_bytes(pol, opt) for role, pol, opt in _policy_groups(trainer)}
+        for role in frozen_roles:
+            assert weights_after[role] == weights_before[role], role
+            pol = dict((r, p) for r, p, _ in _policy_groups(trainer))[role]
+            critic_names = {n for n, _ in pol.named_parameters() if n.startswith("critic.")}
+            assert critic_names and critic_names <= {n for n, _ in adam_before[role]}, role  # critic Adam state is populated
+            assert adam_after[role] == adam_before[role], role
+            for part in (0, 1, 2):  # actor bytes, Adam state, critic bytes
+                assert {k: v for k, v in after[part].items() if k[0] == role} == {k: v for k, v in before[part].items() if k[0] == role}
+            assert math.isnan(metrics[role]["pg_loss"]) and metrics[role]["v_corr_lambda"] == 0.0
+        for role in learner_roles:
+            assert weights_after[role] != weights_before[role], role
+            assert math.isfinite(metrics[role]["pg_loss"])
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("frozen_team, frozen_cols, roles", [("B", slice(6, 12), ("red_field", "red_keeper")), ("A", slice(0, 6), ("blue_field", "blue_keeper"))])
+def test_frozen_rows_never_reach_a_batch_the_fire_statistics_or_the_value_correlations(tmp_path: Path, frozen_team, frozen_cols, roles) -> None:
+    """[RED] On a 2-env hybrid5 rollout with env 1's team frozen and every frozen row poisoned with NaN, that team's update
+    (weights, losses, v_corr_*, fire_sat_*, p_kick, p_spec) equals the update on the env-0-only slice of the rollout."""
+    ppo = {"num_minibatches": 1}
+    full = _pool_trainer(tmp_path, head="hybrid5", name="full", num_envs=2, pool_envs=0, ppo=ppo)
+    ref = _pool_trainer(tmp_path, head="hybrid5", name="ref", num_envs=2, pool_envs=0, ppo=ppo)
+    try:
+        rollout = full.collect_rollouts(active_generation=1)
+        sliced = {k: (v[:, :1].copy() if k in ROLLOUT_ARRAYS else v) for k, v in rollout.items()}
+        poisoned = {k: (v.copy() if k in ROLLOUT_ARRAYS else v) for k, v in rollout.items()}
+        frozen = np.zeros((2, 12), dtype=bool)
+        frozen[1, frozen_cols] = True
+        for key in ROLLOUT_ARRAYS:
+            poisoned[key][:, 1, frozen_cols] = np.nan
+        poisoned["frozen_seats"] = frozen
+        m_full = full.update_policies(poisoned)
+        m_ref = ref.update_policies(sliced)
+        by_role_full = {role: pol for role, pol, _ in _policy_groups(full)}
+        by_role_ref = {role: pol for role, pol, _ in _policy_groups(ref)}
+        for role in roles:
+            for (name, a), (_, b) in zip(by_role_full[role].state_dict().items(), by_role_ref[role].state_dict().items()):
+                assert torch.isfinite(a).all(), (role, name)
+                assert torch.equal(a, b), (role, name)
+            assert set(m_full[role]) >= {"p_kick", "p_spec", "fire_sat_kick", "fire_sat_spec", "v_corr_lambda", "v_corr_mc"}
+            assert m_full[role] == m_ref[role], role
+            assert all(math.isfinite(v) for v in m_full[role].values())
+    finally:
+        full.close()
+        ref.close()
+
+
+def test_the_pool_members_weights_are_unchanged_on_disk_and_in_memory_after_a_generation(tmp_path: Path) -> None:
+    """[RED] After a full generation (rollout, update, checkpoint) with the member in play, the snapshot files are
+    byte-identical and the loaded member networks still equal the files and are not the trainer's networks."""
+    trainer = _pool_trainer(tmp_path, pool_envs=2, max_rl_steps=4)
+    try:
+        _train_to_generation(trainer, 50)
+        snap = tmp_path / "ckpt" / "snapshots" / "gen0050"
+        digest = lambda: {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(snap.iterdir())}  # noqa: E731
+        before = digest()
+        trainer.train(total_updates=2)  # generations 51 and 52, both with the member in play
+        assert digest() == before
+        loaded = trainer._pool_members
+        assert loaded, "the member of the last generation is retained for inspection"
+        trainer_nets = {id(p) for _, p, _ in _policy_groups(trainer)}
+        for (member_gen, team), (keeper, field) in loaded.items():
+            assert member_gen == 50
+            prefix = "blue" if team == "A" else "red"
+            for net, role in ((keeper, "keeper"), (field, "field")):
+                assert id(net) not in trainer_nets
+                disk = torch.load(snap / f"{prefix}_{role}_policy.pt", map_location="cpu", weights_only=True)
+                assert _hash_tensors(list(net.state_dict().values())) == _hash_tensors(list(disk.values()))
+                assert not any(p.requires_grad for p in net.parameters()) and not net.training
+        live = torch.load(tmp_path / "ckpt" / "blue_field_policy.pt", map_location="cpu", weights_only=True)
+        snapshot = torch.load(snap / "blue_field_policy.pt", map_location="cpu", weights_only=True)
+        assert _hash_tensors(list(live.values())) != _hash_tensors(list(snapshot.values()))  # training moved on
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ records and co-evolution
+def test_pool_matches_do_not_enter_the_coevolution_window(tmp_path: Path) -> None:
+    """[RED] 24 matches of 1-0 for team A sync team B when untagged; the same 24 tagged as pool matches leave
+    `recent_match_scores` empty and both teams' weights alone; a half-tagged set leaves 12 scores and no sync."""
+    pool_tag = {"frozen_team": "B", "member_gen": 50}
+    records = _matches_with_totals(24, 0, n=24)
+
+    control = _coevo_trainer(tmp_path / "c")
+    try:
+        assert control._coevolution_step([dict(r) for r in records]) is True
+        assert _team_b_weight(control) == pytest.approx(0.35)
+    finally:
+        control.close()
+
+    pooled = _coevo_trainer(tmp_path / "p")
+    try:
+        assert pooled._coevolution_step([dict(r, pool=pool_tag) for r in records]) is False
+        assert len(pooled.recent_match_scores) == 0
+        assert (_team_a_weight(pooled), _team_b_weight(pooled)) == (1.0, 0.0)
+    finally:
+        pooled.close()
+
+    half = _coevo_trainer(tmp_path / "h")
+    try:
+        tagged = [dict(r, pool=pool_tag) if i % 2 else dict(r, pool=None) for i, r in enumerate(records)]
+        assert half._coevolution_step(tagged) is False
+        assert list(half.recent_match_scores) == [(1, 0)] * 12
+        assert _team_b_weight(half) == 0.0
+    finally:
+        half.close()
+
+
+def test_a_training_generation_of_pool_matches_leaves_the_window_unchanged(tmp_path: Path) -> None:
+    """[RED] 2 envs, N = 2, 4-step matches, 8 steps: gen 50 (no pool) adds its 4 matches to the window, gen 51 (every env
+    a pool env) adds none."""
+    trainer = _pool_trainer(tmp_path, pool_envs=2, max_rl_steps=4)
+    try:
+        _train_to_generation(trainer, 50)
+        assert len(trainer.recent_match_scores) == 4
+        trainer.train(total_updates=1)
+        assert trainer.current_generation == 51 and len(trainer.match_history) == 8
+        assert len(trainer.recent_match_scores) == 4
+        assert [m["pool"] is not None for m in trainer.match_history[-4:]] == [True] * 4
+        assert [m["pool"] for m in trainer.match_history[:4]] == [None] * 4
+    finally:
+        trainer.close()
+
+
+def test_match_records_and_the_generation_record_carry_the_pool_tags(tmp_path: Path) -> None:
+    """[RED] Gen 51, N = 1 of 2 envs, 4-step matches: two of four matches carry {"frozen_team": "A", "member_gen": 50},
+    the others `None`; the generation record lists the schedule; a pool_envs = 0 trainer records empty schedules and `None` tags."""
+    trainer = _pool_trainer(tmp_path, pool_envs=1, max_rl_steps=4)
+    plain = _pool_trainer(tmp_path, name="plain", pool_envs=0, max_rl_steps=4)
+    try:
+        _train_to_generation(trainer, 50)
+        trainer.train(total_updates=1)
+        tags = [m["pool"] for m in trainer.match_history[-4:]]
+        assert sorted(tags, key=lambda t: t is None) == [{"frozen_team": "A", "member_gen": 50}] * 2 + [None] * 2
+        rec = trainer.generation_history[-1]
+        pool_env = trainer.pool_schedule_for(51)[0]["env"]
+        assert rec["pool_schedule"] == [{"env": pool_env, "frozen_team": "A", "member_gen": 50}]
+        assert (rec["pool_envs"], rec["pool_size"]) == (1, 10)
+
+        plain.train(total_updates=1)
+        assert plain.generation_history[-1]["pool_schedule"] == [] and plain.generation_history[-1]["pool_envs"] == 0
+        assert all(m["pool"] is None for m in plain.match_history)
+    finally:
+        trainer.close()
+        plain.close()
+
+
+def test_a_match_that_began_in_a_pool_generation_stays_tagged_when_it_ends_in_another(tmp_path: Path) -> None:
+    """[RED] 6-step generations and 5-step matches make matches straddle generations. Seed 1 picks env 1 in gen 51 and env 0
+    in gen 52 (asserted). Gen 51's tick-10 matches: env 1's began in gen 50 and ends under the pool, env 0's is free. Gen
+    52's tick-15 matches: env 0's began in gen 51 under the pool and ends free, env 1's began free and ends under the pool;
+    both are tagged, with the generation that froze them (A in gen 51, B in gen 52)."""
+    trainer = _pool_trainer(tmp_path, pool_envs=1, seed=1, rollout_steps=6, max_rl_steps=5)
+    try:
+        _train_to_generation(trainer, 50)
+        assert [trainer.pool_schedule_for(g)[0]["env"] for g in (51, 52)] == [1, 0]
+        mark = len(trainer.match_history)
+        trainer.train(total_updates=1)  # gen 51
+        gen51 = trainer.match_history[mark:]
+        assert len(gen51) == 2
+        assert sorted(m["pool"] is None for m in gen51) == [False, True]
+        assert [m["pool"] for m in gen51 if m["pool"]] == [{"frozen_team": "A", "member_gen": 50}]
+        mark = len(trainer.match_history)
+        trainer.train(total_updates=1)  # gen 52
+        gen52 = trainer.match_history[mark:]
+        assert len(gen52) == 2
+        assert sorted((m["pool"] for m in gen52), key=lambda t: t["frozen_team"]) == [
+            {"frozen_team": "A", "member_gen": 50}, {"frozen_team": "B", "member_gen": 50}]
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("trainer_head, member_head", [("hybrid5", "gaussian4"), ("gaussian4", "hybrid5")])
+def test_a_member_with_the_other_head_is_skipped_with_one_line_and_its_envs_play_self_play(tmp_path: Path, capsys, trainer_head, member_head) -> None:
+    """[RED] Both pool envs draw the only member, which has the other head: exactly one printed line names it and both heads,
+    the schedule is empty, no seat is frozen, and the buffers equal a pool_envs = 0 trainer's."""
+    plain = _pool_trainer(tmp_path, head=trainer_head, name="plain", pool_envs=0)
+    pooled = _pool_trainer(tmp_path, head=trainer_head, name="pooled", pool_envs=2)
+    try:
+        _write_member(tmp_path / "pooled", 50, head=member_head)
+        a = _seeded_collect(plain, 51)
+        capsys.readouterr()
+        b = _seeded_collect(pooled, 51)
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if "gen0050" in ln]
+        assert len(lines) == 1 and member_head in lines[0] and trainer_head in lines[0]
+        assert b["pool_schedule"] == [] and (b["frozen_seats"] is None or not np.any(b["frozen_seats"]))
+        for key in ROLLOUT_ARRAYS:
+            assert np.array_equal(a[key], b[key]), key
+    finally:
+        plain.close()
+        pooled.close()
+
+
+def test_hybrid5_pool_generation_keeps_the_fire_telemetry_finite_and_per_learner_batch(tmp_path: Path) -> None:
+    """[RED] A hybrid5 pool generation records finite fire_sat / p_kick / p_spec for all four roles."""
+    trainer = _pool_trainer(tmp_path, head="hybrid5", pool_envs=1, max_rl_steps=4)
+    try:
+        _train_to_generation(trainer, 50)
+        trainer.train(total_updates=1)
+        rec = trainer.generation_history[-1]
+        assert rec["pool_schedule"] != []
+        for role in ROLE_KEYS:
+            assert all(math.isfinite(v) for v in (rec["fire_sat"][role]["kick"], rec["fire_sat"][role]["spec"], rec["p_kick"][role], rec["p_spec"][role]))
+    finally:
+        trainer.close()
+
+
+def test_main_stores_the_pool_settings_and_enforces_them_on_resume(tmp_path: Path, monkeypatch) -> None:
+    """[RED] End to end through `main()`: `--pool-envs` / `--pool-size` reach the stored state and the generation record,
+    and resuming without them is refused."""
+    monkeypatch.chdir(tmp_path)
+    base = ["train_ppo", "--num-envs", "2", "--rollout-steps", "8", "--total-updates", "1", "--device", "cpu"]
+    monkeypatch.setattr("sys.argv", base + ["--pool-envs", "1", "--pool-size", "4"])
+    tp.main()
+    state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert (state["pool_envs"], state["pool_size"], state["current_generation"]) == (1, 4, 1)
+    assert [(g["pool_envs"], g["pool_size"]) for g in state["generation_history"]] == [(1, 4)]
+
+    monkeypatch.setattr("sys.argv", base)
+    with pytest.raises(ValueError, match="pool_envs"):
+        tp.main()
+    assert torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)["current_generation"] == 1
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_frozen_seat_batch_matches_every_networks_own_forward_pass(head: str) -> None:
+    """[RED] Four groups with four different networks (keeper / field seats of two teams in different envs): the batched
+    values, replay means and (sigma e^-20) sampled Gaussian actions equal each network's own forward pass on its own
+    rows; stored log-probabilities are 0; every seat outside the groups keeps its sentinel in every output."""
+    rng = np.random.default_rng(5)
+    nets = []
+    for seed in range(4):
+        net = _seeded_net(head, 40 + seed)
+        with torch.no_grad():
+            net.actor_mean[4].weight.mul_(60.0)  # outputs that depend on the observation
+            net.actor_logstd.fill_(-20.0)
+        nets.append(net)
+    groups = [
+        (np.array([0, 2]), [0], nets[0]),
+        (np.array([0, 2]), [1, 2, 3, 4, 5], nets[1]),
+        (np.array([1]), [6], nets[2]),
+        (np.array([1]), [7, 8, 9, 10, 11], nets[3]),
+    ]
+    obs = rng.normal(size=(3, 12, OBS_DIM)).astype(np.float32)
+    cen = rng.normal(size=(3, 12, CENTRAL_STATE_DIM)).astype(np.float32)
+    width = 5 if head == "hybrid5" else 4
+    actions = np.full((3, 12, width), np.nan, dtype=np.float32)
+    logprobs = np.full((3, 12), np.nan, dtype=np.float32)
+    values = np.full((3, 12), np.nan, dtype=np.float32)
+    means = np.full((3, 12, 4), np.nan, dtype=np.float32)
+    tp.FrozenSeatBatch(groups).apply(obs, cen, tp.pool_generator(1, 2), actions, logprobs, values, means)
+
+    touched = np.zeros((3, 12), dtype=bool)
+    for envs, seats, net in groups:
+        touched[np.ix_(envs, seats)] = True
+        ix = np.ix_(envs, seats)
+        o = torch.as_tensor(obs[ix].reshape(-1, OBS_DIM))
+        c = torch.as_tensor(cen[ix].reshape(-1, CENTRAL_STATE_DIM))
+        _, _, _, value, mean = net.get_action_and_value(o, deterministic=True, central_state=c, return_mean=True)
+        shape = (len(envs), len(seats))
+        np.testing.assert_allclose(values[ix], value.detach().numpy().reshape(shape), atol=1e-4)
+        np.testing.assert_allclose(means[ix], mean.detach().numpy().reshape(*shape, 4), atol=1e-5)
+        assert (logprobs[ix] == 0.0).all()
+        if head == "gaussian4":
+            np.testing.assert_allclose(actions[ix], mean.detach().numpy().reshape(*shape, 4), atol=1e-5)
+        else:
+            mean3, _, _ = net.hybrid_heads(o)
+            np.testing.assert_allclose(actions[ix][..., :3], mean3.detach().numpy().reshape(*shape, 3), atol=1e-5)
+            assert set(np.unique(actions[ix][..., 3:])) <= {0.0, 1.0}
+    for out in (actions, logprobs, values, means):
+        assert np.isnan(out[~touched]).all()
+    assert np.abs(values[touched]).max() > 0.01 and np.abs(means[touched]).max() > 0.05  # the check is not vacuous
+    # Without replay means the same call must still fill actions, values and log-probabilities (and not fail).
+    actions2, logprobs2, values2 = (np.full_like(a, np.nan) for a in (actions, logprobs, values))
+    tp.FrozenSeatBatch(groups).apply(obs, cen, tp.pool_generator(1, 2), actions2, logprobs2, values2, None)
+    np.testing.assert_allclose(values2[touched], values[touched], atol=1e-6)
+    np.testing.assert_allclose(actions2[touched], actions[touched], atol=1e-6)
+    assert np.isnan(actions2[~touched]).all()

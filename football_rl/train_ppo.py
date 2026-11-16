@@ -411,6 +411,173 @@ def uniform_env_index(seed: int, generation: int, num_envs: int) -> int:
     return int(np.random.default_rng(int(seed) + int(generation)).integers(int(num_envs)))
 
 
+# Opponent snapshot pool: the newest `pool_size` generation snapshots serve as frozen opponents in `pool_envs` of the
+# parallel environments. Team A is stored under the `blue_*` file names and team B under `red_*`.
+POOL_SCHEDULE_SALT = 0xB5
+DEFAULT_POOL_SIZE = 10
+POOL_TEAM_PREFIX = {"A": "blue", "B": "red"}
+_SNAPSHOT_DIR_PATTERN = re.compile(r"^gen(\d{4,})$")
+
+
+def validate_pool_settings(
+    pool_envs: int, pool_size: int, num_envs: int, separate_teams: bool = True, seed: int = 0
+) -> None:
+    """Raise ValueError unless the opponent-pool settings are usable; `pool_envs = 0` (pool off) accepts any `pool_size`."""
+    if pool_envs < 0 or pool_envs > num_envs:
+        raise ValueError(f"pool_envs must be between 0 and num_envs ({num_envs}), got {pool_envs}")
+    if pool_envs == 0:
+        return
+    if pool_size < 1:
+        raise ValueError(f"pool_size must be at least 1 when pool_envs > 0, got {pool_size}")
+    if not separate_teams:
+        raise ValueError("pool_envs > 0 needs separate teams; a shared-team run has no opponent snapshot to freeze")
+    if seed < 0:
+        raise ValueError(f"seed must be non-negative when pool_envs > 0, got {seed}")
+
+
+def list_pool_generations(checkpoint_dir: str, last_completed: int, pool_size: int) -> List[int]:
+    """Generations of the newest `pool_size` snapshots `<checkpoint_dir>/snapshots/genNNNN` with generation <= `last_completed`.
+
+    Returned in ascending order. Staging directories (`genNNNN.tmp`), plain files and other names are not snapshots.
+    """
+    root = os.path.join(checkpoint_dir, "snapshots")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    found = sorted(
+        int(match.group(1))
+        for match in (_SNAPSHOT_DIR_PATTERN.match(name) for name in names)
+        if match is not None and os.path.isdir(os.path.join(root, match.group(0))) and int(match.group(1)) <= last_completed
+    )
+    return found[-pool_size:] if pool_size > 0 else []
+
+
+def pool_schedule(
+    seed: int, generation: int, num_envs: int, pool_envs: int, pool_generations: Sequence[int]
+) -> List[Dict[str, Any]]:
+    """Pool environments of `generation` as `{"env", "frozen_team", "member_gen"}` entries (empty without a pool).
+
+    `pool_envs` distinct environments are drawn from `np.random.default_rng([seed, generation, 0xB5])`; the k-th one
+    freezes team B when `generation + k` is even and team A otherwise, and draws one member of `pool_generations`
+    uniformly. The result depends only on the arguments.
+    """
+    if pool_envs < 0 or pool_envs > num_envs:
+        raise ValueError(f"pool_envs must be between 0 and num_envs ({num_envs}), got {pool_envs}")
+    if pool_envs == 0 or len(pool_generations) == 0:
+        return []
+    rng = np.random.default_rng([int(seed), int(generation), POOL_SCHEDULE_SALT])
+    envs = rng.choice(num_envs, size=pool_envs, replace=False)
+    members = rng.integers(len(pool_generations), size=pool_envs)
+    return [
+        {
+            "env": int(env),
+            "frozen_team": "B" if (int(generation) + k) % 2 == 0 else "A",
+            "member_gen": int(pool_generations[int(member)]),
+        }
+        for k, (env, member) in enumerate(zip(envs, members))
+    ]
+
+
+def pool_generator(seed: int, generation: int) -> torch.Generator:
+    """CPU generator, seeded from `(seed, generation, 0xB5)`, for the draws of the frozen pool seats of one generation."""
+    state = np.random.SeedSequence([int(seed), int(generation), POOL_SCHEDULE_SALT]).generate_state(1, dtype=np.uint64)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(state[0]))
+    return generator
+
+
+class FrozenSeatBatch:
+    """Batched inference for the frozen pool seats of one generation.
+
+    `groups` are `(env indices, seat indices, member network)` triples, one per (member, team, role). The actors and
+    critics of all groups are stacked into one batched matrix product per layer (the actor input is padded with zero
+    weights over the central-state columns); groups with fewer rows than the largest are zero padded. Every random
+    draw comes from the generator passed to `apply`, in a fixed order.
+    """
+
+    def __init__(self, groups: List[Tuple[np.ndarray, List[int], ActorCritic]]) -> None:
+        self.groups = groups
+        count = len(groups)
+        nets = [net for _, _, net in groups]
+        self.hybrid = nets[0].hybrid
+        self.rows = [len(envs) * len(seats) for envs, seats, _ in groups]
+        self._index = [np.ix_(envs, seats) for envs, seats, _ in groups]
+        max_rows = max(self.rows)
+        width = OBS_DIM + CENTRAL_STATE_DIM
+        out = HYBRID_ACTION_DIM if self.hybrid else ACTION_DIM
+        h1, h2 = nets[0].actor_mean[0].out_features, nets[0].actor_mean[2].out_features
+        w0, b0 = torch.zeros(2 * count, width, h1), torch.zeros(2 * count, 1, h1)
+        w1, b1 = torch.zeros(2 * count, h1, h2), torch.zeros(2 * count, 1, h2)
+        w2, b2 = torch.zeros(2 * count, h2, out), torch.zeros(2 * count, 1, out)
+        with torch.no_grad():
+            for g, net in enumerate(nets):
+                for slot, layers in ((g, (net.actor_mean[0], net.actor_mean[2], net.actor_mean[4])),
+                                     (count + g, (net.critic[0], net.critic[2], net.critic[4]))):
+                    first, second, last = layers
+                    w0[slot, : first.in_features] = first.weight.t()
+                    b0[slot, 0] = first.bias
+                    w1[slot], b1[slot, 0] = second.weight.t(), second.bias
+                    w2[slot, :, : last.out_features] = last.weight.t()
+                    b2[slot, 0, : last.out_features] = last.bias
+            self._weights = (w0, b0, w1, b1, w2, b2)
+            self._std = torch.stack([torch.exp(net.actor_logstd) for net in nets])
+            if self.hybrid:
+                self._floor = torch.stack([net.fire_prob_floor for net in nets]).view(count, 1, 1)
+                self._bound = torch.stack([net.fire_logit_bound for net in nets]).view(count, 1, 1)
+        self._inputs = np.zeros((2 * count, max_rows, width), dtype=np.float32)
+
+    @torch.no_grad()
+    def apply(
+        self,
+        obs: np.ndarray,
+        central: np.ndarray,
+        generator: torch.Generator,
+        actions: np.ndarray,
+        logprobs: np.ndarray,
+        values: np.ndarray,
+        action_means: Optional[np.ndarray],
+    ) -> None:
+        """Overwrite the frozen seats' entries of `actions`, `logprobs`, `values` and `action_means` in place.
+
+        `obs` and `central` are the current `(num_envs, 12, dim)` observations. Stored log-probabilities of frozen
+        seats are zero: those transitions are never trained on. Replay means are written only when asked for.
+        """
+        count = len(self.groups)
+        buf = self._inputs
+        for g, ix in enumerate(self._index):
+            rows = self.rows[g]
+            buf[g, :rows, :OBS_DIM] = obs[ix].reshape(rows, OBS_DIM)
+            buf[g, :rows, OBS_DIM:] = central[ix].reshape(rows, CENTRAL_STATE_DIM)
+        buf[count:] = buf[:count]  # the critics read the same rows as the actors
+        w0, b0, w1, b1, w2, b2 = self._weights
+        h = torch.baddbmm(b0, torch.from_numpy(buf), w0).tanh_()
+        h = torch.baddbmm(b1, h, w1).tanh_()
+        y = torch.baddbmm(b2, h, w2)
+        z, value = y[:count], y[count:, :, 0]
+        if self.hybrid:
+            mean3 = torch.tanh(z[..., :3])
+            p = fire_probability(z[..., 3:], self._floor, self._bound)
+            action = torch.cat(
+                [torch.normal(mean3, self._std.expand_as(mean3), generator=generator), torch.bernoulli(p, generator=generator)],
+                dim=-1,
+            )
+            mean = torch.cat([mean3[..., :2], 2.0 * p - 1.0], dim=-1) if action_means is not None else None
+        else:
+            mean = torch.tanh(z)
+            action = torch.normal(mean, self._std.expand_as(mean), generator=generator)
+        action_np, value_np = action.numpy(), value.numpy()
+        mean_np = mean.numpy() if action_means is not None else None
+        for g, ix in enumerate(self._index):
+            rows, (envs, seats, _) = self.rows[g], self.groups[g]
+            shape = (len(envs), len(seats))
+            actions[ix] = action_np[g, :rows].reshape(*shape, -1)
+            logprobs[ix] = 0.0
+            values[ix] = value_np[g, :rows].reshape(shape)
+            if action_means is not None:
+                action_means[ix] = mean_np[g, :rows].reshape(*shape, -1)
+
+
 def compute_mc_returns(
     rewards: np.ndarray, dones: Optional[np.ndarray], gamma: float
 ) -> np.ndarray:
@@ -710,7 +877,10 @@ class ParameterSharingPPOTrainer:
         critic_only_until_gen: int = 0,
         config_overrides: Optional[Dict[str, Any]] = None,
         accept_config_change: bool = False,
+        pool_envs: int = 0,
+        pool_size: int = DEFAULT_POOL_SIZE,
     ) -> None:
+        validate_pool_settings(int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed))
         self.cfg = config
         self.num_envs = num_envs
         self.rollout_steps = rollout_steps
@@ -723,6 +893,11 @@ class ParameterSharingPPOTrainer:
         self.critic_only_until_gen = int(critic_only_until_gen)
         self.config_overrides: Dict[str, Any] = dict(sorted((config_overrides or {}).items()))
         self.accept_config_change = bool(accept_config_change)
+        self.pool_envs = int(pool_envs)
+        self.pool_size = int(pool_size)
+        # Frozen pool members of the generation being played, keyed by (member generation, team) -> (keeper, field).
+        self._pool_members: Dict[Tuple[int, str], Tuple[ActorCritic, ActorCritic]] = {}
+        self._pool_skipped: set = set()
         self.git_commit: str = current_git_commit()
         self.policy_head: str = self.cfg.ppo.policy_head
         self.policy_action_dim: int = HYBRID_ACTION_DIM if self.policy_head == "hybrid5" else ACTION_DIM
@@ -874,6 +1049,8 @@ class ParameterSharingPPOTrainer:
         )
         self.current_obs[:] = obs_batch
         self.current_central_state[:] = central_batch
+        # Pool assignment of the match each environment is playing (None: no frozen seat so far in that match).
+        self._pool_match_tags: List[Optional[Dict[str, Any]]] = [None] * self.num_envs
 
     def _rollout_groups(self) -> List[Tuple[List[int], ActorCritic]]:
         """`(agent indices, CPU policy)` groups in the order their random draws are made."""
@@ -1061,6 +1238,81 @@ class ParameterSharingPPOTrainer:
             return current
         return max(1, min(current, (os.cpu_count() or 1) - self.num_envs - 1))
 
+    def pool_schedule_for(self, generation: int) -> List[Dict[str, Any]]:
+        """Pool schedule of `generation`: snapshots completed before it, `pool_size` newest, `pool_envs` environments."""
+        if self.pool_envs <= 0:
+            return []
+        members = list_pool_generations(self.checkpoint_dir, generation - 1, self.pool_size)
+        return pool_schedule(self.seed, generation, self.num_envs, self.pool_envs, members)
+
+    def _load_pool_member(self, member_gen: int, team: str) -> Optional[Tuple[ActorCritic, ActorCritic]]:
+        """`(keeper, field)` networks of `team` from snapshot `member_gen`, frozen and in eval mode; None when skipped.
+
+        A snapshot whose policy head differs from the trainer's is skipped, with one printed line per generation.
+        The networks are built without consuming the trainer's random streams.
+        """
+        key = (member_gen, team)
+        if key in self._pool_members:
+            return self._pool_members[key]
+        if member_gen in self._pool_skipped:
+            return None
+        directory = os.path.join(self.checkpoint_dir, "snapshots", f"gen{member_gen:04d}")
+        weights = [
+            torch.load(
+                os.path.join(directory, f"{POOL_TEAM_PREFIX[team]}_{role}_policy.pt"),
+                map_location=self.inference_device,
+                weights_only=True,
+            )
+            for role in ("keeper", "field")
+        ]
+        for w in weights:
+            head = policy_head_of_weights(w)
+            if head != self.policy_head:
+                print(
+                    f"  [Pool] Skipping snapshot gen{member_gen:04d}: its policies use the {head!r} head but the "
+                    f"trainer's head is {self.policy_head!r}; environments that drew it play self-play."
+                )
+                self._pool_skipped.add(member_gen)
+                return None
+        nets: List[ActorCritic] = []
+        with torch.random.fork_rng(devices=[]):
+            for w in weights:
+                net = self._new_policy(self.inference_device)
+                self._load_adapted_weights(net, w)
+                net.eval()
+                net.requires_grad_(False)
+                nets.append(net)
+        self._pool_members[key] = (nets[0], nets[1])
+        return self._pool_members[key]
+
+    def _prepare_pool(
+        self, generation: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray], Optional[FrozenSeatBatch]]:
+        """`(played schedule, frozen-seat mask (num_envs, 12) or None, batched frozen-seat inference or None)`.
+
+        The frozen groups are ordered by (member generation, team, role), so the frozen draws are made in a fixed order.
+        """
+        self._pool_members = {}
+        self._pool_skipped = set()
+        played: List[Dict[str, Any]] = []
+        for entry in self.pool_schedule_for(generation):
+            if self._load_pool_member(entry["member_gen"], entry["frozen_team"]) is not None:
+                played.append(entry)
+        if not played:
+            return [], None, None
+        frozen = np.zeros((self.num_envs, self.num_agents), dtype=bool)
+        grouped: Dict[Tuple[int, str, str], Tuple[ActorCritic, List[int], List[int]]] = {}
+        for entry in played:
+            team = entry["frozen_team"]
+            keeper_net, field_net = self._pool_members[(entry["member_gen"], team)]
+            keeper_seats = self.blue_keeper_indices if team == "A" else self.red_keeper_indices
+            field_seats = self.blue_field_indices if team == "A" else self.red_field_indices
+            frozen[entry["env"], keeper_seats + field_seats] = True
+            for role, net, seats in (("keeper", keeper_net, keeper_seats), ("field", field_net, field_seats)):
+                grouped.setdefault((entry["member_gen"], team, role), (net, seats, []))[2].append(entry["env"])
+        groups = [(np.array(envs), seats, net) for _, (net, seats, envs) in sorted(grouped.items())]
+        return played, frozen, FrozenSeatBatch(groups)
+
     def collect_rollouts(self, active_generation: int) -> Dict[str, Any]:
         """Collect `self.rollout_steps` across all parallel environments and compute per-agent GAE."""
         previous_threads = torch.get_num_threads()
@@ -1090,6 +1342,16 @@ class ParameterSharingPPOTrainer:
         self.vec_env.set_generation(active_generation)
         recording = bool(self.cfg.replay.enable_recording)
 
+        pool_played, frozen_seats, pool_batch = (
+            self._prepare_pool(active_generation) if self.pool_envs > 0 else ([], None, None)
+        )
+        pool_generator_ = pool_generator(self.seed, active_generation) if pool_batch is not None else None
+        pool_assign = {
+            e["env"]: {"frozen_team": e["frozen_team"], "member_gen": e["member_gen"]} for e in pool_played
+        }
+        for env_i, tag in pool_assign.items():
+            self._pool_match_tags[env_i] = dict(tag)
+
         for t in range(T):
             buf_obs[t] = self.current_obs
             buf_central[t] = self.current_central_state
@@ -1102,6 +1364,10 @@ class ParameterSharingPPOTrainer:
                     self.current_obs, self.current_central_state
                 )
                 action_means = None
+            if pool_batch is not None:
+                pool_batch.apply(
+                    self.current_obs, self.current_central_state, pool_generator_, actions, logprobs, values, action_means
+                )
             buf_act[t] = actions
             buf_logp[t] = logprobs
             buf_val[t] = values
@@ -1169,11 +1435,15 @@ class ParameterSharingPPOTrainer:
                         "kick_to_teammate": int(fstats.get("kick_to_teammate", 0)),
                         "kick_to_opponent": int(fstats.get("kick_to_opponent", 0)),
                         "kick_other": int(fstats.get("kick_other", 0)),
+                        "pool": dict(self._pool_match_tags[env_i]) if self._pool_match_tags[env_i] else None,
                         "replay_path": rpath or "",
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     self.match_history.append(match_record)
                     gen_completed_matches.append((env_i, match_record))
+
+                    # The next match of this environment starts under this generation's pool assignment, if any.
+                    self._pool_match_tags[env_i] = dict(pool_assign[env_i]) if env_i in pool_assign else None
 
                     # Auto-reset environment for seamless rollout collection
                     next_gen_hint = active_generation + (1 if t == T - 1 else 0)
@@ -1240,6 +1510,8 @@ class ParameterSharingPPOTrainer:
             "completed_episodes": completed_episodes,
             "max_interest": max_interest,
             "exported_replays": exported_replays,
+            "frozen_seats": frozen_seats,
+            "pool_schedule": pool_played,
         }
 
     @staticmethod
@@ -1266,8 +1538,18 @@ class ParameterSharingPPOTrainer:
         b_central: Optional[torch.Tensor] = None,
         critic_only: bool = False,
     ) -> Dict[str, float]:
-        """Run multi-epoch minibatch PPO update on pooled role transitions."""
+        """Run multi-epoch minibatch PPO update on pooled role transitions.
+
+        A role without any learning transition (every seat frozen) is left untouched: no optimizer step is taken and
+        its statistics are NaN.
+        """
         batch_size = b_obs.shape[0]
+        if batch_size == 0:
+            nan = float("nan")
+            empty = {"pg_loss": nan, "v_loss": nan, "entropy": nan}
+            if self.policy_head == "hybrid5":
+                empty.update({"fire_sat_kick": nan, "fire_sat_spec": nan, "p_kick": nan, "p_spec": nan})
+            return empty
         num_minibatches = min(self.cfg.ppo.num_minibatches, batch_size)
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
@@ -1399,13 +1681,21 @@ class ParameterSharingPPOTrainer:
             if rewards is not None
             else None
         )
+        frozen_seats = rollout.get("frozen_seats")
+
+        def _role_rows(arr: np.ndarray, role_indices: List[int]) -> np.ndarray:
+            """Rollout array `(T, num_envs, 12, ...)` restricted to the role's seats, without the frozen ones."""
+            rows = arr[:, :, role_indices]
+            if frozen_seats is not None:
+                rows = rows[:, ~np.asarray(frozen_seats, dtype=bool)[:, role_indices]]
+            return rows
 
         def _attach_v_corr(role_metrics: Dict[str, float], role_indices: List[int]) -> None:
-            role_val = values[:, :, role_indices]
-            role_ret = returns[:, :, role_indices]
+            role_val = _role_rows(values, role_indices)
+            role_ret = _role_rows(returns, role_indices)
             role_metrics["v_corr_lambda"] = pearson_correlation(role_val, role_ret)
             role_metrics["v_corr_mc"] = (
-                pearson_correlation(role_val, mc_returns[:, :, role_indices])
+                pearson_correlation(role_val, _role_rows(mc_returns, role_indices))
                 if mc_returns is not None
                 else 0.0
             )
@@ -1414,13 +1704,13 @@ class ParameterSharingPPOTrainer:
             role_indices: List[int],
         ) -> Tuple[torch.Tensor, ...]:
             r_obs = torch.as_tensor(
-                obs[:, :, role_indices, :].reshape(-1, OBS_DIM),
+                _role_rows(obs, role_indices).reshape(-1, OBS_DIM),
                 dtype=torch.float32,
                 device=self.device,
             )
             r_cen = (
                 torch.as_tensor(
-                    central_state[:, :, role_indices, :].reshape(-1, CENTRAL_STATE_DIM),
+                    _role_rows(central_state, role_indices).reshape(-1, CENTRAL_STATE_DIM),
                     dtype=torch.float32,
                     device=self.device,
                 )
@@ -1428,27 +1718,27 @@ class ParameterSharingPPOTrainer:
                 else None
             )
             r_act = torch.as_tensor(
-                actions[:, :, role_indices, :].reshape(-1, self.policy_action_dim),
+                _role_rows(actions, role_indices).reshape(-1, self.policy_action_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             r_logp = torch.as_tensor(
-                logprobs[:, :, role_indices].reshape(-1),
+                _role_rows(logprobs, role_indices).reshape(-1),
                 dtype=torch.float32,
                 device=self.device,
             )
             r_adv = torch.as_tensor(
-                advantages[:, :, role_indices].reshape(-1),
+                _role_rows(advantages, role_indices).reshape(-1),
                 dtype=torch.float32,
                 device=self.device,
             )
             r_ret = torch.as_tensor(
-                returns[:, :, role_indices].reshape(-1),
+                _role_rows(returns, role_indices).reshape(-1),
                 dtype=torch.float32,
                 device=self.device,
             )
             r_val = torch.as_tensor(
-                values[:, :, role_indices].reshape(-1),
+                _role_rows(values, role_indices).reshape(-1),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -1560,6 +1850,8 @@ class ParameterSharingPPOTrainer:
                 "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
                 "policy_head": self.policy_head,
+                "pool_envs": self.pool_envs,
+                "pool_size": self.pool_size,
                 "field_policy": self.blue_field_policy.state_dict(),
                 "keeper_policy": self.blue_keeper_policy.state_dict(),
                 "field_optimizer": self.blue_field_optimizer.state_dict(),
@@ -1817,6 +2109,19 @@ class ParameterSharingPPOTrainer:
                     f"[Resume] Config overrides changed: stored {stored_overrides!r}, "
                     f"requested {self.config_overrides!r}; continuing with the requested overrides."
                 )
+            stored_pool = (int(state.get("pool_envs", 0)), int(state.get("pool_size", DEFAULT_POOL_SIZE)))
+            requested_pool = (self.pool_envs, self.pool_size)
+            if (stored_pool[0] or requested_pool[0]) and stored_pool != requested_pool:
+                described = (
+                    f"stored pool_envs={stored_pool[0]}, pool_size={stored_pool[1]}, "
+                    f"requested pool_envs={requested_pool[0]}, pool_size={requested_pool[1]}"
+                )
+                if not self.accept_config_change:
+                    raise ValueError(
+                        f"Pool settings differ from the checkpoint: {described}. "
+                        "Pass --accept-config-change to resume anyway."
+                    )
+                print(f"[Resume] Pool settings changed: {described}; continuing with the requested settings.")
             saved_seed = state.get("seed")
             if saved_seed is not None and int(saved_seed) != int(self.seed):
                 print(f"[Resume] Checkpoint seed was {int(saved_seed)}; continuing with seed={int(self.seed)}.")
@@ -1935,7 +2240,8 @@ class ParameterSharingPPOTrainer:
     def _coevolution_step(self, completed_matches: List[Dict[str, Any]]) -> bool:
         """Record newly completed matches and soft-sync the trailing team when one side dominates.
 
-        Scores enter the rolling window in completion order. The condition is evaluated only once
+        Scores enter the rolling window in completion order; matches played with frozen pool seats (record `pool` set)
+        are skipped. The condition is evaluated only once
         the window holds `COEVO_WINDOW_MATCHES` matches: at least 8 total goals with one side
         scoring >= 3x the other (opponent floored at 1 goal). The trailing team's policies are then
         blended 35% towards the dominant team's and the window is cleared. Returns True on a sync.
@@ -1943,6 +2249,8 @@ class ParameterSharingPPOTrainer:
         if not self.separate_teams:
             return False
         for m in completed_matches:
+            if m.get("pool") is not None:
+                continue  # a match with frozen opponent seats says nothing about the balance of the two live teams
             self.recent_match_scores.append((int(m["score"][0]), int(m["score"][1])))
         if len(self.recent_match_scores) < COEVO_WINDOW_MATCHES:
             return False
@@ -2057,6 +2365,9 @@ class ParameterSharingPPOTrainer:
                     "total_matches_so_far": len(self.match_history),
                     "uniform_env": uniform_env,
                     "uniform_replay": uniform_replay,
+                    "pool_envs": self.pool_envs,
+                    "pool_size": self.pool_size,
+                    "pool_schedule": list(rollout.get("pool_schedule", [])),
                 }
                 if self.policy_head == "hybrid5":
                     roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
@@ -2497,9 +2808,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Applied overrides are stored with the checkpoint and must match on resume.",
     )
     parser.add_argument(
+        "--pool-envs",
+        type=int,
+        default=0,
+        help="Environments per generation whose one team is frozen to a snapshot from the opponent pool "
+        "(default: 0 = pure self-play). Stored with the checkpoint and must match on resume.",
+    )
+    parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=DEFAULT_POOL_SIZE,
+        help="Number of newest generation snapshots forming the opponent pool (default: 10).",
+    )
+    parser.add_argument(
         "--accept-config-change",
         action="store_true",
-        help="Resume even when --config-override values differ from those stored in the checkpoint.",
+        help="Resume even when --config-override or pool values differ from those stored in the checkpoint.",
     )
 
     # Lifecycle & Batch Management Flags
@@ -2595,6 +2919,8 @@ def main() -> None:
         ),
     )
 
+    validate_pool_settings(args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed)
+
     # 3. Handle `--from-scratch` vs automatic/explicit `--resume`
     if args.from_scratch:
         print("Starting a NEW training batch from scratch (clearing active `checkpoints/` and `replays/`)...")
@@ -2613,6 +2939,8 @@ def main() -> None:
         critic_only_until_gen=args.critic_only_until_gen,
         config_overrides=applied_overrides,
         accept_config_change=args.accept_config_change,
+        pool_envs=args.pool_envs,
+        pool_size=args.pool_size,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")

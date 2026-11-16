@@ -19,8 +19,8 @@ C0 floors (per arm seed, gens >= 200, strict; `gk_*` rows apply to each keeper):
 C0L: T2(last) - T2(100) < 0.50 fails, where T2 is the mean `goal_diff` of `vs_frozen` and
 `vs_frozen_red`; not evaluated unless generation 100 is in `--gens` and is not the last one.
 G6: fails if more than half of the arm seeds have no takeoff (`training_progress.takeoff_generation`
-with its default threshold and window) in their `--history`; not evaluated unless every arm seed
-has a history.
+with its default threshold and window, self-play matches only) in their `--history`; not evaluated
+unless every arm seed has a history.
 
 Computes `delta = arm - comparator`, `SE(delta) = sqrt(SE_a^2 + SE_c^2)`, `*` when
 `|delta| > 2 * SE(delta)`, and between-seed SDs / ranges when >= 2 seeds are supplied.
