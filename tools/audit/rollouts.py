@@ -1,0 +1,1130 @@
+"""Counterfactual rollouts over harness traces: keeper reach (`gk`) and hold-vs-kick (`hold`).
+
+From a harness trace directory (`m*.npz`) and (for `hold`) the checkpoint that produced it,
+re-simulates each match from its harness seed (`trace_seed * 1000 + match_idx`), verifies position
+determinism (< 1e-3 u for players and ball across every recorded decision, skipping and counting
+any match that fails), clones the engine at target decision points, and rolls counterfactual
+branches:
+
+  gk    At loose-ball keeper opportunities (loose ball inside the keeper's box, 40-140 u from the
+        keeper, ball speed < 80 u/s, >= 3 s after that keeper's previous opportunity, and >= 15
+        decisions remaining in the match), rolls 15 decisions (1 s) while all other players
+        replay recorded actions and the keeper plays: (a) recorded actions, (b) scripted
+        go-to-ball, (c) inert. Reports per-variant pickup within 1 s, undiscounted keeper step
+        reward (including shaping), and undiscounted team step reward (sum over 6 players), plus
+        paired (b) - (a). `--checkpoint-dir` is accepted for CLI symmetry but unused by `gk`.
+
+  hold  At eligible outfield holding decisions (outfield holder, hold_t >= 0.08 s, >= 3 s after
+        the previous point in the match), clones the env twice with identical generator seeds and
+        loads policies via `tools/audit/harness.py` (supporting both `gaussian4` and `hybrid5`).
+        Branch KICK forces the holder's env-space kick column to +1 on decision 0; branch HOLD
+        forces it to -1 for the first 15 decisions. Rolls 75 decisions (5 s) and 225 decisions
+        (15 s), reporting paired HOLD - KICK differences (overall, by pressure < 70 u / >= 120 u,
+        and by canonical third) for discounted non-shaping return, full return with gamma^H
+        team-mean critic bootstrap, P(team holds at 1 s), P(goal for), P(goal against), and the
+        non-shaping component split.
+
+Nothing is written to `checkpoints/`, `replays/`, checkpoint directories, or the trace directory.
+
+Usage:
+  python tools/audit/rollouts.py gk --trace-dir DIR [--max-matches 48] [--workers 4] --out OUT
+  python tools/audit/rollouts.py hold --trace-dir DIR --checkpoint-dir DIR [--max-matches 48]
+         [--workers 4] [--seed 1] --out OUT
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import multiprocessing as mp
+import re
+import sys
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from football_rl.config import DEFAULT_CONFIG  # noqa: E402
+from football_rl.env import FootballParallelEnv  # noqa: E402
+from tools.audit import census, harness  # noqa: E402
+
+__all__ = [
+    "COMPONENT_KEYS",
+    "GK_HORIZON_STEPS",
+    "GK_INERT_ACTION",
+    "GK_MAX_BALL_SPEED",
+    "GK_MAX_DIST",
+    "GK_MIN_DIST",
+    "HOLD_HORIZONS",
+    "HOLD_MIN_HOLD_S",
+    "HOLD_OVERRIDE_STEPS",
+    "KICK_OVERRIDE_STEPS",
+    "POS_ERR_LIMIT",
+    "SPACING_STEPS",
+    "eval_gk_opportunity",
+    "find_gk_opportunities",
+    "find_hold_decisions",
+    "gk_scripted_action",
+    "main",
+    "resimulate_match",
+    "roll_hold_branches",
+    "run_gk",
+    "run_hold",
+    "summarize_gk",
+    "summarize_hold",
+]
+
+POS_ERR_LIMIT = 1e-3
+STEP_SECONDS = census.STEP_SECONDS
+RL_HZ = float(DEFAULT_CONFIG.physics.rl_hz)
+FIELD_WIDTH = census.FIELD_WIDTH
+GOAL_Y = census.GOAL_Y
+TEAM_SIZE = census.TEAM_SIZE
+
+SPACING_SECONDS = 3.0
+SPACING_STEPS = int(round(SPACING_SECONDS * RL_HZ))  # 45 decisions at 15 Hz
+
+GK_HORIZON_STEPS = 15
+GK_MIN_DIST = 40.0
+GK_MAX_DIST = 140.0
+GK_MAX_BALL_SPEED = 80.0
+GK_INERT_ACTION = np.array([0.0, 0.0, -1.0, -1.0], dtype=np.float32)
+
+HOLD_MIN_HOLD_S = float(DEFAULT_CONFIG.mechanics.pickup_kick_grace)
+KICK_OVERRIDE_STEPS = 1
+HOLD_OVERRIDE_STEPS = 15
+HOLD_HORIZONS = (75, 225)
+ONE_SECOND_STEPS = 15
+
+PRESSURE_NEAR = 70.0
+PRESSURE_FAR = 120.0
+PITCH_THIRD = FIELD_WIDTH / 3.0
+
+COMPONENT_KEYS = (
+    "turnover",
+    "pass_bonus",
+    "shot_on_target",
+    "goal",
+    "failed_tackle",
+    "five_s_rule",
+    "save",
+    "other",
+)
+
+_MATCH_INDEX_RE = re.compile(r"^m(\d+)\.npz$")
+
+
+# ----------------------------------------------------------------------------
+# Trace, environment, and output helpers
+# ----------------------------------------------------------------------------
+def _trace_paths_with_indices(
+    trace_dir: Path | str, max_matches: Optional[int] = None
+) -> List[Tuple[int, Path]]:
+    paths = census._trace_paths(trace_dir)
+    if max_matches is not None:
+        if max_matches <= 0:
+            raise ValueError(f"max_matches must be positive, got {max_matches}")
+        paths = paths[:max_matches]
+    out: List[Tuple[int, Path]] = []
+    for i, path in enumerate(paths):
+        m = _MATCH_INDEX_RE.match(path.name)
+        out.append((int(m.group(1)) if m else i, path))
+    return out
+
+
+def _resolve_trace_seed(trace_dir: Path | str, trace_seed: Optional[int]) -> int:
+    if trace_seed is not None:
+        return int(trace_seed)
+    census_path = Path(trace_dir) / "census.json"
+    if census_path.is_file():
+        data = json.loads(census_path.read_text(encoding="utf-8"))
+        if "seed" in data and data["seed"] is not None:
+            return int(data["seed"])
+    return 11
+
+
+def _load_trace(path: Path) -> Dict[str, np.ndarray]:
+    with np.load(path) as z:
+        return {k: z[k] for k in z.files}
+
+
+def _build_env(shaping_mode: Optional[str] = None) -> FootballParallelEnv:
+    cfg = DEFAULT_CONFIG
+    if shaping_mode is not None:
+        cfg = replace(cfg, rewards=replace(cfg.rewards, shaping_mode=shaping_mode))
+    cfg = replace(
+        cfg,
+        replay=replace(
+            cfg.replay,
+            enable_recording=False,
+            interest_threshold=harness.REPLAY_KEEP_THRESHOLD,
+            save_dir=tempfile.gettempdir(),
+        ),
+    )
+    return FootballParallelEnv(config=cfg)
+
+
+def _validate_out_path(out: Path | str, protected: Sequence[Path | str]) -> Path:
+    resolved = Path(out).resolve()
+    harness.check_output_dir(resolved, protected)
+    harness.check_output_dir(resolved.parent, protected)
+    return resolved
+
+
+def _write_outputs(out_path: Path, payload: Dict[str, Any], report_text: str) -> None:
+    if out_path.suffix.lower() == ".json":
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    else:
+        out_path.mkdir(parents=True, exist_ok=True)
+        (out_path / "rollouts.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        (out_path / "report.txt").write_text(report_text + "\n", encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Re-simulation
+# ----------------------------------------------------------------------------
+def resimulate_match(
+    trace: Dict[str, np.ndarray],
+    match_seed: int,
+    *,
+    target_steps: Iterable[int] = (),
+    shaping_mode: Optional[str] = None,
+) -> Tuple[bool, float, Dict[int, FootballParallelEnv]]:
+    """Re-simulate a trace from `match_seed`, checking player and ball error < 1e-3 u at every step.
+
+    Returns `(ok, max_pos_err, snapshots)` where `snapshots[t]` is a `copy.deepcopy(env)` taken
+    immediately before step `t` for each `t` in `target_steps`. If any step exceeds `POS_ERR_LIMIT`,
+    returns `(False, err, {})`.
+    """
+    act = np.asarray(trace["act"], dtype=np.float32)
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    n_steps = int(act.shape[0])
+    if n_steps <= 0 or pos.shape[0] < n_steps or ball.shape[0] < n_steps:
+        return False, float("inf"), {}
+
+    wanted = set(int(s) for s in target_steps)
+    snapshots: Dict[int, FootballParallelEnv] = {}
+    env = _build_env(shaping_mode=shaping_mode)
+    env.reset(seed=int(match_seed))
+    max_err = 0.0
+
+    for t in range(n_steps):
+        p_err = float(
+            np.max(np.hypot(env.player_pos[:, 0] - pos[t, :, 0], env.player_pos[:, 1] - pos[t, :, 1]))
+        )
+        b_err = float(math.hypot(env.ball_pos[0] - ball[t, 0], env.ball_pos[1] - ball[t, 1]))
+        err = max(p_err, b_err)
+        if err > max_err:
+            max_err = err
+        if not math.isfinite(err) or err >= POS_ERR_LIMIT:
+            return False, max_err, {}
+        if t in wanted:
+            snapshots[t] = copy.deepcopy(env)
+        env.step_array(act[t])
+
+    return True, max_err, snapshots
+
+
+# ----------------------------------------------------------------------------
+# GK opportunity rollouts
+# ----------------------------------------------------------------------------
+def find_gk_opportunities(trace: Dict[str, np.ndarray]) -> List[Tuple[int, int]]:
+    """Find `(step, team)` opportunities: loose ball in own box, 40-140 u from GK, speed < 80 u/s, >= 3 s apart."""
+    holder = np.asarray(trace["holder"], dtype=np.int64)
+    n = int(holder.size)
+    if n < GK_HORIZON_STEPS:
+        return []
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    bvel = np.asarray(trace["bvel"], dtype=np.float64)
+    speed = np.hypot(bvel[:, 0], bvel[:, 1])
+    side = np.asarray(trace["side"], dtype=np.int64)
+    box = np.asarray(trace["box"], dtype=np.float64)
+
+    max_start = n - GK_HORIZON_STEPS
+    out: List[Tuple[int, int]] = []
+    for team in (0, 1):
+        keeper = TEAM_SIZE * team
+        goal_x = np.where(side[:, team] == 0, 0.0, FIELD_WIDTH)
+        radius = box[np.arange(n), side[:, team]]
+        ball_goal = np.hypot(ball[:, 0] - goal_x, ball[:, 1] - GOAL_Y)
+        keeper_ball = np.hypot(pos[:, keeper, 0] - ball[:, 0], pos[:, keeper, 1] - ball[:, 1])
+        eligible = (
+            (holder < 0)
+            & (ball_goal <= radius)
+            & (keeper_ball >= GK_MIN_DIST)
+            & (keeper_ball <= GK_MAX_DIST)
+            & (speed < GK_MAX_BALL_SPEED)
+        )
+        last_step = -SPACING_STEPS - 1
+        for step in np.flatnonzero(eligible[: max_start + 1]).tolist():
+            if step - last_step >= SPACING_STEPS:
+                out.append((step, team))
+                last_step = step
+    out.sort()
+    return out
+
+
+def gk_scripted_action(env: FootballParallelEnv, keeper_idx: int) -> np.ndarray:
+    """Scripted go-to-ball action: throttle 1, steer = clip(2 * bearing_error, -1, 1), kick -1, special -1."""
+    dx = float(env.ball_pos[0] - env.player_pos[keeper_idx, 0])
+    dy = float(env.ball_pos[1] - env.player_pos[keeper_idx, 1])
+    bearing_err = (math.atan2(dy, dx) - float(env.player_angle[keeper_idx]) + math.pi) % (2.0 * math.pi) - math.pi
+    steer = max(-1.0, min(1.0, 2.0 * bearing_err))
+    return np.array([1.0, steer, -1.0, -1.0], dtype=np.float32)
+
+
+def eval_gk_opportunity(
+    snap: FootballParallelEnv,
+    team: int,
+    recorded_actions: np.ndarray,
+) -> Dict[str, Dict[str, float]]:
+    """Run variants (a) recorded, (b) scripted go-to-ball, (c) inert for 15 decisions from `snap`."""
+    keeper = TEAM_SIZE * team
+    team_slice = slice(keeper, keeper + TEAM_SIZE)
+    results: Dict[str, Dict[str, float]] = {}
+
+    for variant in ("recorded", "scripted", "inert"):
+        env = copy.deepcopy(snap)
+        picked_up = False
+        gk_rew = 0.0
+        team_rew = 0.0
+        for k in range(GK_HORIZON_STEPS):
+            act = np.array(recorded_actions[k], dtype=np.float32, copy=True)
+            if variant == "scripted":
+                act[keeper] = gk_scripted_action(env, keeper)
+            elif variant == "inert":
+                act[keeper] = GK_INERT_ACTION
+            _, _, rew, done, _ = env.step_array(act)
+            if env.ball_holder == keeper:
+                picked_up = True
+            gk_rew += float(rew[keeper])
+            team_rew += float(np.sum(rew[team_slice]))
+            if done:
+                break
+        results[variant] = {
+            "pickup": 1.0 if picked_up else 0.0,
+            "gk_reward": gk_rew,
+            "team_reward": team_rew,
+        }
+
+    results["diff_scripted_minus_recorded"] = {
+        k: results["scripted"][k] - results["recorded"][k]
+        for k in ("pickup", "gk_reward", "team_reward")
+    }
+    return results
+
+
+def _gk_worker(task: Tuple[int, str, int, Optional[str]]) -> Dict[str, Any]:
+    match_idx, path_str, trace_seed, shaping_mode = task
+    trace = _load_trace(Path(path_str))
+    opps = find_gk_opportunities(trace)
+    target_steps = sorted({step for step, _ in opps})
+    ok, max_err, snapshots = resimulate_match(
+        trace,
+        match_seed=trace_seed * 1000 + match_idx,
+        target_steps=target_steps,
+        shaping_mode=shaping_mode,
+    )
+    if not ok:
+        return {"ok": False, "max_err": max_err, "records": []}
+    act = np.asarray(trace["act"], dtype=np.float32)
+    records = []
+    for step, team in opps:
+        rec = eval_gk_opportunity(snapshots[step], team, act[step : step + GK_HORIZON_STEPS])
+        rec["match_idx"] = match_idx
+        rec["step"] = step
+        rec["team"] = team
+        records.append(rec)
+    return {"ok": True, "max_err": max_err, "records": records}
+
+
+def _stat_dict(values: Iterable[float]) -> Dict[str, Any]:
+    mean, se, n = census.mean_se(values)
+    return {"mean": mean, "se": se, "n": n}
+
+
+def summarize_gk(
+    records: Sequence[Dict[str, Any]],
+    n_matches_total: int,
+    n_matches_ok: int,
+    n_matches_skipped: int,
+    max_pos_err: Optional[float],
+) -> Dict[str, Any]:
+    variants = {}
+    for group in ("recorded", "scripted", "inert", "diff_scripted_minus_recorded"):
+        variants[group] = {
+            metric: _stat_dict(r[group][metric] for r in records)
+            for metric in ("pickup", "gk_reward", "team_reward")
+        }
+    return {
+        "mode": "gk",
+        "n_matches_total": n_matches_total,
+        "n_matches_ok": n_matches_ok,
+        "n_matches_skipped": n_matches_skipped,
+        "max_pos_err": max_pos_err,
+        "n_opportunities": len(records),
+        "variants": variants,
+    }
+
+
+def run_gk(
+    *,
+    trace_dir: Path | str,
+    trace_seed: Optional[int] = None,
+    max_matches: Optional[int] = None,
+    workers: int = 1,
+    shaping_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    if workers <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    seed_val = _resolve_trace_seed(trace_dir, trace_seed)
+    items = _trace_paths_with_indices(trace_dir, max_matches=max_matches)
+    tasks = [(idx, str(path), seed_val, shaping_mode) for idx, path in items]
+
+    if workers == 1 or len(tasks) == 1:
+        outputs = [_gk_worker(t) for t in tasks]
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(min(workers, len(tasks))) as pool:
+            outputs = list(pool.map(_gk_worker, tasks, chunksize=1))
+
+    records: List[Dict[str, Any]] = []
+    n_ok = 0
+    n_skipped = 0
+    max_err: Optional[float] = None
+    for res in outputs:
+        if res["ok"]:
+            n_ok += 1
+            records.extend(res["records"])
+            err = float(res["max_err"])
+            max_err = err if max_err is None else max(max_err, err)
+        else:
+            n_skipped += 1
+    return summarize_gk(records, len(tasks), n_ok, n_skipped, max_err)
+
+
+def format_gk_report(summary: Dict[str, Any], title: str = "") -> str:
+    header = f"===== rollouts gk {title}".strip()
+    lines = [
+        f"{header}  matches ok={summary['n_matches_ok']}/{summary['n_matches_total']} "
+        f"skipped={summary['n_matches_skipped']} n_opp={summary['n_opportunities']} "
+        f"max_pos_err={summary['max_pos_err'] if summary['max_pos_err'] is not None else '-'}"
+    ]
+    labels = (
+        ("recorded", "recorded (a)"),
+        ("scripted", "scripted (b)"),
+        ("inert", "inert    (c)"),
+        ("diff_scripted_minus_recorded", "diff (b)-(a)"),
+    )
+    for key, label in labels:
+        v = summary["variants"][key]
+        lines.append(
+            f"  {label}: pickup={census._fmt_d(v['pickup'], 3)} | "
+            f"gk_rew={census._fmt_d(v['gk_reward'], 3)} | "
+            f"team_rew={census._fmt_d(v['team_reward'], 3)}"
+        )
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Hold-vs-kick rollouts
+# ----------------------------------------------------------------------------
+def find_hold_decisions(trace: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    """Eligible outfield holding decisions (`hold_t >= 0.08`, >= 3 s apart) with pressure and third."""
+    holder = np.asarray(trace["holder"], dtype=np.int64)
+    hold_t = np.asarray(trace["hold_t"], dtype=np.float64)
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    side = np.asarray(trace["side"], dtype=np.int64)
+    n = int(holder.size)
+
+    eligible = (holder >= 0) & (holder % TEAM_SIZE != 0) & (hold_t >= HOLD_MIN_HOLD_S)
+    points: List[Dict[str, Any]] = []
+    last_step = -SPACING_STEPS - 1
+    for step in np.flatnonzero(eligible).tolist():
+        if step - last_step < SPACING_STEPS:
+            continue
+        last_step = step
+        h = int(holder[step])
+        team = h // TEAM_SIZE
+        opp_slice = slice(TEAM_SIZE, 2 * TEAM_SIZE) if team == 0 else slice(0, TEAM_SIZE)
+        d_opp = float(
+            np.min(np.hypot(pos[step, opp_slice, 0] - pos[step, h, 0], pos[step, opp_slice, 1] - pos[step, h, 1]))
+        )
+        if d_opp < PRESSURE_NEAR:
+            pressure = "lt70"
+        elif d_opp >= PRESSURE_FAR:
+            pressure = "ge120"
+        else:
+            pressure = "mid"
+        canon_x = float(ball[step, 0]) if int(side[step, team]) == 0 else (FIELD_WIDTH - float(ball[step, 0]))
+        if canon_x < PITCH_THIRD:
+            third = "defensive"
+        elif canon_x < 2.0 * PITCH_THIRD:
+            third = "middle"
+        else:
+            third = "attacking"
+        points.append({
+            "step": step,
+            "holder": h,
+            "team": team,
+            "nearest_opp": d_opp,
+            "pressure": pressure,
+            "third": third,
+        })
+    return points
+
+
+def _non_shaping_rewards(env: Any, rew: np.ndarray) -> np.ndarray:
+    """Step reward minus `last_shaping_rewards` when exposed, else breakdown `r_sparse`."""
+    if hasattr(env, "last_shaping_rewards"):
+        return np.asarray(rew, dtype=np.float64) - np.asarray(env.last_shaping_rewards, dtype=np.float64)
+    bd = getattr(env, "last_rew_breakdown", None)
+    if bd is not None:
+        return np.array([float(row["r_sparse"]) for row in bd], dtype=np.float64)
+    raise AttributeError("environment exposes neither last_shaping_rewards nor last_rew_breakdown")
+
+
+def _snapshot_step_state(env: Any) -> Dict[str, Any]:
+    stats = env.stats
+    return {
+        "score": (int(stats["score"][0]), int(stats["score"][1])),
+        "own_goals": int(stats.get("own_goals", 0)),
+        "team_assists": (
+            int(stats.get("team_assists", (0, 0))[0]),
+            int(stats.get("team_assists", (0, 0))[1]),
+        ),
+        "field_5s": int(stats.get("field_5s_violations", 0)),
+        "keeper_5s": int(stats.get("keeper_5s_violations", 0)),
+        "failed_tackles": int(stats.get("failed_tackles", 0)),
+        "shots": (int(stats.get("shots", (0, 0))[0]), int(stats.get("shots", (0, 0))[1])),
+        "team_passes": (int(stats.get("team_passes", (0, 0))[0]), int(stats.get("team_passes", (0, 0))[1])),
+        "team_saves": (int(stats.get("team_saves", (0, 0))[0]), int(stats.get("team_saves", (0, 0))[1])),
+        "holder": env.ball_holder,
+        "turnover_t": float(env.last_turnover_reward_time),
+        "tackle_cd": np.asarray(env.tackle_cooldown, dtype=np.float64).copy(),
+        "stun": np.asarray(env.stun_timer, dtype=np.float64).copy(),
+    }
+
+
+def _attribute_sparse_components(
+    pre: Dict[str, Any],
+    env: Any,
+    act: np.ndarray,
+    r_ns: np.ndarray,
+    team: int,
+) -> Dict[str, float]:
+    """Decompose `team`'s mean non-shaping reward for one step across sparse categories."""
+    opp = 1 - team
+    team_mean_ns = float(np.mean(r_ns[team * TEAM_SIZE : (team + 1) * TEAM_SIZE]))
+    stats = env.stats
+    rew_cfg = env.cfg.rewards
+    mech_cfg = env.cfg.mechanics
+    dt = float(env.cfg.physics.dt)
+
+    # 1. Goal
+    goal = 0.0
+    d_score_for = int(stats["score"][team]) - pre["score"][team]
+    d_score_opp = int(stats["score"][opp]) - pre["score"][opp]
+    d_own = int(stats.get("own_goals", 0)) - pre["own_goals"]
+    d_assist_for = int(stats.get("team_assists", (0, 0))[team]) - pre["team_assists"][team]
+    if d_score_for > 0:
+        goal += d_score_for * float(rew_cfg.goal_team_shared)
+        if d_own == 0:
+            goal += (float(rew_cfg.goal_scorer_ind) / TEAM_SIZE) + d_assist_for * (
+                float(rew_cfg.goal_assist_ind) / TEAM_SIZE
+            )
+    if d_score_opp > 0:
+        goal += d_score_opp * float(rew_cfg.goal_concede_team_shared)
+        if d_own > 0:
+            goal += float(rew_cfg.own_goal_ind) / TEAM_SIZE
+
+    # 2. 5-second violation
+    five_s = 0.0
+    d_f5 = int(stats.get("field_5s_violations", 0)) - pre["field_5s"]
+    d_k5 = int(stats.get("keeper_5s_violations", 0)) - pre["keeper_5s"]
+    if d_f5 > 0 and pre["holder"] is not None and (pre["holder"] // TEAM_SIZE) == team:
+        five_s += (float(rew_cfg.field_5s_violation_ind) / TEAM_SIZE) + float(rew_cfg.field_5s_violation_team)
+    if d_k5 > 0 and pre["holder"] is not None and (pre["holder"] // TEAM_SIZE) == team:
+        five_s += float(rew_cfg.keeper_5s_violation_ind) / TEAM_SIZE
+
+    # 3. Failed tackle
+    failed_tackle = 0.0
+    d_ft = int(stats.get("failed_tackles", 0)) - pre["failed_tackles"]
+    if d_ft > 0:
+        tackle_cd = np.asarray(env.tackle_cooldown, dtype=np.float64)
+        stun = np.asarray(env.stun_timer, dtype=np.float64)
+        n_ft_team = 0
+        for i in range(team * TEAM_SIZE, (team + 1) * TEAM_SIZE):
+            if (
+                i % TEAM_SIZE != 0
+                and act[i, 3] > mech_cfg.special_trigger_threshold
+                and pre["tackle_cd"][i] <= 4.0 * dt + 1e-9
+                and tackle_cd[i] > 0.5
+                and 0.5 < (stun[i] - pre["stun"][i]) <= mech_cfg.tackle_miss_stun_time + 1e-6
+            ):
+                n_ft_team += 1
+        failed_tackle = n_ft_team * (float(rew_cfg.failed_tackle_ind) / TEAM_SIZE)
+
+    # 4. Shot on target (if not immediately clawed back by a save in the same RL step)
+    sot = 0.0
+    d_shots_for = int(stats.get("shots", (0, 0))[team]) - pre["shots"][team]
+    d_shots_opp = int(stats.get("shots", (0, 0))[opp]) - pre["shots"][opp]
+    d_saves_for = int(stats.get("team_saves", (0, 0))[team]) - pre["team_saves"][team]
+    d_saves_opp = int(stats.get("team_saves", (0, 0))[opp]) - pre["team_saves"][opp]
+    if d_shots_for == 1 and d_shots_opp == 0 and d_saves_opp == 0:
+        sot = (float(getattr(env, "last_shot_sot_reward", 0.0)) / TEAM_SIZE) + float(
+            getattr(env, "last_shot_team_reward", 0.0)
+        )
+
+    # 5. Remainder: turnover, pass_bonus, save, other
+    rem = team_mean_ns - (goal + five_s + failed_tackle + sot)
+    pass_active = int(stats.get("team_passes", (0, 0))[team]) > pre["team_passes"][team]
+    save_active = (d_saves_for > 0) or (d_saves_opp > 0)
+    stun = np.asarray(env.stun_timer, dtype=np.float64)
+    strip_stun = float(mech_cfg.keeper_strip_stun_duration)
+    gk_strip_victim = next(
+        (
+            i
+            for i in range(2 * TEAM_SIZE)
+            if (i % TEAM_SIZE != 0)
+            and 0.25 * strip_stun < (stun[i] - pre["stun"][i])
+            and stun[i] <= strip_stun + 1e-6
+        ),
+        None,
+    )
+    gk_strip = (
+        (
+            pre["holder"] is not None
+            and env.ball_holder in (0, TEAM_SIZE)
+            and (env.ball_holder // TEAM_SIZE) != (pre["holder"] // TEAM_SIZE)
+        )
+        or gk_strip_victim is not None
+    )
+    turnover_active = (float(env.last_turnover_reward_time) != pre["turnover_t"]) or gk_strip
+
+    turnover = 0.0
+    pass_bonus = 0.0
+    save = 0.0
+    other = 0.0
+    if abs(rem) > 1e-9:
+        n_active = int(pass_active) + int(save_active) + int(turnover_active)
+        if n_active == 1:
+            if pass_active:
+                pass_bonus = rem
+            elif save_active:
+                save = rem
+            else:
+                turnover = rem
+        elif turnover_active and pass_active and not save_active:
+            # Turnover magnitude is fixed zero-sum (+-0.316667); attribute remainder to pass_bonus.
+            unit_to = float(rew_cfg.successful_tackle_tackler_ind) / TEAM_SIZE + float(rew_cfg.successful_tackle_team)
+            if env.ball_holder is not None:
+                won = (env.ball_holder // TEAM_SIZE) == team
+            elif gk_strip_victim is not None:
+                won = (gk_strip_victim // TEAM_SIZE) != team
+            else:
+                won = env.last_ball_team == team
+            sign = 1.0 if won else -1.0
+            turnover = sign * unit_to
+            pass_bonus = rem - turnover
+        elif save_active:
+            save = rem
+        elif pass_active:
+            pass_bonus = rem
+        elif turnover_active:
+            turnover = rem
+        else:
+            other = rem
+
+    return {
+        "turnover": turnover,
+        "pass_bonus": pass_bonus,
+        "shot_on_target": sot,
+        "goal": goal,
+        "failed_tackle": failed_tackle,
+        "five_s_rule": five_s,
+        "save": save,
+        "other": other,
+    }
+
+
+def _team_action_and_value(
+    policy: Optional[harness.TeamPolicy],
+    env: Any,
+    team: int,
+    obs: np.ndarray,
+    cen: np.ndarray,
+    mode: str,
+    sigma_scale: float,
+    gen: torch.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if policy is None:
+        from football_rl.baselines import scripted_actions
+
+        return scripted_actions(env, team), np.zeros(TEAM_SIZE, dtype=np.float32)
+    sl = slice(team * TEAM_SIZE, (team + 1) * TEAM_SIZE)
+    act, val, _ = policy.act(obs[sl], cen[sl], mode, sigma_scale, gen)
+    return act, val
+
+
+def _roll_single_branch(
+    snap: Any,
+    *,
+    holder_player: int,
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    branch_seed: int,
+    mode: str,
+    sigma_scale: float,
+    horizons: Sequence[int],
+    override_steps: int,
+    override_value: Optional[float],
+    after_step: Optional[Callable[[int, Any], None]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    env = copy.deepcopy(snap)
+    holder_team = holder_player // TEAM_SIZE
+    opp_team = 1 - holder_team
+    sl = slice(holder_team * TEAM_SIZE, (holder_team + 1) * TEAM_SIZE)
+
+    gamma = float(env.cfg.ppo.gamma)
+    max_h = max(horizons)
+    sorted_h = sorted(set(int(h) for h in horizons))
+
+    gen = torch.Generator().manual_seed(int(branch_seed))
+    obs = env._get_observations_array()
+    cen = env.get_centralized_state()
+    start_score = (int(env.stats["score"][0]), int(env.stats["score"][1]))
+
+    disc_ns = 0.0
+    disc_full = 0.0
+    comp_sums = {k: 0.0 for k in COMPONENT_KEYS}
+    team_ball_1s: Optional[float] = None
+    horizon_out: Dict[int, Dict[str, Any]] = {}
+    done_at: Optional[int] = None
+
+    for k in range(max_h):
+        act_a, val_a = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        act_b, val_b = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        val = np.concatenate([val_a, val_b])
+
+        # Record critic bootstrap at any completed horizon k before applying step k's override
+        if k in horizon_out:
+            raise RuntimeError(f"duplicate horizon {k}")
+        if k in sorted_h:
+            boot = (gamma ** k) * float(np.mean(val[sl]))
+            horizon_out[k] = {
+                "non_shaping_return": disc_ns,
+                "full_return_bootstrap": disc_full + boot,
+                "p_team_ball_1s": float(team_ball_1s) if team_ball_1s is not None else 0.0,
+                "p_goal_for": 1.0 if int(env.stats["score"][holder_team]) > start_score[holder_team] else 0.0,
+                "p_goal_against": 1.0 if int(env.stats["score"][opp_team]) > start_score[opp_team] else 0.0,
+                "components": dict(comp_sums),
+            }
+
+        act = np.concatenate([act_a, act_b])
+        if override_value is not None and k < override_steps:
+            act[holder_player, 2] = float(override_value)
+
+        pre = _snapshot_step_state(env)
+        obs, cen, rew, done, _ = env.step_array(act, val)
+        if after_step is not None:
+            after_step(k, env)
+
+        r_ns = _non_shaping_rewards(env, rew)
+        w = gamma ** k
+        disc_ns += w * float(np.mean(r_ns[sl]))
+        disc_full += w * float(np.mean(np.asarray(rew, dtype=np.float64)[sl]))
+
+        step_comps = _attribute_sparse_components(pre, env, act, r_ns, holder_team)
+        for ck, cv in step_comps.items():
+            comp_sums[ck] += w * cv
+
+        if k == ONE_SECOND_STEPS - 1 or (done and team_ball_1s is None):
+            team_ball_1s = 1.0 if (env.ball_holder is not None and (env.ball_holder // TEAM_SIZE) == holder_team) else 0.0
+
+        if done:
+            done_at = k + 1
+            break
+
+    # Finalise horizons >= steps actually run
+    final_steps = done_at if done_at is not None else max_h
+    if done_at is None:
+        _, val_a_end = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        _, val_b_end = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        val_end = np.concatenate([val_a_end, val_b_end])
+        end_boot_val = float(np.mean(val_end[sl]))
+    else:
+        end_boot_val = 0.0
+
+    goal_for_final = 1.0 if int(env.stats["score"][holder_team]) > start_score[holder_team] else 0.0
+    goal_against_final = 1.0 if int(env.stats["score"][opp_team]) > start_score[opp_team] else 0.0
+    ball_1s_final = float(team_ball_1s) if team_ball_1s is not None else 0.0
+
+    for h in sorted_h:
+        if h not in horizon_out:
+            boot = (gamma ** final_steps) * end_boot_val if done_at is None else 0.0
+            horizon_out[h] = {
+                "non_shaping_return": disc_ns,
+                "full_return_bootstrap": disc_full + boot,
+                "p_team_ball_1s": ball_1s_final,
+                "p_goal_for": goal_for_final,
+                "p_goal_against": goal_against_final,
+                "components": dict(comp_sums),
+            }
+    return horizon_out
+
+
+def roll_hold_branches(
+    snap: Any,
+    *,
+    holder_player: int,
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    branch_seed: int,
+    mode: str = "sampled",
+    sigma_scale: float = 1.0,
+    horizons: Sequence[int] = HOLD_HORIZONS,
+    kick_steps: int = KICK_OVERRIDE_STEPS,
+    hold_steps: int = HOLD_OVERRIDE_STEPS,
+    identical_override: bool = False,
+    after_kick_step: Optional[Callable[[int, Any], None]] = None,
+    after_hold_step: Optional[Callable[[int, Any], None]] = None,
+) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """Roll paired KICK and HOLD branches from `snap` with identical generator seeds."""
+    kick_val = None if identical_override else 1.0
+    kick_n = 0 if identical_override else kick_steps
+    hold_val = None if identical_override else -1.0
+    hold_n = 0 if identical_override else hold_steps
+
+    kick_res = _roll_single_branch(
+        snap,
+        holder_player=holder_player,
+        team_a=team_a,
+        team_b=team_b,
+        branch_seed=branch_seed,
+        mode=mode,
+        sigma_scale=sigma_scale,
+        horizons=horizons,
+        override_steps=kick_n,
+        override_value=kick_val,
+        after_step=after_kick_step,
+    )
+    hold_res = _roll_single_branch(
+        snap,
+        holder_player=holder_player,
+        team_a=team_a,
+        team_b=team_b,
+        branch_seed=branch_seed,
+        mode=mode,
+        sigma_scale=sigma_scale,
+        horizons=horizons,
+        override_steps=hold_n,
+        override_value=hold_val,
+        after_step=after_hold_step,
+    )
+
+    diff_res: Dict[int, Dict[str, Any]] = {}
+    for h in sorted(set(int(x) for x in horizons)):
+        kh, hh = kick_res[h], hold_res[h]
+        diff_res[h] = {
+            metric: hh[metric] - kh[metric]
+            for metric in (
+                "non_shaping_return",
+                "full_return_bootstrap",
+                "p_team_ball_1s",
+                "p_goal_for",
+                "p_goal_against",
+            )
+        }
+        diff_res[h]["components"] = {
+            ck: hh["components"][ck] - kh["components"][ck] for ck in COMPONENT_KEYS
+        }
+
+    return {"kick": kick_res, "hold": hold_res, "diff": diff_res}
+
+
+_HOLD_POLICIES: Optional[Tuple[Optional[harness.TeamPolicy], Optional[harness.TeamPolicy]]] = None
+_HOLD_SPEC_CFG: Optional[Tuple[str, float, Optional[str]]] = None
+
+
+def _init_hold_worker(spec: harness.EvalSpec, shaping_mode: Optional[str]) -> None:
+    global _HOLD_POLICIES, _HOLD_SPEC_CFG
+    torch.set_num_threads(1)
+    spec.validate()
+    _HOLD_POLICIES = harness._load_policies(spec)
+    _HOLD_SPEC_CFG = (spec.mode, float(spec.sigma_scale), shaping_mode)
+
+
+def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
+    match_idx, path_str, trace_seed, rollout_seed = task
+    assert _HOLD_POLICIES is not None and _HOLD_SPEC_CFG is not None
+    team_a, team_b = _HOLD_POLICIES
+    mode, sigma_scale, shaping_mode = _HOLD_SPEC_CFG
+
+    trace = _load_trace(Path(path_str))
+    pts = find_hold_decisions(trace)
+    target_steps = [p["step"] for p in pts]
+    ok, max_err, snapshots = resimulate_match(
+        trace,
+        match_seed=trace_seed * 1000 + match_idx,
+        target_steps=target_steps,
+        shaping_mode=shaping_mode,
+    )
+    if not ok:
+        return {"ok": False, "max_err": max_err, "records": []}
+
+    records = []
+    for p in pts:
+        step = p["step"]
+        branch_seed = (rollout_seed * 1_000_003 + match_idx * 10_000 + step) & 0x7FFF_FFFF
+        res = roll_hold_branches(
+            snapshots[step],
+            holder_player=p["holder"],
+            team_a=team_a,
+            team_b=team_b,
+            branch_seed=branch_seed,
+            mode=mode,
+            sigma_scale=sigma_scale,
+            horizons=HOLD_HORIZONS,
+        )
+        records.append({
+            "match_idx": match_idx,
+            "step": step,
+            "holder": p["holder"],
+            "team": p["team"],
+            "nearest_opp": p["nearest_opp"],
+            "pressure": p["pressure"],
+            "third": p["third"],
+            "rollout": res,
+        })
+    return {"ok": True, "max_err": max_err, "records": records}
+
+
+def _summarize_hold_bucket(records: Sequence[Dict[str, Any]], h: int) -> Dict[str, Any]:
+    scalar_metrics = (
+        "non_shaping_return",
+        "full_return_bootstrap",
+        "p_team_ball_1s",
+        "p_goal_for",
+        "p_goal_against",
+    )
+    out: Dict[str, Any] = {"n": len(records)}
+    for m in scalar_metrics:
+        out[m] = _stat_dict(r["rollout"]["diff"][h][m] for r in records)
+    out["components"] = {
+        ck: _stat_dict(r["rollout"]["diff"][h]["components"][ck] for r in records)
+        for ck in COMPONENT_KEYS
+    }
+    return out
+
+
+def summarize_hold(
+    records: Sequence[Dict[str, Any]],
+    n_matches_total: int,
+    n_matches_ok: int,
+    n_matches_skipped: int,
+    max_pos_err: Optional[float],
+    *,
+    seed: int,
+) -> Dict[str, Any]:
+    buckets = {
+        "overall": lambda r: True,
+        "pressure_lt70": lambda r: r["pressure"] == "lt70",
+        "pressure_ge120": lambda r: r["pressure"] == "ge120",
+        "pressure_mid": lambda r: r["pressure"] == "mid",
+        "third_defensive": lambda r: r["third"] == "defensive",
+        "third_middle": lambda r: r["third"] == "middle",
+        "third_attacking": lambda r: r["third"] == "attacking",
+    }
+    horizons_out: Dict[str, Any] = {}
+    for h in HOLD_HORIZONS:
+        horizons_out[str(h)] = {
+            b_name: _summarize_hold_bucket([r for r in records if pred(r)], h)
+            for b_name, pred in buckets.items()
+        }
+    return {
+        "mode": "hold",
+        "seed": seed,
+        "n_matches_total": n_matches_total,
+        "n_matches_ok": n_matches_ok,
+        "n_matches_skipped": n_matches_skipped,
+        "max_pos_err": max_pos_err,
+        "n_decisions": len(records),
+        "horizons": horizons_out,
+    }
+
+
+def run_hold(
+    *,
+    trace_dir: Path | str,
+    checkpoint_dir: Optional[Path | str],
+    opponent: str = "self",
+    swap: bool = False,
+    mode: str = "sampled",
+    sigma_scale: float = 1.0,
+    trace_seed: Optional[int] = None,
+    seed: int = 1,
+    max_matches: Optional[int] = None,
+    workers: int = 1,
+    shaping_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    if workers <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    spec = harness.EvalSpec(
+        checkpoint_dir=str(checkpoint_dir) if checkpoint_dir is not None else None,
+        opponent=opponent,
+        mode=mode,
+        n=1,
+        seed=int(seed),
+        sigma_scale=float(sigma_scale),
+        swap=bool(swap),
+        workers=int(workers),
+    )
+    spec.validate()
+    t_seed = _resolve_trace_seed(trace_dir, trace_seed)
+    items = _trace_paths_with_indices(trace_dir, max_matches=max_matches)
+    tasks = [(idx, str(path), t_seed, int(seed)) for idx, path in items]
+
+    if workers == 1 or len(tasks) == 1:
+        prev_threads = torch.get_num_threads()
+        try:
+            _init_hold_worker(spec, shaping_mode)
+            outputs = [_hold_worker(t) for t in tasks]
+        finally:
+            torch.set_num_threads(prev_threads)
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(min(workers, len(tasks)), initializer=_init_hold_worker, initargs=(spec, shaping_mode)) as pool:
+            outputs = list(pool.map(_hold_worker, tasks, chunksize=1))
+
+    records: List[Dict[str, Any]] = []
+    n_ok = 0
+    n_skipped = 0
+    max_err: Optional[float] = None
+    for res in outputs:
+        if res["ok"]:
+            n_ok += 1
+            records.extend(res["records"])
+            err = float(res["max_err"])
+            max_err = err if max_err is None else max(max_err, err)
+        else:
+            n_skipped += 1
+    return summarize_hold(records, len(tasks), n_ok, n_skipped, max_err, seed=int(seed))
+
+
+def format_hold_report(summary: Dict[str, Any], title: str = "") -> str:
+    header = f"===== rollouts hold {title}".strip()
+    lines = [
+        f"{header}  matches ok={summary['n_matches_ok']}/{summary['n_matches_total']} "
+        f"skipped={summary['n_matches_skipped']} n_decisions={summary['n_decisions']} "
+        f"seed={summary['seed']} max_pos_err={summary['max_pos_err'] if summary['max_pos_err'] is not None else '-'}"
+    ]
+    bucket_order = (
+        ("overall", "overall"),
+        ("pressure_lt70", "opp < 70 u"),
+        ("pressure_ge120", "opp >= 120 u"),
+        ("third_defensive", "defensive 1/3"),
+        ("third_middle", "middle 1/3"),
+        ("third_attacking", "attacking 1/3"),
+    )
+    for h in HOLD_HORIZONS:
+        h_data = summary["horizons"][str(h)]
+        lines.append(f"  -- horizon H={h} ({h * STEP_SECONDS:.0f} s), paired HOLD - KICK --")
+        for b_key, b_label in bucket_order:
+            b = h_data[b_key]
+            comps = ", ".join(f"{ck}={census._fmt_d(b['components'][ck], 4)}" for ck in COMPONENT_KEYS)
+            lines.append(
+                f"    {b_label:15s}: non_shaping={census._fmt_d(b['non_shaping_return'], 4)} | "
+                f"full_boot={census._fmt_d(b['full_return_bootstrap'], 4)} | "
+                f"ball_1s={census._fmt_d(b['p_team_ball_1s'], 3)} | "
+                f"gf={census._fmt_d(b['p_goal_for'], 4)} | ga={census._fmt_d(b['p_goal_against'], 4)}"
+            )
+            lines.append(f"      components: {comps}")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Command line
+# ----------------------------------------------------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    def add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--trace-dir", required=True, help="directory containing m*.npz harness traces (read only)")
+        p.add_argument("--trace-seed", type=int, default=None, help="harness seed used for traces (default: census.json or 11)")
+        p.add_argument("--max-matches", type=int, default=None, help="use only the first N trace files")
+        p.add_argument("--workers", type=int, default=4, help="worker processes")
+        p.add_argument("--shaping-mode", choices=("legacy", "ball", "all"), default=None, help="override env shaping mode")
+        p.add_argument("--out", required=True, help="output .json file or directory (outside protected dirs)")
+
+    p_gk = sub.add_parser("gk", help="counterfactual goalkeeper loose-ball opportunity rollouts")
+    add_common(p_gk)
+    p_gk.add_argument("--checkpoint-dir", default=None, help="optional checkpoint directory (read only)")
+
+    p_hold = sub.add_parser("hold", help="counterfactual hold-vs-kick rollouts from eligible holding decisions")
+    add_common(p_hold)
+    p_hold.add_argument("--checkpoint-dir", required=True, help="checkpoint directory with blue_*/red_* policies (read only)")
+    p_hold.add_argument("--opp", default="self", help="self | scripted | scripted2 | frozen:DIR")
+    p_hold.add_argument("--mode", default="sampled", choices=harness.MODES)
+    p_hold.add_argument("--sigma-scale", type=float, default=1.0)
+    p_hold.add_argument("--swap", action="store_true", help="team A plays red_*, team B plays blue_*")
+    p_hold.add_argument("--seed", type=int, default=1, help="rollout RNG seed")
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    protected: List[Path | str] = [args.trace_dir]
+    if getattr(args, "checkpoint_dir", None):
+        protected.append(args.checkpoint_dir)
+    opp = getattr(args, "opp", "self")
+    if isinstance(opp, str) and opp.startswith("frozen:"):
+        protected.append(opp.split(":", 1)[1])
+
+    out_path = _validate_out_path(args.out, protected)
+
+    if args.command == "gk":
+        summary = run_gk(
+            trace_dir=args.trace_dir,
+            trace_seed=args.trace_seed,
+            max_matches=args.max_matches,
+            workers=args.workers,
+            shaping_mode=args.shaping_mode,
+        )
+        rep = format_gk_report(summary, title=str(args.trace_dir))
+    else:
+        summary = run_hold(
+            trace_dir=args.trace_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            opponent=args.opp,
+            swap=args.swap,
+            mode=args.mode,
+            sigma_scale=args.sigma_scale,
+            trace_seed=args.trace_seed,
+            seed=args.seed,
+            max_matches=args.max_matches,
+            workers=args.workers,
+            shaping_mode=args.shaping_mode,
+        )
+        rep = format_hold_report(summary, title=str(args.trace_dir))
+
+    _write_outputs(out_path, summary, rep)
+    print(rep)
+    return 0
+
+
+if __name__ == "__main__":  # required: spawned workers re-import this module
+    raise SystemExit(main())
