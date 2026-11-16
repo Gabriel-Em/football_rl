@@ -6,8 +6,21 @@ Inputs map `{seed: {gen: {tag: census_dict}}}` for an arm and an optional compar
 Supports `--protocol`:
   resume150  guards G1-G5 (consecutive-point rules) and G9'(b)/(c) at gen 1200
   fresh300   guards G1-G5 over the final points (superseded by `fresh`)
-  fresh      requires `--calibration PATH`: C0 catastrophe floors (gens >= 200), G1-G5 relative
-             guards vs calibration anchor, and targets T1-T3 vs `--comparator` or anchor
+  fresh      requires `--calibration PATH`: C0 catastrophe floors (gens >= 200), C0L learning
+             floor (T2 gain from gen 100 to the last generation), G1-G5 relative guards vs
+             calibration anchor, G6 takeoff (with `--history`), and targets T1-T3 vs
+             `--comparator` or anchor; T2 is the primary target
+
+C0 floors (per arm seed, gens >= 200, strict; `gk_*` rows apply to each keeper):
+  hold_share_pooled < 0.05      holder_spell_s_pooled < 0.15
+  gk_in_box_A/B < 0.80          gk_goal_line_A/B > 0.60
+  n_within_100_pooled > 1.00    cluster_ge4_pooled > 0.30
+  role_inversion_pooled > 0.55  goals_total < 0.40 or > 5.0      scoreless > 0.70
+C0L: T2(last) - T2(100) < 0.50 fails, where T2 is the mean `goal_diff` of `vs_frozen` and
+`vs_frozen_red`; not evaluated unless generation 100 is in `--gens` and is not the last one.
+G6: fails if more than half of the arm seeds have no takeoff (`training_progress.takeoff_generation`
+with its default threshold and window) in their `--history`; not evaluated unless every arm seed
+has a history.
 
 Computes `delta = arm - comparator`, `SE(delta) = sqrt(SE_a^2 + SE_c^2)`, `*` when
 `|delta| > 2 * SE(delta)`, and between-seed SDs / ranges when >= 2 seeds are supplied.
@@ -16,7 +29,12 @@ Usage:
   python tools/audit/gates.py --arm [SEED=]DIR ... [--comparator [SEED=]DIR ...]
          [--tag self_sampled] [--gens 1100 1150 1200]
          [--protocol {resume150,fresh300,fresh}] [--calibration PATH]
+         [--history SEED=PATH ...] [--exit-on-c0]
          [--target KEY@TAG:higher|lower:DELTA] [--json OUT] [--md OUT]
+
+`--history`, `--calibration` and `--exit-on-c0` belong to `--protocol fresh`; with another protocol
+they are an error. With `--exit-on-c0` the exit status is 2 when C0, C0L or G6 failed (a gate that
+was not evaluated does not count) and 0 otherwise.
 """
 
 from __future__ import annotations
@@ -33,10 +51,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.audit import census  # noqa: E402
+from tools.audit import census, training_progress  # noqa: E402
 
 __all__ = [
     "PROTOCOLS",
+    "LEARNING_FLOOR_GAIN",
+    "TAKEOFF_FAIL_SHARE",
+    "PRIMARY_TARGET",
     "TargetSpec",
     "parse_target_spec",
     "delta_stat",
@@ -52,7 +73,7 @@ PROTOCOLS = ("resume150", "fresh300", "fresh")
 _GEN_RE = re.compile(r"(\d+)$")
 
 CATASTROPHE_SPECS: List[Tuple[str, str, Callable[[float], bool]]] = [
-    ("hold_share_pooled", "< 0.10", lambda v: v < 0.10),
+    ("hold_share_pooled", "< 0.05", lambda v: v < 0.05),
     ("holder_spell_s_pooled", "< 0.15", lambda v: v < 0.15),
     ("gk_in_box_A", "< 0.80", lambda v: v < 0.80),
     ("gk_in_box_B", "< 0.80", lambda v: v < 0.80),
@@ -61,9 +82,16 @@ CATASTROPHE_SPECS: List[Tuple[str, str, Callable[[float], bool]]] = [
     ("n_within_100_pooled", "> 1.00", lambda v: v > 1.00),
     ("cluster_ge4_pooled", "> 0.30", lambda v: v > 0.30),
     ("role_inversion_pooled", "> 0.55", lambda v: v > 0.55),
-    ("goals_total", "< 0.8 or > 5.0", lambda v: v < 0.8 or v > 5.0),
-    ("scoreless", "> 0.40", lambda v: v > 0.40),
+    ("goals_total", "< 0.40 or > 5.0", lambda v: v < 0.40 or v > 5.0),
+    ("scoreless", "> 0.70", lambda v: v > 0.70),
 ]
+
+LEARNING_FLOOR_GAIN = 0.50
+LEARNING_FLOOR_METRIC = "goal_diff"
+LEARNING_FLOOR_FIRST_GEN = "100"
+TAKEOFF_FAIL_SHARE = 0.5
+PRIMARY_TARGET = "T2"
+INFORMATIONAL_TARGETS: Dict[str, str] = {"T1": "informational at gen 300"}
 
 FRESH_GUARD_GROUPS: List[Tuple[str, str, List[str]]] = [
     ("G1", "ball holding (relative)", ["hold_share_pooled", "holder_spell_s_pooled"]),
@@ -90,6 +118,8 @@ FRESH_TARGET_TAGS: Dict[str, Tuple[str, ...]] = {
     "T2": ("vs_frozen", "vs_frozen_red"),
     "T3": ("self_sampled",),
 }
+
+FRESH_TARGET_DIRECTION: Dict[str, str] = {"T1": "higher", "T2": "higher", "T3": "higher"}
 
 FRESH_INFO_METRICS: List[str] = [
     "hold_share_A", "hold_share_B",
@@ -465,7 +495,25 @@ def _require_seed_metric(
     return val
 
 
-def _validate_calibration(calibration: Dict[str, Any]) -> None:
+def _check_calibration_entry(kind: str, name: str, entry: Dict[str, Any], min_seeds: int) -> None:
+    """Reject an entry with fewer than `min_seeds` anchor seeds or a delta that is not finite, positive and >= its floor."""
+    per_seed = entry.get("per_seed")
+    n_seeds = len(per_seed) if isinstance(per_seed, dict) else 0
+    if n_seeds < min_seeds:
+        raise ValueError(f"calibration {kind} {name!r} has {n_seeds} anchor seeds; at least {min_seeds} are required")
+    delta, floor = entry.get("delta"), entry.get("floor")
+    for label, value in (("delta", delta), ("floor", floor)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"calibration {kind} {name!r} {label} must be a number, got {value!r}")
+    if not math.isfinite(delta) or delta <= 0.0:
+        raise ValueError(f"calibration {kind} {name!r} delta must be finite and > 0, got {delta!r}")
+    if delta < floor:
+        raise ValueError(f"calibration {kind} {name!r} delta {delta!r} is below its floor {floor!r}")
+
+
+def _validate_calibration(calibration: Dict[str, Any], tag: str) -> None:
+    from tools.audit.calibrate import MIN_ANCHOR_SEEDS  # deferred: calibrate imports this module
+
     guards = calibration.get("guards")
     if not isinstance(guards, dict) or set(guards) != set(FRESH_GUARD_WORSE):
         got = sorted(guards) if isinstance(guards, dict) else type(guards).__name__
@@ -477,6 +525,11 @@ def _validate_calibration(calibration: Dict[str, Any]) -> None:
             raise ValueError(
                 f"calibration guard {metric!r} worse mismatch: expected {expected_worse!r}, got {actual_worse!r}"
             )
+        if g_entry.get("tag") != tag:
+            raise ValueError(
+                f"calibration guard {metric!r} tag {g_entry.get('tag')!r} does not match the --tag in use {tag!r}"
+            )
+        _check_calibration_entry("guard", metric, g_entry, MIN_ANCHOR_SEEDS)
     targets = calibration.get("targets")
     if not isinstance(targets, dict) or set(targets) != set(FRESH_TARGET_TAGS):
         got_t = sorted(targets) if isinstance(targets, dict) else type(targets).__name__
@@ -488,6 +541,12 @@ def _validate_calibration(calibration: Dict[str, Any]) -> None:
             raise ValueError(
                 f"calibration target {tid!r} tags mismatch: expected {expected_tags!r}, got {actual_tags!r}"
             )
+        if t_entry.get("direction") != FRESH_TARGET_DIRECTION[tid]:
+            raise ValueError(
+                f"calibration target {tid!r} direction mismatch: expected {FRESH_TARGET_DIRECTION[tid]!r}, "
+                f"got {t_entry.get('direction')!r}"
+            )
+        _check_calibration_entry("target", tid, t_entry, MIN_ANCHOR_SEEDS)
 
 
 def _multi_tag_per_seed(
@@ -505,6 +564,71 @@ def _multi_tag_per_seed(
     return out
 
 
+def _evaluate_learning_floor(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    eval_gens: List[str],
+) -> Dict[str, Any]:
+    """C0L: per arm seed, T2 at the last generation minus T2 at generation 100 must be >= `LEARNING_FLOOR_GAIN`."""
+    last_gen = eval_gens[-1]
+    out: Dict[str, Any] = {
+        "description": "learning floor (T2 gain from gen 100 to the last gen)",
+        "rule": f"T2(last) - T2({LEARNING_FLOOR_FIRST_GEN}) < {LEARNING_FLOOR_GAIN:.2f}",
+        "passed": None,
+        "per_seed": {},
+        "note": "",
+    }
+    if LEARNING_FLOOR_FIRST_GEN not in eval_gens:
+        out["note"] = f"not evaluated: gen {LEARNING_FLOOR_FIRST_GEN} not in --gens"
+        return out
+    if last_gen == LEARNING_FLOOR_FIRST_GEN:
+        out["note"] = f"not evaluated: the last generation is {LEARNING_FLOOR_FIRST_GEN}"
+        return out
+    tags = FRESH_TARGET_TAGS["T2"]
+    first = _multi_tag_per_seed(arm_norm, LEARNING_FLOOR_FIRST_GEN, tags, LEARNING_FLOOR_METRIC, role="arm")
+    last = _multi_tag_per_seed(arm_norm, last_gen, tags, LEARNING_FLOOR_METRIC, role="arm")
+    for seed in sorted(arm_norm):
+        gain = last[seed] - first[seed]
+        out["per_seed"][seed] = {
+            "t_first": first[seed],
+            "t_last": last[seed],
+            "gain": gain,
+            "passed": not (gain < LEARNING_FLOOR_GAIN),
+        }
+    out["passed"] = all(v["passed"] for v in out["per_seed"].values())
+    return out
+
+
+def _evaluate_takeoff_gate(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    histories: Optional[Dict[str, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """G6: fails if more than `TAKEOFF_FAIL_SHARE` of the arm seeds have no takeoff in their training history."""
+    seeds = sorted(arm_norm)
+    out: Dict[str, Any] = {
+        "description": "takeoff (share of seeds without takeoff)",
+        "rule": f"FAIL if the share of seeds without takeoff > {TAKEOFF_FAIL_SHARE}",
+        "passed": None,
+        "per_seed": {},
+        "history_gens": {},
+        "no_takeoff_seeds": [],
+        "no_takeoff_share": None,
+        "note": "",
+    }
+    have = {str(k): v for k, v in (histories or {}).items()}
+    lacking = [s for s in seeds if s not in have]
+    if lacking:
+        out["note"] = f"not evaluated: no training history for seed(s) {', '.join(lacking)}"
+        return out
+    for seed in seeds:
+        info = training_progress.takeoff_summary(have[seed])
+        out["per_seed"][seed] = info["gen"]
+        out["history_gens"][seed] = [info["first_gen"], info["last_gen"]]
+    out["no_takeoff_seeds"] = [s for s in seeds if out["per_seed"][s] is None]
+    out["no_takeoff_share"] = len(out["no_takeoff_seeds"]) / len(seeds)
+    out["passed"] = not (out["no_takeoff_share"] > TAKEOFF_FAIL_SHARE)
+    return out
+
+
 def _evaluate_fresh(
     arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
     comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
@@ -513,6 +637,7 @@ def _evaluate_fresh(
     parsed_targets: List[TargetSpec],
     calibration: Optional[Dict[str, Any]],
     calibration_path: Optional[str],
+    histories: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if calibration is None:
         raise ValueError("--calibration is required when protocol='fresh'")
@@ -520,7 +645,10 @@ def _evaluate_fresh(
         raise ValueError("at least one generation is required when protocol='fresh'")
     if not arm_norm:
         raise ValueError("at least one arm seed is required when protocol='fresh'")
-    _validate_calibration(calibration)
+    _validate_calibration(calibration, tag)
+    extra = sorted(str(k) for k in (histories or {}) if str(k) not in arm_norm)
+    if extra:
+        raise ValueError(f"history seed(s) {', '.join(extra)} are not arm seeds {sorted(arm_norm)}")
     cal_gen = normalize_gen(calibration["gen"])
     last_gen = eval_gens[-1]
     if last_gen != cal_gen:
@@ -551,6 +679,7 @@ def _evaluate_fresh(
         "passed": None if not c0_has_any else (len(violations) == 0),
         "violations": violations,
     }
+    gates_out["C0L"] = _evaluate_learning_floor(arm_norm, eval_gens)
 
     # G1-G5 relative guards at last_gen against anchor values in calibration
     cal_guards = calibration["guards"]
@@ -608,6 +737,7 @@ def _evaluate_fresh(
             "passed": passed_all,
             "metrics": metrics_out,
         }
+    gates_out["G6"] = _evaluate_takeoff_gate(arm_norm, histories)
 
     # Targets T1-T3 against --comparator if given, else calibration anchor
     targets_out: List[Dict[str, Any]] = []
@@ -641,6 +771,7 @@ def _evaluate_fresh(
 
     return {
         "protocol": "fresh",
+        "primary_target": PRIMARY_TARGET,
         "tag": tag,
         "gens": eval_gens,
         "calibration_path": calibration_path or "<in-memory>",
@@ -662,10 +793,16 @@ def evaluate_gates(
     targets: Optional[Sequence[str | TargetSpec]] = None,
     calibration: Optional[Dict[str, Any]] = None,
     calibration_path: Optional[str] = None,
+    histories: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Evaluate guard and target gates over `arm` (and optional `comparator`)."""
+    """Evaluate guard and target gates over `arm` (and optional `comparator`).
+
+    `histories` maps arm seeds to loaded `training_history.json` dicts and feeds G6 (fresh protocol only).
+    """
     if protocol not in PROTOCOLS:
         raise ValueError(f"protocol must be one of {PROTOCOLS}, got {protocol!r}")
+    if histories and protocol != "fresh":
+        raise ValueError(f"training histories are only used with protocol='fresh', got {protocol!r}")
     parsed_targets = [parse_target_spec(t) for t in (targets or ())]
     arm_norm = _normalize_arm(arm)
     comp_norm = _normalize_arm(comparator) if comparator else None
@@ -685,6 +822,7 @@ def evaluate_gates(
             parsed_targets,
             calibration,
             calibration_path,
+            histories,
         )
 
     gates_out: Dict[str, Any] = {}
@@ -804,12 +942,22 @@ def _append_between_seed_sd(lines: List[str], result: Dict[str, Any]) -> None:
                 lines.append(f"| {gid} | {metric} | {asd} | {csd} |")
 
 
+def _target_label(t: Dict[str, Any]) -> str:
+    if not t.get("id"):
+        return f"{t['key']}@{t['tag']}"
+    if t["id"] == PRIMARY_TARGET:
+        return f"{t['id']} (primary)"
+    if t["id"] in INFORMATIONAL_TARGETS:
+        return f"{t['id']} ({INFORMATIONAL_TARGETS[t['id']]})"
+    return f"{t['id']} ({t['key']}@{t['tag']})"
+
+
 def _append_targets_table(lines: List[str], result: Dict[str, Any]) -> None:
     if result.get("targets"):
         lines.extend(["", "## Targets", "", "| Target | Gen | Dir | Delta min | Arm seeds | Comp seeds | Mean diff | Verdict | Note |", "|---|---|---|---|---|---|---|---|---|"])
         for t in result["targets"]:
             mdiff = "-" if t["mean_diff"] is None else f"{t['mean_diff']:+.3f}"
-            label = f"{t['id']} ({t['key']}@{t['tag']})" if t.get("id") else f"{t['key']}@{t['tag']}"
+            label = _target_label(t)
             lines.append(
                 f"| {label} | {t['gen'] or '-'} | {t['direction']} | {t['delta']:.3f} | "
                 f"{_fmt_seeds(t['arm_per_seed'])} | {_fmt_seeds(t['comp_per_seed'])} | "
@@ -840,6 +988,37 @@ def _format_fresh_markdown(result: Dict[str, Any]) -> str:
     else:
         gens_str = ", ".join(c0["gens_checked"]) if c0["gens_checked"] else "none"
         lines.append(f"No catastrophe floor violations across gens [{gens_str}].")
+
+    c0l = result["gates"]["C0L"]
+    lines.extend(["", "## C0L Learning Floor", ""])
+    if c0l["passed"] is None:
+        lines.append(c0l["note"])
+    else:
+        lines.extend([
+            f"FAIL if T2({last_gen}) - T2({LEARNING_FLOOR_FIRST_GEN}) < {LEARNING_FLOOR_GAIN:.2f}.",
+            "",
+            f"| Seed | T2 at {LEARNING_FLOOR_FIRST_GEN} | T2 at {last_gen} | Gain | Status |",
+            "|---|---|---|---|---|",
+        ])
+        for seed, v in c0l["per_seed"].items():
+            lines.append(
+                f"| {seed} | {v['t_first']:.3f} | {v['t_last']:.3f} | {v['gain']:+.3f} | {_status_str(v['passed'])} |"
+            )
+
+    g6 = result["gates"]["G6"]
+    lines.extend(["", "## Takeoff (G6)", ""])
+    if g6["passed"] is None:
+        lines.append(g6["note"])
+    else:
+        lines.extend(["| Seed | Takeoff gen | History gens |", "|---|---|---|"])
+        for seed, gen in g6["per_seed"].items():
+            first, last = g6["history_gens"][seed]
+            lines.append(f"| {seed} | {'none' if gen is None else gen} | {first}-{last} |")
+        lines.extend([
+            "",
+            f"Seeds without takeoff: {len(g6['no_takeoff_seeds'])} of {len(g6['per_seed'])} "
+            f"(share {g6['no_takeoff_share']:.3f}; FAIL if > {TAKEOFF_FAIL_SHARE}).",
+        ])
 
     lines.extend([
         "",
@@ -928,6 +1107,19 @@ def _parse_seed_dirs(items: Sequence[str], tag: Optional[str]) -> Dict[str, Dict
     return out
 
 
+def _parse_history_args(items: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        seed, sep, path = item.partition("=")
+        seed = seed.strip()
+        if not sep or not seed or not path:
+            raise ValueError(f"--history entries must match SEED=PATH, got {item!r}")
+        if seed in out:
+            raise ValueError(f"duplicate --history seed {seed!r}")
+        out[seed] = json.loads(Path(path).read_text(encoding="utf-8"))
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", nargs="+", required=True, help="[SEED=]DIR entries from evaluate_arm.py")
@@ -936,15 +1128,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--gens", nargs="*", default=None, help="generations to evaluate (e.g. 1100 1150 1200)")
     ap.add_argument("--protocol", choices=PROTOCOLS, default="resume150", help="gate protocol")
     ap.add_argument("--calibration", default=None, help="calibration JSON path (required for --protocol fresh)")
+    ap.add_argument("--history", nargs="+", default=None, help="SEED=PATH training_history.json per arm seed, for G6 (fresh only)")
+    ap.add_argument("--exit-on-c0", action="store_true", help="exit 2 if C0, C0L or G6 failed (fresh only)")
     ap.add_argument("--target", action="append", default=None, help="EBE target KEY@TAG:higher|lower:DELTA (repeatable)")
     ap.add_argument("--json", default=None, help="write JSON gate report here")
     ap.add_argument("--md", default=None, help="write Markdown gate report here")
     args = ap.parse_args(argv)
 
+    if args.protocol != "fresh":
+        for flag, given in (("--calibration", args.calibration), ("--history", args.history), ("--exit-on-c0", args.exit_on_c0)):
+            if given:
+                raise ValueError(f"{flag} requires --protocol fresh, got {args.protocol!r}")
+
     load_tag = None if (args.target or args.protocol == "fresh") else args.tag
     arm_data = _parse_seed_dirs(args.arm, load_tag)
     comp_data = _parse_seed_dirs(args.comparator, load_tag) if args.comparator else None
     cal_data = json.loads(Path(args.calibration).read_text(encoding="utf-8")) if args.calibration else None
+    history_data = _parse_history_args(args.history) if args.history else None
     result = evaluate_gates(
         arm_data,
         comparator=comp_data,
@@ -954,6 +1154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         targets=args.target,
         calibration=cal_data,
         calibration_path=args.calibration,
+        histories=history_data,
     )
     md = format_markdown(result)
     print(md)
@@ -963,6 +1164,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.md:
         Path(args.md).parent.mkdir(parents=True, exist_ok=True)
         Path(args.md).write_text(md, encoding="utf-8")
+    if args.exit_on_c0 and any(result["gates"][g]["passed"] is False for g in ("C0", "C0L", "G6")):
+        return 2
     return 0
 
 

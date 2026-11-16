@@ -1924,7 +1924,7 @@ class TestGatesFreshE3:
     @pytest.mark.parametrize(
         "metric,inside_val,outside_val",
         [
-            ("hold_share_pooled", 0.10, 0.099),
+            ("hold_share_pooled", 0.05, 0.049),
             ("holder_spell_s_pooled", 0.15, 0.149),
             ("gk_in_box_A", 0.80, 0.799),
             ("gk_in_box_B", 0.80, 0.799),
@@ -1933,9 +1933,9 @@ class TestGatesFreshE3:
             ("n_within_100_pooled", 1.00, 1.001),
             ("cluster_ge4_pooled", 0.30, 0.301),
             ("role_inversion_pooled", 0.55, 0.551),
-            ("goals_total", 0.80, 0.799),
+            ("goals_total", 0.40, 0.399),
             ("goals_total", 5.00, 5.001),
-            ("scoreless", 0.40, 0.401),
+            ("scoreless", 0.70, 0.701),
         ],
     )
     def test_catastrophe_floors_all_twelve_bounds(self, metric, inside_val, outside_val):
@@ -1960,35 +1960,35 @@ class TestGatesFreshE3:
 
         cal = _make_fake_calibration()
 
-        # hold share [0.05, 0.15, 0.16] over [100, 200, 300] -> gen 100 ignored -> PASS
+        # hold share [0.02, 0.15, 0.16] over [100, 200, 300] -> gen 100 ignored -> PASS
         pass_100 = {"s42": _fresh_arm_seed({
-            "100": {"hold_share_pooled": 0.05},
+            "100": {"hold_share_pooled": 0.02},
             "200": {"hold_share_pooled": 0.15},
             "300": {"hold_share_pooled": 0.16},
         })}
         assert gates.evaluate_gates(pass_100, gens=["100", "200", "300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is True
 
-        # [0.15, 0.09, 0.16] -> FAIL at 200
+        # [0.15, 0.04, 0.16] -> FAIL at 200
         fail_200 = {"s42": _fresh_arm_seed({
             "100": {"hold_share_pooled": 0.15},
-            "200": {"hold_share_pooled": 0.09},
+            "200": {"hold_share_pooled": 0.04},
             "300": {"hold_share_pooled": 0.16},
         })}
         res_200 = gates.evaluate_gates(fail_200, gens=["100", "200", "300"], protocol="fresh", calibration=cal)
         assert res_200["gates"]["C0"]["passed"] is False
         assert res_200["gates"]["C0"]["violations"][0]["seed"] == "s42"
         assert res_200["gates"]["C0"]["violations"][0]["gen"] == "200"
-        assert res_200["gates"]["C0"]["violations"][0]["value"] == pytest.approx(0.09)
+        assert res_200["gates"]["C0"]["violations"][0]["value"] == pytest.approx(0.04)
 
         # gk_goal_line_B 0.61 at 300 -> FAIL
         fail_gk = {"s42": _fresh_arm_seed({"300": {"gk_goal_line_B": 0.61}})}
         assert gates.evaluate_gates(fail_gk, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is False
 
-        # goals_total 5.1 -> FAIL; exact 0.8 and exact 0.10 hold_share -> PASS
+        # goals_total 5.1 -> FAIL; exact 0.40 goals_total and exact 0.05 hold_share -> PASS
         fail_goals = {"s42": _fresh_arm_seed({"300": {"goals_total": 5.1}})}
         assert gates.evaluate_gates(fail_goals, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is False
 
-        exact_bounds = {"s42": _fresh_arm_seed({"300": {"goals_total": 0.8, "hold_share_pooled": 0.10}})}
+        exact_bounds = {"s42": _fresh_arm_seed({"300": {"goals_total": 0.40, "hold_share_pooled": 0.05}})}
         assert gates.evaluate_gates(exact_bounds, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is True
 
     def test_fresh_protocol_validation_errors(self):
@@ -2369,3 +2369,762 @@ class TestEvaluateArmE3:
         assert (out_dir / "gen0300" / "self_sampled" / "report.txt").read_text(encoding="utf-8") == sentinel
 
 
+
+
+# ----------------------------------------------------------------------------
+# Fresh gates: catastrophe floors, learning floor, takeoff, primary target, CLI flags
+# ----------------------------------------------------------------------------
+FIRE_ROLES = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+
+
+def _arm_seed_t2(t2_by_gen: dict, **kw) -> dict:
+    """`_fresh_arm_seed` whose frozen-opponent goal_diff differs per generation: {gen: (blue, red)}."""
+    out = _fresh_arm_seed({g: {} for g in t2_by_gen}, **kw)
+    for g, (blue, red) in t2_by_gen.items():
+        out[g]["vs_frozen"]["summary"]["metrics"]["goal_diff"]["mean"] = blue
+        out[g]["vs_frozen_red"]["summary"]["metrics"]["goal_diff"]["mean"] = red
+    return out
+
+
+def _goal_history(goals_by_gen: dict, **match_extra) -> dict:
+    """Training history with one match per entry of `goals_by_gen[gen]` (a list of goal counts)."""
+    matches = []
+    for gen in sorted(goals_by_gen):
+        for goals in goals_by_gen[gen]:
+            matches.append({"match_id": len(matches), "generation": gen, "goals": goals, **match_extra})
+    return {"matches": matches}
+
+
+def _flat_history(first: int, last: int, goals: float, per_gen: int = 8) -> dict:
+    return _goal_history({g: [goals] * per_gen for g in range(first, last + 1)})
+
+
+def _takeoff_history(takeoff_gen, last: int = 300) -> dict:
+    """Goals 1.5 per match from generation `takeoff_gen - 24` on (0.0 before); never 1.5 for None."""
+    start = None if takeoff_gen is None else takeoff_gen - 24
+    return _goal_history({g: [1.5 if start is not None and g >= start else 0.0] for g in range(1, last + 1)})
+
+
+def _hybrid_history(n_gens: int) -> dict:
+    """Linear-in-generation fire telemetry for four roles (role index i = 0..3)."""
+    hist = _goal_history({g: [1.0] for g in range(1, n_gens + 1)})
+    hist["generations"] = [
+        {
+            "generation": g,
+            "fire_sat": {r: {"kick": 0.10 * i + 0.02 * g, "spec": 0.10 * i + 0.50 + 0.02 * g} for i, r in enumerate(FIRE_ROLES)},
+            "p_kick": {r: 0.20 + 0.10 * i + 0.01 * g for i, r in enumerate(FIRE_ROLES)},
+            "p_spec": {r: 0.60 - 0.10 * i - 0.01 * g for i, r in enumerate(FIRE_ROLES)},
+        }
+        for g in range(1, n_gens + 1)
+    ]
+    return hist
+
+
+def _write_history(path: Path, hist: dict) -> str:
+    path.write_text(json.dumps(hist), encoding="utf-8")
+    return str(path)
+
+
+_FRESH_SELF_BASE = {"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)}
+
+
+def _fresh_cli_argv(tmp_path: Path, t2_by_gen: dict, *, self_by_gen: dict | None = None, takeoffs: dict | None = None) -> list:
+    """Arguments for `gates.main` over four on-disk arm seeds (42-45), a calibration file and optional histories."""
+    cal_path = tmp_path / "cal.json"
+    cal_path.write_text(json.dumps(_make_fake_calibration()), encoding="utf-8")
+    argv = ["--arm"]
+    for seed in ("42", "43", "44", "45"):
+        root = tmp_path / "arm" / seed
+        for gen, (blue, red) in t2_by_gen.items():
+            _write_e3_anchor_dir(root, gen, self_overrides={**_FRESH_SELF_BASE, **(self_by_gen or {}).get(gen, {})}, frozen_blue_gd=blue, frozen_red_gd=red)
+        argv.append(f"{seed}={root}")
+    argv += ["--protocol", "fresh", "--calibration", str(cal_path), "--gens", *t2_by_gen]
+    if takeoffs is not None:
+        argv.append("--history")
+        for seed, t in takeoffs.items():
+            argv.append(f"{seed}={_write_history(tmp_path / f'h{seed}.json', _takeoff_history(t))}")
+    return argv
+
+
+class TestCatastropheFloors:
+    def test_registered_rules_pin_three_changed_rows(self):
+        """[RED] The eleven catastrophe rows carry exactly the registered rule text."""
+        from tools.audit import gates
+
+        assert [(m, r) for m, r, _ in gates.CATASTROPHE_SPECS] == [
+            ("hold_share_pooled", "< 0.05"),
+            ("holder_spell_s_pooled", "< 0.15"),
+            ("gk_in_box_A", "< 0.80"),
+            ("gk_in_box_B", "< 0.80"),
+            ("gk_goal_line_A", "> 0.60"),
+            ("gk_goal_line_B", "> 0.60"),
+            ("n_within_100_pooled", "> 1.00"),
+            ("cluster_ge4_pooled", "> 0.30"),
+            ("role_inversion_pooled", "> 0.55"),
+            ("goals_total", "< 0.40 or > 5.0"),
+            ("scoreless", "> 0.70"),
+        ]
+
+    def test_baseline_run_that_trips_older_floors_passes(self):
+        """[RED] The late-takeoff anchor seed (gen 300: hold 0.0920, goals 0.938, scoreless 0.427) is not a catastrophe."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration()
+        arm = {"43": _fresh_arm_seed({
+            "100": {"hold_share_pooled": 0.069, "goals_total": 0.531, "scoreless": 0.573},
+            "200": {"hold_share_pooled": 0.097, "goals_total": 0.792, "scoreless": 0.448},
+            "300": {"hold_share_pooled": 0.0920, "goals_total": 0.938, "scoreless": 0.427},
+        })}
+        res = gates.evaluate_gates(arm, gens=["100", "200", "300"], protocol="fresh", calibration=cal)
+        assert res["gates"]["C0"]["passed"] is True
+        assert res["gates"]["C0"]["violations"] == []
+
+    @pytest.mark.parametrize("metric,value", [("hold_share_pooled", 0.049), ("goals_total", 0.399), ("scoreless", 0.701)])
+    def test_values_below_the_registered_floors_fail_at_gen_200(self, metric, value):
+        """[GUARD] Each changed row still fails just outside its registered bound, at gen 200."""
+        from tools.audit import gates
+
+        arm = {"42": _fresh_arm_seed({"200": {metric: value}, "300": {}})}
+        res = gates.evaluate_gates(arm, gens=["200", "300"], protocol="fresh", calibration=_make_fake_calibration())
+        assert [(v["gen"], v["metric"]) for v in res["gates"]["C0"]["violations"]] == [("200", metric)]
+
+
+class TestLearningFloor:
+    def _run(self, t100, t300, **kw):
+        from tools.audit import gates
+
+        arm = {"42": _arm_seed_t2({"100": t100, "300": t300})}
+        return gates.evaluate_gates(arm, gens=["100", "300"], protocol="fresh", calibration=_make_fake_calibration(), **kw)["gates"]["C0L"]
+
+    def test_constant_is_registered_value(self):
+        from tools.audit import gates
+
+        assert gates.LEARNING_FLOOR_GAIN == 0.50
+
+    def test_gain_above_floor_passes_and_reports_hand_values(self):
+        """[RED] T2(100) = -4.0, T2(300) = (-3.5 + -3.4)/2 = -3.45: gain 0.55 -> PASS."""
+        c0l = self._run((-4.0, -4.0), (-3.5, -3.4))
+        assert c0l["passed"] is True
+        assert set(c0l) >= {"passed", "rule", "per_seed"}
+        assert set(c0l["per_seed"]["42"]) == {"t_first", "t_last", "gain", "passed"}
+        s = c0l["per_seed"]["42"]
+        assert s["t_first"] == pytest.approx(-4.0)
+        assert s["t_last"] == pytest.approx(-3.45)
+        assert s["gain"] == pytest.approx(0.55)
+        assert s["passed"] is True
+
+    def test_gain_below_floor_fails(self):
+        """[RED] T2(300) = (-3.6 + -3.5)/2 = -3.55: gain 0.45 -> FAIL."""
+        c0l = self._run((-4.0, -4.0), (-3.6, -3.5))
+        assert c0l["passed"] is False
+        assert c0l["per_seed"]["42"]["gain"] == pytest.approx(0.45)
+        assert c0l["per_seed"]["42"]["passed"] is False
+
+    def test_gain_exactly_at_floor_passes(self):
+        """[RED] The bound is strict: gain exactly 0.50 passes."""
+        c0l = self._run((-4.0, -4.0), (-3.5, -3.5))
+        assert c0l["per_seed"]["42"]["gain"] == 0.5
+        assert c0l["passed"] is True
+
+    def test_each_frozen_tag_contributes_equally(self):
+        """[RED] Only the red pair improves: (-4, -4) -> (-4, -3) is a gain of 0.5, not 1.0 and not 0.0."""
+        c0l = self._run((-4.0, -4.0), (-4.0, -3.0))
+        assert c0l["per_seed"]["42"]["gain"] == 0.5
+
+    def test_one_failing_seed_fails_the_floor(self):
+        """[RED] Seeds are judged one by one; the gate fails if any seed fails."""
+        from tools.audit import gates
+
+        arm = {
+            "42": _arm_seed_t2({"100": (-4.0, -4.0), "300": (-1.0, -1.0)}),
+            "43": _arm_seed_t2({"100": (-4.0, -4.0), "300": (-3.9, -3.9)}),
+        }
+        c0l = gates.evaluate_gates(arm, gens=["100", "300"], protocol="fresh", calibration=_make_fake_calibration())["gates"]["C0L"]
+        assert c0l["passed"] is False
+        assert c0l["per_seed"]["42"]["passed"] is True and c0l["per_seed"]["43"]["passed"] is False
+        assert c0l["per_seed"]["42"]["gain"] == pytest.approx(3.0)
+
+    @pytest.mark.parametrize("gens", [["200", "300"], ["300"]])
+    def test_not_evaluated_without_gen_100(self, gens):
+        """[RED] Without generation 100 in --gens the floor is not evaluated (passed None) and says why."""
+        from tools.audit import gates
+
+        arm = {"42": _arm_seed_t2({g: (-1.0, -1.0) for g in gens})}
+        c0l = gates.evaluate_gates(arm, gens=gens, protocol="fresh", calibration=_make_fake_calibration())["gates"]["C0L"]
+        assert c0l["passed"] is None
+        assert "not evaluated: gen 100 not in --gens" in c0l["note"]
+
+    def test_missing_red_tag_at_gen_100_fails_closed(self):
+        """[RED] A missing vs_frozen_red at gen 100 raises ValueError naming role, seed, gen, tag and metric."""
+        from tools.audit import gates
+
+        seed = _arm_seed_t2({"100": (-4.0, -4.0), "300": (-1.0, -1.0)})
+        del seed["100"]["vs_frozen_red"]
+        with pytest.raises(ValueError) as exc:
+            gates.evaluate_gates({"42": seed}, gens=["100", "300"], protocol="fresh", calibration=_make_fake_calibration())
+        msg = str(exc.value)
+        assert "arm" in msg and "'42'" in msg and "'100'" in msg and "vs_frozen_red" in msg and "goal_diff" in msg
+
+    @pytest.mark.parametrize("bad", [None, float("nan"), float("inf")])
+    @pytest.mark.parametrize("gen", ["100", "300"])
+    def test_none_or_non_finite_value_fails_closed(self, bad, gen):
+        """[RED] None, NaN or Inf in a T2 term at gen 100 or at the last generation raises ValueError naming it."""
+        from tools.audit import gates
+
+        seed = _arm_seed_t2({"100": (-4.0, -4.0), "300": (-1.0, -1.0)})
+        seed[gen]["vs_frozen"]["summary"]["metrics"]["goal_diff"]["mean"] = bad
+        with pytest.raises(ValueError) as exc:
+            gates.evaluate_gates({"42": seed}, gens=["100", "300"], protocol="fresh", calibration=_make_fake_calibration())
+        msg = str(exc.value)
+        assert "'42'" in msg and f"'{gen}'" in msg and "vs_frozen" in msg and "goal_diff" in msg
+
+    def test_comparator_is_not_checked(self):
+        """[RED] A comparator with zero gain, and one with no gen 100 at all, does not change C0L."""
+        comp_flat = {"91": _arm_seed_t2({"100": (-1.0, -1.0), "300": (-1.0, -1.0)}), "92": _arm_seed_t2({"100": (-1.0, -1.0), "300": (-1.0, -1.0)})}
+        c0l = self._run((-4.0, -4.0), (-3.0, -3.0), comparator=comp_flat)
+        assert c0l["passed"] is True and c0l["per_seed"]["42"]["gain"] == pytest.approx(1.0)
+        comp_no_100 = {"91": _arm_seed_t2({"300": (-1.0, -1.0)}), "92": _arm_seed_t2({"300": (-1.0, -1.0)})}
+        assert self._run((-4.0, -4.0), (-3.0, -3.0), comparator=comp_no_100)["passed"] is True
+
+    def test_markdown_row_and_section(self):
+        """[RED] The summary table has a C0L row; the section lists seed, T2 at 100, T2 at last, gain and status."""
+        from tools.audit import gates
+
+        arm = {"42": _arm_seed_t2({"100": (-4.0, -4.0), "300": (-3.5, -3.4)}), "43": _arm_seed_t2({"100": (-4.0, -4.0), "300": (-3.6, -3.5)})}
+        md = gates.format_markdown(gates.evaluate_gates(arm, gens=["100", "300"], protocol="fresh", calibration=_make_fake_calibration()))
+        lines = md.splitlines()
+        assert any(ln.startswith("| C0L |") and ln.endswith("| FAIL |") for ln in lines)
+        assert "| 42 | -4.000 | -3.450 | +0.550 | PASS |" in lines
+        assert "| 43 | -4.000 | -3.550 | +0.450 | FAIL |" in lines
+
+    def test_fresh300_and_resume150_have_no_learning_floor(self):
+        """[GUARD] The older protocols carry neither C0L, G6 nor a primary target."""
+        from tools.audit import gates
+
+        arm = {"42": {"300": {"self_sampled": _fake_census_point()}}}
+        for protocol in ("fresh300", "resume150"):
+            res = gates.evaluate_gates(arm, gens=["300"], protocol=protocol)
+            assert "C0L" not in res["gates"] and "G6" not in res["gates"] and "primary_target" not in res
+
+
+class TestTakeoffGeneration:
+    def test_step_history_hand_value(self):
+        """[RED] 1.0 for gens 1-30, 2.0 for 31-60: gen 42 averages 1.48, gen 43 averages 1.52 -> 43."""
+        from tools.audit import training_progress
+
+        hist = _goal_history({g: [1.0 if g <= 30 else 2.0] * 8 for g in range(1, 61)})
+        assert training_progress.takeoff_generation(hist) == 43
+        cut = _goal_history({g: [1.0 if g <= 30 else 2.0] * 8 for g in range(1, 43)})
+        assert training_progress.takeoff_generation(cut) is None
+
+    def test_threshold_is_inclusive_and_earliest_is_first_plus_window_minus_one(self):
+        """[RED] A constant 1.5 reaches the threshold exactly at gen 25."""
+        from tools.audit import training_progress
+
+        assert training_progress.takeoff_generation(_flat_history(1, 60, 1.5)) == 25
+
+    def test_just_below_threshold_never_qualifies(self):
+        """[RED] A constant 1.49 never reaches 1.5."""
+        from tools.audit import training_progress
+
+        assert training_progress.takeoff_generation(_flat_history(1, 60, 1.49)) is None
+
+    def test_history_shorter_than_window_is_none_and_exactly_window_qualifies(self):
+        """[RED] 24 generations of 3.0 give no full window; 25 give takeoff at 25."""
+        from tools.audit import training_progress
+
+        assert training_progress.takeoff_generation(_flat_history(1, 24, 3.0)) is None
+        assert training_progress.takeoff_generation(_flat_history(1, 25, 3.0)) == 25
+
+    def test_missing_generation_is_an_error_naming_it(self):
+        """[RED] Every generation from first to last needs a match."""
+        from tools.audit import training_progress
+
+        hist = _goal_history({g: [3.0] for g in range(1, 61) if g != 10})
+        with pytest.raises(ValueError, match=r"\b10\b"):
+            training_progress.takeoff_generation(hist)
+
+    def test_window_starts_at_first_generation_in_history(self):
+        """[RED] A history starting at gen 101 with all 3.0 takes off at 125; a hole at 150 is named."""
+        from tools.audit import training_progress
+
+        assert training_progress.takeoff_generation(_flat_history(101, 160, 3.0)) == 125
+        holed = _goal_history({g: [3.0] for g in range(101, 161) if g != 150})
+        with pytest.raises(ValueError, match=r"\b150\b"):
+            training_progress.takeoff_generation(holed)
+
+    def test_per_generation_mean_is_taken_before_the_window_mean(self):
+        """[RED] Window 2: gen 1 = [0,0,0,3] (mean 0.75), gen 2 = [3] (mean 3.0) -> 1.875 >= 1.5 -> 2. Pooled over matches it would be 6/5 = 1.2."""
+        from tools.audit import training_progress
+
+        hist = _goal_history({1: [0, 0, 0, 3], 2: [3]})
+        assert training_progress.takeoff_generation(hist, goals=1.5, window=2) == 2
+
+    def test_order_of_matches_does_not_matter(self):
+        """[RED] Matches are grouped by their generation field."""
+        from tools.audit import training_progress
+
+        hist = _goal_history({g: [1.0 if g <= 30 else 2.0] * 8 for g in range(1, 61)})
+        hist["matches"] = hist["matches"][::-1]
+        assert training_progress.takeoff_generation(hist) == 43
+
+    def test_window_of_one_and_custom_threshold(self):
+        """[RED] Window 1 is the first generation whose own mean reaches the threshold."""
+        from tools.audit import training_progress
+
+        hist = _goal_history({1: [0], 2: [1, 2], 3: [4]})
+        assert training_progress.takeoff_generation(hist, goals=1.5, window=1) == 2
+        assert training_progress.takeoff_generation(hist, goals=1.51, window=1) == 3
+
+    @pytest.mark.parametrize("hist", [{"matches": []}, {}, {"matches": [{"generation": 1}]}, {"matches": [{"generation": 1, "goals": float("nan")}]}])
+    def test_degenerate_histories_are_errors(self, hist):
+        """[RED] No matches, a match without goals, or a non-finite goal count raises ValueError."""
+        from tools.audit import training_progress
+
+        with pytest.raises(ValueError):
+            training_progress.takeoff_generation(hist)
+
+    @pytest.mark.parametrize("kwargs", [{"window": 0}, {"window": -3}, {"goals": float("nan")}])
+    def test_invalid_parameters_are_errors(self, kwargs):
+        """[RED] A non-positive window or a non-finite threshold raises ValueError."""
+        from tools.audit import training_progress
+
+        with pytest.raises(ValueError):
+            training_progress.takeoff_generation(_flat_history(1, 30, 3.0), **kwargs)
+
+    def test_cli_prints_takeoff_line_and_json(self, tmp_path, capsys):
+        """[RED] --takeoff prints the registered line; --json gains the takeoff block only with the flag."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", _goal_history({g: [1.0 if g <= 30 else 2.0] * 8 for g in range(1, 61)}))
+        out_json = tmp_path / "o.json"
+        assert training_progress.main(["--history", h, "--bucket", "30", "--takeoff", "--json", str(out_json)]) == 0
+        assert "takeoff_gen=43 (trailing 25-gen mean training goals >= 1.5)" in capsys.readouterr().out.splitlines()
+        assert json.loads(out_json.read_text(encoding="utf-8"))["takeoff"] == {"gen": 43, "goals": 1.5, "window": 25, "first_gen": 1, "last_gen": 60}
+
+        assert training_progress.main(["--history", h, "--bucket", "30", "--json", str(out_json)]) == 0
+        assert "takeoff" not in json.loads(out_json.read_text(encoding="utf-8"))
+        assert "takeoff_gen" not in capsys.readouterr().out
+
+    def test_cli_options_and_none_result(self, tmp_path, capsys):
+        """[RED] --takeoff-goals / --takeoff-window apply; no takeoff prints `none` with the last generation."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", _goal_history({g: [1.0 if g <= 30 else 2.0] * 8 for g in range(1, 61)}))
+        out_json = tmp_path / "o.json"
+        training_progress.main(["--history", h, "--takeoff", "--takeoff-goals", "2.0", "--takeoff-window", "5", "--json", str(out_json)])
+        assert "takeoff_gen=35 (trailing 5-gen mean training goals >= 2.0)" in capsys.readouterr().out.splitlines()
+        assert json.loads(out_json.read_text(encoding="utf-8"))["takeoff"]["gen"] == 35
+
+        training_progress.main(["--history", h, "--takeoff", "--takeoff-goals", "2.5", "--json", str(out_json)])
+        assert "takeoff_gen=none (not reached by gen 60)" in capsys.readouterr().out.splitlines()
+        assert json.loads(out_json.read_text(encoding="utf-8"))["takeoff"] == {"gen": None, "goals": 2.5, "window": 25, "first_gen": 1, "last_gen": 60}
+
+
+class TestTrainingProgressOutput:
+    GUARD_HISTORY = {"matches": [
+        {"generation": 1, "interest_score": 10.0, "goals": 1, "completed_passes": 2, "shots": [1, 1], "successful_tackles": 3,
+         "keeper_saves": 0, "true_possession_pct": [10.0, 10.0, 80.0], "stationary_ball_frames": 100},
+        {"generation": 1, "interest_score": 20.0, "goals": 3, "completed_passes": 4, "shots": [2, 0], "successful_tackles": 5,
+         "keeper_saves": 2, "true_possession_pct": [10.0, 10.0, 90.0], "stationary_ball_frames": 300},
+        {"generation": 2, "interest_score": 60.0, "goals": 2, "completed_passes": 0, "shots": [0, 0], "successful_tackles": 1,
+         "keeper_saves": 1, "true_possession_pct": [10.0, 10.0, 70.0], "stationary_ball_frames": 200},
+        {"generation": 3, "interest_score": 5.0, "goals": 0, "completed_passes": 1, "shots": [1, 0], "successful_tackles": 0,
+         "keeper_saves": 0, "true_possession_pct": [10.0, 10.0, 50.0], "stationary_ball_frames": 0},
+    ]}
+    GUARD_STDOUT = (
+        "training_progress: 4 matches in 2 bucket(s) of 2 gens\n"
+        "  gens     1-    2 n=   3 interest= 30.0 (med  20.0 max  60.0) goals=2.00 passes=2.0 shots=1.3 tackles=3.0 saves=1.00 loose%=80.0 stat=200\n"
+        "  gens     3-    3 n=   1 interest=  5.0 (med   5.0 max   5.0) goals=0.00 passes=1.0 shots=1.0 tackles=0.0 saves=0.00 loose%=50.0 stat=0\n"
+        "  newest 2 generation(s):\n"
+        "  gens     2-    2 n=   1 interest= 60.0 (med  60.0 max  60.0) goals=2.00 passes=0.0 shots=0.0 tackles=1.0 saves=1.00 loose%=70.0 stat=200\n"
+        "  gens     3-    3 n=   1 interest=  5.0 (med   5.0 max   5.0) goals=0.00 passes=1.0 shots=1.0 tackles=0.0 saves=0.00 loose%=50.0 stat=0\n"
+    )
+
+    def test_output_without_takeoff_or_fire_is_unchanged(self, tmp_path, capsys):
+        """[GUARD] Plain stdout is the literal below (taken from the tool before --takeoff/--fire existed; hand values: interest mean 30, shots 4/3, ...) and the JSON keeps its keys."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", self.GUARD_HISTORY)
+        out_json = tmp_path / "o.json"
+        assert training_progress.main(["--history", h, "--bucket", "2", "--last-gens", "2", "--json", str(out_json)]) == 0
+        assert capsys.readouterr().out == self.GUARD_STDOUT
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert set(data) == {"buckets", "last_generations"}
+        assert all("fire" not in b and "takeoff" not in b for b in data["buckets"])
+        assert data["buckets"][0]["shots"] == pytest.approx(4.0 / 3.0)
+
+    def test_fire_and_takeoff_append_after_the_plain_output(self, tmp_path, capsys):
+        """[RED] With both flags the plain lines come first and unchanged."""
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", self.GUARD_HISTORY)
+        assert training_progress.main(["--history", h, "--bucket", "2", "--last-gens", "2", "--takeoff", "--fire"]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith(self.GUARD_STDOUT)
+        assert len(out) > len(self.GUARD_STDOUT)
+
+
+class TestFireSummary:
+    def _run(self, tmp_path, capsys, hist, *extra):
+        from tools.audit import training_progress
+
+        h = _write_history(tmp_path / "h.json", hist)
+        out_json = tmp_path / "o.json"
+        rc = training_progress.main(["--history", h, "--bucket", "2", "--fire", "--json", str(out_json), *extra])
+        return rc, capsys.readouterr().out, json.loads(out_json.read_text(encoding="utf-8"))
+
+    def test_bucket_means_of_hybrid_telemetry(self, tmp_path, capsys):
+        """[RED] Two buckets of two generations: per-role means of fire_sat kick/spec, p_kick and p_spec (hand values)."""
+        rc, out, data = self._run(tmp_path, capsys, _hybrid_history(4))
+        assert rc == 0
+        # generations {1,2}: base + 0.03 (kick/spec), p_kick base + 0.015, p_spec base - 0.015; generations {3,4}: 0.07 / 0.035
+        expected = [
+            {"kick": [0.03, 0.13, 0.23, 0.33], "spec": [0.53, 0.63, 0.73, 0.83], "p_kick": [0.215, 0.315, 0.415, 0.515], "p_spec": [0.585, 0.485, 0.385, 0.285]},
+            {"kick": [0.07, 0.17, 0.27, 0.37], "spec": [0.57, 0.67, 0.77, 0.87], "p_kick": [0.235, 0.335, 0.435, 0.535], "p_spec": [0.565, 0.465, 0.365, 0.265]},
+        ]
+        assert len(data["buckets"]) == 2
+        for bucket, exp in zip(data["buckets"], expected):
+            fire = bucket["fire"]
+            assert fire["n"] == 2
+            for i, role in enumerate(FIRE_ROLES):
+                assert fire["fire_sat"][role]["kick"] == pytest.approx(exp["kick"][i], abs=1e-12)
+                assert fire["fire_sat"][role]["spec"] == pytest.approx(exp["spec"][i], abs=1e-12)
+                assert fire["p_kick"][role] == pytest.approx(exp["p_kick"][i], abs=1e-12)
+                assert fire["p_spec"][role] == pytest.approx(exp["p_spec"][i], abs=1e-12)
+        lines = out.splitlines()
+        assert "  fire gens     1-    2 (n=2)" in lines
+        assert "    fire_sat.kick  blue_field=0.030 blue_keeper=0.130 red_field=0.230 red_keeper=0.330" in lines
+        assert "    fire_sat.spec  blue_field=0.530 blue_keeper=0.630 red_field=0.730 red_keeper=0.830" in lines
+        assert "    p_kick         blue_field=0.215 blue_keeper=0.315 red_field=0.415 red_keeper=0.515" in lines
+        assert "    p_spec         blue_field=0.585 blue_keeper=0.485 red_field=0.385 red_keeper=0.285" in lines
+        assert "  fire gens     3-    4 (n=2)" in lines
+        assert "    fire_sat.kick  blue_field=0.070 blue_keeper=0.170 red_field=0.270 red_keeper=0.370" in lines
+        assert "fire: n/a (no hybrid5 telemetry)" not in out
+
+    def test_gaussian_history_prints_not_available_and_exits_zero(self, tmp_path, capsys):
+        """[RED] No fire_sat in the generation records -> the n/a line, exit 0, null fire blocks."""
+        hist = _hybrid_history(4)
+        for rec in hist["generations"]:
+            for k in ("fire_sat", "p_kick", "p_spec"):
+                del rec[k]
+        rc, out, data = self._run(tmp_path, capsys, hist)
+        assert rc == 0
+        assert "fire: n/a (no hybrid5 telemetry)" in out.splitlines()
+        assert [b["fire"] for b in data["buckets"]] == [None, None]
+
+    def test_history_without_generation_records_is_not_available(self, tmp_path, capsys):
+        """[RED] An old history with no generation list prints the n/a line."""
+        hist = _hybrid_history(4)
+        del hist["generations"]
+        rc, out, data = self._run(tmp_path, capsys, hist)
+        assert rc == 0 and "fire: n/a (no hybrid5 telemetry)" in out.splitlines()
+
+    def test_incomplete_record_is_an_error_naming_the_generation(self, tmp_path):
+        """[RED] A record with fire_sat but a role missing raises ValueError naming the generation."""
+        from tools.audit import training_progress
+
+        hist = _hybrid_history(4)
+        del hist["generations"][2]["fire_sat"]["red_field"]
+        with pytest.raises(ValueError, match=r"generation 3\b"):
+            training_progress.fire_progress(hist, bucket=2)
+
+    def test_bucket_without_records_between_buckets_with_records(self, tmp_path, capsys):
+        """[RED] Records only for generations 3-4: the first bucket prints n/a, the second its means."""
+        hist = _hybrid_history(4)
+        hist["generations"] = hist["generations"][2:]
+        rc, out, data = self._run(tmp_path, capsys, hist)
+        assert data["buckets"][0]["fire"] is None
+        assert data["buckets"][1]["fire"]["n"] == 2
+        assert "  fire gens     1-    2: n/a" in out.splitlines()
+
+
+class TestGatesTakeoff:
+    @staticmethod
+    def _g6(takeoffs: dict, **kw):
+        from tools.audit import gates
+
+        arm = {s: _fresh_arm_seed({"300": {}}) for s in takeoffs}
+        hist = {s: _takeoff_history(t) for s, t in takeoffs.items()}
+        return gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(), histories=hist, **kw)
+
+    def test_constant_is_registered_value(self):
+        from tools.audit import gates
+
+        assert gates.TAKEOFF_FAIL_SHARE == 0.5
+
+    def test_anchor_like_split_passes(self):
+        """[RED] Takeoff gens {37, none, 242, 37}: one of four without takeoff -> PASS."""
+        res = self._g6({"42": 37, "43": None, "44": 242, "45": 37})
+        g6 = res["gates"]["G6"]
+        assert g6["passed"] is True
+        assert g6["per_seed"] == {"42": 37, "43": None, "44": 242, "45": 37}
+
+    def test_three_of_four_without_takeoff_fails(self):
+        """[RED] {none, none, none, 37}: share 0.75 > 0.5 -> FAIL."""
+        assert self._g6({"42": None, "43": None, "44": None, "45": 37})["gates"]["G6"]["passed"] is False
+
+    def test_exactly_half_without_takeoff_passes(self):
+        """[RED] {none, none, 37, 37}: share 0.5 is not above 0.5 -> PASS."""
+        assert self._g6({"42": None, "43": None, "44": 37, "45": 37})["gates"]["G6"]["passed"] is True
+
+    def test_missing_history_gives_none_and_names_the_seeds(self):
+        """[RED] A seed without a history makes G6 not evaluated, and the note names it."""
+        from tools.audit import gates
+
+        arm = {s: _fresh_arm_seed({"300": {}}) for s in ("42", "43", "44", "45")}
+        hist = {s: _takeoff_history(37) for s in ("42", "43", "44")}
+        g6 = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(), histories=hist)["gates"]["G6"]
+        assert g6["passed"] is None and "45" in g6["note"]
+        no_hist = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration())["gates"]["G6"]
+        assert no_hist["passed"] is None and all(s in no_hist["note"] for s in arm)
+
+    def test_history_for_a_non_arm_seed_is_an_error(self):
+        """[RED] A history seed that is not an arm seed raises ValueError naming it."""
+        from tools.audit import gates
+
+        arm = {"42": _fresh_arm_seed({"300": {}})}
+        hist = {"42": _takeoff_history(37), "99": _takeoff_history(37)}
+        with pytest.raises(ValueError, match="99"):
+            gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(), histories=hist)
+
+    def test_histories_with_other_protocols_are_an_error(self):
+        from tools.audit import gates
+
+        arm = {"42": {"300": {"self_sampled": _fake_census_point()}}}
+        with pytest.raises(ValueError, match="history|histories"):
+            gates.evaluate_gates(arm, gens=["300"], protocol="fresh300", histories={"42": _takeoff_history(37)})
+
+    def test_markdown_takeoff_table(self):
+        """[RED] The Takeoff section lists seed, takeoff generation (none when absent) and the history range."""
+        from tools.audit import gates
+
+        md = gates.format_markdown(self._g6({"42": 37, "43": None, "44": 242, "45": 37}))
+        lines = md.splitlines()
+        assert any(ln.startswith("| G6 |") and ln.endswith("| PASS |") for ln in lines)
+        assert "| 42 | 37 | 1-300 |" in lines
+        assert "| 43 | none | 1-300 |" in lines
+        assert "| 44 | 242 | 1-300 |" in lines
+
+    def test_cli_history_flag_end_to_end(self, tmp_path, capsys):
+        """[RED] --history SEED=PATH feeds G6 through the CLI and the JSON report."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"300": (-1.0, -1.0)}, takeoffs={"42": 37, "43": None, "44": 242, "45": 37})
+        out_json = tmp_path / "g.json"
+        assert gates.main([*argv, "--json", str(out_json)]) == 0
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["gates"]["G6"]["passed"] is True
+        assert data["gates"]["G6"]["per_seed"] == {"42": 37, "43": None, "44": 242, "45": 37}
+        assert "| 43 | none | 1-300 |" in capsys.readouterr().out.splitlines()
+
+    def test_cli_history_flag_rejects_malformed_and_duplicate_items(self, tmp_path):
+        """[RED] Items must be SEED=PATH, and a seed may be given once."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"300": (-1.0, -1.0)})
+        h = _write_history(tmp_path / "h.json", _takeoff_history(37))
+        with pytest.raises(ValueError, match="SEED=PATH"):
+            gates.main([*argv, "--history", h])
+        with pytest.raises(ValueError, match="42"):
+            gates.main([*argv, "--history", f"42={h}", f"42={h}"])
+
+
+class TestPrimaryTarget:
+    def test_constant_labels_and_json(self):
+        """[RED] T2 is primary, T1 informational at gen 300, T3 unchanged; JSON names the primary target."""
+        from tools.audit import gates
+
+        assert gates.PRIMARY_TARGET == "T2"
+        arm = {s: _fresh_arm_seed({"300": {}}) for s in ("42", "43")}
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration())
+        assert res["primary_target"] == "T2"
+        rows = {ln.split("|")[1].strip(): ln for ln in gates.format_markdown(res).splitlines() if ln.startswith("| T")}
+        assert "T2 (primary)" in rows
+        assert "T1 (informational at gen 300)" in rows
+        assert any(k.startswith("T3 (") for k in rows)
+
+    def test_target_verdicts_do_not_depend_on_the_labels(self):
+        """[GUARD] Arm T1 -13.5 beats the anchor -18.5 (delta 2.582); T2 and T3 are neutral."""
+        from tools.audit import gates
+
+        arm = {"42": _fresh_arm_seed({"300": {}}, bot_b=-12.0, bot_r=-14.0), "43": _fresh_arm_seed({"300": {}}, bot_b=-13.0, bot_r=-15.0)}
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration())
+        assert {t["id"]: t["verdict"] for t in res["targets"]} == {"T1": "BEATS", "T2": "NEUTRAL", "T3": "NEUTRAL"}
+
+
+class TestExitOnFailure:
+    FAILING_C0 = {"200": {"hold_share_pooled": 0.04}}
+
+    def test_returns_two_on_catastrophe(self, tmp_path):
+        """[RED] A C0 violation returns 2 with the flag and 0 without it."""
+        from tools.audit import gates
+
+        t2 = {"100": (-4.0, -4.0), "200": (-2.0, -2.0), "300": (-1.0, -1.0)}
+        argv = _fresh_cli_argv(tmp_path, t2, self_by_gen=self.FAILING_C0)
+        assert gates.main(argv) == 0
+        assert gates.main([*argv, "--exit-on-c0"]) == 2
+
+    def test_returns_two_on_learning_floor_failure(self, tmp_path):
+        """[RED] A flat T2 (gain 0.0 < 0.50) returns 2 with the flag and 0 without it."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"100": (-1.0, -1.0), "300": (-1.0, -1.0)})
+        assert gates.main(argv) == 0
+        assert gates.main([*argv, "--exit-on-c0"]) == 2
+
+    def test_returns_two_on_takeoff_failure(self, tmp_path):
+        """[RED] Three of four seeds without takeoff returns 2 with the flag and 0 without it."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"100": (-4.0, -4.0), "300": (-1.0, -1.0)}, takeoffs={"42": None, "43": None, "44": None, "45": 37})
+        assert gates.main(argv) == 0
+        assert gates.main([*argv, "--exit-on-c0"]) == 2
+
+    def test_returns_zero_when_everything_passes(self, tmp_path):
+        """[RED] C0, C0L and G6 all pass -> 0 even with the flag."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"100": (-4.0, -4.0), "200": (-2.0, -2.0), "300": (-1.0, -1.0)}, takeoffs={"42": 37, "43": None, "44": 242, "45": 37})
+        assert gates.main([*argv, "--exit-on-c0"]) == 0
+
+    def test_not_evaluated_does_not_trigger(self, tmp_path):
+        """[RED] Without gen 100 and without histories C0L and G6 are None; the flag still returns 0."""
+        from tools.audit import gates
+
+        argv = _fresh_cli_argv(tmp_path, {"300": (-1.0, -1.0)})
+        assert gates.main([*argv, "--exit-on-c0"]) == 0
+
+    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
+    def test_flag_with_other_protocols_is_an_error(self, tmp_path, protocol):
+        """[RED] --exit-on-c0 belongs to the fresh protocol only."""
+        from tools.audit import gates
+
+        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
+        with pytest.raises(ValueError, match="exit-on-c0"):
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--exit-on-c0"])
+
+
+class TestFreshCliFlags:
+    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
+    def test_calibration_with_other_protocols_is_an_error(self, tmp_path, protocol):
+        """[RED] --calibration is only read by the fresh protocol, so giving it with another one is an error."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration()), encoding="utf-8")
+        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
+        with pytest.raises(ValueError, match="calibration"):
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--calibration", str(cal_path)])
+
+    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
+    def test_history_with_other_protocols_is_an_error(self, tmp_path, protocol):
+        """[RED] --history is only read by the fresh protocol."""
+        from tools.audit import gates
+
+        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
+        h = _write_history(tmp_path / "h.json", _takeoff_history(37))
+        with pytest.raises(ValueError, match="history"):
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--history", f"42={h}"])
+
+
+class TestCalibrationValidation:
+    @staticmethod
+    def _evaluate(cal, tag="self_sampled"):
+        from tools.audit import gates
+
+        arm = {"42": _fresh_arm_seed({"300": {}})}
+        if tag != "self_sampled":
+            arm["42"]["300"][tag] = arm["42"]["300"]["self_sampled"]
+        return gates.evaluate_gates(arm, gens=["300"], tag=tag, protocol="fresh", calibration=cal)
+
+    def test_valid_calibration_is_accepted(self):
+        """[GUARD] The fixture calibration passes every check."""
+        assert self._evaluate(_make_fake_calibration())["gates"]["G1"]["passed"] is True
+
+    @pytest.mark.parametrize("tid", ["T1", "T2", "T3"])
+    def test_rejects_target_direction_other_than_registered(self, tid):
+        """[RED] A target registered as `higher` with direction `lower` is rejected."""
+        cal = _make_fake_calibration(target_overrides={tid: {"direction": "lower"}})
+        with pytest.raises(ValueError, match=rf"{tid}.*direction"):
+            self._evaluate(cal)
+
+    @pytest.mark.parametrize("kind,entry,bad", [
+        ("guards", "hold_share_pooled", float("nan")),
+        ("guards", "scoreless", float("inf")),
+        ("targets", "T2", float("nan")),
+        ("targets", "T1", float("inf")),
+    ])
+    def test_rejects_non_finite_delta(self, kind, entry, bad):
+        """[RED] A NaN or infinite delta is rejected."""
+        cal = _make_fake_calibration()
+        cal[kind][entry]["delta"] = bad
+        with pytest.raises(ValueError, match=rf"{entry}.*delta must be finite and > 0"):
+            self._evaluate(cal)
+
+    @pytest.mark.parametrize("kind,entry,bad", [
+        ("guards", "hold_share_pooled", 0.0),
+        ("guards", "goals_total", -0.30),
+        ("targets", "T2", 0.0),
+        ("targets", "T3", -0.03),
+    ])
+    def test_rejects_non_positive_delta(self, kind, entry, bad):
+        """[RED] A delta of 0 or below is rejected."""
+        cal = _make_fake_calibration()
+        cal[kind][entry]["delta"] = bad
+        with pytest.raises(ValueError, match=rf"{entry}.*delta must be finite and > 0"):
+            self._evaluate(cal)
+
+    @pytest.mark.parametrize("kind,entry,bad", [
+        ("guards", "hold_share_pooled", 0.0099),
+        ("guards", "goals_total", 0.29),
+        ("targets", "T1", 1.99),
+        ("targets", "T2", 0.4999),
+    ])
+    def test_rejects_delta_below_its_floor(self, kind, entry, bad):
+        """[RED] A positive delta just under the entry's own floor is rejected; a delta equal to the floor is accepted."""
+        cal = _make_fake_calibration()
+        cal[kind][entry]["delta"] = bad
+        with pytest.raises(ValueError, match=rf"{entry}.*floor"):
+            self._evaluate(cal)
+        cal[kind][entry]["delta"] = cal[kind][entry]["floor"]
+        self._evaluate(cal)
+
+    @pytest.mark.parametrize("kind,entry", [("guards", "hold_share_pooled"), ("guards", "scoreless"), ("targets", "T1"), ("targets", "T3")])
+    def test_rejects_fewer_than_three_anchor_seeds(self, kind, entry):
+        """[RED] An entry built from two anchor seeds is rejected; three are accepted."""
+        cal = _make_fake_calibration()
+        seeds = dict(cal[kind][entry]["per_seed"])
+        cal[kind][entry]["per_seed"] = dict(list(seeds.items())[:2])
+        with pytest.raises(ValueError, match=rf"{entry}.*anchor seeds"):
+            self._evaluate(cal)
+        cal[kind][entry]["per_seed"] = dict(list(seeds.items())[:3])
+        self._evaluate(cal)
+
+    def test_rejects_guard_tag_that_differs_from_tag_in_use(self):
+        """[RED] Guards calibrated on self_sampled cannot be applied to --tag self_mixed; the error names both."""
+        with pytest.raises(ValueError) as exc:
+            self._evaluate(_make_fake_calibration(), tag="self_mixed")
+        assert "self_sampled" in str(exc.value) and "self_mixed" in str(exc.value)
+
+    def test_gates_constants_match_the_calibration_specs(self):
+        """[GUARD] gates.py and calibrate.py register the same worse directions, target tags and target directions."""
+        from tools.audit import calibrate, gates
+
+        assert gates.FRESH_GUARD_WORSE == {metric: worse for _, metric, worse, _ in calibrate.GUARD_CALIBRATION_SPECS}
+        assert gates.FRESH_TARGET_TAGS == {tid: tags for tid, _, tags, _, _ in calibrate.TARGET_CALIBRATION_SPECS}
+        assert gates.FRESH_TARGET_DIRECTION == {tid: direction for tid, _, _, direction, _ in calibrate.TARGET_CALIBRATION_SPECS}
+
+
+class TestRedTagSpecs:
+    @pytest.mark.parametrize("red,blue,seed", [("vs_scripted_sampled_red", "vs_scripted_sampled", 13), ("vs_frozen_red", "vs_frozen", 15)])
+    def test_red_tag_equals_blue_twin_except_swap(self, red, blue, seed):
+        """[RED] Opponent, mode, match count and seed are those of the blue twin; only the seats are swapped."""
+        from tools.audit import evaluate_arm
+
+        r, b = evaluate_arm.TAG_SPECS[red], evaluate_arm.TAG_SPECS[blue]
+        for key in ("opp", "mode", "n", "seed"):
+            assert r[key] == b[key], key
+        assert r["n"] == 48 and r["seed"] == seed
+        assert r["swap"] is True
+        assert not b.get("swap", False)
