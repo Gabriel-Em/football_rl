@@ -1617,3 +1617,755 @@ class TestInternalsHybridHead:
         old = self._trace(None)
         np.savez_compressed(d / "m000.npz", **old)
         assert "head" not in next(iter(internals._iter_internal_traces(d)))
+
+# ----------------------------------------------------------------------------
+# E3: Anchor calibration, relative fresh gates, red tags, and --recensus
+# ----------------------------------------------------------------------------
+def _write_e3_anchor_dir(
+    root: Path,
+    gen: str,
+    *,
+    self_overrides: dict | None = None,
+    bot_blue_gd: float | None = -16.0,
+    bot_red_gd: float | None = -18.0,
+    frozen_blue_gd: float | None = -1.0,
+    frozen_red_gd: float | None = -1.2,
+    omit_tags: tuple[str, ...] = (),
+) -> Path:
+    """Write fake evaluate_arm output for one seed at one generation."""
+    gen_dir = root / f"gen{int(gen):04d}"
+    tag_payloads = {
+        "self_sampled": _fake_census_point(**(self_overrides or {})),
+        "vs_scripted_sampled": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": bot_blue_gd, "se": 0.4, "n": 48}}}},
+        "vs_scripted_sampled_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": bot_red_gd, "se": 0.4, "n": 48}}}},
+        "vs_frozen": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": frozen_blue_gd, "se": 0.2, "n": 48}}}},
+        "vs_frozen_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": frozen_red_gd, "se": 0.2, "n": 48}}}},
+    }
+    for tag, payload in tag_payloads.items():
+        if tag in omit_tags:
+            continue
+        tdir = gen_dir / tag
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / "census.json").write_text(json.dumps(payload), encoding="utf-8")
+    return root
+
+
+def _make_fake_calibration(
+    *,
+    gen: str = "300",
+    guard_overrides: dict | None = None,
+    target_overrides: dict | None = None,
+) -> dict:
+    """Build an in-memory calibration dict matching calibrate.py's schema."""
+    guards = {
+        "hold_share_pooled": {"gate": "G1", "tag": "self_sampled", "worse": "lower", "floor": 0.010, "per_seed": {"42": 0.18, "43": 0.20, "44": 0.19, "45": 0.21}, "mean": 0.195, "sd": 0.012909944487358056, "delta": 0.025819888974716113},
+        "holder_spell_s_pooled": {"gate": "G1", "tag": "self_sampled", "worse": "lower", "floor": 0.020, "per_seed": {"42": 0.27, "43": 0.27, "44": 0.27, "45": 0.27}, "mean": 0.27, "sd": 0.0, "delta": 0.020},
+        "gk_in_box_pooled": {"gate": "G2", "tag": "self_sampled", "worse": "lower", "floor": 0.010, "per_seed": {"42": 0.99, "43": 0.99, "44": 0.99, "45": 0.99}, "mean": 0.99, "sd": 0.0, "delta": 0.010},
+        "gk_goal_line_pooled": {"gate": "G2", "tag": "self_sampled", "worse": "higher", "floor": 0.030, "per_seed": {"42": 0.175, "43": 0.175, "44": 0.175, "45": 0.175}, "mean": 0.175, "sd": 0.0, "delta": 0.030},
+        "n_within_100_pooled": {"gate": "G3", "tag": "self_sampled", "worse": "higher", "floor": 0.030, "per_seed": {"42": 0.50, "43": 0.50, "44": 0.50, "45": 0.50}, "mean": 0.50, "sd": 0.0, "delta": 0.030},
+        "cluster_ge4_pooled": {"gate": "G3", "tag": "self_sampled", "worse": "higher", "floor": 0.010, "per_seed": {"42": 0.06, "43": 0.06, "44": 0.06, "45": 0.06}, "mean": 0.06, "sd": 0.0, "delta": 0.010},
+        "role_inversion_pooled": {"gate": "G4", "tag": "self_sampled", "worse": "higher", "floor": 0.030, "per_seed": {"42": 0.28, "43": 0.30, "44": 0.29, "45": 0.31}, "mean": 0.295, "sd": 0.012909944487358056, "delta": 0.05},
+        "goals_total": {"gate": "G5", "tag": "self_sampled", "worse": "lower", "floor": 0.30, "per_seed": {"42": 2.2, "43": 2.2, "44": 2.2, "45": 2.2}, "mean": 2.2, "sd": 0.0, "delta": 0.30},
+        "scoreless": {"gate": "G5", "tag": "self_sampled", "worse": "higher", "floor": 0.05, "per_seed": {"42": 0.10, "43": 0.10, "44": 0.10, "45": 0.10}, "mean": 0.10, "sd": 0.0, "delta": 0.05},
+    }
+    if guard_overrides:
+        for k, v in guard_overrides.items():
+            guards[k] = {**guards[k], **v}
+    targets = {
+        "T1": {"id": "T1", "key": "goal_diff", "tags": ["vs_scripted_sampled", "vs_scripted_sampled_red"], "direction": "higher", "floor": 2.0, "per_seed": {"42": -19.0, "43": -18.0, "44": -20.0, "45": -17.0}, "mean": -18.5, "sd": 1.2909944487358056, "delta": 2.581988897471611},
+        "T2": {"id": "T2", "key": "goal_diff", "tags": ["vs_frozen", "vs_frozen_red"], "direction": "higher", "floor": 0.5, "per_seed": {"42": -1.0, "43": -1.2, "44": -1.1, "45": -0.9}, "mean": -1.05, "sd": 0.12909944487358058, "delta": 0.5},
+        "T3": {"id": "T3", "key": "kick_outcome_teammate", "tags": ["self_sampled"], "direction": "higher", "floor": 0.03, "per_seed": {"42": 0.31, "43": 0.30, "44": 0.32, "45": 0.29}, "mean": 0.305, "sd": 0.012909944487358056, "delta": 0.03},
+    }
+    if target_overrides:
+        for k, v in target_overrides.items():
+            targets[k] = {**targets[k], **v}
+    return {
+        "gen": gen,
+        "git_commit": "abc1234",
+        "anchor_seeds": ["42", "43", "44", "45"],
+        "anchor_dirs": {"42": "a42", "43": "a43", "44": "a44", "45": "a45"},
+        "guards": guards,
+        "targets": targets,
+    }
+
+
+def _fresh_arm_seed(gens_vals: dict[str, dict], *, bot_b: float = -18.0, bot_r: float = -18.0, fr_b: float = -1.0, fr_r: float = -1.0, kot: float = 0.31) -> dict:
+    out = {}
+    for g, ov in gens_vals.items():
+        self_ov = {"kick_outcome_teammate": (kot, 0.01), "gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), **ov}
+        out[g] = {
+            "self_sampled": _fake_census_point(**self_ov),
+            "vs_scripted_sampled": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": bot_b, "se": 0.4, "n": 48}}}},
+            "vs_scripted_sampled_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": bot_r, "se": 0.4, "n": 48}}}},
+            "vs_frozen": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": fr_b, "se": 0.2, "n": 48}}}},
+            "vs_frozen_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": fr_r, "se": 0.2, "n": 48}}}},
+        }
+    return out
+
+
+class TestCalibrateE3:
+    def test_calibrate_hand_values_sd_floor_and_two_tag_target(self, tmp_path):
+        """[RED] Exact sample SD (ddof=1), floor binding, and two-tag per-seed mean."""
+        from tools.audit import calibrate
+
+        # 4 seeds: hold_share {0.18, 0.20, 0.19, 0.21} (s=0.012910, delta=0.025820)
+        # cluster_ge4_pooled {0.190, 0.191, 0.192, 0.193} (s=0.001291, floor 0.010 binds)
+        specs = [
+            ("42", 0.18, 0.190),
+            ("43", 0.20, 0.191),
+            ("44", 0.19, 0.192),
+            ("45", 0.21, 0.193),
+        ]
+        anchor_dirs = {}
+        for seed, hs, cl in specs:
+            anchor_dirs[seed] = _write_e3_anchor_dir(
+                tmp_path / f"s{seed}",
+                "300",
+                self_overrides={
+                    "hold_share_pooled": hs,
+                    "cluster_ge4_pooled": cl,
+                    "gk_in_box_pooled": (0.99, 0.002),
+                    "gk_goal_line_pooled": (0.175, 0.01),
+                    "kick_outcome_teammate": (0.31, 0.01),
+                },
+            )
+        cal4 = calibrate.calibrate_from_dirs(anchor_dirs, gen="300")
+        hs_entry = cal4["guards"]["hold_share_pooled"]
+        assert hs_entry["mean"] == pytest.approx(0.195, abs=1e-9)
+        assert hs_entry["sd"] == pytest.approx(0.012910, abs=1e-6)
+        assert hs_entry["delta"] == pytest.approx(0.025820, abs=1e-6)
+
+        cl_entry = cal4["guards"]["cluster_ge4_pooled"]
+        assert cl_entry["sd"] == pytest.approx(0.001291, abs=1e-6)
+        assert cl_entry["delta"] == pytest.approx(0.010, abs=1e-9)
+
+        # 3 seeds for two-tag target: blue {-10, -18, -16}, red {-14, -20, -16}
+        three_dirs = {}
+        for seed, bb, br in (("42", -10.0, -14.0), ("43", -18.0, -20.0), ("44", -16.0, -16.0)):
+            three_dirs[seed] = _write_e3_anchor_dir(
+                tmp_path / f"t3_{seed}",
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+                bot_blue_gd=bb,
+                bot_red_gd=br,
+            )
+        cal3 = calibrate.calibrate_from_dirs(three_dirs, gen="300")
+        t1 = cal3["targets"]["T1"]
+        assert t1["per_seed"] == {"42": pytest.approx(-12.0), "43": pytest.approx(-19.0), "44": pytest.approx(-16.0)}
+        assert t1["mean"] == pytest.approx(-15.6667, abs=1e-4)
+        assert t1["sd"] == pytest.approx(3.5119, abs=1e-4)
+        assert t1["delta"] == pytest.approx(7.0238, abs=1e-4)
+
+    def test_calibrate_rejects_fewer_than_three_seeds_and_none_values(self, tmp_path):
+        """[RED] Fewer than 3 seeds or None/missing metric errors naming seed, tag, and metric."""
+        from tools.audit import calibrate
+
+        two_dirs = {
+            seed: _write_e3_anchor_dir(
+                tmp_path / f"two_{seed}",
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+            )
+            for seed in ("42", "43")
+        }
+        with pytest.raises(ValueError, match="3"):
+            calibrate.calibrate_from_dirs(two_dirs, gen="300")
+
+        bad_dirs = {
+            seed: _write_e3_anchor_dir(
+                tmp_path / f"bad_{seed}",
+                "300",
+                self_overrides={
+                    "gk_in_box_pooled": (0.99, 0.002),
+                    "gk_goal_line_pooled": (0.175, 0.01),
+                    "kick_outcome_teammate": (0.31, 0.01),
+                    **({"hold_share_pooled": (None, 0.0)} if seed == "43" else {}),
+                },
+            )
+            for seed in ("42", "43", "44")
+        }
+        with pytest.raises(ValueError) as exc_info:
+            calibrate.calibrate_from_dirs(bad_dirs, gen="300")
+        msg = str(exc_info.value)
+        assert "43" in msg and "self_sampled" in msg and "hold_share_pooled" in msg
+
+        missing_tag_dirs = {
+            seed: _write_e3_anchor_dir(
+                tmp_path / f"mtag_{seed}",
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+                omit_tags=("vs_frozen_red",) if seed == "44" else (),
+            )
+            for seed in ("42", "43", "44")
+        }
+        with pytest.raises(ValueError) as exc_tag:
+            calibrate.calibrate_from_dirs(missing_tag_dirs, gen="300")
+        assert "44" in str(exc_tag.value) and "vs_frozen_red" in str(exc_tag.value)
+
+    def test_calibrate_cli_writes_json_md_and_calls_git_once(self, tmp_path, monkeypatch):
+        """[RED] CLI writes JSON+MD, records gen, anchor_dirs, and git_commit via one helper call."""
+        from tools.audit import calibrate
+
+        anchor_args = []
+        for seed in ("42", "43", "44"):
+            d = _write_e3_anchor_dir(
+                tmp_path / f"cli_{seed}",
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+            )
+            anchor_args.append(f"{seed}={d}")
+        calls = []
+
+        def fake_git():
+            calls.append(1)
+            return "deadbee-dirty"
+
+        monkeypatch.setattr(calibrate, "current_git_commit", fake_git)
+        out_json = tmp_path / "cal.json"
+        out_md = tmp_path / "cal.md"
+        rc = calibrate.main(["--anchor", *anchor_args, "--gen", "300", "--json", str(out_json), "--md", str(out_md)])
+        assert rc == 0
+        assert len(calls) == 1
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["gen"] == "300"
+        assert data["git_commit"] == "deadbee-dirty"
+        assert set(data["anchor_dirs"]) == {"42", "43", "44"}
+        assert set(data["guards"]) == {
+            "hold_share_pooled", "holder_spell_s_pooled", "gk_in_box_pooled", "gk_goal_line_pooled",
+            "n_within_100_pooled", "cluster_ge4_pooled", "role_inversion_pooled", "goals_total", "scoreless",
+        }
+        assert set(data["targets"]) == {"T1", "T2", "T3"}
+        assert out_md.is_file() and "T1" in out_md.read_text(encoding="utf-8")
+
+    def test_calibrate_cli_requires_json_and_sorts_seeds_numerically(self, tmp_path):
+        """[RED] --json is required on CLI and --anchor seeds sort numerically."""
+        from tools.audit import calibrate
+
+        anchor_args = []
+        anchor_dirs = {}
+        for seed in ("100", "42", "43"):
+            d = _write_e3_anchor_dir(
+                tmp_path / f"num_{seed}",
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+            )
+            anchor_args.append(f"{seed}={d}")
+            anchor_dirs[seed] = d
+
+        with pytest.raises(SystemExit) as exc_info:
+            calibrate.main(["--anchor", *anchor_args, "--gen", "300"])
+        assert exc_info.value.code != 0
+
+        cal = calibrate.calibrate_from_dirs(anchor_dirs, gen="300", git_commit="abc1234")
+        assert cal["anchor_seeds"] == ["42", "43", "100"]
+        md = calibrate.format_markdown(cal)
+        assert "seeds=[42, 43, 100]" in md.splitlines()[0]
+        g1_line = next(ln for ln in md.splitlines() if "| hold_share_pooled |" in ln)
+        assert g1_line.index("42=") < g1_line.index("43=") < g1_line.index("100=")
+
+
+class TestGatesFreshE3:
+    def test_relative_guard_lower_and_higher_hand_cases(self):
+        """[RED] Relative guards require both strict seed separation and mean diff >= delta."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration()
+
+        # Worse = lower: anchor {0.18, 0.20, 0.19, 0.21}, delta 0.025820
+        fail_arm = {
+            "s1": _fresh_arm_seed({"300": {"hold_share_pooled": 0.15}}),
+            "s2": _fresh_arm_seed({"300": {"hold_share_pooled": 0.16}}),
+        }
+        res_fail = gates.evaluate_gates(fail_arm, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_fail["gates"]["G1"]["passed"] is False
+        assert res_fail["gates"]["G1"]["metrics"]["hold_share_pooled"]["passed"] is False
+        assert res_fail["gates"]["G1"]["metrics"]["hold_share_pooled"]["mean_diff"] == pytest.approx(-0.040, abs=1e-9)
+
+        unsep_arm = {
+            "s1": _fresh_arm_seed({"300": {"hold_share_pooled": 0.15}}),
+            "s2": _fresh_arm_seed({"300": {"hold_share_pooled": 0.185}}),
+        }
+        assert gates.evaluate_gates(unsep_arm, gens=["300"], protocol="fresh", calibration=cal)["gates"]["G1"]["passed"] is True
+
+        small_diff_arm = {
+            "s1": _fresh_arm_seed({"300": {"hold_share_pooled": 0.17}}),
+            "s2": _fresh_arm_seed({"300": {"hold_share_pooled": 0.175}}),
+        }
+        res_small = gates.evaluate_gates(small_diff_arm, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_small["gates"]["G1"]["passed"] is True
+        assert res_small["gates"]["G1"]["metrics"]["hold_share_pooled"]["mean_diff"] == pytest.approx(-0.0225, abs=1e-9)
+
+        # Worse = higher: anchor {0.28, 0.30, 0.29, 0.31}, delta 0.05
+        inv_fail = {
+            "s1": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.40}}),
+            "s2": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.42}}),
+        }
+        res_inv_fail = gates.evaluate_gates(inv_fail, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_inv_fail["gates"]["G4"]["passed"] is False
+        assert res_inv_fail["gates"]["G4"]["metrics"]["role_inversion_pooled"]["mean_diff"] == pytest.approx(0.115, abs=1e-9)
+
+        inv_pass = {
+            "s1": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.32}}),
+            "s2": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.33}}),
+        }
+        res_inv_pass = gates.evaluate_gates(inv_pass, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_inv_pass["gates"]["G4"]["passed"] is True
+        assert res_inv_pass["gates"]["G4"]["metrics"]["role_inversion_pooled"]["mean_diff"] == pytest.approx(0.030, abs=1e-9)
+
+        # Worse = higher, not separated: anchor {0.28, 0.30, 0.29, 0.31}, arm {0.29, 0.60} -> diff 0.15 >= 0.05, PASS
+        inv_unsep = {
+            "s1": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.29}}),
+            "s2": _fresh_arm_seed({"300": {"role_inversion_pooled": 0.60}}),
+        }
+        res_inv_unsep = gates.evaluate_gates(inv_unsep, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_inv_unsep["gates"]["G4"]["passed"] is True
+        assert res_inv_unsep["gates"]["G4"]["metrics"]["role_inversion_pooled"]["mean_diff"] == pytest.approx(0.15, abs=1e-9)
+
+    @pytest.mark.parametrize(
+        "metric,inside_val,outside_val",
+        [
+            ("hold_share_pooled", 0.10, 0.099),
+            ("holder_spell_s_pooled", 0.15, 0.149),
+            ("gk_in_box_A", 0.80, 0.799),
+            ("gk_in_box_B", 0.80, 0.799),
+            ("gk_goal_line_A", 0.60, 0.601),
+            ("gk_goal_line_B", 0.60, 0.601),
+            ("n_within_100_pooled", 1.00, 1.001),
+            ("cluster_ge4_pooled", 0.30, 0.301),
+            ("role_inversion_pooled", 0.55, 0.551),
+            ("goals_total", 0.80, 0.799),
+            ("goals_total", 5.00, 5.001),
+            ("scoreless", 0.40, 0.401),
+        ],
+    )
+    def test_catastrophe_floors_all_twelve_bounds(self, metric, inside_val, outside_val):
+        """Parametrised C0 check covering all 12 bounds: inside/at-bound passes, outside fails."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration()
+        inside_arm = {"s42": _fresh_arm_seed({"300": {metric: inside_val}})}
+        res_in = gates.evaluate_gates(inside_arm, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_in["gates"]["C0"]["passed"] is True
+        assert res_in["gates"]["C0"]["violations"] == []
+
+        outside_arm = {"s42": _fresh_arm_seed({"300": {metric: outside_val}})}
+        res_out = gates.evaluate_gates(outside_arm, gens=["300"], protocol="fresh", calibration=cal)
+        assert res_out["gates"]["C0"]["passed"] is False
+        assert len(res_out["gates"]["C0"]["violations"]) == 1
+        assert res_out["gates"]["C0"]["violations"][0]["metric"] == metric
+
+    def test_catastrophe_floors_gen_filtering_and_strict_bounds(self):
+        """[RED] C0 checks gens >= 200 per seed with strict inequality bounds and per-keeper checks."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration()
+
+        # hold share [0.05, 0.15, 0.16] over [100, 200, 300] -> gen 100 ignored -> PASS
+        pass_100 = {"s42": _fresh_arm_seed({
+            "100": {"hold_share_pooled": 0.05},
+            "200": {"hold_share_pooled": 0.15},
+            "300": {"hold_share_pooled": 0.16},
+        })}
+        assert gates.evaluate_gates(pass_100, gens=["100", "200", "300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is True
+
+        # [0.15, 0.09, 0.16] -> FAIL at 200
+        fail_200 = {"s42": _fresh_arm_seed({
+            "100": {"hold_share_pooled": 0.15},
+            "200": {"hold_share_pooled": 0.09},
+            "300": {"hold_share_pooled": 0.16},
+        })}
+        res_200 = gates.evaluate_gates(fail_200, gens=["100", "200", "300"], protocol="fresh", calibration=cal)
+        assert res_200["gates"]["C0"]["passed"] is False
+        assert res_200["gates"]["C0"]["violations"][0]["seed"] == "s42"
+        assert res_200["gates"]["C0"]["violations"][0]["gen"] == "200"
+        assert res_200["gates"]["C0"]["violations"][0]["value"] == pytest.approx(0.09)
+
+        # gk_goal_line_B 0.61 at 300 -> FAIL
+        fail_gk = {"s42": _fresh_arm_seed({"300": {"gk_goal_line_B": 0.61}})}
+        assert gates.evaluate_gates(fail_gk, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is False
+
+        # goals_total 5.1 -> FAIL; exact 0.8 and exact 0.10 hold_share -> PASS
+        fail_goals = {"s42": _fresh_arm_seed({"300": {"goals_total": 5.1}})}
+        assert gates.evaluate_gates(fail_goals, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is False
+
+        exact_bounds = {"s42": _fresh_arm_seed({"300": {"goals_total": 0.8, "hold_share_pooled": 0.10}})}
+        assert gates.evaluate_gates(exact_bounds, gens=["300"], protocol="fresh", calibration=cal)["gates"]["C0"]["passed"] is True
+
+    def test_fresh_protocol_validation_errors(self):
+        """[RED] Last gen != calibration gen or missing calibration raises ValueError."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration(gen="300")
+        arm = {"s42": _fresh_arm_seed({"200": {}})}
+        with pytest.raises(ValueError, match="calibration"):
+            gates.evaluate_gates(arm, gens=["200"], protocol="fresh", calibration=None)
+        with pytest.raises(ValueError, match="300"):
+            gates.evaluate_gates(arm, gens=["200"], protocol="fresh", calibration=cal)
+
+    def test_fresh_protocol_targets_cli_and_markdown_header(self, tmp_path, capsys):
+        """[RED] T1-T3 against anchor or --comparator, explicit --target after T1-T3, header names protocol/path/gen."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration(gen="300")
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(cal), encoding="utf-8")
+
+        # Anchor T1 is {-19, -18, -20, -17}, mean -18.5, delta 2.582.
+        # Arm T1 = (-12 + -14)/2 = -13 and (-13 + -15)/2 = -14 -> mean -13.5, beats anchor (+5.0 >= 2.582)
+        for seed, bb, br in (("42", -12.0, -14.0), ("43", -13.0, -15.0)):
+            _write_e3_anchor_dir(
+                tmp_path / "arm" / seed,
+                "300",
+                self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+                bot_blue_gd=bb,
+                bot_red_gd=br,
+            )
+
+        rc = gates.main([
+            "--arm", f"42={tmp_path}/arm/42", f"43={tmp_path}/arm/43",
+            "--protocol", "fresh", "--calibration", str(cal_path),
+            "--gens", "300", "--target", "goals_total@self_sampled:higher:0.1",
+        ])
+        assert rc == 0
+        out = capsys.readouterr().out
+        first_line = out.splitlines()[0]
+        assert "protocol=fresh" in first_line
+        assert str(cal_path) in first_line
+        assert "300" in first_line
+        assert "T1" in out and "BEATS" in out
+        assert out.index("T3") < out.index("goals_total@self_sampled")
+        assert "Between-seed SD at gen 300" in out
+
+        # When --comparator is given, T1-T3 use --comparator while G1-G5 still use anchor.
+        # Comparator hold_share_pooled=0.30 so G1 would FAIL if wrongly compared against comparator.
+        for seed, bb, br in (("91", -12.0, -14.0), ("92", -13.0, -15.0)):
+            _write_e3_anchor_dir(
+                tmp_path / "comp" / seed,
+                "300",
+                self_overrides={"hold_share_pooled": 0.30, "gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+                bot_blue_gd=bb,
+                bot_red_gd=br,
+            )
+        rc2 = gates.main([
+            "--arm", f"42={tmp_path}/arm/42", f"43={tmp_path}/arm/43",
+            "--comparator", f"91={tmp_path}/comp/91", f"92={tmp_path}/comp/92",
+            "--protocol", "fresh", "--calibration", str(cal_path),
+            "--gens", "300",
+        ])
+        assert rc2 == 0
+        out2 = capsys.readouterr().out
+        # Same T1 as comparator -> T1 row verdict is NEUTRAL, and G1 still compares vs anchor (PASS)
+        t1_rows = [ln for ln in out2.splitlines() if ln.startswith("| T1 (")]
+        assert len(t1_rows) == 1
+        t1_cells = [c.strip() for c in t1_rows[0].split("|")[1:-1]]
+        assert t1_cells[7] == "NEUTRAL"
+        assert "91=-13.000" in t1_cells[5] and "92=-14.000" in t1_cells[5]
+        assert "G1 | ball holding (relative) | PASS" in out2
+
+    def test_fresh_protocol_fails_closed_on_missing_data(self):
+        """[RED] Fresh protocol raises ValueError naming seed, gen, tag, and metric on missing data."""
+        from tools.audit import gates
+
+        cal = _make_fake_calibration(gen="300")
+
+        # 1a. Missing generation in C0
+        arm_missing_gen = {
+            "s42": _fresh_arm_seed({"300": {}}),
+            "s43": _fresh_arm_seed({"200": {}, "300": {}}),
+        }
+        with pytest.raises(ValueError) as exc_gen:
+            gates.evaluate_gates(arm_missing_gen, gens=["200", "300"], protocol="fresh", calibration=cal)
+        msg_gen = str(exc_gen.value)
+        assert "s42" in msg_gen and "200" in msg_gen and "self_sampled" in msg_gen and "hold_share_pooled" in msg_gen
+
+        # 1b. Missing tag in C0
+        arm_missing_c0_tag = {"s42": _fresh_arm_seed({"200": {}, "300": {}})}
+        del arm_missing_c0_tag["s42"]["200"]["self_sampled"]
+        with pytest.raises(ValueError) as exc_c0_tag:
+            gates.evaluate_gates(arm_missing_c0_tag, gens=["200", "300"], protocol="fresh", calibration=cal)
+        msg_c0_tag = str(exc_c0_tag.value)
+        assert "s42" in msg_c0_tag and "200" in msg_c0_tag and "self_sampled" in msg_c0_tag and "hold_share_pooled" in msg_c0_tag
+
+        # 1c. None value in C0
+        arm_none_c0 = {"s42": _fresh_arm_seed({"200": {"gk_in_box_A": (None, 0.0)}, "300": {}})}
+        with pytest.raises(ValueError) as exc_none_c0:
+            gates.evaluate_gates(arm_none_c0, gens=["200", "300"], protocol="fresh", calibration=cal)
+        msg_none_c0 = str(exc_none_c0.value)
+        assert "s42" in msg_none_c0 and "200" in msg_none_c0 and "self_sampled" in msg_none_c0 and "gk_in_box_A" in msg_none_c0
+
+        # 2. Missing arm value for a guard metric at last_gen
+        arm_missing_guard = {"s42": _fresh_arm_seed({"300": {"gk_in_box_pooled": (None, 0.0)}})}
+        with pytest.raises(ValueError) as exc_guard:
+            gates.evaluate_gates(arm_missing_guard, gens=["300"], protocol="fresh", calibration=cal)
+        msg_guard = str(exc_guard.value)
+        assert "s42" in msg_guard and "300" in msg_guard and "self_sampled" in msg_guard and "gk_in_box_pooled" in msg_guard
+
+        # 3a. Missing tag for T1-T3 on arm
+        arm_missing_t_tag = {
+            "s42": _fresh_arm_seed({"300": {}}),
+            "s43": _fresh_arm_seed({"300": {}}),
+        }
+        del arm_missing_t_tag["s43"]["300"]["vs_scripted_sampled_red"]
+        with pytest.raises(ValueError) as exc_t_arm:
+            gates.evaluate_gates(arm_missing_t_tag, gens=["300"], protocol="fresh", calibration=cal)
+        msg_t_arm = str(exc_t_arm.value)
+        assert "s43" in msg_t_arm and "300" in msg_t_arm and "vs_scripted_sampled_red" in msg_t_arm and "goal_diff" in msg_t_arm
+
+        # 3b. Missing tag for T1-T3 on comparator
+        arm_ok = {"s42": _fresh_arm_seed({"300": {}}), "s43": _fresh_arm_seed({"300": {}})}
+        comp_missing_t_tag = {"c91": _fresh_arm_seed({"300": {}}), "c92": _fresh_arm_seed({"300": {}})}
+        del comp_missing_t_tag["c91"]["300"]["vs_frozen"]
+        with pytest.raises(ValueError) as exc_t_comp:
+            gates.evaluate_gates(arm_ok, comparator=comp_missing_t_tag, gens=["300"], protocol="fresh", calibration=cal)
+        msg_t_comp = str(exc_t_comp.value)
+        assert "c91" in msg_t_comp and "300" in msg_t_comp and "vs_frozen" in msg_t_comp and "goal_diff" in msg_t_comp
+
+    def test_resume150_and_fresh300_unchanged_with_missing_data(self):
+        """resume150 and fresh300 keep their missing-data behaviour unchanged."""
+        from tools.audit import gates
+
+        arm = {"s42": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=(None, 0.0))}}}
+        res_f300 = gates.evaluate_gates(arm, gens=["200", "300"], protocol="fresh300", targets=["goal_diff@vs_frozen:higher:0.5"])
+        assert res_f300["gates"]["G1"]["metrics"]["hold_share_pooled"]["passed"] is None
+        assert res_f300["targets"][0]["verdict"] == "NEUTRAL"
+
+        res_r150 = gates.evaluate_gates(arm, gens=["300", "1200"], protocol="resume150", targets=["goal_diff@vs_frozen:higher:0.5"])
+        assert res_r150["gates"]["G1"]["metrics"]["hold_share_pooled"]["passed"] is None
+        assert res_r150["targets"][0]["verdict"] == "NEUTRAL"
+
+    def test_fresh_protocol_rejects_mismatched_calibration_constants(self, tmp_path):
+        """[RED] Loading/evaluating calibration rejects guard key, worse direction, or target tag mismatch."""
+        from tools.audit import gates
+
+        arm = {"s42": _fresh_arm_seed({"300": {}})}
+
+        # Mismatched guard worse direction
+        bad_worse = _make_fake_calibration(guard_overrides={"hold_share_pooled": {"worse": "higher"}})
+        with pytest.raises(ValueError, match="hold_share_pooled"):
+            gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=bad_worse)
+
+        # Mismatched guard metric keys
+        bad_keys = _make_fake_calibration()
+        del bad_keys["guards"]["scoreless"]
+        bad_keys["guards"]["extra_metric"] = {"gate": "G5", "tag": "self_sampled", "worse": "higher", "floor": 0.05, "per_seed": {"42": 0.1}, "mean": 0.1, "sd": 0.0, "delta": 0.05}
+        with pytest.raises(ValueError, match="scoreless|guards"):
+            gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=bad_keys)
+
+        # Mismatched target tags via CLI --calibration
+        bad_tags = _make_fake_calibration(target_overrides={"T1": {"tags": ["vs_scripted_sampled"]}})
+        cal_path = tmp_path / "bad_cal.json"
+        cal_path.write_text(json.dumps(bad_tags), encoding="utf-8")
+        _write_e3_anchor_dir(
+            tmp_path / "arm" / "42",
+            "300",
+            self_overrides={"gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), "kick_outcome_teammate": (0.31, 0.01)},
+        )
+        with pytest.raises(ValueError, match="T1"):
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", "fresh", "--calibration", str(cal_path), "--gens", "300"])
+
+    def test_gates_docstring_mentions_protocol_and_calibration(self):
+        """[RED] gates.py module docstring documents --protocol and --calibration."""
+        from tools.audit import gates
+
+        assert gates.__doc__ is not None
+        assert "--protocol" in gates.__doc__
+        assert "--calibration" in gates.__doc__
+
+
+class TestEvaluateArmE3:
+    def test_red_tags_match_direct_swap_harness_and_report_red_goals_A(self, tmp_path):
+        """[RED] vs_scripted_sampled_red matches swap=True array-for-array and reports red goals_A."""
+        from tools.audit import census, evaluate_arm, harness
+
+        ckpt_dir = tmp_path / "ckpt" / "gen0300"
+        ckpt_dir.mkdir(parents=True)
+        torch.manual_seed(7)
+        for prefix in ("blue", "red"):
+            for kind in ("field", "keeper"):
+                ac = ActorCritic()
+                # Distinguish blue vs red deterministically via output bias
+                with torch.no_grad():
+                    ac.actor_mean[-2].bias.fill_(1.0 if prefix == "red" else -1.0)
+                torch.save(ac.state_dict(), ckpt_dir / f"{prefix}_{kind}_policy.pt")
+
+        frozen_dir = write_checkpoint(tmp_path / "frozen" / "gen1050", seed=9)
+        out_dir = tmp_path / "eval_out"
+        evaluate_arm.evaluate_arm(
+            [ckpt_dir],
+            out_dir,
+            workers=1,
+            frozen_dir=frozen_dir,
+            tags=["vs_scripted_sampled_red", "vs_frozen_red"],
+            n_override=2,
+            max_steps=30,
+        )
+
+        # Direct harness runs with swap=True
+        direct_bot = harness.run_matches(
+            harness.EvalSpec(
+                checkpoint_dir=str(ckpt_dir), opponent="scripted", mode="sampled",
+                n=2, seed=13, swap=True, workers=1, max_steps=30,
+            )
+        )
+        direct_straight = harness.run_matches(
+            harness.EvalSpec(
+                checkpoint_dir=str(ckpt_dir), opponent="scripted", mode="sampled",
+                n=2, seed=13, swap=False, workers=1, max_steps=30,
+            )
+        )
+        assert not np.array_equal(direct_bot[0]["mean"][:, :6], direct_straight[0]["mean"][:, :6])
+
+        red_traces = census.load_traces(out_dir / "gen0300" / "vs_scripted_sampled_red")
+        assert len(red_traces) == 2
+        for got, exp in zip(red_traces, direct_bot):
+            assert set(got) == set(exp)
+            for k in exp:
+                assert np.array_equal(got[k], exp[k]), k
+
+        c_red = json.loads((out_dir / "gen0300" / "vs_scripted_sampled_red" / "census.json").read_text(encoding="utf-8"))
+        exp_goals_a = census.summarize([census.match_metrics(t) for t in direct_bot])["metrics"]["goals_A"]["mean"]
+        assert c_red["summary"]["metrics"]["goals_A"]["mean"] == pytest.approx(exp_goals_a)
+
+        direct_fr = harness.run_matches(
+            harness.EvalSpec(
+                checkpoint_dir=str(ckpt_dir), opponent=f"frozen:{frozen_dir}", mode="sampled",
+                n=2, seed=15, swap=True, workers=1, max_steps=30,
+            )
+        )
+        fr_traces = census.load_traces(out_dir / "gen0300" / "vs_frozen_red")
+        for got, exp in zip(fr_traces, direct_fr):
+            for k in exp:
+                assert np.array_equal(got[k], exp[k]), k
+
+    def test_adding_tags_leaves_existing_tags_byte_identical_and_recensus_reproduces_bytes(self, tmp_path, monkeypatch):
+        """[RED] Adding tags preserves existing tag files; --recensus reproduces JSONs without running harness."""
+        from tools.audit import evaluate_arm, harness
+
+        snap = write_checkpoint(tmp_path / "snaps" / "gen0300", seed=12)
+        out_dir = tmp_path / "eval_out"
+        evaluate_arm.evaluate_arm(
+            [snap], out_dir, workers=1, tags=["self_sampled"], n_override=2, max_steps=20,
+        )
+        before_self = dir_digest(out_dir / "gen0300" / "self_sampled")
+        census_bytes = (out_dir / "gen0300" / "self_sampled" / "census.json").read_bytes()
+        internals_bytes = (out_dir / "gen0300" / "self_sampled" / "internals.json").read_bytes()
+
+        # Adding another tag leaves self_sampled byte-identical
+        evaluate_arm.evaluate_arm(
+            [snap], out_dir, workers=1, tags=["vs_scripted_sampled_red"], n_override=2, max_steps=20,
+        )
+        assert dir_digest(out_dir / "gen0300" / "self_sampled") == before_self
+        assert (out_dir / "gen0300" / "vs_scripted_sampled_red" / "census.json").is_file()
+
+        # Corrupt JSONs, block harness completely, and run --recensus
+        (out_dir / "gen0300" / "self_sampled" / "census.json").write_text("{}", encoding="utf-8")
+        (out_dir / "gen0300" / "self_sampled" / "internals.json").write_text("{}", encoding="utf-8")
+
+        def forbid_harness(*args, **kwargs):
+            raise AssertionError("harness must not run during --recensus")
+
+        monkeypatch.setattr(harness, "iter_matches", forbid_harness)
+        monkeypatch.setattr(harness, "Session", forbid_harness)
+        rc = evaluate_arm.main([
+            "--snapshots", str(tmp_path / "nonexistent" / "gen0300"),
+            "--out", str(out_dir),
+            "--recensus",
+            "--tags", "self_sampled", "vs_scripted_sampled_red",
+        ])
+        assert rc == 0
+        assert (out_dir / "gen0300" / "self_sampled" / "census.json").read_bytes() == census_bytes
+        assert (out_dir / "gen0300" / "self_sampled" / "internals.json").read_bytes() == internals_bytes
+
+        # Missing traces in a tag directory errors naming it
+        empty_tag = out_dir / "gen0300" / "self_mixed"
+        empty_tag.mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="self_mixed"):
+            evaluate_arm.main([
+                "--snapshots", str(tmp_path / "nonexistent" / "gen0300"),
+                "--out", str(out_dir),
+                "--recensus",
+                "--tags", "self_mixed",
+            ])
+
+    def test_red_goal_attribution_differs_between_swap_true_and_false(self, tmp_path, monkeypatch):
+        """When only the red pair scores, goals_A is positive with swap=True and 0 with swap=False."""
+        from tools.audit import evaluate_arm, harness
+
+        ckpt_dir = tmp_path / "ckpt" / "gen0300"
+        ckpt_dir.mkdir(parents=True)
+        for prefix in ("blue", "red"):
+            for kind in ("field", "keeper"):
+                ac = ActorCritic()
+                with torch.no_grad():
+                    for p in ac.parameters():
+                        p.zero_()
+                    # Distinguishable blue vs red weights; bias[0] drives Team A throttle when kept as TeamPolicy
+                    ac.actor_mean[-2].bias.fill_(1.0 if prefix == "red" else -1.0)
+                torch.save(ac.state_dict(), ckpt_dir / f"{prefix}_{kind}_policy.pt")
+
+        frozen_dir = tmp_path / "frozen" / "gen1050"
+        frozen_dir.mkdir(parents=True)
+        for prefix in ("blue", "red"):
+            for kind in ("field", "keeper"):
+                ac = ActorCritic()
+                with torch.no_grad():
+                    for p in ac.parameters():
+                        p.zero_()
+                torch.save(ac.state_dict(), frozen_dir / f"{prefix}_{kind}_policy.pt")
+
+        orig_load = harness._load_policies
+
+        def load_scoring_red(spec):
+            team_a, team_b = orig_load(spec)
+            # When Team A loaded the red policy (bias[0] > 0), drive Team A with scripted_actions (scores in <=160 steps)
+            if team_a is not None and float(team_a.heads[0][1][-1][1][0]) > 0.0:
+                return None, team_b
+            return team_a, team_b
+
+        monkeypatch.setattr(harness, "_load_policies", load_scoring_red)
+        out_dir = tmp_path / "eval_out"
+        evaluate_arm.evaluate_arm(
+            [ckpt_dir],
+            out_dir,
+            workers=1,
+            frozen_dir=frozen_dir,
+            tags=["vs_frozen", "vs_frozen_red"],
+            n_override=1,
+            max_steps=160,
+        )
+        c_blue = json.loads((out_dir / "gen0300" / "vs_frozen" / "census.json").read_text(encoding="utf-8"))
+        c_red = json.loads((out_dir / "gen0300" / "vs_frozen_red" / "census.json").read_text(encoding="utf-8"))
+        goals_blue = c_blue["summary"]["metrics"]["goals_A"]["mean"]
+        goals_red = c_red["summary"]["metrics"]["goals_A"]["mean"]
+        assert goals_blue == pytest.approx(0.0)
+        assert goals_red >= 1.0
+        assert goals_red != goals_blue
+
+    def test_recensus_multitag_computes_all_before_writing(self, tmp_path):
+        """[RED] A multi-tag --recensus failure on a later tag leaves earlier tags untouched."""
+        from tools.audit import evaluate_arm
+
+        snap = write_checkpoint(tmp_path / "snaps" / "gen0300", seed=12)
+        out_dir = tmp_path / "eval_out"
+        evaluate_arm.evaluate_arm(
+            [snap], out_dir, workers=1, tags=["self_sampled"], n_override=2, max_steps=20,
+        )
+        sentinel = '{"sentinel": "keep_me"}\n'
+        (out_dir / "gen0300" / "self_sampled" / "census.json").write_text(sentinel, encoding="utf-8")
+        (out_dir / "gen0300" / "self_sampled" / "internals.json").write_text(sentinel, encoding="utf-8")
+        (out_dir / "gen0300" / "self_sampled" / "report.txt").write_text(sentinel, encoding="utf-8")
+
+        empty_tag = out_dir / "gen0300" / "vs_scripted_sampled_red"
+        empty_tag.mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="vs_scripted_sampled_red"):
+            evaluate_arm.main([
+                "--snapshots", str(tmp_path / "nonexistent" / "gen0300"),
+                "--out", str(out_dir),
+                "--recensus",
+                "--tags", "self_sampled", "vs_scripted_sampled_red",
+            ])
+        assert (out_dir / "gen0300" / "self_sampled" / "census.json").read_text(encoding="utf-8") == sentinel
+        assert (out_dir / "gen0300" / "self_sampled" / "internals.json").read_text(encoding="utf-8") == sentinel
+        assert (out_dir / "gen0300" / "self_sampled" / "report.txt").read_text(encoding="utf-8") == sentinel
+
+
