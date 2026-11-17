@@ -365,6 +365,11 @@ class PPOHyperparams:
     # hybrid5 fire probabilities lie in [floor + (1 - 2*floor)*sigmoid(-bound), 1 - that]; the logit is bounded by `fire_logit_bound`.
     fire_prob_floor: float = 0.005
     fire_logit_bound: float = 6.0
+    # hybrid5 entropy bonus: "joint" applies `ent_coef` to the whole head entropy, including the two Bernoulli fire
+    # entropies and the kick-weighted power entropy; "separate" applies `ent_coef` to the Gaussian terms and a detached
+    # kick-weighted power term, and `fire_ent_coef` to the two Bernoulli fire entropies.
+    fire_entropy: str = "joint"
+    fire_ent_coef: float = 0.0
 
     def __post_init__(self) -> None:
         if self.policy_head not in ("gaussian4", "hybrid5"):
@@ -378,6 +383,14 @@ class PPOHyperparams:
             raise ValueError(f"fire_prob_floor must be in [0, 0.5), got {self.fire_prob_floor}")
         if not (math.isfinite(self.fire_logit_bound) and self.fire_logit_bound > 0.0):
             raise ValueError(f"fire_logit_bound must be finite and > 0, got {self.fire_logit_bound}")
+        if self.fire_entropy not in ("joint", "separate"):
+            raise ValueError(f"fire_entropy must be 'joint' or 'separate', got {self.fire_entropy!r}")
+        if not (math.isfinite(self.fire_ent_coef) and self.fire_ent_coef >= 0.0):
+            raise ValueError(f"fire_ent_coef must be finite and >= 0, got {self.fire_ent_coef}")
+        if self.fire_entropy == "separate" and self.policy_head != "hybrid5":
+            raise ValueError(f"fire_entropy 'separate' requires policy_head 'hybrid5', got {self.policy_head!r}")
+        if self.fire_entropy == "joint" and self.fire_ent_coef != 0.0:
+            raise ValueError(f"fire_ent_coef must be 0 with fire_entropy 'joint', got {self.fire_ent_coef}")
         if self.policy_head == "hybrid5":
             # The head starts at the gaussian4 kick and special fire rates; refuse a floor / bound pair that cannot.
             _initial_fire_logit(

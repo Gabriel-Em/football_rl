@@ -128,6 +128,24 @@ def hybrid_log_prob_entropy(
     return _hybrid_log_prob(mean, logstd, p, action), _hybrid_entropy(logstd, p)
 
 
+def hybrid_entropy_bonus(
+    logstd: torch.Tensor, p: torch.Tensor, ent_coef: float, fire_entropy: str, fire_ent_coef: float
+) -> torch.Tensor:
+    """Per-sample entropy bonus of the hybrid5 loss; `p[..., 0]` is the kick and `p[..., 1]` the special fire probability.
+
+    `joint`: `ent_coef` times the full head entropy. `separate`: `ent_coef` times the three Gaussian terms, with the
+    power term weighted by the detached kick probability, plus `fire_ent_coef` times the two Bernoulli entropies.
+    """
+    if fire_entropy == "joint":
+        return ent_coef * _hybrid_entropy(logstd, p)
+    if fire_entropy != "separate":
+        raise ValueError(f"fire_entropy must be 'joint' or 'separate', got {fire_entropy!r}")
+    h_n = 0.5 + _HALF_LOG_TWO_PI + logstd
+    h_b = -(p * torch.log(p) + (1.0 - p) * torch.log1p(-p)).sum(-1)
+    gaussian = h_n[..., 0] + h_n[..., 1] + p[..., 0].detach() * h_n[..., 2]
+    return ent_coef * gaussian + fire_ent_coef * h_b
+
+
 class ActorCritic(nn.Module):
     """Actor-Critic network for shared role policies, with a Gaussian or a hybrid action head.
 
@@ -233,11 +251,18 @@ class ActorCritic(nn.Module):
         deterministic: bool = False,
         central_state: Optional[torch.Tensor] = None,
         return_mean: bool = False,
+        return_heads: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
-        """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended."""
+        """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended.
+
+        With `return_heads` (hybrid5 only) the `(logstd, p)` pair of the same forward pass is appended last, where
+        `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities.
+        """
         actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
         if self.hybrid:
-            return self._hybrid_action_and_value(actor_obs, action, deterministic, central_state, return_mean)
+            return self._hybrid_action_and_value(actor_obs, action, deterministic, central_state, return_mean, return_heads)
+        if return_heads:
+            raise ValueError("return_heads requires the hybrid5 policy head")
         action_mean = self.actor_mean(actor_obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
@@ -298,6 +323,7 @@ class ActorCritic(nn.Module):
         deterministic: bool,
         central_state: Optional[torch.Tensor],
         return_mean: bool,
+        return_heads: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         mean3, p = self._hybrid_split(self.actor_mean(actor_obs))
         logstd = self.actor_logstd
@@ -312,9 +338,12 @@ class ActorCritic(nn.Module):
         entropy = _hybrid_entropy(logstd, p)
         critic_in = self._prepare_critic_input(actor_obs, central_state)
         value = self.critic(critic_in).squeeze(-1)
+        out: Tuple[Any, ...] = (action, log_prob, entropy, value)
         if return_mean:
-            return action, log_prob, entropy, value, self._hybrid_env_mean(mean3, p[..., 0], p[..., 1])
-        return action, log_prob, entropy, value
+            out += (self._hybrid_env_mean(mean3, p[..., 0], p[..., 1]),)
+        if return_heads:
+            out += ((logstd, p),)
+        return out
 
     @torch.no_grad()
     def hybrid_logits_and_value(
@@ -1553,6 +1582,7 @@ class ParameterSharingPPOTrainer:
         num_minibatches = min(self.cfg.ppo.num_minibatches, batch_size)
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
+        separate_fire_entropy = self.policy_head == "hybrid5" and self.cfg.ppo.fire_entropy == "separate"
 
         # Fire statistics of the policy that produced this batch, taken before any update.
         fire_metrics: Dict[str, float] = {}
@@ -1620,9 +1650,14 @@ class ParameterSharingPPOTrainer:
                     entropy_losses.append(0.0)
                     continue
 
-                _, newlogprob, entropy, newvalue = policy.get_action_and_value(
-                    mb_obs, mb_actions, central_state=cen_mb
-                )
+                if separate_fire_entropy:
+                    _, newlogprob, entropy, newvalue, (head_logstd, head_p) = policy.get_action_and_value(
+                        mb_obs, mb_actions, central_state=cen_mb, return_heads=True
+                    )
+                else:
+                    _, newlogprob, entropy, newvalue = policy.get_action_and_value(
+                        mb_obs, mb_actions, central_state=cen_mb
+                    )
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
@@ -1642,11 +1677,17 @@ class ParameterSharingPPOTrainer:
                 v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                 entropy_loss = entropy.mean()
-                loss = (
-                    pg_loss
-                    - self.cfg.ppo.ent_coef * entropy_loss
-                    + v_loss * self.cfg.ppo.vf_coef
-                )
+                if separate_fire_entropy:
+                    bonus = hybrid_entropy_bonus(
+                        head_logstd, head_p, self.cfg.ppo.ent_coef, "separate", self.cfg.ppo.fire_ent_coef
+                    ).mean()
+                    loss = pg_loss - bonus + v_loss * self.cfg.ppo.vf_coef
+                else:
+                    loss = (
+                        pg_loss
+                        - self.cfg.ppo.ent_coef * entropy_loss
+                        + v_loss * self.cfg.ppo.vf_coef
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
