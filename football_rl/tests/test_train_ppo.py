@@ -3382,3 +3382,354 @@ def test_frozen_seat_batch_matches_every_networks_own_forward_pass(head: str) ->
     np.testing.assert_allclose(values2[touched], values[touched], atol=1e-6)
     np.testing.assert_allclose(actions2[touched], actions[touched], atol=1e-6)
     assert np.isnan(actions2[~touched]).all()
+
+
+# ------------------------------------------------------------------ hybrid5 update digest
+HYBRID_UPDATE_DIGEST_ENV = ("2.6.0+cu124", 6)  # torch version and thread count the digests were recorded with
+HYBRID_UPDATE_DIGESTS = {
+    "blue_field": "15b1c6c9f379e1ae403afa91a667bb2afb088b89ea4306e6733a8577b5d40b14",
+    "blue_keeper": "209ec30b5f4757e7b981ca6279313e1c1368d029bf657949bb2fdf73d99b2515",
+    "red_field": "3792f0f5ceb6453dd1616abca979a93eea24a220cda22d57d46a74853e26826a",
+    "red_keeper": "49a2f9256fa9113f6aa87b8de67290ad9204e65e1d21f6a4d56a6615bc3af819",
+}
+
+
+def _hybrid_update_digests(tmp_path: Path, **ppo) -> dict[str, str]:
+    """SHA-256 per role over every actor and critic parameter and every Adam state tensor after one seeded update."""
+    trainer = _head_trainer(tmp_path, num_envs=1, rollout_steps=16, seed=7, **ppo)
+    try:
+        trainer.update_policies(trainer.collect_rollouts(active_generation=1))
+        digests = {}
+        for role, pol, opt in _policy_groups(trainer):
+            h = hashlib.sha256()
+            for name, param in pol.named_parameters():
+                h.update(name.encode("utf-8"))
+                h.update(param.detach().cpu().contiguous().numpy().tobytes())
+                for key in ("exp_avg", "exp_avg_sq", "step"):
+                    h.update(opt.state[param][key].detach().cpu().contiguous().numpy().tobytes())
+            digests[role] = h.hexdigest()
+        return digests
+    finally:
+        trainer.close()
+
+
+def test_hybrid_update_matches_golden_digest(tmp_path: Path) -> None:
+    """[GUARD] One seeded hybrid5 update leaves every role's parameters and Adam state at the recorded SHA-256."""
+    if HYBRID_UPDATE_DIGEST_ENV != (torch.__version__, torch.get_num_threads()):
+        pytest.skip(f"digests recorded with torch {HYBRID_UPDATE_DIGEST_ENV}; running {(torch.__version__, torch.get_num_threads())}")
+    assert _hybrid_update_digests(tmp_path) == HYBRID_UPDATE_DIGESTS
+
+
+# ------------------------------------------------------------------ fire-head entropy switch
+from football_rl.config import PPOHyperparams  # noqa: E402
+
+# logstd = 0 on all three Gaussians, p_kick = p_spec = 0.25, ent_coef = 0.005.
+# Columns: fire_entropy, fire_ent_coef, bonus, d/dp_kick, d/dp_spec (d/dlogstd is the same in every row).
+BONUS_TABLE = [
+    ("joint", 0.0, 0.02158641, 0.01258775, 0.00549306),
+    ("separate", 0.0, 0.01596306, 0.0, 0.0),
+    ("separate", 0.002, 0.01821240, 0.00219722, 0.00219722),
+    ("separate", 0.005, 0.02158641, 0.00549306, 0.00549306),
+]
+BONUS_DLOGSTD = (0.005, 0.005, 0.00125)
+JOINT_KICK_MAXIMISER = 0.744395  # sigmoid(H_N(power)) at logstd_power = -0.35
+
+
+def _bonus_and_grads(logstd_values, p_values, ent_coef, fire_entropy, fire_ent_coef):
+    """Per-sample bonus (float64) and the gradients of its sum with respect to logstd and p (zeros when unused)."""
+    logstd = torch.tensor([list(logstd_values)], dtype=torch.float64, requires_grad=True)
+    p = torch.tensor(p_values, dtype=torch.float64, requires_grad=True)
+    bonus = tp.hybrid_entropy_bonus(logstd, p, ent_coef, fire_entropy, fire_ent_coef)
+    g_logstd, g_p = torch.autograd.grad(bonus.sum(), (logstd, p), allow_unused=True)
+    g_logstd = torch.zeros_like(logstd) if g_logstd is None else g_logstd
+    g_p = torch.zeros_like(p) if g_p is None else g_p
+    return bonus.detach(), g_logstd, g_p
+
+
+def test_fire_entropy_config_defaults_are_todays_loss() -> None:
+    """[RED] The defaults select the joint entropy with no separate fire coefficient."""
+    ppo = DEFAULT_CONFIG.ppo
+    assert (ppo.fire_entropy, ppo.fire_ent_coef) == ("joint", 0.0)
+
+
+@pytest.mark.parametrize("bad", ["", "Joint", "both", "separate "])
+def test_fire_entropy_rejects_unknown_modes(bad: str) -> None:
+    """[RED] fire_entropy must be exactly 'joint' or 'separate'; the error names the field."""
+    with pytest.raises(ValueError, match="fire_entropy"):
+        PPOHyperparams(policy_head="hybrid5", fire_entropy=bad)
+
+
+@pytest.mark.parametrize("bad", [-1e-9, -0.002, float("nan"), float("inf"), float("-inf")])
+def test_fire_ent_coef_must_be_finite_and_non_negative(bad: float) -> None:
+    """[RED] fire_ent_coef rejects negative and non-finite values; the error names the field."""
+    with pytest.raises(ValueError, match="fire_ent_coef"):
+        PPOHyperparams(policy_head="hybrid5", fire_entropy="separate", fire_ent_coef=bad)
+
+
+def test_separate_fire_entropy_requires_the_hybrid_head() -> None:
+    """[RED] 'separate' with the gaussian4 head is an error naming fire_entropy; with hybrid5 it is accepted."""
+    with pytest.raises(ValueError, match="fire_entropy"):
+        PPOHyperparams(policy_head="gaussian4", fire_entropy="separate")
+    ok = PPOHyperparams(policy_head="hybrid5", fire_entropy="separate", fire_ent_coef=0.0)
+    assert (ok.fire_entropy, ok.fire_ent_coef) == ("separate", 0.0)
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_joint_fire_entropy_rejects_a_fire_coefficient(head: str) -> None:
+    """[RED] A coefficient that 'joint' would ignore is an error naming fire_ent_coef, under either head."""
+    with pytest.raises(ValueError, match="fire_ent_coef"):
+        PPOHyperparams(policy_head=head, fire_entropy="joint", fire_ent_coef=0.001)
+
+
+def test_fire_entropy_is_reachable_through_config_overrides() -> None:
+    """[RED] The command-line override path sets the three fields together and returns the coerced values."""
+    cfg, applied = tp.parse_config_overrides(
+        ["ppo.policy_head=hybrid5", "ppo.fire_entropy=separate", "ppo.fire_ent_coef=0"]
+    )
+    assert (cfg.ppo.policy_head, cfg.ppo.fire_entropy, cfg.ppo.fire_ent_coef) == ("hybrid5", "separate", 0.0)
+    assert isinstance(cfg.ppo.fire_ent_coef, float)
+    assert applied == {"ppo.fire_ent_coef": 0.0, "ppo.fire_entropy": "separate", "ppo.policy_head": "hybrid5"}
+    with pytest.raises(ValueError, match="fire_entropy"):
+        tp.parse_config_overrides(["ppo.fire_entropy=separate"])  # head left at gaussian4
+
+
+@pytest.mark.parametrize(("mode", "fire_coef", "value", "d_kick", "d_spec"), BONUS_TABLE)
+def test_hybrid_entropy_bonus_hand_values(mode, fire_coef, value, d_kick, d_spec) -> None:
+    """[RED] Value and gradients at logstd 0, p = 0.25, ent_coef 0.005 (hand-solved table; 1e-7).
+
+    joint: 0.005 (2.25 H_N + 2 H_B(0.25)) with H_N = 1.418939, H_B(0.25) = 0.562335. d/dp_kick = 0.005 (ln 3 + H_N),
+    d/dp_spec = 0.005 ln 3. separate: p_kick is detached in the power term, so only fire_ent_coef * ln 3 remains.
+    """
+    bonus, g_logstd, g_p = _bonus_and_grads((0.0, 0.0, 0.0), [[0.25, 0.25]], 0.005, mode, fire_coef)
+    assert bonus.shape == (1,)
+    assert float(bonus[0]) == pytest.approx(value, abs=1e-7)
+    assert float(g_p[0, 0]) == pytest.approx(d_kick, abs=1e-7)
+    assert float(g_p[0, 1]) == pytest.approx(d_spec, abs=1e-7)
+    np.testing.assert_allclose(g_logstd.numpy().reshape(3), BONUS_DLOGSTD, atol=1e-7)
+
+
+def test_hybrid_entropy_bonus_is_per_sample_and_row_independent() -> None:
+    """[RED] A two-row batch returns two values; the p = 0.5 row has the joint value 0.005 (2.5 H_N + 2 ln 2) = 0.02466820."""
+    bonus, _, _ = _bonus_and_grads((0.0, 0.0, 0.0), [[0.25, 0.25], [0.5, 0.5]], 0.005, "joint", 0.0)
+    assert bonus.shape == (2,)
+    np.testing.assert_allclose(bonus.numpy(), [0.02158641, 0.02466820], atol=1e-7)
+    sep, _, _ = _bonus_and_grads((0.0, 0.0, 0.0), [[0.25, 0.25], [0.5, 0.5]], 0.005, "separate", 0.0)
+    np.testing.assert_allclose(sep.numpy(), [0.01596306, 0.01773673], atol=1e-7)
+
+
+def test_separate_bonus_with_zero_ent_coef_keeps_only_the_fire_term() -> None:
+    """[RED] ent_coef 0, fire_ent_coef 0.002 at p = 0.25: value 0.002 * 2 * H_B(0.25) = 0.00224934; no logstd gradient."""
+    bonus, g_logstd, g_p = _bonus_and_grads((0.0, 0.0, 0.0), [[0.25, 0.25]], 0.0, "separate", 0.002)
+    assert float(bonus[0]) == pytest.approx(0.00224934, abs=1e-7)
+    assert not g_logstd.any()
+    np.testing.assert_allclose(g_p.numpy(), [[0.00219722, 0.00219722]], atol=1e-7)
+
+
+def test_hybrid_entropy_bonus_rejects_an_unknown_mode() -> None:
+    """[RED] An unrecognised mode raises instead of silently picking one."""
+    with pytest.raises(ValueError, match="fire_entropy"):
+        tp.hybrid_entropy_bonus(torch.zeros(1, 3), torch.full((1, 2), 0.25), 0.005, "both", 0.0)
+
+
+def test_joint_entropy_pays_the_kick_head_for_firing_up_to_the_maximiser() -> None:
+    """[RED] Joint, logstd_power = -0.35: d bonus / d p_kick is positive below p = sigmoid(1.0689385) = 0.744395 and zero at it.
+
+    Separate with a zero fire coefficient has no such pull at any p_kick.
+    """
+    logstd = (0.0, 0.0, -0.35)
+    grad_kick = lambda p, mode, coef: float(_bonus_and_grads(logstd, [[p, 0.25]], 0.005, mode, coef)[2][0, 0])
+    for p in (0.01, 0.129, 0.5, 0.74):
+        assert grad_kick(p, "joint", 0.0) > 0.0
+    assert grad_kick(JOINT_KICK_MAXIMISER - 1e-6, "joint", 0.0) > 0.0
+    assert grad_kick(JOINT_KICK_MAXIMISER + 1e-6, "joint", 0.0) < 0.0
+    assert grad_kick(0.9, "joint", 0.0) < 0.0
+    for p in (0.01, 0.129, 0.5, JOINT_KICK_MAXIMISER, 0.9):
+        assert grad_kick(p, "separate", 0.0) == 0.0
+
+
+def test_get_action_and_value_can_return_the_head_parameters_it_used() -> None:
+    """[RED] `return_heads` appends `(logstd, p)` of the same forward pass; gaussian4 has no such heads and refuses."""
+    net = _constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0], logstd=(0.1, -0.2, -0.35))
+    obs = torch.randn(3, OBS_DIM)
+    out = net.get_action_and_value(obs, torch.zeros(3, 5), return_heads=True)
+    assert len(out) == 5
+    logstd, p = out[4]
+    np.testing.assert_allclose(logstd.detach().numpy(), [[0.1, -0.2, -0.35]], atol=1e-7)
+    np.testing.assert_allclose(p.detach().numpy(), [[0.25, 0.5]] * 3, atol=1e-6)
+    with_mean = net.get_action_and_value(obs, torch.zeros(3, 5), return_mean=True, return_heads=True)
+    assert len(with_mean) == 6 and with_mean[5][1].shape == (3, 2)
+    with pytest.raises(ValueError, match="hybrid5"):
+        ActorCritic().get_action_and_value(obs, return_heads=True)
+
+
+# ------------------------------------------------------------------ update behaviour
+def _zero_advantage_update(tmp_path: Path, **ppo):
+    """Run `_ppo_update_role` on a seeded batch with advantage 0 and returns equal to the values; return before/after."""
+    torch.manual_seed(11)
+    trainer = _head_trainer(tmp_path, **ppo)
+    try:
+        policy, opt, _ = _bandit_policy(trainer)
+        obs = torch.randn(32, OBS_DIM)
+        with torch.no_grad():
+            action, logp, value = policy.sample_action_and_value(obs)
+        before = {n: p.detach().clone() for n, p in policy.named_parameters()}
+        with torch.no_grad():
+            p_before = torch.stack(policy.hybrid_heads(obs)[1:], dim=-1).clone()
+        trainer._ppo_update_role(policy, opt, obs, action, logp, torch.zeros(32), value.clone(), value)
+        with torch.no_grad():
+            p_after = torch.stack(policy.hybrid_heads(obs)[1:], dim=-1)
+        after = {n: p.detach().clone() for n, p in policy.named_parameters()}
+        return before, after, p_before, p_after
+    finally:
+        trainer.close()
+
+
+def test_zero_advantage_gives_an_exactly_zero_policy_gradient_term(tmp_path: Path) -> None:
+    """[GUARD] With advantage 0, ent_coef 0 and returns = values, an update leaves every actor parameter byte-identical.
+
+    This establishes that the zero-advantage cases below isolate the entropy term: normalisation maps zeros to zeros.
+    """
+    before, after, _, _ = _zero_advantage_update(tmp_path, ent_coef=0.0)
+    for name in before:
+        if name.startswith("actor_"):
+            assert torch.equal(before[name], after[name]), name
+
+
+def test_separate_fire_entropy_leaves_the_mean_head_untouched_without_advantage(tmp_path: Path) -> None:
+    """[RED] separate, 0, zero advantage: every `actor_mean` parameter is byte-identical and `actor_logstd` moves."""
+    before, after, _, _ = _zero_advantage_update(tmp_path, fire_entropy="separate", fire_ent_coef=0.0)
+    for name in before:
+        if name.startswith("actor_mean"):
+            assert torch.equal(before[name], after[name]), name
+    assert not torch.equal(before["actor_logstd"], after["actor_logstd"])
+
+
+def test_joint_fire_entropy_raises_both_fire_probabilities_without_advantage(tmp_path: Path) -> None:
+    """[GUARD] joint, zero advantage: `actor_mean` changes and p_kick and p_spec at a fixed observation both rise.
+
+    At the initial p_kick = 0.129 and p_spec = 0.0275 both entropy gradients point upward (ln((1-p)/p) > 0).
+    """
+    before, after, p_before, p_after = _zero_advantage_update(tmp_path)
+    assert any(not torch.equal(before[n], after[n]) for n in before if n.startswith("actor_mean"))
+    assert (p_after[0] > p_before[0]).all(), (p_before[0], p_after[0])
+    assert (p_after.mean(dim=0) > p_before.mean(dim=0)).all()
+
+
+def test_separate_fire_entropy_with_a_coefficient_raises_both_fire_probabilities(tmp_path: Path) -> None:
+    """[RED] separate with fire_ent_coef 0.005 and zero advantage: the Bernoulli bonus alone lifts p_kick and p_spec."""
+    before, after, p_before, p_after = _zero_advantage_update(tmp_path, fire_entropy="separate", fire_ent_coef=0.005)
+    assert any(not torch.equal(before[n], after[n]) for n in before if n.startswith("actor_mean"))
+    assert (p_after[0] > p_before[0]).all(), (p_before[0], p_after[0])
+
+
+def test_hybrid_bandit_learns_to_fire_and_to_stop_firing_without_fire_entropy(tmp_path: Path) -> None:
+    """[RED] separate, 0: the one-state bandit still rises above 0.9 and falls below 0.05 inside the same update budget."""
+    torch.manual_seed(0)
+    trainer = _head_trainer(tmp_path, fire_entropy="separate", fire_ent_coef=0.0)
+    try:
+        policy, opt, obs = _bandit_policy(trainer)
+        up = _bandit_calls(trainer, policy, opt, obs, +1.0, BANDIT_UPDATE_CALLS, lambda p: p > 0.9)
+        assert _p_kick(policy, obs) > 0.9, f"P(kick)={_p_kick(policy, obs):.3f} after {up} calls"
+        down = _bandit_calls(trainer, policy, opt, obs, -1.0, BANDIT_UPDATE_CALLS, lambda p: p < 0.05)
+        assert _p_kick(policy, obs) < 0.05, f"P(kick)={_p_kick(policy, obs):.3f} after {down} calls"
+        print(f"separate bandit update calls needed: rise {up}, fall {down}, budget {BANDIT_UPDATE_CALLS}")
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize(("mode", "fire_coef"), [("joint", 0.0), ("separate", 0.0), ("separate", 0.005)])
+def test_reported_entropy_is_the_full_entropy_in_every_mode(tmp_path: Path, mode: str, fire_coef: float) -> None:
+    """[RED] One minibatch, one epoch: the `entropy` statistic is the full hybrid entropy, 4.448094 at p = (0.25, 0.5), sigma 1."""
+    torch.manual_seed(5)
+    trainer = _head_trainer(tmp_path, fire_entropy=mode, fire_ent_coef=fire_coef, num_minibatches=1, update_epochs=1)
+    try:
+        policy, opt, _ = _bandit_policy(trainer)
+        policy.load_state_dict(_constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0]).state_dict())
+        obs = torch.randn(16, OBS_DIM)
+        with torch.no_grad():
+            action, logp, value = policy.sample_action_and_value(obs)
+        stats = trainer._ppo_update_role(policy, opt, obs, action, logp, torch.zeros(16), value.clone(), value)
+        assert stats["entropy"] == pytest.approx(4.448094, abs=1e-5)
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("mode", ["joint", "separate"])
+def test_reported_entropy_equals_the_batch_mean_of_the_policy_entropy(tmp_path: Path, mode: str) -> None:
+    """[RED] For an observation-dependent policy the statistic equals the mean `hybrid_log_prob_entropy` entropy of the batch."""
+    torch.manual_seed(6)
+    trainer = _head_trainer(tmp_path, fire_entropy=mode, fire_ent_coef=0.0, num_minibatches=1, update_epochs=1)
+    try:
+        policy, opt, _ = _bandit_policy(trainer)
+        with torch.no_grad():
+            policy.actor_mean[4].weight.normal_(0.0, 0.3)
+        obs = torch.randn(24, OBS_DIM)
+        with torch.no_grad():
+            action, logp, value = policy.sample_action_and_value(obs)
+            mean3, p_kick, p_spec = policy.hybrid_heads(obs)
+            expected = float(tp.hybrid_log_prob_entropy(mean3, policy.actor_logstd, p_kick, p_spec, action)[1].mean())
+        stats = trainer._ppo_update_role(policy, opt, obs, action, logp, torch.zeros(24), value.clone(), value)
+        assert stats["entropy"] == pytest.approx(expected, abs=1e-6)
+        assert stats["entropy"] > 2.0  # the throttle and steer Gaussians alone give 2 * 0.918939 = 1.837877
+    finally:
+        trainer.close()
+
+
+def test_separate_fire_entropy_adds_no_actor_forward_pass_to_the_update(tmp_path: Path) -> None:
+    """[RED] The actor runs once per minibatch step plus the single fire-statistics pass, identically in both modes."""
+    counts = {}
+    for mode in ("joint", "separate"):
+        torch.manual_seed(7)
+        trainer = _head_trainer(tmp_path, name=mode, fire_entropy=mode, num_minibatches=4, update_epochs=3)
+        try:
+            policy, opt, _ = _bandit_policy(trainer)
+            obs = torch.randn(32, OBS_DIM)
+            with torch.no_grad():
+                action, logp, value = policy.sample_action_and_value(obs)
+            calls = []
+            handle = policy.actor_mean.register_forward_hook(lambda *_: calls.append(1))
+            trainer._ppo_update_role(policy, opt, obs, action, logp, torch.randn(32), value.clone(), value)
+            handle.remove()
+            counts[mode] = len(calls)
+        finally:
+            trainer.close()
+    assert counts == {"joint": 1 + 3 * 4, "separate": 1 + 3 * 4}
+
+
+def test_separate_power_term_is_weighted_by_the_kick_probability_not_the_special_one() -> None:
+    """[RED] separate, 0, logstd 0: p = (0.25, 0.5) gives 0.005 * 2.25 * H_N = 0.01596306; p = (0.5, 0.25) gives 0.005 * 2.5 * H_N = 0.01773673."""
+    kick_low, _, _ = _bonus_and_grads((0.0, 0.0, 0.0), [[0.25, 0.5]], 0.005, "separate", 0.0)
+    kick_high, _, _ = _bonus_and_grads((0.0, 0.0, 0.0), [[0.5, 0.25]], 0.005, "separate", 0.0)
+    assert float(kick_low[0]) == pytest.approx(0.01596306, abs=1e-7)
+    assert float(kick_high[0]) == pytest.approx(0.01773673, abs=1e-7)
+
+
+@pytest.mark.parametrize(
+    ("mode", "fire_coef", "d_bias_kick"),
+    [("joint", 0.0, 0.00228107), ("separate", 0.0, 0.0), ("separate", 0.002, 0.00039817), ("separate", 0.005, 0.00099542)],
+)
+def test_update_step_moves_the_head_by_the_hand_solved_entropy_gradient(tmp_path: Path, mode, fire_coef, d_bias_kick) -> None:
+    """[RED] One plain SGD step (lr 1) at zero advantage moves each parameter by the gradient of the entropy bonus.
+
+    Constant policy: sigma 1, p_kick 0.25, p_spec 0.5, sigmoid slope dp/dz = p (1 - p) sech^2(z / 6) = 0.18121381 for
+    the kick head. d logstd = ent_coef * (1, 1, p_kick) = (0.005, 0.005, 0.00125) in every mode. d bias_kick is
+    joint: 0.005 (ln 3 + H_N) * 0.18121381; separate: fire_ent_coef * ln 3 * 0.18121381. The special bias stays put
+    because ln((1 - 0.5) / 0.5) = 0.
+    """
+    torch.manual_seed(8)
+    trainer = _head_trainer(tmp_path, fire_entropy=mode, fire_ent_coef=fire_coef, num_minibatches=1, update_epochs=1)
+    try:
+        policy, _, _ = _bandit_policy(trainer)
+        policy.load_state_dict(_constant_hybrid_net([0.0, 0.0, 0.0, Z_FOR_QUARTER, 0.0]).state_dict())
+        sgd = torch.optim.SGD(policy.parameters(), lr=1.0)
+        obs = torch.randn(16, OBS_DIM)
+        with torch.no_grad():
+            action, logp, value = policy.sample_action_and_value(obs)
+        logstd0, bias0 = policy.actor_logstd.detach().clone(), policy.actor_mean[4].bias.detach().clone()
+        trainer._ppo_update_role(policy, sgd, obs, action, logp, torch.zeros(16), value.clone(), value)
+        d_logstd = (policy.actor_logstd.detach() - logstd0).numpy().reshape(3)
+        d_bias = (policy.actor_mean[4].bias.detach() - bias0).numpy()
+        np.testing.assert_allclose(d_logstd, BONUS_DLOGSTD, atol=1e-7)
+        np.testing.assert_allclose(d_bias, [0.0, 0.0, 0.0, d_bias_kick, 0.0], atol=1e-7)
+    finally:
+        trainer.close()
