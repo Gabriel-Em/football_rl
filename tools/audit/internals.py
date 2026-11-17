@@ -1,13 +1,21 @@
 """Policy-internal metrics over harness traces (`tools/audit/harness.py`).
 
 Every metric is computed per match from one trace and aggregated across matches as mean +- SE with n
-(skipping matches where a denominator is zero). Field players are slots 1..5 and 7..11.
+(skipping matches where a denominator is zero). Keepers are slots 0 and 6; field players are slots 1..5
+and 7..11.
 
 Policy heads: the trace's optional `head` field gives each team's head (0 = gaussian4, the default when the field
 is absent; 1 = hybrid5). A hybrid5 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
 p = (mean + 1) / 2 > 0.5; a gaussian4 seat's intent is mean > 0.35 (kick) or mean > 0.5 (special). `sat99_*` and
 `grad_scale_*` of the kick and special columns are computed over gaussian4 field players only (a probability
-column has no tanh gradient scale) and are None when no such decision exists.
+column has no tanh gradient scale) and are None when no such decision exists. The fire-behaviour metrics
+(`keeper_special_rate`, `field_special_rate_far`, `keeper_kick_fire_holding`) read the env-space `act` columns,
+so they mean the same thing for both policy heads.
+
+Tackle counters: in `football_rl/env.py`, `self.stats["failed_tackles"]` and `self.stats["successful_tackles"]`
+are incremented across the match and never reset per step, and `tools/audit/harness.py` records them after each
+step; both `s_failed_tackles` and `s_successful_tackles` are therefore cumulative series, and the per-match total
+is the final step's value.
 
 Metrics
   sat99_<head>            share of field-player decisions with |mean| > 0.99 (throttle, steer, kick, special).
@@ -23,6 +31,13 @@ Metrics
                           the bearing to an outfield teammate strictly 85..500 u away (sampled and mean steer).
   special_rate            share of field-player decisions with act_special > 0.5.
   special_from_intent     share of field-player special fires taken on a decision with special intent.
+  keeper_special_rate     share of keeper decisions where that keeper is not the holder, with act_special > 0.5.
+  field_special_rate_far  share of field-player decisions with act_special > 0.5 while strictly more than
+                          `tackle_whiff_max_ball_dist` u from the ball.
+  keeper_kick_fire_holding share of keeper decisions where that keeper holds the ball and
+                          hold_t >= pickup_kick_grace, with act_kick > 0.35.
+  failed_tackles_pm       per-match failed tackle total (final value of cumulative `s_failed_tackles`).
+  successful_tackles_pm   per-match successful tackle total (final value of cumulative `s_successful_tackles`).
 
 Usage:
   python tools/audit/internals.py TRACE_DIR [TRACE_DIR ...] [--json OUT]
@@ -46,6 +61,7 @@ from football_rl.config import DEFAULT_CONFIG  # noqa: E402
 from tools.audit import census  # noqa: E402
 
 __all__ = [
+    "KEEPERS",
     "FIELD_PLAYERS",
     "HEAD_COLS",
     "METRIC_KEYS",
@@ -56,15 +72,23 @@ __all__ = [
     "main",
 ]
 
+KEEPERS = (0, 6)
 FIELD_PLAYERS = (1, 2, 3, 4, 5, 7, 8, 9, 10, 11)
 TEAM_OUTFIELD_OFFSETS = np.arange(1, 6, dtype=np.int64)
 HEAD_COLS = (("throttle", 0), ("steer", 1), ("kick", 2), ("special", 3))
-TRACE_KEYS = ("mean", "act", "holder", "hold_t", "pos", "ang")
-OPTIONAL_TRACE_KEYS = ("head",)
+TRACE_KEYS = ("mean", "act", "holder", "hold_t", "pos", "ang", "ball")
+OPTIONAL_TRACE_KEYS = ("head", "s_failed_tackles", "s_successful_tackles")
 
 KICK_THR = float(DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
 SPECIAL_THR = float(DEFAULT_CONFIG.mechanics.special_trigger_threshold)
 PICKUP_GRACE_S = float(DEFAULT_CONFIG.mechanics.pickup_kick_grace)
+TACKLE_WHIFF_MAX_BALL_DIST = float(
+    getattr(
+        DEFAULT_CONFIG.mechanics,
+        "tackle_whiff_max_ball_dist",
+        getattr(DEFAULT_CONFIG.rewards, "tackle_whiff_max_ball_dist", 180.0),
+    )
+)
 DEFLECTION_RAD = math.radians(float(DEFAULT_CONFIG.mechanics.kick_steer_max_deflection_deg))
 MIN_PASS_DIST = float(DEFAULT_CONFIG.mechanics.min_pass_distance)
 AIM_MAX_DIST = 500.0
@@ -88,6 +112,11 @@ METRIC_KEYS = (
     "aim_teammate_share_mean",
     "special_rate",
     "special_from_intent",
+    "keeper_special_rate",
+    "field_special_rate_far",
+    "keeper_kick_fire_holding",
+    "failed_tackles_pm",
+    "successful_tackles_pm",
 )
 
 
@@ -207,6 +236,37 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     rec["n_special_fires"] = n_fires
     rec["special_rate"] = float(fire.mean())
     rec["special_from_intent"] = float(sp_intent[fire].mean()) if n_fires > 0 else None
+
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    field_delta = pos[:, FIELD_PLAYERS, :] - ball[:, None, :]
+    field_dist = np.hypot(field_delta[:, :, 0], field_delta[:, :, 1])
+    rec["field_special_rate_far"] = float((fire & (field_dist > TACKLE_WHIFF_MAX_BALL_DIST)).mean())
+
+    keeper_not_holder = holder[:, None] != np.asarray(KEEPERS, dtype=np.int64)[None, :]
+    if keeper_not_holder.any():
+        keeper_fire = act[:, KEEPERS, 3] > SPECIAL_THR
+        rec["keeper_special_rate"] = float(keeper_fire[keeper_not_holder].mean())
+    else:
+        rec["keeper_special_rate"] = None
+
+    gk_elig_mask = (holder >= 0) & (holder % census.TEAM_SIZE == 0) & (hold_t >= PICKUP_GRACE_S)
+    if gk_elig_mask.any():
+        gk_idx = np.flatnonzero(gk_elig_mask)
+        gk_pl = holder[gk_idx]
+        rec["keeper_kick_fire_holding"] = float((act[gk_idx, gk_pl, 2] > KICK_THR).mean())
+    else:
+        rec["keeper_kick_fire_holding"] = None
+
+    rec["failed_tackles_pm"] = (
+        float(np.asarray(trace["s_failed_tackles"], dtype=np.float64)[-1])
+        if "s_failed_tackles" in trace
+        else None
+    )
+    rec["successful_tackles_pm"] = (
+        float(np.asarray(trace["s_successful_tackles"], dtype=np.float64)[-1])
+        if "s_successful_tackles" in trace
+        else None
+    )
     return rec
 
 
@@ -256,6 +316,18 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
     lines.append(
         "special     (rate / from_intent)     : "
         + " / ".join(census._fmt_d(met[k], 3) for k in ("special_rate", "special_from_intent"))
+    )
+    lines.append(
+        "keeper      (spec / kick_holding)    : "
+        + " / ".join(census._fmt_d(met[k], 3) for k in ("keeper_special_rate", "keeper_kick_fire_holding"))
+    )
+    lines.append(
+        "field_spec  (far)                    : "
+        + census._fmt_d(met["field_special_rate_far"], 3)
+    )
+    lines.append(
+        "tackles/m   (failed / successful)    : "
+        + " / ".join(census._fmt_d(met[k], 2) for k in ("failed_tackles_pm", "successful_tackles_pm"))
     )
     return "\n".join(lines)
 

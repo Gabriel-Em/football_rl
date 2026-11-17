@@ -3282,3 +3282,261 @@ class TestPoolMatchExclusion:
         g6 = res["gates"]["G6"]
         assert g6["per_seed"] == {s: None for s in seeds}
         assert g6["passed"] is False
+
+
+# ----------------------------------------------------------------------------
+# E5: Fire-behaviour internals (tools/audit/internals.py)
+# ----------------------------------------------------------------------------
+def _e5_archives_root() -> Path:
+    for cand in (REPO_ROOT / "archives", REPO_ROOT.parent / "football_rl" / "archives"):
+        if cand.is_dir():
+            return cand
+    pytest.skip("archives directory not found")
+
+
+class TestInternalsFireE5:
+    def test_fire_internals_hand_trace_and_aggregation(self, tmp_path, monkeypatch):
+        """[RED] Hand-solved 4-decision trace for keeper_special_rate, field_special_rate_far,
+        keeper_kick_fire_holding (including zero-eligible None skipping), and cumulative tackle totals.
+        """
+        from football_rl.config import DEFAULT_CONFIG
+        from tools.audit import internals
+
+        # Match 1: 4 decisions (T=4), ball at (100, 420), all players start at (100, 420)
+        tr1 = make_internals_trace(4)
+        tr1["ball"][:] = (100.0, 420.0)
+        tr1["pos"][:] = (100.0, 420.0)
+
+        # Keepers (slots 0 and 6): 8 total keeper decisions.
+        # - step 0: holder=0, hold_t=0.04 (<0.08 grace); act[0,0,2]=0.9 (excluded by grace),
+        #           act[0,0,3]=0.9 (excluded from keeper_special_rate because holding);
+        #           keeper 6 not holding, act[0,6,3]=0.8 (>0.5 -> fire #1).
+        # - step 1: holder=0, hold_t=0.10 (>=0.08 grace); act[1,0,2]=0.8 (>0.35 -> kick fire #1),
+        #           act[1,0,3]=0.9 (excluded because holding); keeper 6 not holding, act[1,6,3]=-1.0.
+        # - step 2: holder=6, hold_t=0.20 (>=0.08 grace); act[2,6,2]=0.35 (not >0.35 -> no kick),
+        #           act[2,6,3]=0.9 (excluded because holding); keeper 0 not holding, act[2,0,3]=0.5 (not >0.5).
+        # - step 3: holder=6, hold_t=0.25 (>=0.08 grace); act[3,6,2]=0.6 (>0.35 -> kick fire #2),
+        #           act[3,6,3]=-1.0 (excluded because holding); keeper 0 not holding, act[3,0,3]=-1.0.
+        # Hand values for tr1:
+        #   keeper_special_rate: 1 fire (step 0 k6) out of 4 non-holding keeper decisions = 1/4 = 0.25
+        #   (if holding states were included: 4 fires out of 8 = 0.50)
+        #   keeper_kick_fire_holding: 2 fires (steps 1, 3) out of 3 eligible GK holds (steps 1, 2, 3) = 2/3
+        #   (if grace ignored: 3 fires out of 4 = 0.75)
+        tr1["holder"][:] = np.array([0, 0, 6, 6], dtype=np.int8)
+        tr1["hold_t"][:] = np.array([0.04, 0.10, 0.20, 0.25], dtype=np.float32)
+        tr1["act"][0, 0, 2] = 0.9
+        tr1["act"][0, 0, 3] = 0.9
+        tr1["act"][0, 6, 3] = 0.8
+        tr1["act"][1, 0, 2] = 0.8
+        tr1["act"][1, 0, 3] = 0.9
+        tr1["act"][2, 6, 2] = 0.35
+        tr1["act"][2, 6, 3] = 0.9
+        tr1["act"][2, 0, 3] = 0.5
+        tr1["act"][3, 6, 2] = 0.6
+
+        # Field players (slots 1..5, 7..11): 4 * 10 = 40 field decisions.
+        # - step 0 slot 1: dist 179.9 u (not > 180), act=0.9 (near fire)
+        # - step 1 slot 2: dist 180.0 u (exact boundary, not > 180), act=0.9 (near fire)
+        # - step 2 slot 3: dist 180.1 u (> 180), act=0.9 (far fire #1)
+        # - step 3 slot 7: dist 200.0 u (> 180), act=0.7 (far fire #2)
+        # - step 3 slot 8: dist 200.0 u (> 180), act=0.5 (not > 0.5, no fire)
+        # Hand values for tr1:
+        #   special_rate = 4 / 40 = 0.10
+        #   field_special_rate_far = 2 / 40 = 0.05 (if >= instead of >: 3 / 40 = 0.075)
+        tr1["pos"][0, 1] = (279.9, 420.0)
+        tr1["act"][0, 1, 3] = 0.9
+        tr1["pos"][1, 2] = (280.0, 420.0)
+        tr1["act"][1, 2, 3] = 0.9
+        tr1["pos"][2, 3] = (280.1, 420.0)
+        tr1["act"][2, 3, 3] = 0.9
+        tr1["pos"][3, 7] = (100.0, 620.0)
+        tr1["act"][3, 7, 3] = 0.7
+        tr1["pos"][3, 8] = (100.0, 620.0)
+        tr1["act"][3, 8, 3] = 0.5
+
+        # Cumulative tackle counters: final value is match total (sum would be 9 and 4)
+        tr1["s_failed_tackles"] = np.array([1, 1, 3, 4], dtype=np.int32)
+        tr1["s_successful_tackles"] = np.array([0, 1, 1, 2], dtype=np.int32)
+
+        m1 = internals.match_internals(tr1)
+        assert m1["keeper_special_rate"] == pytest.approx(0.25)
+        assert m1["field_special_rate_far"] == pytest.approx(0.05)
+        assert m1["special_rate"] == pytest.approx(0.10)
+        assert m1["keeper_kick_fire_holding"] == pytest.approx(2.0 / 3.0)
+        assert m1["failed_tackles_pm"] == pytest.approx(4.0)
+        assert m1["successful_tackles_pm"] == pytest.approx(2.0)
+
+        # Head-agnostic: hybrid5 team flags leave all env-act fire metrics identical
+        tr1_hyb = {k: v.copy() for k, v in tr1.items()}
+        tr1_hyb["head"] = np.array([1, 1], dtype=np.int8)
+        m1_hyb = internals.match_internals(tr1_hyb)
+        for key in (
+            "keeper_special_rate",
+            "field_special_rate_far",
+            "keeper_kick_fire_holding",
+            "failed_tackles_pm",
+            "successful_tackles_pm",
+        ):
+            assert m1_hyb[key] == pytest.approx(m1[key])
+
+        # Verify config threshold matches DEFAULT_CONFIG.mechanics.tackle_whiff_max_ball_dist
+        assert internals.TACKLE_WHIFF_MAX_BALL_DIST == pytest.approx(
+            float(DEFAULT_CONFIG.mechanics.tackle_whiff_max_ball_dist)
+        )
+        monkeypatch.setattr(internals, "TACKLE_WHIFF_MAX_BALL_DIST", 190.0)
+        assert internals.match_internals(tr1)["field_special_rate_far"] == pytest.approx(1.0 / 40.0)
+        monkeypatch.undo()
+
+        # Match 2: zero eligible keeper holding decisions (holder=0 below grace at step 0, loose/outfield otherwise)
+        #   keeper_kick_fire_holding = None (skipped in summarize)
+        #   keeper_special_rate = 0 / 7 = 0.0
+        #   field_special_rate_far = 0 / 40 = 0.0
+        #   failed_tackles_pm = 2.0, successful_tackles_pm = 0.0
+        tr2 = make_internals_trace(4)
+        tr2["ball"][:] = (100.0, 420.0)
+        tr2["pos"][:] = (100.0, 420.0)
+        tr2["holder"][:] = np.array([0, -1, 3, -1], dtype=np.int8)
+        tr2["hold_t"][:] = np.array([0.05, 0.0, 0.20, 0.0], dtype=np.float32)
+        tr2["act"][0, 0, 2] = 0.9
+        tr2["s_failed_tackles"] = np.array([0, 2, 2, 2], dtype=np.int32)
+        tr2["s_successful_tackles"] = np.array([0, 0, 0, 0], dtype=np.int32)
+
+        m2 = internals.match_internals(tr2)
+        assert m2["keeper_kick_fire_holding"] is None
+        assert m2["keeper_special_rate"] == pytest.approx(0.0)
+        assert m2["field_special_rate_far"] == pytest.approx(0.0)
+        assert m2["failed_tackles_pm"] == pytest.approx(2.0)
+        assert m2["successful_tackles_pm"] == pytest.approx(0.0)
+
+        # Aggregated across [m1, m2]:
+        #   keeper_kick_fire_holding: n=1, mean=2/3, se=None
+        #   keeper_special_rate: n=2, mean=(0.25+0)/2=0.125, se=0.125
+        #   field_special_rate_far: n=2, mean=(0.05+0)/2=0.025, se=0.025
+        #   failed_tackles_pm: n=2, mean=(4+2)/2=3.0, se=1.0
+        #   successful_tackles_pm: n=2, mean=(2+0)/2=1.0, se=1.0
+        summ = internals.summarize([m1, m2])["metrics"]
+        assert summ["keeper_kick_fire_holding"] == {"mean": pytest.approx(2.0 / 3.0), "se": None, "n": 1}
+        assert summ["keeper_special_rate"] == {"mean": pytest.approx(0.125), "se": pytest.approx(0.125), "n": 2}
+        assert summ["field_special_rate_far"] == {"mean": pytest.approx(0.025), "se": pytest.approx(0.025), "n": 2}
+        assert summ["failed_tackles_pm"] == {"mean": pytest.approx(3.0), "se": pytest.approx(1.0), "n": 2}
+        assert summ["successful_tackles_pm"] == {"mean": pytest.approx(1.0), "se": pytest.approx(1.0), "n": 2}
+
+        # CLI JSON + report output includes all new keys and preserves existing lines
+        d = tmp_path / "traces_e5"
+        d.mkdir()
+        np.savez_compressed(d / "m000.npz", **tr1)
+        np.savez_compressed(d / "m001.npz", **tr2)
+        out_json = tmp_path / "internals_e5.json"
+        assert internals.main([str(d), "--json", str(out_json)]) == 0
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        for key in (
+            "keeper_special_rate",
+            "field_special_rate_far",
+            "keeper_kick_fire_holding",
+            "failed_tackles_pm",
+            "successful_tackles_pm",
+        ):
+            assert key in payload[str(d)]["summary"]["metrics"]
+
+    def test_fire_internals_reads_whiff_dist_from_config(self, monkeypatch):
+        """Reloading internals picks up DEFAULT_CONFIG.mechanics.tackle_whiff_max_ball_dist (not hard-coded 180)."""
+        import importlib
+        from dataclasses import replace
+        import football_rl.config as cfg_mod
+        from tools.audit import internals
+
+        tr = make_internals_trace(2)
+        tr["ball"][:] = (100.0, 420.0)
+        tr["pos"][:] = (100.0, 420.0)
+        # Step 0 slot 1: dist 160 u (> 150, <= 180) with special fire; step 1 slot 1: dist 190 u (> 180) with fire
+        tr["pos"][0, 1] = (260.0, 420.0)
+        tr["act"][0, 1, 3] = 0.9
+        tr["pos"][1, 1] = (290.0, 420.0)
+        tr["act"][1, 1, 3] = 0.9
+
+        assert internals.match_internals(tr)["field_special_rate_far"] == pytest.approx(1.0 / 20.0)
+
+        custom_cfg = replace(
+            cfg_mod.DEFAULT_CONFIG,
+            mechanics=replace(cfg_mod.DEFAULT_CONFIG.mechanics, tackle_whiff_max_ball_dist=150.0),
+        )
+        monkeypatch.setattr(cfg_mod, "DEFAULT_CONFIG", custom_cfg)
+        try:
+            importlib.reload(internals)
+            assert internals.TACKLE_WHIFF_MAX_BALL_DIST == pytest.approx(150.0)
+            assert internals.match_internals(tr)["field_special_rate_far"] == pytest.approx(2.0 / 20.0)
+        finally:
+            monkeypatch.undo()
+            importlib.reload(internals)
+
+    def test_keeper_kick_fire_holding_grace_boundary(self):
+        """Exact float64 pickup_kick_grace (0.08 s) is included (>=), while float32(0.08) (< 0.08) is excluded."""
+        from tools.audit import internals
+
+        tr = make_internals_trace(2)
+        tr["holder"][:] = np.array([0, 6], dtype=np.int8)
+        # Step 0: exact 0.08 in float64 -> eligible (>= grace), does not kick -> 0/1
+        # Step 1: 0.10 in float64 -> eligible, kicks -> 1/2 = 0.5 (if > instead of >=, step 0 excluded -> 1/1 = 1.0)
+        tr["hold_t"] = np.array([0.08, 0.10], dtype=np.float64)
+        tr["act"][0, 0, 2] = 0.0
+        tr["act"][1, 6, 2] = 0.8
+        assert internals.match_internals(tr)["keeper_kick_fire_holding"] == pytest.approx(0.5)
+
+        # Confirm float32(0.08) rounds below float64(0.08) and is excluded, leaving only step 1 -> 1.0
+        tr_f32 = {k: v.copy() for k, v in tr.items()}
+        tr_f32["hold_t"] = np.array([np.float32(0.08), np.float32(0.10)], dtype=np.float32)
+        assert internals.match_internals(tr_f32)["keeper_kick_fire_holding"] == pytest.approx(1.0)
+
+    def test_existing_internals_keys_unchanged_against_master(self):
+        """[GUARD] Every existing internals key keeps its exact value on real FL42 and FX42 traces."""
+        import subprocess
+        import types
+        from tools.audit import internals
+
+        arch = _e5_archives_root()
+        master_src = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "show",
+                "89109c0a900ab536d6aa74a1509f2180c6b48145:tools/audit/internals.py",
+            ],
+            text=True,
+        )
+        master_mod = types.ModuleType("master_internals_ref")
+        master_mod.__file__ = str(REPO_ROOT / "tools" / "audit" / "internals.py")
+        master_mod.__package__ = "tools.audit"
+        exec(compile(master_src, "master:tools/audit/internals.py", "exec"), master_mod.__dict__)
+
+        assert set(master_mod.METRIC_KEYS).issubset(set(internals.METRIC_KEYS))
+
+        paths = [
+            arch / "fl_s42_gen300" / "eval" / "gen0300" / "self_sampled" / "m000.npz",
+            arch / "fx_s42_gen300" / "eval" / "gen0300" / "self_sampled" / "m000.npz",
+        ]
+        cur_matches = []
+        old_matches = []
+        for p in paths:
+            with np.load(p) as z:
+                tr = {k: z[k] for k in z.files}
+            cur = internals.match_internals(tr)
+            old = master_mod.match_internals(tr)
+            cur_matches.append(cur)
+            old_matches.append(old)
+            for key in master_mod.METRIC_KEYS:
+                if old[key] is None:
+                    assert cur[key] is None, (p, key)
+                else:
+                    assert cur[key] == pytest.approx(old[key], rel=0.0, abs=0.0), (p, key)
+
+        cur_sum = internals.summarize(cur_matches)["metrics"]
+        old_sum = master_mod.summarize(old_matches)["metrics"]
+        for key in master_mod.METRIC_KEYS:
+            assert cur_sum[key]["n"] == old_sum[key]["n"]
+            for sub in ("mean", "se"):
+                if old_sum[key][sub] is None:
+                    assert cur_sum[key][sub] is None
+                else:
+                    assert cur_sum[key][sub] == pytest.approx(old_sum[key][sub], rel=0.0, abs=0.0)
+
