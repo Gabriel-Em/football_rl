@@ -83,6 +83,7 @@ __all__ = [
 ]
 
 POS_ERR_LIMIT = 1e-3
+CHECKPOINT_MATCH_TOL = 1e-5
 STEP_SECONDS = census.STEP_SECONDS
 RL_HZ = float(DEFAULT_CONFIG.physics.rl_hz)
 FIELD_WIDTH = census.FIELD_WIDTH
@@ -354,12 +355,19 @@ def _stat_dict(values: Iterable[float]) -> Dict[str, Any]:
     return {"mean": mean, "se": se, "n": n}
 
 
+def _resolved_shaping_mode(shaping_mode: Optional[str]) -> str:
+    return str(shaping_mode) if shaping_mode is not None else str(DEFAULT_CONFIG.rewards.shaping_mode)
+
+
 def summarize_gk(
     records: Sequence[Dict[str, Any]],
     n_matches_total: int,
     n_matches_ok: int,
     n_matches_skipped: int,
     max_pos_err: Optional[float],
+    *,
+    shaping_mode: str = str(DEFAULT_CONFIG.rewards.shaping_mode),
+    gamma: float = float(DEFAULT_CONFIG.ppo.gamma),
 ) -> Dict[str, Any]:
     variants = {}
     for group in ("recorded", "scripted", "inert", "diff_scripted_minus_recorded"):
@@ -369,6 +377,8 @@ def summarize_gk(
         }
     return {
         "mode": "gk",
+        "shaping_mode": shaping_mode,
+        "gamma": float(gamma),
         "n_matches_total": n_matches_total,
         "n_matches_ok": n_matches_ok,
         "n_matches_skipped": n_matches_skipped,
@@ -411,7 +421,15 @@ def run_gk(
             max_err = err if max_err is None else max(max_err, err)
         else:
             n_skipped += 1
-    return summarize_gk(records, len(tasks), n_ok, n_skipped, max_err)
+    return summarize_gk(
+        records,
+        len(tasks),
+        n_ok,
+        n_skipped,
+        max_err,
+        shaping_mode=_resolved_shaping_mode(shaping_mode),
+        gamma=float(DEFAULT_CONFIG.ppo.gamma),
+    )
 
 
 def format_gk_report(summary: Dict[str, Any], title: str = "") -> str:
@@ -867,6 +885,56 @@ def _init_hold_worker(spec: harness.EvalSpec, shaping_mode: Optional[str]) -> No
     _HOLD_SPEC_CFG = (spec.mode, float(spec.sigma_scale), shaping_mode)
 
 
+def _team_mean_and_value(
+    policy: Optional[harness.TeamPolicy],
+    env: Any,
+    team: int,
+    obs: np.ndarray,
+    cen: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if policy is None:
+        from football_rl.baselines import scripted_actions
+
+        return scripted_actions(env, team), np.zeros(TEAM_SIZE, dtype=np.float32)
+    sl = slice(team * TEAM_SIZE, (team + 1) * TEAM_SIZE)
+    _, val, mean = policy.act(obs[sl], cen[sl], "greedy", 0.0, torch.Generator())
+    return mean, val
+
+
+def _verify_checkpoint_matches_trace(
+    match_idx: int,
+    step: int,
+    snap: FootballParallelEnv,
+    trace: Dict[str, np.ndarray],
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+) -> None:
+    obs = snap._get_observations_array()
+    cen = snap.get_centralized_state()
+    mean_a, val_a = _team_mean_and_value(team_a, snap, 0, obs, cen)
+    mean_b, val_b = _team_mean_and_value(team_b, snap, 1, obs, cen)
+    pred_mean = np.clip(np.concatenate([mean_a, mean_b]), -1.0, 1.0).astype(np.float64)
+    pred_val = np.concatenate([val_a, val_b]).astype(np.float64)
+    trace_mean = np.asarray(trace["mean"][step], dtype=np.float64)
+    trace_val = np.asarray(trace["val"][step], dtype=np.float64)
+    val_diff = np.abs(pred_val - trace_val)
+    mean_diff = np.max(np.abs(pred_mean - trace_mean), axis=1)
+    seat_diff = np.maximum(val_diff, mean_diff)
+    if not np.all(np.isfinite(seat_diff)):
+        bad = int(np.flatnonzero(~np.isfinite(seat_diff))[0])
+        raise ValueError(
+            f"checkpoint mismatch at match {match_idx} step {step} seat {bad}: "
+            f"max_diff=non-finite > {CHECKPOINT_MATCH_TOL}"
+        )
+    max_seat = int(np.argmax(seat_diff))
+    max_diff = float(seat_diff[max_seat])
+    if max_diff > CHECKPOINT_MATCH_TOL:
+        raise ValueError(
+            f"checkpoint mismatch at match {match_idx} step {step} seat {max_seat}: "
+            f"max_diff={max_diff:.6g} > {CHECKPOINT_MATCH_TOL}"
+        )
+
+
 def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
     match_idx, path_str, trace_seed, rollout_seed = task
     assert _HOLD_POLICIES is not None and _HOLD_SPEC_CFG is not None
@@ -875,7 +943,7 @@ def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
 
     trace = _load_trace(Path(path_str))
     pts = find_hold_decisions(trace)
-    target_steps = [p["step"] for p in pts]
+    target_steps = sorted({0, *(p["step"] for p in pts)})
     ok, max_err, snapshots = resimulate_match(
         trace,
         match_seed=trace_seed * 1000 + match_idx,
@@ -884,6 +952,8 @@ def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
     )
     if not ok:
         return {"ok": False, "max_err": max_err, "records": []}
+
+    _verify_checkpoint_matches_trace(match_idx, 0, snapshots[0], trace, team_a, team_b)
 
     records = []
     for p in pts:
@@ -938,6 +1008,8 @@ def summarize_hold(
     max_pos_err: Optional[float],
     *,
     seed: int,
+    shaping_mode: str = str(DEFAULT_CONFIG.rewards.shaping_mode),
+    gamma: float = float(DEFAULT_CONFIG.ppo.gamma),
 ) -> Dict[str, Any]:
     buckets = {
         "overall": lambda r: True,
@@ -957,6 +1029,8 @@ def summarize_hold(
     return {
         "mode": "hold",
         "seed": seed,
+        "shaping_mode": shaping_mode,
+        "gamma": float(gamma),
         "n_matches_total": n_matches_total,
         "n_matches_ok": n_matches_ok,
         "n_matches_skipped": n_matches_skipped,
@@ -1021,7 +1095,16 @@ def run_hold(
             max_err = err if max_err is None else max(max_err, err)
         else:
             n_skipped += 1
-    return summarize_hold(records, len(tasks), n_ok, n_skipped, max_err, seed=int(seed))
+    return summarize_hold(
+        records,
+        len(tasks),
+        n_ok,
+        n_skipped,
+        max_err,
+        seed=int(seed),
+        shaping_mode=_resolved_shaping_mode(shaping_mode),
+        gamma=float(DEFAULT_CONFIG.ppo.gamma),
+    )
 
 
 def format_hold_report(summary: Dict[str, Any], title: str = "") -> str:

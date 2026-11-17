@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -771,3 +772,173 @@ class TestHoldRollouts:
             if done:
                 break
         assert nonzero_sparse_steps >= 5
+
+
+# ----------------------------------------------------------------------------
+# 4. E5: X4 leftovers (F5b limit boundary, F6 checkpoint-trace match & metadata)
+# ----------------------------------------------------------------------------
+def _e5_rollouts_archives_root() -> Path:
+    for cand in (REPO_ROOT / "archives", REPO_ROOT.parent / "football_rl" / "archives"):
+        if cand.is_dir():
+            return cand
+    pytest.skip("archives directory not found")
+
+
+class TestRolloutsE5:
+    def test_f5b_pos_err_limit_tight_bracket(self, tmp_path):
+        """[GUARD] POS_ERR_LIMIT=1e-3 tightly bracketed: 9.0e-4 passes, 1.1e-3 is skipped and counted."""
+        from tools.audit import rollouts
+
+        _, trace_dir, traces = _make_gaussian_trace_run(tmp_path, max_steps=90, n=2, seed=11)
+        base = traces[0]
+        match_seed = 11 * 1000 + 0
+
+        # Pass at 9.0e-4 u (pos and ball), both in resimulate_match and run_gk
+        for field in ("pos", "ball"):
+            near_ok = {k: v.copy() for k, v in base.items()}
+            if field == "pos":
+                near_ok["pos"][40, 0, 0] += np.float32(9.0e-4)
+            else:
+                near_ok["ball"][40, 0] += np.float32(9.0e-4)
+            ok, max_err, _ = rollouts.resimulate_match(near_ok, match_seed=match_seed)
+            assert ok is True
+            assert 8.0e-4 <= max_err < rollouts.POS_ERR_LIMIT
+
+        ok_trace = {k: v.copy() for k, v in base.items()}
+        ok_trace["pos"][40, 0, 0] += np.float32(9.0e-4)
+        np.savez_compressed(trace_dir / "m000.npz", **ok_trace)
+        res_ok = rollouts.run_gk(trace_dir=trace_dir, trace_seed=11, workers=1)
+        assert res_ok["n_matches_total"] == 2
+        assert res_ok["n_matches_ok"] == 2
+        assert res_ok["n_matches_skipped"] == 0
+
+        # Skip and count at 1.1e-3 u (pos and ball), both in resimulate_match and run_gk
+        for field in ("pos", "ball"):
+            bad = {k: v.copy() for k, v in base.items()}
+            if field == "pos":
+                bad["pos"][40, 0, 0] += np.float32(1.1e-3)
+            else:
+                bad["ball"][40, 0] += np.float32(1.1e-3)
+            ok_bad, err_bad, _ = rollouts.resimulate_match(bad, match_seed=match_seed)
+            assert ok_bad is False
+            assert err_bad >= rollouts.POS_ERR_LIMIT
+
+        bad_trace = {k: v.copy() for k, v in base.items()}
+        bad_trace["ball"][40, 0] += np.float32(1.1e-3)
+        np.savez_compressed(trace_dir / "m000.npz", **bad_trace)
+        res_bad = rollouts.run_gk(trace_dir=trace_dir, trace_seed=11, workers=1)
+        assert res_bad["n_matches_total"] == 2
+        assert res_bad["n_matches_ok"] == 1
+        assert res_bad["n_matches_skipped"] == 1
+
+    def test_f6_checkpoint_matches_real_trace_and_rejects_wrong_checkpoint(self):
+        """[RED] On archives/fl_s42_gen300 traces (1 match, workers=1), own checkpoint passes and fl_s45 raises."""
+        from tools.audit import rollouts
+
+        arch = _e5_rollouts_archives_root()
+        fl42_traces = arch / "fl_s42_gen300" / "eval" / "gen0300" / "self_sampled"
+        fl42_ckpt = arch / "fl_s42_gen300" / "checkpoints" / "snapshots" / "gen0300"
+        fl45_ckpt = arch / "fl_s45_gen300" / "checkpoints" / "snapshots" / "gen0300"
+
+        res = rollouts.run_hold(
+            trace_dir=fl42_traces,
+            checkpoint_dir=fl42_ckpt,
+            trace_seed=11,
+            seed=1,
+            max_matches=1,
+            workers=1,
+        )
+        assert res["n_matches_ok"] == 1
+        assert res["n_matches_skipped"] == 0
+        assert res["shaping_mode"] == str(DEFAULT_CONFIG.rewards.shaping_mode)
+        assert res["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
+
+        with pytest.raises(ValueError) as exc_info:
+            rollouts.run_hold(
+                trace_dir=fl42_traces,
+                checkpoint_dir=fl45_ckpt,
+                trace_seed=11,
+                seed=1,
+                max_matches=1,
+                workers=1,
+            )
+        msg = str(exc_info.value)
+        assert re.search(r"\bmatch 0 step 0 seat \d+\b", msg), msg
+
+    def test_f6_tolerance_1e_5_and_checks_matches_after_first(self, tmp_path):
+        """[RED] Tight 1e-5 val/mean check at step 0 across every match and seat (kills 1e-5->1e-2 and first-match-only)."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, traces = _make_hybrid_trace_run(tmp_path, max_steps=120, n=2, seed=11, z_kick=-2.0)
+
+        # 5e-6 perturbation at step 0 of match 1 must pass
+        ok_m1 = {k: v.copy() for k, v in traces[1].items()}
+        ok_m1["val"][0, 4] += np.float32(5.0e-6)
+        np.savez_compressed(trace_dir / "m001.npz", **ok_m1)
+        res_ok = rollouts.run_hold(
+            trace_dir=trace_dir, checkpoint_dir=ckpt, trace_seed=11, seed=1, max_matches=2, workers=1,
+        )
+        assert res_ok["n_matches_ok"] == 2
+
+        # 5e-5 perturbation on val at step 0 of match 1 (match 0 clean) must raise, naming match 1, step 0, seat 4
+        bad_val = {k: v.copy() for k, v in traces[1].items()}
+        bad_val["val"][0, 4] += np.float32(5.0e-5)
+        np.savez_compressed(trace_dir / "m001.npz", **bad_val)
+        with pytest.raises(ValueError) as exc_val:
+            rollouts.run_hold(
+                trace_dir=trace_dir, checkpoint_dir=ckpt, trace_seed=11, seed=1, max_matches=2, workers=1,
+            )
+        msg_val = str(exc_val.value)
+        assert re.search(r"\bmatch 1 step 0 seat 4\b", msg_val), msg_val
+
+        # 5e-5 perturbation on mean at step 0 of match 1 seat 9 (team B) must raise, naming match 1, step 0, seat 9
+        bad_mean = {k: v.copy() for k, v in traces[1].items()}
+        bad_mean["mean"][0, 9, 2] += np.float32(5.0e-5)
+        np.savez_compressed(trace_dir / "m001.npz", **bad_mean)
+        with pytest.raises(ValueError) as exc_mean:
+            rollouts.run_hold(
+                trace_dir=trace_dir, checkpoint_dir=ckpt, trace_seed=11, seed=1, max_matches=2, workers=1,
+            )
+        msg_mean = str(exc_mean.value)
+        assert re.search(r"\bmatch 1 step 0 seat 9\b", msg_mean), msg_mean
+
+    def test_f6_verifies_step_zero_even_without_hold_decisions(self, tmp_path):
+        """[RED] Checkpoint verification runs at step 0 even when a match has no hold decision points."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, traces = _make_hybrid_trace_run(tmp_path, max_steps=2, n=1, seed=11, z_kick=-2.0)
+        assert rollouts.find_hold_decisions(traces[0]) == []
+
+        bad = {k: v.copy() for k, v in traces[0].items()}
+        bad["val"][0, 2] += np.float32(5.0e-5)
+        np.savez_compressed(trace_dir / "m000.npz", **bad)
+        with pytest.raises(ValueError) as exc_info:
+            rollouts.run_hold(
+                trace_dir=trace_dir, checkpoint_dir=ckpt, trace_seed=11, seed=1, max_matches=1, workers=1,
+            )
+        msg = str(exc_info.value)
+        assert re.search(r"\bmatch 0 step 0 seat 2\b", msg), msg
+
+    def test_gk_and_hold_json_include_shaping_mode_and_gamma(self, tmp_path):
+        """[RED] Both gk and hold JSON outputs record shaping_mode and gamma."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _make_hybrid_trace_run(tmp_path, max_steps=60, n=1, seed=11, z_kick=-2.0)
+        gk_out = tmp_path / "gk.json"
+        hold_out = tmp_path / "hold.json"
+        assert rollouts.main([
+            "gk", "--trace-dir", str(trace_dir), "--trace-seed", "11",
+            "--workers", "1", "--shaping-mode", "all", "--out", str(gk_out),
+        ]) == 0
+        assert rollouts.main([
+            "hold", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt),
+            "--trace-seed", "11", "--workers", "1", "--shaping-mode", "ball", "--out", str(hold_out),
+        ]) == 0
+
+        gk_data = json.loads(gk_out.read_text(encoding="utf-8"))
+        hold_data = json.loads(hold_out.read_text(encoding="utf-8"))
+        assert gk_data["shaping_mode"] == "all"
+        assert gk_data["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
+        assert hold_data["shaping_mode"] == "ball"
+        assert hold_data["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
+
