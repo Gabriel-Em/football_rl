@@ -3733,3 +3733,795 @@ def test_update_step_moves_the_head_by_the_hand_solved_entropy_gradient(tmp_path
         np.testing.assert_allclose(d_bias, [0.0, 0.0, 0.0, d_bias_kick, 0.0], atol=1e-7)
     finally:
         trainer.close()
+
+
+# ------------------------------------------------------------------ critic switches: value clip and return normalisation
+def _critic_trainer(tmp_path: Path, name: str = "ckpt", head: str = "gaussian4", num_envs: int = 1,
+                    rollout_steps: int = 24, seed: int = 5, separate_teams: bool = True,
+                    full_batch: bool = False, **ppo) -> ParameterSharingPPOTrainer:
+    """Trainer with the given PPO overrides; `full_batch` uses one minibatch and one epoch, so an update reports its pre-step loss."""
+    cfg = _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}"))
+    if full_batch:
+        ppo = {"num_minibatches": 1, "update_epochs": 1, **ppo}
+    cfg = replace(cfg, ppo=replace(cfg.ppo, policy_head=head, **ppo))
+    return ParameterSharingPPOTrainer(
+        config=cfg, num_envs=num_envs, rollout_steps=rollout_steps, device="cpu",
+        checkpoint_dir=str(tmp_path / name), seed=seed, separate_teams=separate_teams,
+    )
+
+
+def _set_return_stats(net: ActorCritic, mean: float, std: float) -> None:
+    with torch.no_grad():
+        net.ret_mean.fill_(mean)
+        net.ret_std.fill_(std)
+
+
+def _constant_head_critic(net: ActorCritic, head_value: float) -> None:
+    """Critic whose raw head output is `head_value` for every input: zero last-layer weights, bias `head_value`."""
+    with torch.no_grad():
+        net.critic[4].weight.zero_()
+        net.critic[4].bias.fill_(head_value)
+
+
+def _critic_staircase(net: ActorCritic) -> torch.Tensor:
+    """Make the critic output 0, 1, 2 for observations whose first column is the returned values.
+
+    Hidden unit 0 carries `tanh(tanh(x))` (the other units are silent) and the output is `2 * h + 1`, so the outputs
+    0 / 1 / 2 need `tanh(tanh(x)) = -0.5 / 0 / +0.5`, i.e. `x = atanh(atanh(+-0.5))`.
+    """
+    with torch.no_grad():
+        for layer in (net.critic[0], net.critic[2], net.critic[4]):
+            layer.weight.zero_()
+            layer.bias.zero_()
+        net.critic[0].weight[0, 0] = 1.0
+        net.critic[2].weight[0, 0] = 1.0
+        net.critic[4].weight[0, 0] = 2.0
+        net.critic[4].bias.fill_(1.0)
+    x = math.atanh(math.atanh(0.5))
+    obs = torch.zeros(3, OBS_DIM)
+    obs[:, 0] = torch.tensor([-x, 0.0, x])
+    return obs
+
+
+def _critic_update(trainer, policy, obs, old_values, returns, critic_only: bool) -> float:
+    """Run one `_ppo_update_role` with zero advantages and a zero learning rate; return the reported value loss."""
+    n = obs.shape[0]
+    with torch.no_grad():
+        action, logp, _ = policy.sample_action_and_value(obs)
+    sgd = torch.optim.SGD(policy.parameters(), lr=0.0)
+    metrics = trainer._ppo_update_role(
+        policy, sgd, obs, action, logp, torch.zeros(n), torch.as_tensor(returns, dtype=torch.float32),
+        torch.as_tensor(old_values, dtype=torch.float32), critic_only=critic_only,
+    )
+    return metrics["v_loss"]
+
+
+def test_critic_switch_defaults_are_todays_loss() -> None:
+    """[RED] The defaults keep the clipped value loss and raw targets; the momentum default is 0.95."""
+    ppo = DEFAULT_CONFIG.ppo
+    assert (ppo.value_clip, ppo.value_norm, ppo.value_norm_momentum) == (True, False, 0.95)
+
+
+def test_value_norm_momentum_rejects_zero() -> None:
+    """[RED] Momentum 0 would discard all history; the error names the field."""
+    with pytest.raises(ValueError, match="value_norm_momentum"):
+        PPOHyperparams(value_norm_momentum=0.0)
+
+
+def test_value_norm_momentum_rejects_one() -> None:
+    """[RED] Momentum 1 would never learn a statistic; the error names the field."""
+    with pytest.raises(ValueError, match="value_norm_momentum"):
+        PPOHyperparams(value_norm_momentum=1.0)
+
+
+def test_value_norm_momentum_rejects_nan() -> None:
+    """[RED] NaN momentum is refused with an error naming the field."""
+    with pytest.raises(ValueError, match="value_norm_momentum"):
+        PPOHyperparams(value_norm_momentum=float("nan"))
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("inf"), float("-inf")])
+def test_value_norm_momentum_rejects_values_outside_the_open_unit_interval(bad: float) -> None:
+    """[RED] Negative, above-one and infinite momenta are refused."""
+    with pytest.raises(ValueError, match="value_norm_momentum"):
+        PPOHyperparams(value_norm_momentum=bad)
+
+
+@pytest.mark.parametrize("good", [0.01, 0.5, 0.99])
+def test_value_norm_momentum_accepts_interior_values(good: float) -> None:
+    """[RED] Any momentum strictly inside (0, 1) is accepted."""
+    assert PPOHyperparams(value_norm_momentum=good).value_norm_momentum == good
+
+
+def test_critic_switches_are_reachable_through_config_overrides() -> None:
+    """[RED] `ppo.value_clip=false` and `ppo.value_norm=true` parse to False / True; the momentum parses as a float."""
+    cfg, applied = tp.parse_config_overrides(
+        ["ppo.value_clip=false", "ppo.value_norm=true", "ppo.value_norm_momentum=0.9"]
+    )
+    assert (cfg.ppo.value_clip, cfg.ppo.value_norm, cfg.ppo.value_norm_momentum) == (False, True, 0.9)
+    assert applied == {"ppo.value_clip": False, "ppo.value_norm": True, "ppo.value_norm_momentum": 0.9}
+    with pytest.raises(ValueError, match="value_norm_momentum"):
+        tp.parse_config_overrides(["ppo.value_norm_momentum=1.0"])
+
+
+def test_running_stat_first_batch_sets_mean_and_population_variance() -> None:
+    """[RED] Batch [1, 2, 3]: mean 2, population variance (1 + 0 + 1) / 3 = 2/3, std sqrt(2/3) = 0.8164966."""
+    stat = tp.RunningStat(0.5)
+    assert (stat.mean, stat.std, stat.count) == (0.0, 1.0, 0)
+    stat.update([1.0, 2.0, 3.0])
+    assert stat.mean == pytest.approx(2.0, abs=1e-7)
+    assert stat.var == pytest.approx(2.0 / 3.0, abs=1e-7)
+    assert stat.std == pytest.approx(0.8164966, abs=1e-7)
+    assert stat.count == 1
+
+
+def test_running_stat_blends_first_and_second_moments_with_weight_one_minus_momentum() -> None:
+    """[RED] After [1, 2, 3], batch [4] at m = 0.5: mean 0.5*2 + 0.5*4 = 3; second moment 0.5*(2/3 + 4) + 0.5*16 = 10.3333; var 10.3333 - 9 = 1.3333."""
+    stat = tp.RunningStat(0.5)
+    stat.update([1.0, 2.0, 3.0])
+    stat.update([4.0])
+    assert stat.mean == pytest.approx(3.0, abs=1e-7)
+    assert stat.var == pytest.approx(4.0 / 3.0, abs=1e-7)
+    assert stat.count == 2
+
+
+def test_running_stat_weights_are_not_symmetric() -> None:
+    """[RED] After [1, 2, 3], batch [4] at m = 0.75: mean 0.75*2 + 0.25*4 = 2.5; second moment 0.75*(2/3 + 4) + 0.25*16 = 7.5; var 7.5 - 6.25 = 1.25.
+
+    At m = 0.5 swapping m and 1 - m changes nothing, so this case is the one that tells them apart.
+    """
+    stat = tp.RunningStat(0.75)
+    stat.update([1.0, 2.0, 3.0])
+    stat.update([4.0])
+    assert stat.mean == pytest.approx(2.5, abs=1e-7)
+    assert stat.var == pytest.approx(1.25, abs=1e-7)
+
+
+def test_running_stat_ignores_empty_batches() -> None:
+    """[RED] An empty batch changes nothing, fresh or not."""
+    stat = tp.RunningStat(0.5)
+    stat.update([])
+    assert (stat.mean, stat.var, stat.count) == (0.0, 1.0, 0)
+    stat.update([1.0, 2.0, 3.0])
+    stat.update(np.zeros(0))
+    assert stat.mean == pytest.approx(2.0, abs=1e-7)
+    assert stat.count == 1
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_running_stat_rejects_non_finite_batches_and_keeps_its_state(bad: float) -> None:
+    """[RED] A batch holding NaN or an infinity raises ValueError and leaves the statistic untouched."""
+    stat = tp.RunningStat(0.5)
+    stat.update([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError):
+        stat.update([1.0, bad])
+    assert stat.mean == pytest.approx(2.0, abs=1e-7) and stat.count == 1
+
+
+def test_running_stat_std_never_drops_below_one_thousandth() -> None:
+    """[RED] A constant batch [5, 5, 5] has variance 25 - 25 = 0, so std is the 1e-3 floor and 5 normalises to 0."""
+    stat = tp.RunningStat(0.5)
+    stat.update([5.0, 5.0, 5.0])
+    assert stat.var == 0.0 and stat.std == 1e-3
+    assert float(stat.normalize(torch.tensor(5.0))) == 0.0
+    assert float(stat.normalize(torch.tensor(5.001))) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_running_stat_normalise_and_denormalise_invert_each_other() -> None:
+    """[RED] After [1, 2, 3] (mean 2, std 0.8164966): 3 -> 1.2247449, and 1.2247449 -> 3."""
+    stat = tp.RunningStat(0.5)
+    stat.update([1.0, 2.0, 3.0])
+    assert float(stat.normalize(torch.tensor(3.0, dtype=torch.float64))) == pytest.approx(1.2247449, abs=1e-7)
+    assert float(stat.denormalize(torch.tensor(1.2247449, dtype=torch.float64))) == pytest.approx(3.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("critic_only", [False, True])
+@pytest.mark.parametrize(("value_clip", "expected"), [(True, 0.44), (False, 1.0 / 3.0)])
+def test_value_loss_on_the_three_sample_hand_case(tmp_path: Path, critic_only: bool, value_clip: bool, expected: float) -> None:
+    """[RED] v = (0, 1, 2), old v = (0, 0, 0), R = (1, 1, 1), clip 0.2, in both paths.
+
+    Clipped: 0.5 * mean(max(1, 1), max(0, 0.64), max(1, 0.64)) = 0.5 * 2.64 / 3 = 0.44 (the clipped value is
+    0, 0.2, 0.2 for the three samples).  Unclipped: 0.5 * (1 + 0 + 1) / 3 = 1/3.
+    """
+    trainer = _critic_trainer(tmp_path, rollout_steps=8, seed=3, full_batch=True, value_clip=value_clip)
+    try:
+        policy = trainer.blue_field_policy
+        obs = _critic_staircase(policy)
+        with torch.no_grad():
+            assert policy.get_value(obs).tolist() == pytest.approx([0.0, 1.0, 2.0], abs=1e-6)
+        loss = _critic_update(trainer, policy, obs, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], critic_only)
+        assert loss == pytest.approx(expected, abs=1e-6)
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("critic_only", [False, True])
+@pytest.mark.parametrize(("value_clip", "expected"), [(True, 0.7225), (False, 0.625)])
+def test_value_norm_loss_is_measured_in_normalised_units_with_the_batch_statistics(
+    tmp_path: Path, critic_only: bool, value_clip: bool, expected: float
+) -> None:
+    """[RED] Raw returns (0, 3), raw old values (1.5, 1.5), head output 0.5 for both samples, clip 0.2.
+
+    The batch sets mean 1.5 and variance (0 + 9) / 2 - 2.25 = 2.25, so std 1.5 and the normalised returns are
+    (-1, +1) and the normalised old values (0, 0). Unclipped: 0.5 * mean(1.5^2, 0.5^2) = 0.5 * 2.5 / 2 = 0.625.
+    Clipped: the clipped value is 0 + 0.2 = 0.2, so the clipped squares are 1.2^2 = 1.44 and 0.8^2 = 0.64 and the
+    loss is 0.5 * mean(max(2.25, 1.44), max(0.25, 0.64)) = 0.5 * (2.25 + 0.64) / 2 = 0.7225. The statistics are
+    those of the batch itself, so they must be in place before the loss is taken.
+    """
+    trainer = _critic_trainer(tmp_path, rollout_steps=8, seed=3, full_batch=True, value_norm=True, value_clip=value_clip)
+    try:
+        policy = trainer.blue_field_policy
+        _constant_head_critic(policy, 0.5)
+        loss = _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [1.5, 1.5], [0.0, 3.0], critic_only)
+        assert loss == pytest.approx(expected, abs=1e-6)
+        assert policy.return_stats() == pytest.approx((1.5, 1.5), abs=1e-7)
+    finally:
+        trainer.close()
+
+
+def test_value_norm_statistics_blend_across_updates_with_the_configured_momentum(tmp_path: Path) -> None:
+    """[RED] Returns (0, 3) then (4, 4) at m = 0.75: mean 0.75*1.5 + 0.25*4 = 2.125; second moment 0.75*(2.25 + 2.25) + 0.25*16 = 7.375; var 7.375 - 4.515625 = 2.859375; std 1.6909.
+
+    Swapping m and 1 - m would give mean 0.25*1.5 + 0.75*4 = 3.375 instead.
+    """
+    trainer = _critic_trainer(tmp_path, rollout_steps=8, seed=3, full_batch=True, value_norm=True, value_norm_momentum=0.75)
+    try:
+        policy = trainer.blue_field_policy
+        _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [1.5, 1.5], [0.0, 3.0], False)
+        _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [2.0, 2.0], [4.0, 4.0], False)
+        mean, std = policy.return_stats()
+        assert mean == pytest.approx(2.125, abs=1e-6)
+        # sqrt(2.859375) = 1.6909686573085854. The std reaches this value through the float32 `ret_std` buffer, whose
+        # rounding error is at most half an ulp (6e-8 in [1, 2)), so the bound is one float32 ulp, 1.2e-7, not the 1e-7 of float64.
+        assert std == pytest.approx(1.6909686573085854, abs=1.2e-7)
+    finally:
+        trainer.close()
+
+
+def test_value_norm_off_keeps_the_critic_free_of_statistics_and_the_loss_in_raw_units(tmp_path: Path) -> None:
+    """[GUARD] value_norm off: no `ret_*` entries in any state dict, and with head 1 against returns (0, 3) the unclipped loss is 0.5 * mean(1, 4) = 1.25 in raw units."""
+    trainer = _critic_trainer(tmp_path, rollout_steps=8, seed=3, full_batch=True, value_clip=False)
+    try:
+        for _, policy, _ in _policy_groups(trainer):
+            assert not any(k.startswith("ret_") for k in policy.state_dict())
+            assert policy.value_norm is False and policy.return_stats() == (0.0, 1.0)
+        policy = trainer.blue_field_policy
+        _constant_head_critic(policy, 1.0)
+        loss = _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [0.0, 0.0], [0.0, 3.0], False)
+        assert loss == pytest.approx(1.25, abs=1e-6)
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_every_value_output_of_the_network_is_in_raw_units(head: str) -> None:
+    """[RED] Head output 0.5, ret_mean 7, ret_std 2.5: every raw-unit output is 0.5 * 2.5 + 7 = 8.25; the normalised view is 0.5."""
+    net = ActorCritic(policy_head=head, value_norm=True)
+    _constant_head_critic(net, 0.5)
+    _set_return_stats(net, 7.0, 2.5)
+    obs = torch.randn(4, OBS_DIM, generator=torch.Generator().manual_seed(1))
+    cen = torch.randn(4, CENTRAL_STATE_DIM, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        assert net.get_value(obs, cen).tolist() == [8.25] * 4
+        assert net.get_value(obs, cen, normalized_value=True).tolist() == [0.5] * 4
+        assert net.get_action_and_value(obs, central_state=cen)[3].tolist() == [8.25] * 4
+        assert net.get_action_and_value(obs, central_state=cen, normalized_value=True)[3].tolist() == [0.5] * 4
+        assert net.sample_action_and_value(obs, central_state=cen)[2].tolist() == [8.25] * 4
+        assert net.sample_action_and_value(obs, central_state=cen, return_mean=True)[2].tolist() == [8.25] * 4
+        if head == "hybrid5":
+            assert net.hybrid_logits_and_value(obs, central_state=cen)[1].tolist() == [8.25] * 4
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_default_network_has_no_statistics_and_values_are_the_raw_critic_output(head: str) -> None:
+    """[GUARD] Without value_norm: no `ret_*` entries, and `get_value` is bit-identical to the critic's output."""
+    net = _seeded_net(head, 4)
+    assert not any(k.startswith("ret_") for k in net.state_dict())
+    obs = torch.randn(5, OBS_DIM, generator=torch.Generator().manual_seed(1))
+    cen = torch.randn(5, CENTRAL_STATE_DIM, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        assert torch.equal(net.get_value(obs, cen), net.critic(torch.cat([obs, cen], dim=-1)).squeeze(-1))
+
+
+def test_a_network_loading_statistics_it_was_not_built_with_picks_them_up() -> None:
+    """[RED] A plain `ActorCritic` loaded (strictly) from a state dict with `ret_mean` 7 and `ret_std` 2.5 returns raw values 8.25, as the harness loads."""
+    saved = ActorCritic(value_norm=True)
+    _constant_head_critic(saved, 0.5)
+    _set_return_stats(saved, 7.0, 2.5)
+    loaded = ActorCritic()
+    loaded.load_state_dict(tp.adapt_policy_weights(saved.state_dict(), loaded.obs_dim, loaded.central_state_dim))
+    assert loaded.value_norm is True and loaded.return_stats() == (7.0, 2.5)
+    assert loaded.get_value(torch.zeros(3, OBS_DIM)).tolist() == [8.25] * 3
+
+
+def test_adapt_policy_weights_passes_the_statistics_through() -> None:
+    """[RED] The adapted state dict holds the very same `ret_mean` / `ret_std` tensors."""
+    saved = ActorCritic(value_norm=True)
+    _set_return_stats(saved, 7.0, 2.5)
+    weights = saved.state_dict()
+    adapted = tp.adapt_policy_weights(weights, OBS_DIM, CENTRAL_STATE_DIM)
+    assert adapted["ret_mean"] is weights["ret_mean"] and adapted["ret_std"] is weights["ret_std"]
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_value_norm_trainer_reaches_the_constant_return_in_raw_units(tmp_path: Path, head: str) -> None:
+    """[RED] A constant reward of 1 per step that never ends, at gamma 0.9, has the fixed point V = 1 + 0.9 V, so V = 10.
+
+    After 30 updates the critic's raw `get_value` is within 5% of 10 on every observation of the last rollout while
+    its normalised head output is that raw value in units of the running spread and the last batch's normalised targets obey the
+    mixture bound derived in the body, the saved policy files carry the statistics, and a
+    network loaded the way the harness loads it returns the trainer's values to 1e-6. A rollout or bootstrap that
+    read the normalised head would see values near 0 and never get there.
+    """
+    trainer = _critic_trainer(
+        tmp_path, head=head, rollout_steps=64, seed=11, value_norm=True, value_norm_momentum=0.5, gamma=0.9
+    )
+    try:
+        real_step = trainer.vec_env.step_array
+
+        def constant_reward_step(actions, values=None, action_means=None):
+            obs, cen, rew, done, summaries = real_step(actions, values, action_means=action_means)
+            return obs, cen, np.full_like(rew, 1.0), done, summaries
+
+        trainer.vec_env.step_array = constant_reward_step
+        for gen in range(1, 31):
+            rollout = trainer.collect_rollouts(active_generation=gen)
+            trainer.update_policies(rollout)
+        trainer.current_generation = 30
+        trainer.save_checkpoints()
+
+        for role, policy, indices in (
+            ("blue_field", trainer.blue_field_policy, trainer.blue_field_indices),
+            ("blue_keeper", trainer.blue_keeper_policy, trainer.blue_keeper_indices),
+        ):
+            obs = torch.as_tensor(rollout["obs"][:, :, indices].reshape(-1, OBS_DIM))
+            cen = torch.as_tensor(rollout["central_state"][:, :, indices].reshape(-1, CENTRAL_STATE_DIM))
+            with torch.no_grad():
+                raw = policy.get_value(obs, cen)
+                head_out = policy.get_value(obs, cen, normalized_value=True)
+            assert float(raw.min()) > 9.5 and float(raw.max()) < 10.5, (role, float(raw.min()), float(raw.max()))
+            # What the normalised head must look like, derived from the definitions and not from a run.
+            # (1) It is the raw value in units of the running spread: head = (raw - ret_mean) / ret_std, to float32 precision.
+            #     A head that was left in raw units (~10) or a denormalisation with the wrong statistics breaks this.
+            #     Tolerance: raw is a float32 near 10 (ulp 9.5e-7), recovered through a division by ret_std, so
+            #     |error| <= 4 * ulp / ret_std = 4e-6 / ret_std.
+            mean, std = policy.return_stats()
+            np.testing.assert_allclose(head_out.numpy(), ((raw - mean) / std).numpy(), rtol=0, atol=4e-6 / std)
+            # (2) The normalised targets of the last batch are bounded. After the update the statistics are the mixture
+            #     m * (old batches) + (1 - m) * (this batch) with m = 0.5, whose mean and variance are (ret_mean, ret_std^2).
+            #     This batch carries weight (1 - m) of that mixture, so E_batch[(R - mean)^2] <= Var_mixture / (1 - m) and
+            #     the root mean square of (R - mean) / std is at most 1 / sqrt(1 - m) = sqrt(2) = 1.41421356 (the 1e-3 std
+            #     floor only lowers it). Float32 rounding of the buffers: relative 1e-5.
+            returns = torch.as_tensor(rollout["returns"][:, :, indices].reshape(-1)).float()
+            normalised_targets = (returns - mean) / std
+            assert float(normalised_targets.pow(2).mean().sqrt()) <= math.sqrt(2.0) * (1 + 1e-5), role
+            # (3) The head is NOT near 0 in general. An exact critic (V = 10 everywhere) reads (10 - ret_mean) / ret_std,
+            #     and ret_std (the spread of the targets over recent batches, 1e-1 .. 1e-3 here) is far smaller than the
+            #     lag of ret_mean behind 10, so the head sits a few ret_std from 0. Its size is therefore not asserted;
+            #     it is the raw band above and the identity in (1) that pin it.
+            for suffix in ("policy.pt",):
+                weights = torch.load(tmp_path / "ckpt" / f"{role}_{suffix}", weights_only=True)
+                assert float(weights["ret_mean"]) == pytest.approx(policy.return_stats()[0], abs=1e-6)
+                assert float(weights["ret_std"]) == pytest.approx(policy.return_stats()[1], abs=1e-6)
+                loaded = ActorCritic(policy_head=head)
+                loaded.load_state_dict(tp.adapt_policy_weights(weights, loaded.obs_dim, loaded.central_state_dim))
+                with torch.no_grad():
+                    np.testing.assert_allclose(loaded.get_value(obs, cen).numpy(), raw.numpy(), atol=1e-6)
+    finally:
+        trainer.close()
+
+
+def _assert_same_training_state(a: ParameterSharingPPOTrainer, b: ParameterSharingPPOTrainer) -> None:
+    """Every parameter, buffer and Adam tensor of all four roles is bit-identical between two trainers."""
+    for (role, pa, oa), (_, pb, ob) in zip(_policy_groups(a), _policy_groups(b)):
+        sa, sb = pa.state_dict(), pb.state_dict()
+        assert list(sa) == list(sb), role
+        for key in sa:
+            assert torch.equal(sa[key], sb[key]), (role, key)
+        for (_, qa), (_, qb) in zip(pa.named_parameters(), pb.named_parameters()):
+            for key in ("exp_avg", "exp_avg_sq", "step"):
+                assert torch.equal(oa.state[qa][key], ob.state[qb][key]), (role, key)
+
+
+def test_save_load_then_one_more_update_equals_the_uninterrupted_run(tmp_path: Path) -> None:
+    """[RED] Two rollouts r1, r2 from the same start; update(r1) -> save -> load -> update(r2) matches update(r1), update(r2) bit for bit.
+
+    The buffers take part: a checkpoint that dropped them would restart the second update from identity statistics.
+    """
+    ppo = dict(value_norm=True, value_clip=False)
+    straight = _critic_trainer(tmp_path, "straight", **ppo)
+    first = _critic_trainer(tmp_path, "resumed", **ppo)
+    second = None
+    try:
+        r1, r2 = straight.collect_rollouts(1), straight.collect_rollouts(2)
+        torch.manual_seed(100)
+        straight.update_policies(r1)
+        torch.manual_seed(101)
+        straight.update_policies(r2)
+
+        torch.manual_seed(100)
+        first.update_policies(r1)
+        first.current_generation = 1
+        first.save_checkpoints()
+        second = _critic_trainer(tmp_path, "resumed", **ppo)
+        assert second.load_checkpoints()
+        torch.manual_seed(101)
+        second.update_policies(r2)
+
+        assert not torch.equal(straight.blue_field_policy.ret_mean, torch.tensor(0.0))  # the statistics did move
+        _assert_same_training_state(straight, second)
+    finally:
+        for t in (straight, first, second):
+            if t is not None:
+                t.close()
+
+
+def test_a_checkpoint_without_statistics_loads_with_identity_statistics(tmp_path: Path) -> None:
+    """[RED] A state-file checkpoint and a bare policy-file checkpoint saved with value_norm off load into a value_norm trainer as ret_mean 0, ret_std 1."""
+    legacy = _critic_trainer(tmp_path, "legacy")
+    try:
+        legacy.update_policies(legacy.collect_rollouts(1))
+        legacy.current_generation = 1
+        legacy.save_checkpoints()
+        weights = legacy.blue_field_policy.state_dict()
+        assert not any(k.startswith("ret_") for k in weights)
+    finally:
+        legacy.close()
+
+    for remove_state_file in (False, True):
+        folder = tmp_path / ("bare" if remove_state_file else "legacy")
+        if remove_state_file:
+            shutil.copytree(tmp_path / "legacy", folder)
+            (folder / "training_state.pt").unlink()
+        fresh = _critic_trainer(tmp_path, folder.name, value_norm=True)
+        try:
+            assert fresh.load_checkpoints()
+            for _, policy, _ in _policy_groups(fresh):
+                assert policy.value_norm is True
+                assert policy.return_stats() == (0.0, 1.0)
+            for key, value in weights.items():
+                assert torch.equal(fresh.blue_field_policy.state_dict()[key], value), key
+        finally:
+            fresh.close()
+
+
+def test_a_checkpoint_with_statistics_is_refused_when_value_norm_is_off(tmp_path: Path) -> None:
+    """[RED] Loading return statistics into a trainer that does not normalise raises, naming value_norm; the weights would be read in the wrong units."""
+    saved = _critic_trainer(tmp_path, "norm", value_norm=True)
+    try:
+        saved.update_policies(saved.collect_rollouts(1))
+        saved.current_generation = 1
+        saved.save_checkpoints()
+    finally:
+        saved.close()
+    plain = _critic_trainer(tmp_path, "norm")
+    try:
+        with pytest.raises(ValueError, match="value_norm"):
+            plain.load_checkpoints()
+    finally:
+        plain.close()
+
+
+def test_saved_policy_files_carry_the_statistics_of_their_role(tmp_path: Path) -> None:
+    """[RED] All six policy files hold `ret_mean` / `ret_std` equal to the live buffers; the team files match the shared-name files."""
+    trainer = _critic_trainer(tmp_path, value_norm=True)
+    try:
+        trainer.update_policies(trainer.collect_rollouts(1))
+        trainer.current_generation = 1
+        trainer.save_checkpoints()
+        live = {
+            "blue_field": trainer.blue_field_policy, "blue_keeper": trainer.blue_keeper_policy,
+            "red_field": trainer.red_field_policy, "red_keeper": trainer.red_keeper_policy,
+            "field": trainer.blue_field_policy, "keeper": trainer.blue_keeper_policy,
+        }
+        for name, policy in live.items():
+            weights = torch.load(tmp_path / "ckpt" / f"{name}_policy.pt", weights_only=True)
+            assert torch.equal(weights["ret_mean"], policy.ret_mean) and torch.equal(weights["ret_std"], policy.ret_std), name
+        assert trainer.blue_field_policy.return_stats() != trainer.blue_keeper_policy.return_stats()
+    finally:
+        trainer.close()
+
+
+def test_generation_records_carry_the_statistics_per_role_only_with_value_norm(tmp_path: Path) -> None:
+    """[RED] With value_norm the record gains `ret_mean` and `ret_std` for the four roles, equal to the live buffers; without it neither key exists."""
+    on = _critic_trainer(tmp_path, "on", rollout_steps=10, value_norm=True)
+    off = _critic_trainer(tmp_path, "off", rollout_steps=10)
+    try:
+        on.train(total_updates=1)
+        off.train(total_updates=1)
+        rec_on, rec_off = on.generation_history[0], off.generation_history[0]
+        roles = {"blue_field": on.blue_field_policy, "blue_keeper": on.blue_keeper_policy,
+                 "red_field": on.red_field_policy, "red_keeper": on.red_keeper_policy}
+        assert set(rec_on["ret_mean"]) == set(rec_on["ret_std"]) == set(roles)
+        for role, policy in roles.items():
+            assert rec_on["ret_mean"][role] == pytest.approx(policy.return_stats()[0], abs=1e-6)
+            assert rec_on["ret_std"][role] == pytest.approx(policy.return_stats()[1], abs=1e-6)
+        assert rec_on["ret_std"]["blue_field"] != 1.0
+        assert "ret_mean" not in rec_off and "ret_std" not in rec_off
+        assert set(rec_on) - {"ret_mean", "ret_std"} == set(rec_off)
+    finally:
+        on.close()
+        off.close()
+
+
+def test_shared_teams_share_the_statistics(tmp_path: Path) -> None:
+    """[RED] With one policy per role for both teams, blue and red read the same buffers and the record repeats them."""
+    trainer = _critic_trainer(tmp_path, rollout_steps=10, separate_teams=False, value_norm=True)
+    try:
+        trainer.train(total_updates=1)
+        assert trainer.red_field_policy is trainer.blue_field_policy
+        rec = trainer.generation_history[0]
+        assert rec["ret_mean"]["red_field"] == rec["ret_mean"]["blue_field"]
+        assert rec["ret_std"]["red_keeper"] == rec["ret_std"]["blue_keeper"] != 1.0
+    finally:
+        trainer.close()
+
+
+def test_frozen_seat_values_are_in_raw_units() -> None:
+    """[RED] A frozen network with ret_mean 7, ret_std 2.5 and head output 0.5 reports 8.25 for every seat of its group."""
+    net = _seeded_net("gaussian4", 3)
+    net.enable_value_norm()
+    _constant_head_critic(net, 0.5)
+    _set_return_stats(net, 7.0, 2.5)
+    groups = [(np.array([0, 2]), [1, 2, 3, 4, 5], net)]
+    rng = np.random.default_rng(5)
+    obs = rng.normal(size=(3, 12, OBS_DIM)).astype(np.float32)
+    cen = rng.normal(size=(3, 12, CENTRAL_STATE_DIM)).astype(np.float32)
+    actions = np.full((3, 12, 4), np.nan, dtype=np.float32)
+    logprobs = np.full((3, 12), np.nan, dtype=np.float32)
+    values = np.full((3, 12), np.nan, dtype=np.float32)
+    tp.FrozenSeatBatch(groups).apply(obs, cen, tp.pool_generator(1, 2), actions, logprobs, values, None)
+    np.testing.assert_allclose(values[np.ix_([0, 2], [1, 2, 3, 4, 5])], 8.25, atol=1e-5)
+    assert np.isnan(values[1]).all()
+
+
+def test_pool_member_with_statistics_is_loaded_in_raw_units_by_a_plain_trainer(tmp_path: Path) -> None:
+    """[RED] A snapshot saved with return statistics loads as a pool member into a trainer with value_norm off, keeping them; a snapshot without them gets none."""
+    trainer = _critic_trainer(tmp_path, "pool", num_envs=2)
+    try:
+        snap = Path(trainer.checkpoint_dir) / "snapshots" / "gen0050"
+        snap.mkdir(parents=True)
+        for team in ("blue", "red"):
+            for role in ("keeper", "field"):
+                net = ActorCritic(value_norm=(team == "blue"))
+                if team == "blue":
+                    _set_return_stats(net, 7.0, 2.5)
+                torch.save(net.state_dict(), snap / f"{team}_{role}_policy.pt")
+        keeper, field = trainer._load_pool_member(50, "A")
+        assert keeper.return_stats() == (7.0, 2.5) and field.return_stats() == (7.0, 2.5)
+        keeper, field = trainer._load_pool_member(50, "B")
+        assert keeper.value_norm is False and keeper.return_stats() == (0.0, 1.0)
+    finally:
+        trainer.close()
+
+
+def test_the_harness_returns_raw_values_for_a_checkpoint_with_statistics(tmp_path: Path) -> None:
+    """[RED] Policy files saved with ret_mean 7, ret_std 2.5 and head output 0.5: `TeamPolicy.act` reports value 8.25 for all six slots, bit-identical to `get_value`."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.audit import harness
+
+    for prefix in ("blue", "red"):
+        for role in ("keeper", "field"):
+            net = _seeded_net("gaussian4", 9)
+            net.enable_value_norm()
+            _constant_head_critic(net, 0.5)
+            _set_return_stats(net, 7.0, 2.5)
+            torch.save(net.state_dict(), tmp_path / f"{prefix}_{role}_policy.pt")
+    team = harness.TeamPolicy(str(tmp_path), "blue")
+    obs = np.random.default_rng(1).normal(size=(6, OBS_DIM)).astype(np.float32)
+    cen = np.random.default_rng(2).normal(size=(6, CENTRAL_STATE_DIM)).astype(np.float32)
+    _, values, _ = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+    assert values.tolist() == [8.25] * 6
+
+    hybrid_dir = tmp_path / "hybrid"
+    hybrid_dir.mkdir()
+    for prefix in ("blue", "red"):
+        for role in ("keeper", "field"):
+            net = _seeded_net("hybrid5", 9)
+            net.enable_value_norm()
+            _constant_head_critic(net, 0.5)
+            _set_return_stats(net, 7.0, 2.5)
+            torch.save(net.state_dict(), hybrid_dir / f"{prefix}_{role}_policy.pt")
+    _, values, _ = harness.TeamPolicy(str(hybrid_dir), "blue").act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+    assert values.tolist() == [8.25] * 6
+
+
+# ------------------------------------------------------------------ critic switches: sync, statistics bookkeeping
+_HEAD_PROBE_HIDDEN = math.atanh(0.5)  # critic hidden unit 0 outputs tanh(atanh(0.5)) = 0.5 when everything before it is silent
+
+
+def _head_probe_pair(head: str):
+    """Two value-normalising networks with identical hidden layers and different last critic layers and statistics.
+
+    Every critic weight is zero except unit 0 of the second hidden layer, whose bias makes it output 0.5 for any input.
+    The head output is then `W * 0.5 + b`, with
+      dst: W = 2.0,  b = 1.0, ret_mean 10, ret_std 4  -> head 2.0, raw value 2.0 * 4 + 10 = 18;
+      src: W = -1.0, b = 1.5, ret_mean -3, ret_std 2  -> head 1.0, raw value 1.0 * 2 - 3 = -1.
+    """
+    dst = _seeded_net(head, 21)
+    dst.enable_value_norm()
+    with torch.no_grad():
+        for layer in (dst.critic[0], dst.critic[2], dst.critic[4]):
+            layer.weight.zero_()
+            layer.bias.zero_()
+        dst.critic[2].bias[0] = _HEAD_PROBE_HIDDEN
+    src = _seeded_net(head, 22)
+    src.load_state_dict(dst.state_dict())
+    with torch.no_grad():
+        dst.critic[4].weight[0, 0], dst.critic[4].bias[0] = 2.0, 1.0
+        src.critic[4].weight[0, 0], src.critic[4].bias[0] = -1.0, 1.5
+    _set_return_stats(dst, 10.0, 4.0)
+    _set_return_stats(src, -3.0, 2.0)
+    return dst, src
+
+
+def _raw_value(net: ActorCritic) -> float:
+    with torch.no_grad():
+        return float(net.get_value(torch.zeros(1, OBS_DIM))[0])
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_soft_blend_with_tau_one_makes_dst_read_the_raw_values_of_src(head: str) -> None:
+    """[RED] Blending critic heads that sit in different normalised units must not change what the blend means.
+
+    Hand values (see `_head_probe_pair`): raw dst 18, raw src -1. Re-expressing src in dst's units gives
+      W' = W_src * 2 / 4 = -0.5 and b' = (1.5 * 2 + (-3) - 10) / 4 = -2.5, so head' = -0.5 * 0.5 - 2.5 = -2.75 and
+      raw = -2.75 * 4 + 10 = -1, as src itself reads. With tau = 1 dst reads -1. (Blending the heads as they stand gives
+      W = -1, b = 1.5 -> head 1.0 -> raw 1.0 * 4 + 10 = 14, which is wrong.) dst keeps its statistics (10, 4).
+    Tolerance 1e-5: the hidden unit is tanh(atanh(0.5)) in float32 (error ~6e-8) and the raw value is a few float32
+    operations at magnitude ~20 (one ulp there is 1.9e-6).
+    """
+    dst, src = _head_probe_pair(head)
+    assert _raw_value(dst) == pytest.approx(18.0, abs=1e-5) and _raw_value(src) == pytest.approx(-1.0, abs=1e-5)
+    src_before = copy.deepcopy(src.state_dict())
+    ParameterSharingPPOTrainer._soft_blend(dst, src, 1.0)
+    assert _raw_value(dst) == pytest.approx(-1.0, abs=1e-5)
+    assert dst.return_stats() == (10.0, 4.0)
+    for key, value in src.state_dict().items():
+        assert torch.equal(value, src_before[key]), key
+
+
+@pytest.mark.parametrize("head", ["gaussian4", "hybrid5"])
+def test_soft_blend_mixes_raw_values_by_tau_and_keeps_the_statistics_of_dst(head: str) -> None:
+    """[RED] tau = 0.35: dst reads 0.65 * raw_dst + 0.35 * raw_src = 0.65 * 18 + 0.35 * (-1) = 11.7 - 0.35 = 11.35.
+
+    In dst's units: head = 0.65 * 2.0 + 0.35 * (-2.75) = 1.3 - 0.9625 = 0.3375 and raw = 0.3375 * 4 + 10 = 11.35.
+    Blending the heads as they stand would give head 0.65 * 2.0 + 0.35 * 1.0 ... = 1.65 -> raw 16.6. Tolerance 1e-5 as above.
+    """
+    dst, src = _head_probe_pair(head)
+    ParameterSharingPPOTrainer._soft_blend(dst, src, 0.35)
+    assert _raw_value(dst) == pytest.approx(11.35, abs=1e-5)
+    assert dst.return_stats() == (10.0, 4.0)
+    assert src.return_stats() == (-3.0, 2.0)
+
+
+def test_soft_blend_without_value_norm_is_bit_identical_to_the_plain_parameter_blend() -> None:
+    """[GUARD] Default networks: every parameter equals `(1 - tau) * dst + tau * src`, the blend as it was before value_norm existed."""
+    for head in ("gaussian4", "hybrid5"):
+        dst, src = _seeded_net(head, 31), _seeded_net(head, 32)
+        expected = [((1.0 - 0.35) * p_d.detach() + 0.35 * p_s.detach()) for p_d, p_s in zip(dst.parameters(), src.parameters())]
+        ParameterSharingPPOTrainer._soft_blend(dst, src, 0.35)
+        for got, want in zip(dst.parameters(), expected):
+            assert torch.equal(got.detach(), want)
+
+
+def test_coevolution_sync_keeps_the_raw_critic_values_of_the_trailing_team_blended(tmp_path: Path) -> None:
+    """[RED] 6-2 over 24 matches: Team B (red_*) is synced towards Team A (blue_*), field and keeper critics both.
+
+    Hidden layers are made identical, last layers and statistics as in `_head_probe_pair` (blue = src, red = dst), so
+    red reads 0.65 * 18 + 0.35 * (-1) = 11.35 afterwards and blue still reads -1. Tolerance 1e-5 as in the unit tests.
+    """
+    trainer = _critic_trainer(tmp_path, value_norm=True)
+    try:
+        for red, blue in ((trainer.red_field_policy, trainer.blue_field_policy),
+                          (trainer.red_keeper_policy, trainer.blue_keeper_policy)):
+            dst, src = _head_probe_pair("gaussian4")
+            red.load_state_dict(dst.state_dict())
+            blue.load_state_dict(src.state_dict())
+        assert trainer._coevolution_step(_matches_with_totals(6, 2, n=24)) is True
+        for red, blue in ((trainer.red_field_policy, trainer.blue_field_policy),
+                          (trainer.red_keeper_policy, trainer.blue_keeper_policy)):
+            assert _raw_value(red) == pytest.approx(11.35, abs=1e-5)
+            assert _raw_value(blue) == pytest.approx(-1.0, abs=1e-5)
+            assert red.return_stats() == (10.0, 4.0) and blue.return_stats() == (-3.0, 2.0)
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ critic switches: initialisation is stored, not inferred
+def test_a_first_batch_with_mean_zero_and_std_one_is_still_a_first_batch(tmp_path: Path) -> None:
+    """[RED] First returns (-1, 1): mean 0, population variance 1, i.e. exactly the identity statistics. Then returns (4, 4) at m = 0.5.
+
+    The second batch must blend, not overwrite: mean = 0.5 * 0 + 0.5 * 4 = 2; second moment = 0.5 * (1 + 0) + 0.5 * 16 = 8.5;
+    var = 8.5 - 2^2 = 4.5, std = sqrt(4.5) = 2.1213203. Treating (0, 1) as "never updated" would overwrite to mean 4, std 1e-3.
+    Tolerance: the std goes through a float32 buffer (half an ulp at 2.12 is 1.2e-7), so 2.5e-7.
+    """
+    trainer = _critic_trainer(tmp_path, rollout_steps=8, seed=3, full_batch=True, value_norm=True, value_norm_momentum=0.5)
+    try:
+        policy = trainer.blue_field_policy
+        _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [0.0, 0.0], [-1.0, 1.0], False)
+        assert policy.return_stats() == (0.0, 1.0)
+        _critic_update(trainer, policy, torch.zeros(2, OBS_DIM), [0.0, 0.0], [4.0, 4.0], False)
+        mean, std = policy.return_stats()
+        assert mean == pytest.approx(2.0, abs=1e-6)
+        assert std == pytest.approx(2.1213203435596424, abs=2.5e-7)
+    finally:
+        trainer.close()
+
+
+def test_the_update_count_is_a_saved_buffer_and_survives_a_resume(tmp_path: Path) -> None:
+    """[RED] After one update the buffer `ret_count` is 1 in the network and in the saved policy file (0 before any update).
+
+    A resumed trainer whose first batch was (-1, 1) must then blend the next batch (4, 4) at m = 0.5 to mean 2.0
+    (hand values in the test above); losing the count would restart it as a first batch and give mean 4.0.
+    """
+    first = _critic_trainer(tmp_path, "resume_count", rollout_steps=8, seed=3, full_batch=True, value_norm=True, value_norm_momentum=0.5)
+    second = None
+    try:
+        policy = first.blue_field_policy
+        assert int(policy.ret_count) == 0 and "ret_count" in policy.state_dict()
+        _critic_update(first, policy, torch.zeros(2, OBS_DIM), [0.0, 0.0], [-1.0, 1.0], False)
+        assert int(policy.ret_count) == 1
+        first.current_generation = 1
+        first.save_checkpoints()
+        weights = torch.load(tmp_path / "resume_count" / "blue_field_policy.pt", weights_only=True)
+        assert int(weights["ret_count"]) == 1
+        second = _critic_trainer(tmp_path, "resume_count", rollout_steps=8, seed=3, full_batch=True, value_norm=True, value_norm_momentum=0.5)
+        assert second.load_checkpoints()
+        assert int(second.blue_field_policy.ret_count) == 1
+        _critic_update(second, second.blue_field_policy, torch.zeros(2, OBS_DIM), [0.0, 0.0], [4.0, 4.0], False)
+        assert second.blue_field_policy.return_stats()[0] == pytest.approx(2.0, abs=1e-6)
+        assert int(second.blue_field_policy.ret_count) == 2
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+
+
+# ------------------------------------------------------------------ critic switches: the statistics load as a complete set
+_STAT_KEYS = ("ret_mean", "ret_std", "ret_count")
+
+
+def _partial_statistics(missing: str):
+    saved = ActorCritic(value_norm=True)
+    _set_return_stats(saved, 7.0, 2.5)
+    weights = dict(saved.state_dict())
+    del weights[missing]
+    return weights
+
+
+@pytest.mark.parametrize("missing", _STAT_KEYS)
+def test_a_network_refuses_a_state_dict_with_only_some_of_the_statistics(missing: str) -> None:
+    """[RED] A plain `ActorCritic` loading a state dict that holds two of the three statistics raises ValueError naming the missing key."""
+    weights = _partial_statistics(missing)
+    with pytest.raises(ValueError, match=missing):
+        ActorCritic().load_state_dict(weights)
+
+
+@pytest.mark.parametrize("missing", _STAT_KEYS)
+@pytest.mark.parametrize("value_norm", [False, True])
+def test_the_trainer_refuses_a_checkpoint_with_only_some_of_the_statistics(tmp_path: Path, missing: str, value_norm: bool) -> None:
+    """[RED] `_load_adapted_weights` raises ValueError naming the missing key, whether or not the trainer normalises values."""
+    trainer = _critic_trainer(tmp_path, value_norm=value_norm)
+    try:
+        with pytest.raises(ValueError, match=missing):
+            trainer._load_adapted_weights(trainer.blue_field_policy, _partial_statistics(missing))
+    finally:
+        trainer.close()
+
+
+@pytest.mark.parametrize("missing", _STAT_KEYS)
+def test_a_pool_snapshot_with_only_some_of_the_statistics_is_refused(tmp_path: Path, missing: str) -> None:
+    """[RED] `_load_pool_member` raises ValueError naming the missing key instead of loading a half-described critic."""
+    trainer = _critic_trainer(tmp_path, "pool_partial", num_envs=2)
+    try:
+        snap = Path(trainer.checkpoint_dir) / "snapshots" / "gen0050"
+        snap.mkdir(parents=True)
+        for team in ("blue", "red"):
+            for role in ("keeper", "field"):
+                torch.save(_partial_statistics(missing), snap / f"{team}_{role}_policy.pt")
+        with pytest.raises(ValueError, match=missing):
+            trainer._load_pool_member(50, "A")
+    finally:
+        trainer.close()

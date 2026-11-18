@@ -370,6 +370,13 @@ class PPOHyperparams:
     # kick-weighted power term, and `fire_ent_coef` to the two Bernoulli fire entropies.
     fire_entropy: str = "joint"
     fire_ent_coef: float = 0.0
+    # Critic switches. `value_clip` keeps the PPO value-loss clip at +-`clip_coef` around the rollout's value
+    # estimate; with `value_clip=False` the loss is the plain squared error. `value_norm` trains each critic on
+    # lambda-return targets standardised by a running mean and standard deviation (their blend weight on the old
+    # statistics is `value_norm_momentum`); every value read outside the loss stays in raw return units.
+    value_clip: bool = True
+    value_norm: bool = False
+    value_norm_momentum: float = 0.95
 
     def __post_init__(self) -> None:
         if self.policy_head not in ("gaussian4", "hybrid5"):
@@ -391,6 +398,8 @@ class PPOHyperparams:
             raise ValueError(f"fire_entropy 'separate' requires policy_head 'hybrid5', got {self.policy_head!r}")
         if self.fire_entropy == "joint" and self.fire_ent_coef != 0.0:
             raise ValueError(f"fire_ent_coef must be 0 with fire_entropy 'joint', got {self.fire_ent_coef}")
+        if not (math.isfinite(self.value_norm_momentum) and 0.0 < self.value_norm_momentum < 1.0):
+            raise ValueError(f"value_norm_momentum must be finite and in (0, 1), got {self.value_norm_momentum}")
         if self.policy_head == "hybrid5":
             # The head starts at the gaussian4 kick and special fire rates; refuse a floor / bound pair that cannot.
             _initial_fire_logit(
