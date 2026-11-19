@@ -182,6 +182,7 @@ class TeamPolicy:
         base = Path(directory)
         self.heads = []
         self.fire_bounds = []
+        self.value_affines = []
         kinds = set()
         for pattern, slot in ((POLICY_FILES[1], slice(0, 1)), (POLICY_FILES[0], slice(1, 6))):
             weights = torch.load(base / pattern.format(prefix=prefix), map_location="cpu", weights_only=True)
@@ -194,24 +195,30 @@ class TeamPolicy:
                 p.requires_grad_(False)
             self.heads.append((slot, _linear_layers(net.actor_mean), _linear_layers(net.critic), net.actor_logstd.exp()))
             self.fire_bounds.append((net.fire_prob_floor, net.fire_logit_bound) if net.hybrid else None)
+            self.value_affines.append(net.value_affine())  # (ret_mean, ret_std) of a value-normalised critic, else None
         if len(kinds) != 1:
             raise ValueError(f"the field and keeper networks of {base} / {prefix} use different policy heads: {sorted(kinds)}")
         self.head = 1 if kinds == {"hybrid5"} else 0
 
-    def forward(self, obs, cen, slot, actor, critic):
+    @staticmethod
+    def _raw_value(head, affine):
+        """Critic head output in raw return units: `head * ret_std + ret_mean` for a value-normalised critic."""
+        return head if affine is None else head * affine[1] + affine[0]
+
+    def forward(self, obs, cen, slot, actor, critic, affine=None):
         """Return `(mean, value)` of one network for its slice of the team."""
         o = torch.as_tensor(obs[slot])
         c = torch.as_tensor(cen[slot])
-        return _mlp(o, actor, True), _mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1)
+        return _mlp(o, actor, True), self._raw_value(_mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1), affine)
 
-    def _act_hybrid(self, obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values):
+    def _act_hybrid(self, obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine=None):
         from football_rl.config import DEFAULT_CONFIG
         from football_rl.train_ppo import fire_probability, to_env_actions
 
         o = torch.as_tensor(obs[slot])
         c = torch.as_tensor(cen[slot])
         z = _mlp(o, actor, False)
-        values[slot] = _mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1).numpy()
+        values[slot] = self._raw_value(_mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1), affine).numpy()
         mean3 = torch.tanh(z[:, :3])
         floor, bound = bounds
         p_kick = fire_probability(z[:, 3], floor, bound)
@@ -239,11 +246,13 @@ class TeamPolicy:
         values = np.empty(6, dtype=np.float32)
         means = np.empty((6, 4), dtype=np.float32)
         with torch.inference_mode():
-            for (slot, actor, critic, std), bounds in zip(self.heads, self.fire_bounds):
+            for (slot, actor, critic, std), bounds, affine in zip(self.heads, self.fire_bounds, self.value_affines):
                 if bounds is not None:
-                    self._act_hybrid(obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values)
+                    self._act_hybrid(
+                        obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine
+                    )
                     continue
-                mean, value = self.forward(obs, cen, slot, actor, critic)
+                mean, value = self.forward(obs, cen, slot, actor, critic, affine)
                 noise = torch.randn(mean.shape, generator=gen)
                 sampled = mean + sigma_scale * std * noise
                 if mode == "greedy":

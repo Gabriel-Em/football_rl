@@ -146,6 +146,70 @@ def hybrid_entropy_bonus(
     return ent_coef * gaussian + fire_ent_coef * h_b
 
 
+class RunningStat:
+    """Exponential moving mean and variance of a scalar stream (the critic return targets of one policy).
+
+    A fresh statistic is the identity transform (mean 0, variance 1, `count == 0`). The first batch sets the mean and
+    the population variance; later batches blend their first and second moments in with weight `1 - momentum`.
+    `std` never drops below `MIN_STD`.
+    """
+
+    MIN_STD = 1e-3
+
+    def __init__(self, momentum: float = 0.95) -> None:
+        self.momentum = float(momentum)
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 0
+
+    @property
+    def std(self) -> float:
+        return max(math.sqrt(self.var), self.MIN_STD)
+
+    def update(self, x: Any) -> None:
+        """Fold a batch into the statistic; an empty batch is ignored and a batch with a non-finite value raises ValueError."""
+        x = torch.as_tensor(x).detach().reshape(-1)
+        if x.numel() == 0:
+            return
+        x = x.double()
+        batch_mean, batch_second = torch.stack([x.mean(), (x * x).mean()]).tolist()
+        if not (math.isfinite(batch_mean) and math.isfinite(batch_second)):
+            raise ValueError("RunningStat.update received non-finite values")
+        if self.count == 0:
+            mean, second = batch_mean, batch_second
+        else:
+            m = self.momentum
+            mean = m * self.mean + (1.0 - m) * batch_mean
+            second = m * (self.var + self.mean * self.mean) + (1.0 - m) * batch_second
+        self.mean = mean
+        self.var = max(second - mean * mean, 0.0)
+        self.count += 1
+
+    def normalize(self, x: Any) -> Any:
+        return (x - self.mean) / self.std
+
+    def denormalize(self, x: Any) -> Any:
+        return x * self.std + self.mean
+
+
+RETURN_STAT_KEYS = ("ret_mean", "ret_std", "ret_count")
+
+
+def holds_return_statistics(state_dict: Dict[str, Any], prefix: str = "") -> bool:
+    """True when `state_dict` carries the critic return statistics, False when it carries none of them.
+
+    The statistics are one set: a state dict with only some of `RETURN_STAT_KEYS` raises ValueError naming the missing keys.
+    """
+    present = [key for key in RETURN_STAT_KEYS if prefix + key in state_dict]
+    if present and len(present) < len(RETURN_STAT_KEYS):
+        missing = [prefix + key for key in RETURN_STAT_KEYS if prefix + key not in state_dict]
+        raise ValueError(
+            f"state dict holds some of the critic return statistics {RETURN_STAT_KEYS} but is missing {missing}; "
+            "they are loaded only as a complete set"
+        )
+    return bool(present)
+
+
 class ActorCritic(nn.Module):
     """Actor-Critic network for shared role policies, with a Gaussian or a hybrid action head.
 
@@ -158,6 +222,12 @@ class ActorCritic(nn.Module):
     steer and power are Gaussians around `tanh(z)`, kick and special fire as Bernoulli draws with probabilities
     `fire_probability(z)`. The policy action is `[thr, steer, u, K, S]` (see `to_env_actions`). Its fire bounds
     are stored in the state dict as buffers.
+
+    With `value_norm` the critic head is trained in standardised return units and the network holds the running
+    return statistics as the buffers `ret_mean`, `ret_std` and `ret_count`. Every value it returns is in raw return units
+    (`head * ret_std + ret_mean`) unless `normalized_value` asks for the head output itself. A network built without
+    `value_norm` has no such buffers and returns the head output; one that loads a state dict holding them takes the
+    buffers on.
     """
 
     def __init__(
@@ -169,10 +239,12 @@ class ActorCritic(nn.Module):
         policy_head: str = "gaussian4",
         fire_prob_floor: float = 0.005,
         fire_logit_bound: float = 6.0,
+        value_norm: bool = False,
     ) -> None:
         super().__init__()
         if policy_head not in POLICY_HEADS:
             raise ValueError(f"policy_head must be one of {POLICY_HEADS}, got {policy_head!r}")
+        self.value_norm = False
         self.policy_head = policy_head
         self.hybrid = policy_head == "hybrid5"
         h1, h2 = hidden_dims
@@ -223,6 +295,53 @@ class ActorCritic(nn.Module):
         self.actor_mean = nn.Sequential(*actor_layers)
         self.actor_logstd = nn.Parameter(torch.full((1, 3 if self.hybrid else action_dim), -0.5))
         self.action_dim = HYBRID_ACTION_DIM if self.hybrid else action_dim
+        if value_norm:
+            self.enable_value_norm()
+
+    def enable_value_norm(self) -> None:
+        """Give the network the identity return statistics `ret_mean = 0`, `ret_std = 1`, `ret_count = 0` (a no-op when it has them).
+
+        `ret_count` is the number of batches folded into the statistics, so a first batch whose mean is 0 and whose
+        standard deviation is 1 is told apart from a statistic that was never updated.
+        """
+        if self.value_norm:
+            return
+        device = self.actor_logstd.device
+        self.register_buffer("ret_mean", torch.zeros((), dtype=torch.float32, device=device))
+        self.register_buffer("ret_std", torch.ones((), dtype=torch.float32, device=device))
+        self.register_buffer("ret_count", torch.zeros((), dtype=torch.int64, device=device))
+        self.value_norm = True
+
+    def _load_from_state_dict(self, state_dict: Dict[str, Any], prefix: str, *args: Any, **kwargs: Any) -> None:
+        if holds_return_statistics(state_dict, prefix) and not self.value_norm:
+            self.enable_value_norm()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def return_stats(self) -> Tuple[float, float]:
+        """`(ret_mean, ret_std)` as floats; `(0.0, 1.0)` for a network without return statistics."""
+        if not self.value_norm:
+            return 0.0, 1.0
+        return float(self.ret_mean), float(self.ret_std)
+
+    def value_affine(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """`(ret_mean, ret_std)` buffers mapping head outputs to raw return units, or None without return statistics."""
+        return (self.ret_mean, self.ret_std) if self.value_norm else None
+
+    def return_stat(self, momentum: float) -> RunningStat:
+        """The `RunningStat` the buffers hold: a zero `ret_count` is a fresh statistic, any other count resumes the blend."""
+        mean, std = self.return_stats()
+        stat = RunningStat(momentum)
+        count = int(self.ret_count)
+        if count > 0:
+            stat.mean, stat.var, stat.count = mean, std * std, count
+        return stat
+
+    def set_return_stat(self, stat: RunningStat) -> None:
+        """Store `stat`'s mean, standard deviation and batch count in the buffers."""
+        with torch.no_grad():
+            self.ret_mean.fill_(stat.mean)
+            self.ret_std.fill_(stat.std)
+            self.ret_count.fill_(stat.count)
 
     def _prepare_critic_input(
         self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
@@ -239,10 +358,13 @@ class ActorCritic(nn.Module):
         return torch.cat([obs, zeros], dim=-1)
 
     def get_value(
-        self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None
+        self, obs: torch.Tensor, central_state: Optional[torch.Tensor] = None, normalized_value: bool = False
     ) -> torch.Tensor:
         critic_in = self._prepare_critic_input(obs, central_state)
-        return self.critic(critic_in).squeeze(-1)
+        value = self.critic(critic_in).squeeze(-1)
+        if self.value_norm and not normalized_value:
+            value = value * self.ret_std + self.ret_mean
+        return value
 
     def get_action_and_value(
         self,
@@ -252,15 +374,19 @@ class ActorCritic(nn.Module):
         central_state: Optional[torch.Tensor] = None,
         return_mean: bool = False,
         return_heads: bool = False,
+        normalized_value: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended.
 
         With `return_heads` (hybrid5 only) the `(logstd, p)` pair of the same forward pass is appended last, where
-        `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities.
+        `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities. `value` is in raw return units;
+        `normalized_value` returns the critic head output instead (they coincide without return statistics).
         """
         actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
         if self.hybrid:
-            return self._hybrid_action_and_value(actor_obs, action, deterministic, central_state, return_mean, return_heads)
+            return self._hybrid_action_and_value(
+                actor_obs, action, deterministic, central_state, return_mean, return_heads, normalized_value
+            )
         if return_heads:
             raise ValueError("return_heads requires the hybrid5 policy head")
         action_mean = self.actor_mean(actor_obs)
@@ -275,6 +401,8 @@ class ActorCritic(nn.Module):
         entropy = probs.entropy().sum(-1)
         critic_in = self._prepare_critic_input(actor_obs, central_state)
         value = self.critic(critic_in).squeeze(-1)
+        if self.value_norm and not normalized_value:
+            value = value * self.ret_std + self.ret_mean
         if return_mean:
             return action, log_prob, entropy, value, action_mean
         return action, log_prob, entropy, value
@@ -324,6 +452,7 @@ class ActorCritic(nn.Module):
         central_state: Optional[torch.Tensor],
         return_mean: bool,
         return_heads: bool = False,
+        normalized_value: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         mean3, p = self._hybrid_split(self.actor_mean(actor_obs))
         logstd = self.actor_logstd
@@ -338,6 +467,8 @@ class ActorCritic(nn.Module):
         entropy = _hybrid_entropy(logstd, p)
         critic_in = self._prepare_critic_input(actor_obs, central_state)
         value = self.critic(critic_in).squeeze(-1)
+        if self.value_norm and not normalized_value:
+            value = value * self.ret_std + self.ret_mean
         out: Tuple[Any, ...] = (action, log_prob, entropy, value)
         if return_mean:
             out += (self._hybrid_env_mean(mean3, p[..., 0], p[..., 1]),)
@@ -364,7 +495,10 @@ class ActorCritic(nn.Module):
         critic_in = self._prepare_critic_input(obs, central_state)
         v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
         v = torch.tanh(F.linear(v, c1.weight, c1.bias))
-        return z, F.linear(v, c2.weight, c2.bias).squeeze(-1)
+        value = F.linear(v, c2.weight, c2.bias).squeeze(-1)
+        if self.value_norm:
+            value = value * self.ret_std + self.ret_mean
+        return z, value
 
     @torch.no_grad()
     def sample_action_and_value(
@@ -402,6 +536,8 @@ class ActorCritic(nn.Module):
             v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
             v = torch.tanh(F.linear(v, c1.weight, c1.bias))
             value = F.linear(v, c2.weight, c2.bias).squeeze(-1)
+            if self.value_norm:
+                value = value * self.ret_std + self.ret_mean
             if return_mean:
                 return action, log_prob, value, self._hybrid_env_mean(mean3, p[..., 0], p[..., 1])
             return action, log_prob, value
@@ -415,6 +551,8 @@ class ActorCritic(nn.Module):
         v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
         v = torch.tanh(F.linear(v, c1.weight, c1.bias))
         value = F.linear(v, c2.weight, c2.bias).squeeze(-1)
+        if self.value_norm:
+            value = value * self.ret_std + self.ret_mean
         if return_mean:
             return action, log_prob, value, action_mean
         return action, log_prob, value
@@ -549,6 +687,11 @@ class FrozenSeatBatch:
                     w1[slot], b1[slot, 0] = second.weight.t(), second.bias
                     w2[slot, :, : last.out_features] = last.weight.t()
                     b2[slot, 0, : last.out_features] = last.bias
+                    affine = net.value_affine() if slot >= count else None
+                    if affine is not None:  # critic head in raw return units: `head * ret_std + ret_mean`
+                        mean, std = affine
+                        w2[slot, :, 0] *= std
+                        b2[slot, 0, 0] = last.bias[0] * std + mean
             self._weights = (w0, b0, w1, b1, w2, b2)
             self._std = torch.stack([torch.exp(net.actor_logstd) for net in nets])
             if self.hybrid:
@@ -1026,6 +1169,7 @@ class ParameterSharingPPOTrainer:
             policy_head=ppo.policy_head,
             fire_prob_floor=ppo.fire_prob_floor,
             fire_logit_bound=ppo.fire_logit_bound,
+            value_norm=ppo.value_norm,
         ).to(device)
 
     def _sync_cpu_policies(self) -> None:
@@ -1307,6 +1451,8 @@ class ParameterSharingPPOTrainer:
         with torch.random.fork_rng(devices=[]):
             for w in weights:
                 net = self._new_policy(self.inference_device)
+                if holds_return_statistics(w):
+                    net.enable_value_norm()
                 self._load_adapted_weights(net, w)
                 net.eval()
                 net.requires_grad_(False)
@@ -1554,6 +1700,18 @@ class ParameterSharingPPOTrainer:
         std = advantages.std()
         return (advantages - mean) / (std + 1e-8)
 
+    def _value_loss(self, newvalue: torch.Tensor, mb_values: torch.Tensor, mb_returns: torch.Tensor) -> torch.Tensor:
+        """Critic loss of a minibatch: PPO's value clip around `mb_values` when `ppo.value_clip`, else the plain squared error."""
+        if not self.cfg.ppo.value_clip:
+            return 0.5 * ((newvalue - mb_returns) ** 2).mean()
+        clip_coef = self.cfg.ppo.clip_coef
+        v_loss_unclipped = (newvalue - mb_returns) ** 2
+        v_clipped = mb_values + torch.clamp(
+            newvalue - mb_values, -clip_coef, clip_coef
+        )
+        v_loss_clipped = (v_clipped - mb_returns) ** 2
+        return 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
     def _ppo_update_role(
         self,
         policy: ActorCritic,
@@ -1599,6 +1757,19 @@ class ParameterSharingPPOTrainer:
         if not critic_only:
             b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
 
+        # Critic targets and the rollout's value estimates move to the policy's standardised return units, with the
+        # statistics already updated by this batch; the critic head is read in those units too.
+        value_kwargs: Dict[str, bool] = {}
+        if self.cfg.ppo.value_norm:
+            if not policy.value_norm:
+                raise ValueError("ppo.value_norm is on but the policy has no return statistics")
+            stat = policy.return_stat(self.cfg.ppo.value_norm_momentum)
+            stat.update(b_returns)
+            policy.set_return_stat(stat)
+            b_returns = (b_returns - policy.ret_mean) / policy.ret_std
+            b_values = (b_values - policy.ret_mean) / policy.ret_std
+            value_kwargs = {"normalized_value": True}
+
         pg_losses: List[float] = []
         v_losses: List[float] = []
         entropy_losses: List[float] = []
@@ -1631,13 +1802,8 @@ class ParameterSharingPPOTrainer:
                     cen_mb = b_central
 
                 if critic_only:
-                    newvalue = policy.get_value(mb_obs, central_state=cen_mb)
-                    v_loss_unclipped = (newvalue - mb_returns) ** 2
-                    v_clipped = mb_values + torch.clamp(
-                        newvalue - mb_values, -clip_coef, clip_coef
-                    )
-                    v_loss_clipped = (v_clipped - mb_returns) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    newvalue = policy.get_value(mb_obs, central_state=cen_mb, **value_kwargs)
+                    v_loss = self._value_loss(newvalue, mb_values, mb_returns)
                     loss = v_loss * self.cfg.ppo.vf_coef
 
                     optimizer.zero_grad(set_to_none=True)
@@ -1652,11 +1818,11 @@ class ParameterSharingPPOTrainer:
 
                 if separate_fire_entropy:
                     _, newlogprob, entropy, newvalue, (head_logstd, head_p) = policy.get_action_and_value(
-                        mb_obs, mb_actions, central_state=cen_mb, return_heads=True
+                        mb_obs, mb_actions, central_state=cen_mb, return_heads=True, **value_kwargs
                     )
                 else:
                     _, newlogprob, entropy, newvalue = policy.get_action_and_value(
-                        mb_obs, mb_actions, central_state=cen_mb
+                        mb_obs, mb_actions, central_state=cen_mb, **value_kwargs
                     )
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
@@ -1669,12 +1835,7 @@ class ParameterSharingPPOTrainer:
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
-                v_loss_unclipped = (newvalue - mb_returns) ** 2
-                v_clipped = mb_values + torch.clamp(
-                    newvalue - mb_values, -clip_coef, clip_coef
-                )
-                v_loss_clipped = (v_clipped - mb_returns) ** 2
-                v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                v_loss = self._value_loss(newvalue, mb_values, mb_returns)
 
                 entropy_loss = entropy.mean()
                 if separate_fire_entropy:
@@ -2113,13 +2274,20 @@ class ParameterSharingPPOTrainer:
     def _load_adapted_weights(self, policy: ActorCritic, weights: Dict[str, torch.Tensor]) -> None:
         """Load a state dict into `policy`, zero-padding narrower first-layer inputs (`adapt_policy_weights`).
 
-        Raises ValueError when the checkpoint's policy head differs from the network's; heads are not convertible.
+        Raises ValueError when the checkpoint's policy head differs from the network's; heads are not convertible, and
+        when it holds return statistics but the network has none. A checkpoint without statistics leaves a value-normalising
+        network on its identity statistics.
         """
         saved_head = policy_head_of_weights(weights)
         if saved_head is not None and saved_head != policy.policy_head:
             raise ValueError(
                 f"Checkpoint holds {saved_head!r} policies but the configured policy head is {policy.policy_head!r}; "
                 "heads cannot be converted."
+            )
+        if holds_return_statistics(weights) and not policy.value_norm:
+            raise ValueError(
+                "Checkpoint holds critic return statistics but ppo.value_norm is off; its critic is in "
+                "normalised units and cannot be read as raw returns."
             )
         policy.load_state_dict(
             adapt_policy_weights(weights, policy.obs_dim, policy.central_state_dim), strict=False
@@ -2273,9 +2441,26 @@ class ParameterSharingPPOTrainer:
 
     @staticmethod
     def _soft_blend(dst: nn.Module, src: nn.Module, tau: float) -> None:
-        """Move `dst` parameters a fraction `tau` of the way towards `src` (in place)."""
+        """Move `dst` parameters a fraction `tau` of the way towards `src` (in place).
+
+        Value-normalising critics keep their head in units set by their own `ret_mean` / `ret_std`. Before blending,
+        `src`'s last critic layer is re-expressed in `dst`'s units, `W' = W * std_src / std_dst` and
+        `b' = (b * std_src + mean_src - mean_dst) / std_dst`, so that the blended head reads
+        `(1 - tau) * raw_dst + tau * raw_src` in raw return units; `dst` keeps its own statistics.
+        """
         with torch.no_grad():
-            for p_dst, p_src in zip(dst.parameters(), src.parameters()):
+            src_params = list(src.parameters())
+            dst_affine = dst.value_affine() if isinstance(dst, ActorCritic) else None
+            src_affine = src.value_affine() if isinstance(src, ActorCritic) else None
+            if (dst_affine is None) != (src_affine is None):
+                raise ValueError("cannot blend a value-normalising critic with one that has no return statistics")
+            if dst_affine is not None:
+                (mean_d, std_d), (mean_s, std_s) = dst_affine, src_affine
+                last = src.critic[-1]
+                weight = (last.weight.double() * std_s.double() / std_d.double()).to(last.weight.dtype)
+                bias = ((last.bias.double() * std_s.double() + mean_s.double() - mean_d.double()) / std_d.double()).to(last.bias.dtype)
+                src_params = [weight if p is last.weight else bias if p is last.bias else p for p in src_params]
+            for p_dst, p_src in zip(dst.parameters(), src_params):
                 p_dst.data.copy_((1.0 - tau) * p_dst.data + tau * p_src.data)
 
     def _coevolution_step(self, completed_matches: List[Dict[str, Any]]) -> bool:
@@ -2410,6 +2595,15 @@ class ParameterSharingPPOTrainer:
                     "pool_size": self.pool_size,
                     "pool_schedule": list(rollout.get("pool_schedule", [])),
                 }
+                if self.cfg.ppo.value_norm:
+                    role_policies = {
+                        "blue_field": self.blue_field_policy,
+                        "blue_keeper": self.blue_keeper_policy,
+                        "red_field": self.red_field_policy,
+                        "red_keeper": self.red_keeper_policy,
+                    }
+                    gen_record["ret_mean"] = {role: pol.return_stats()[0] for role, pol in role_policies.items()}
+                    gen_record["ret_std"] = {role: pol.return_stats()[1] for role, pol in role_policies.items()}
                 if self.policy_head == "hybrid5":
                     roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
                     gen_record["fire_sat"] = {
