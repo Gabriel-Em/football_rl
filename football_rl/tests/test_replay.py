@@ -396,6 +396,176 @@ def test_scrubber_click_and_drag_seek_by_match_time() -> None:
     assert viz_ulp.frames[18]["cinematic"]["event_type"] == "GOAL!"
 
 
+def test_goal_marker_snap_radius_and_half_pixel_rounding() -> None:
+    """Clicking or dragging within +-6 px of a goal marker snaps to the goal; +-7 px follows match time."""
+    for cinematics in (True, False):
+        # n_frames=451 => T = 450/60 = 7.5s, bar_w = 1200 (1 frame = 8/3 px; 1 px = 0.00625s).
+        # Goal at raw frame 10 (t = 10/60s): ratio = 10/450 = 1/45, round(1200/45) = 27.
+        # Half-pixel rounding places gx at bar_x + 27, whose click time is 27/1200 * 7.5 = 0.16875s > 10/60s,
+        # so rule 3 alone would skip the cinematic and land on raw frame 11 (idx 281).
+        data = _halftime_replay(
+            goal_frames=[10], halftime_frame=10_000, n_frames=451,
+            cinematics=cinematics, with_halftime_event=False,
+        )
+        viz = ReplayVisualizer(data, headless=True)
+        bar_x = viz.margin_x
+        click_y = viz.hud_height + viz.disp_field_h + 16
+        gx = bar_x + 27
+        # Expected target: viewer idx 10 (first FREEZE frame of goal cinematic, or raw frame 10 without cinematics).
+        expected_goal_idx = 10
+        # Non-snap rule-3 frame at gx + 7 (offset 34 -> t = 34/1200 * 7.5 = 0.2125s; 12/60 < t <= 13/60 -> raw frame 13).
+        expected_plus7_idx = 13 + (270 if cinematics else 0)
+        # Non-snap rule-3 frame at gx - 7 (offset 20 -> t = 20/1200 * 7.5 = 0.125s; 7/60 < t <= 8/60 -> raw frame 8).
+        expected_minus7_idx = 8
+
+        # Click at drawn centre (0 px), +6 px, -6 px all snap to goal.
+        for dx in (0, 6, -6):
+            viz.seek_to_frame(0)
+            pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(gx + dx, click_y)))
+            viz.handle_events()
+            assert viz.current_frame_idx == expected_goal_idx
+            if cinematics:
+                assert viz.frames[viz.current_frame_idx]["cinematic"]["event_type"] == "GOAL!"
+                assert viz.frames[viz.current_frame_idx]["cinematic"]["phase"] == "FREEZE"
+                assert viz.frames[viz.current_frame_idx]["cinematic"]["progress"] == 0.0
+
+        # Drag onto gx + 6 snaps; continuing drag to gx + 7 unsnaps back to match time.
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 5, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == 2  # offset 5 -> t = 0.03125s; 1/60 < t <= 2/60 -> raw frame 2
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(gx + 6, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_goal_idx
+
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(gx + 7, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_plus7_idx
+
+        # Release drag, then click at +7 px and -7 px: neither snaps.
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=(gx + 7, click_y)))
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(gx + 7, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_plus7_idx
+
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(gx - 7, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_minus7_idx
+
+
+def test_overlapping_goal_markers_nearest_and_tie_break() -> None:
+    """Overlapping goal markers resolve to the nearest centre, and to the earlier goal on an exact tie."""
+    for cinematics in (True, False):
+        # n_frames=451 => bar_w = 1200, 1 frame = 8/3 px.
+        # Goal 1 at raw frame 10 -> round(10 * 8/3) = 27 (gx1 = bar_x + 27), viewer idx 10.
+        # Goal 2 at raw frame 13 -> round(13 * 8/3) = 35 (gx2 = bar_x + 35), viewer idx 13 (+ 270 with cinematics).
+        # Centres are 8 px apart (<= 12 px), so circles overlap across [29..33] with exact midpoint at 31.
+        data = _halftime_replay(
+            goal_frames=[10, 13], halftime_frame=10_000, n_frames=451,
+            cinematics=cinematics, with_halftime_event=False,
+        )
+        viz = ReplayVisualizer(data, headless=True)
+        bar_x = viz.margin_x
+        click_y = viz.hud_height + viz.disp_field_h + 16
+        g1_idx = 10
+        g2_idx = 13 + (270 if cinematics else 0)
+        # Outside both snap radii: offset 42 -> t = (42/1200)*7.5 = 0.2625s; 15/60 < t <= 16/60 -> raw frame 16.
+        outside_idx = 16 + (540 if cinematics else 0)
+
+        # Nearer to goal 1 (offset 30: d1=3, d2=5) -> goal 1
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 30, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == g1_idx
+
+        # Nearer to goal 2 (offset 32: d1=5, d2=3) -> goal 2
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 32, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == g2_idx
+
+        # Exact tie (offset 31: d1=4, d2=4) -> earlier goal (goal 1)
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 31, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == g1_idx
+
+        # Drag across overlap: drag to 32 (goal 2), then back to tie at 31 (goal 1)
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 5, click_y)))
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(bar_x + 32, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == g2_idx
+
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(bar_x + 31, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == g1_idx
+
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=(bar_x + 31, click_y)))
+        viz.handle_events()
+
+        # Edge of goal 2 (+6 px -> offset 41) snaps to goal 2; +7 px (offset 42) falls back to match time.
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 41, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == g2_idx
+
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 42, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == outside_idx
+
+
+def test_halftime_line_snap_radius_with_and_without_cinematics() -> None:
+    """Clicking or dragging within +-1 px of the half-time line snaps; +-2 px follows match time."""
+    for cinematics, with_ht_event in ((True, True), (False, True), (False, False)):
+        # n_frames=2401 => T = 2400/60 = 40.0s, bar_w = 1200 (1 px = 2 raw frames).
+        # Halftime at raw frame 1200 (t = 20.0s) => ht_x = bar_x + 600, halftime_frame_idx = 1200.
+        # With cinematics, 240 HALFTIME! frames sit at 1200..1439, so raw frame 1204 is viewer idx 1444.
+        # At ht_x - 1 (599): t = 1198/60 (rule 3 -> 1198). At ht_x + 1 (601): t = 1202/60 (rule 3 -> 1442 or 1202).
+        # At ht_x - 2 (598): t = 1196/60 -> 1196. At ht_x + 2 (602): t = 1204/60 -> 1444 (or 1204 without cinematics).
+        data = _halftime_replay(
+            goal_frames=[], halftime_frame=1200, n_frames=2401,
+            cinematics=cinematics, with_halftime_event=with_ht_event,
+        )
+        viz = ReplayVisualizer(data, headless=True)
+        bar_x = viz.margin_x
+        click_y = viz.hud_height + viz.disp_field_h + 16
+        ht_x = bar_x + 600
+        assert viz.halftime_frame_idx == 1200
+        expected_plus2 = 1204 + (240 if cinematics else 0)
+
+        for dx in (-1, 0, 1):
+            viz.seek_to_frame(0)
+            pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(ht_x + dx, click_y)))
+            viz.handle_events()
+            assert viz.current_frame_idx == 1200
+
+        # Drag onto ht_x + 1 snaps to halftime; dragging on to ht_x + 2 unsnaps.
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 10, click_y)))
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(ht_x + 1, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == 1200
+
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEMOTION, pos=(ht_x + 2, click_y), buttons=(1, 0, 0))
+        )
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_plus2
+
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=(ht_x + 2, click_y)))
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(ht_x - 2, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == 1196
+
+        pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(ht_x + 2, click_y)))
+        viz.handle_events()
+        assert viz.current_frame_idx == expected_plus2
+
+
 def test_legacy_replay_without_time_and_metadata_duration() -> None:
     """Replays without `time` fall back to `frame / physics_hz`; metadata `max_rl_steps / rl_hz` sets T."""
     for cinematics in (True, False):
