@@ -815,11 +815,30 @@ def test_coevo_total_goals_below_eight_does_not_sync(tmp_path: Path) -> None:
     assert len(trainer.recent_match_scores) == 24
 
 
-def test_coevo_team_b_dominance_syncs_team_a_towards_b(tmp_path: Path) -> None:
+def test_coevo_sync_log_names_both_teams_by_their_rendered_colour(tmp_path: Path, capsys) -> None:
+    """[GUARD] The sync line follows the team colour schema: team A (seats 0-5, `blue_*` policy files, `score[0]`) is drawn
+    red and is "Red" in every console line; team B (seats 6-11, `red_*` files, `score[1]`) is drawn blue and is "Blue".
+    """
+    from football_rl.replay import COLOR_TEAM_A, COLOR_TEAM_B
+
+    assert COLOR_TEAM_A[0] > COLOR_TEAM_A[2] and COLOR_TEAM_B[2] > COLOR_TEAM_B[0]  # A drawn red, B drawn blue
+
     trainer = _coevo_trainer(tmp_path)
-    assert trainer._coevolution_step(_matches_with_totals(1, 7, n=24)) is True  # 7 >= 3*max(1,1)
-    assert _team_a_weight(trainer) == pytest.approx(0.65)  # 0.65*1 + 0.35*0
-    assert _team_b_weight(trainer) == 0.0
+    assert trainer.blue_keeper_indices == [0] and trainer.blue_field_indices == [1, 2, 3, 4, 5]
+    assert trainer.red_keeper_indices == [6] and trainer.red_field_indices == [7, 8, 9, 10, 11]
+
+    # Team A scores 6, team B scores 2: A (Red) dominated, so B (Blue, stored as red_*) is pulled towards A.
+    assert trainer._coevolution_step(_matches_with_totals(6, 2, n=24)) is True
+    line = capsys.readouterr().out
+    assert "[Co-Evolution Sync] Red dominated (6-2 over 24 matches). Soft-synced Blue policy (tau=0.35)" in line
+    assert _team_b_weight(trainer) == pytest.approx(0.35) and _team_a_weight(trainer) == 1.0
+
+    # Team B scores 7, team A scores 1: B (Blue) dominated, so A (Red, stored as blue_*) is pulled towards B.
+    trainer2 = _coevo_trainer(tmp_path / "second")
+    assert trainer2._coevolution_step(_matches_with_totals(1, 7, n=24)) is True
+    line2 = capsys.readouterr().out
+    assert "[Co-Evolution Sync] Blue dominated (7-1 over 24 matches). Soft-synced Red policy (tau=0.35)" in line2
+    assert _team_a_weight(trainer2) == pytest.approx(0.65) and _team_b_weight(trainer2) == 0.0
 
 
 def test_coevo_zero_goal_opponent_uses_floor_of_one(tmp_path: Path) -> None:
@@ -4053,8 +4072,10 @@ def test_value_norm_trainer_reaches_the_constant_return_in_raw_units(tmp_path: P
     network loaded the way the harness loads it returns the trainer's values to 1e-6. A rollout or bootstrap that
     read the normalised head would see values near 0 and never get there.
     """
+    # Two minibatches per epoch (default 8): the same 30 updates in half the time; the critic still lands in the band.
     trainer = _critic_trainer(
-        tmp_path, head=head, rollout_steps=64, seed=11, value_norm=True, value_norm_momentum=0.5, gamma=0.9
+        tmp_path, head=head, rollout_steps=64, seed=11, value_norm=True, value_norm_momentum=0.5, gamma=0.9,
+        num_minibatches=2,
     )
     try:
         real_step = trainer.vec_env.step_array

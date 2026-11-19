@@ -374,42 +374,53 @@ def test_vision_cone_player_isolation_and_tab_cycling() -> None:
     assert len(viz.selected_cone_players) == 0
 
 
-def test_real_saved_replay_render() -> None:
-    """Verify loading and rendering an actual on-disk match JSON with saves and goals."""
-    import glob
-    import os
+def test_real_saved_replay_render(tmp_path) -> None:
+    """Load and render a replay that a training generation wrote to disk (critic values and policy means recorded)."""
+    from dataclasses import replace
+
+    from football_rl.config import DEFAULT_CONFIG
     from football_rl.replay import load_replay_json
+    from football_rl.train_ppo import ParameterSharingPPOTrainer
 
-    files = sorted(
-        glob.glob("replays/**/match_*.json", recursive=True) + glob.glob("replays/match_*.json"),
-        key=os.path.getmtime,
-        reverse=True,
+    rep_dir = tmp_path / "replays"
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=40),
+        replay=replace(DEFAULT_CONFIG.replay, save_dir=str(rep_dir), enable_recording=True, interest_threshold=0.0),
     )
-    if not files:
-        pytest.skip("No replay files in replays/")
+    trainer = ParameterSharingPPOTrainer(
+        config=cfg, num_envs=1, rollout_steps=40, device="cpu", checkpoint_dir=str(tmp_path / "ckpt"), seed=7
+    )
+    try:
+        trainer.train(total_updates=1)
+    finally:
+        trainer.close()
 
-    data = None
-    # Skip any file that is currently being actively written to by a background training process
-    for fpath in files:
-        try:
-            data = load_replay_json(fpath)
-            break
-        except Exception:
-            continue
+    files = sorted(rep_dir.glob("match_*.json"))
+    assert files, "the training generation wrote no replay"
+    data = load_replay_json(str(files[0]))
+    # 40 decisions at 4 physics frames each, plus the reset frame
+    assert len(data["frames"]) == 161
+    assert data["frames"][-1]["v_pred"] is not None and len(data["frames"][-1]["v_pred"]) == 12
+    assert data["frames"][-1]["action_mean"] is not None and len(data["frames"][-1]["action_mean"]) == 12
 
-    if data is None:
-        pytest.skip("No valid replay file could be loaded")
-
+    # A keeper save on frame 80 must be indexed and renderable (training matches this short rarely contain one).
+    data["frames"][80]["events"].append(
+        {"type": "KEEPER SAVE!", "x": 45.0, "y": 420.0, "team": 0, "agent": "a_keeper", "reward": 0.2}
+    )
     viz = ReplayViewer(data, headless=True)
-    assert viz.num_frames > 0
-    # Render frame 0
+    assert viz.num_frames >= 161  # the viewer may append cinematic frames
     surf = viz.render_frame()
     assert isinstance(surf, pygame.Surface)
-    # If saves exist, seek to first save and render
-    if viz.save_frames:
-        viz.seek_to_frame(viz.save_frames[0][0])
-        surf_save = viz.render_frame()
-        assert isinstance(surf_save, pygame.Surface)
+    assert len(viz.save_frames) == 1
+    save_idx = viz.save_frames[0][0]
+    assert any(ev.get("type") == "KEEPER SAVE!" for ev in viz.frames[save_idx].get("events", []))
+    viz.seek_to_frame(save_idx)
+    assert viz.current_frame_idx == save_idx
+    surf_save = viz.render_frame()
+    assert isinstance(surf_save, pygame.Surface)
+    viz.seek_to_frame(viz.num_frames - 1)
+    assert isinstance(viz.render_frame(), pygame.Surface)
 
 
 def test_software_cursor_rendering(monkeypatch: pytest.MonkeyPatch) -> None:

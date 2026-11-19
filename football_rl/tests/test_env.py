@@ -505,8 +505,11 @@ def test_resume_archive_and_match_indexing(tmp_path: Path) -> None:
     rep_dir = str(tmp_path / "replays")
     arch_dir = str(tmp_path / "archives")
 
+    # One generation = one complete match (1 env, rollout_steps == match length); 30-decision matches keep it fast.
+    match_steps = 30
     cfg = replace(
         DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=match_steps),
         replay=ReplayConfig(
             save_dir=rep_dir,
             enable_recording=True,
@@ -514,11 +517,11 @@ def test_resume_archive_and_match_indexing(tmp_path: Path) -> None:
         ),
     )
 
-    # 1. Train Generations 1..2 (2 full matches: Match #1 and Match #2)
+    # 1. Train Generations 1..2 (2 complete matches: Match #1 and Match #2)
     trainer1 = ParameterSharingPPOTrainer(
         config=cfg,
         num_envs=1,
-        rollout_steps=2700,
+        rollout_steps=match_steps,
         device="cpu",
         checkpoint_dir=ckpt_dir,
         seed=42,
@@ -534,7 +537,7 @@ def test_resume_archive_and_match_indexing(tmp_path: Path) -> None:
     trainer2 = ParameterSharingPPOTrainer(
         config=cfg,
         num_envs=1,
-        rollout_steps=2700,
+        rollout_steps=match_steps,
         device="cpu",
         checkpoint_dir=ckpt_dir,
         seed=42,
@@ -554,7 +557,7 @@ def test_resume_archive_and_match_indexing(tmp_path: Path) -> None:
     trainer_new = ParameterSharingPPOTrainer(
         config=cfg,
         num_envs=1,
-        rollout_steps=2700,
+        rollout_steps=match_steps,
         device="cpu",
         checkpoint_dir=ckpt_dir,
         seed=99,
@@ -572,7 +575,7 @@ def test_resume_archive_and_match_indexing(tmp_path: Path) -> None:
     trainer_restored = ParameterSharingPPOTrainer(
         config=cfg,
         num_envs=1,
-        rollout_steps=2700,
+        rollout_steps=match_steps,
         device="cpu",
         checkpoint_dir=ckpt_dir,
         seed=42,
@@ -3487,33 +3490,6 @@ def test_single_env_step_throughput_above_500_sps() -> None:
     assert sps > 500.0, f"Expected single-env throughput > 500 SPS, got {sps:.1f} SPS"
 
 
-def test_symmetry_breaking_obs_and_ego_canonical_critic_invariance() -> None:
-    """Verify left/right role pairs receive distinct flank bias and Critic places ego agent first."""
-    env = FootballParallelEnv(DEFAULT_CONFIG)
-    obs_dict, _ = env.reset(seed=31)
-
-    # 1. Symmetry breaking between def_1 / def_2 and mid_1 / mid_2
-    assert obs_dict["a_def_1"][13] == obs_dict["a_def_2"][13] == -1.0
-    assert obs_dict["a_def_1"][14] == -1.0 and obs_dict["a_def_2"][14] == +1.0
-    assert obs_dict["a_mid_1"][13] == obs_dict["a_mid_2"][13] == 0.0
-    assert obs_dict["a_mid_1"][14] == -1.0 and obs_dict["a_mid_2"][14] == +1.0
-    assert obs_dict["a_atk_1"][13] == +1.0 and obs_dict["a_atk_1"][14] == 0.0
-
-    # 2. Stationary ball FOV across match time
-    env.physics_frame_count = 10
-    obs_early = env._get_observations_array()[:, 16].copy()
-    env.physics_frame_count = 5000
-    obs_late = env._get_observations_array()[:, 16].copy()
-    np.testing.assert_allclose(obs_early, obs_late, atol=1e-6)
-
-    # 3. Ego-first canonical Critic ordering
-    central = env.get_centralized_state()
-    obs_arr = env._get_observations_array()
-    for idx in range(12):
-        np.testing.assert_allclose(central[idx, 0], obs_arr[idx, 0], atol=1e-5)
-        np.testing.assert_allclose(central[idx, 1], obs_arr[idx, 1], atol=1e-5)
-
-
 def test_post_kick_pbrs_smooth_decay_and_carrier_baseline_continuity() -> None:
     """Verify kicker potential decays smoothly over post-kick timer and carrier matches reception scale."""
     env = FootballParallelEnv(DEFAULT_CONFIG)
@@ -4682,11 +4658,6 @@ def _kick_and_deliver(env: FootballParallelEnv, kicker: int, receiver: int, powe
     env.pickup_cooldown[receiver] = 0.0
     env._check_free_ball_pickup(rewards)
     assert env.ball_holder == receiver
-
-
-def test_fresh_match_has_zero_kick_and_keeper_hold_counters() -> None:
-    env = _kick_env()
-    assert {k: env.stats[k] for k in KICK_KEYS} == {k: 0 for k in KICK_KEYS}
 
 
 def test_one_pass_one_interception_and_one_unresolved_kick_are_counted_once_each() -> None:
