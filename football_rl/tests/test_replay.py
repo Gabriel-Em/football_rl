@@ -250,19 +250,230 @@ def test_halftime_tick_follows_halftime_cinematic_not_midpoint() -> None:
 
 
 def test_halftime_tick_pixel_is_drawn_at_marker_position() -> None:
-    """The scrubber bar draws its half-time line at the marker, not at 50 %."""
-    data = _halftime_replay(goal_frames=[5, 18, 22, 26], halftime_frame=15)
+    """In a full match with uneven goals and cinematics, the half-time line sits at the midpoint."""
+    data = _halftime_replay(goal_frames=[5, 18, 22, 26], halftime_frame=15, n_frames=31)
     viz = ReplayVisualizer(data, headless=True)
     viz.seek_to_frame(viz.num_frames - 1)
     surf = viz.render_frame()
     bar_x, bar_w = viz.margin_x, viz.disp_field_w
     bar_y = viz.hud_height + viz.disp_field_h + 16
-    ht_x = bar_x + int((viz.halftime_frame_idx / float(viz.num_frames - 1)) * bar_w)
     mid_x = bar_x + bar_w // 2
+    frame_prop_x = bar_x + int((viz.halftime_frame_idx / float(viz.num_frames - 1)) * bar_w)
     probe_y = bar_y - 3
-    assert tuple(surf.get_at((ht_x, probe_y)))[:3] == (235, 240, 245)
-    assert ht_x != mid_x
-    assert tuple(surf.get_at((mid_x, probe_y)))[:3] != (235, 240, 245)
+    assert viz.halftime_frame_idx != viz.num_frames // 2
+    assert any(
+        tuple(surf.get_at((mid_x + dx, probe_y)))[:3] == (235, 240, 245) for dx in (-1, 0, 1)
+    )
+    assert frame_prop_x != mid_x
+    assert tuple(surf.get_at((frame_prop_x, probe_y)))[:3] != (235, 240, 245)
+
+
+def test_markers_and_fill_follow_match_time_with_and_without_cinematics() -> None:
+    """Goal, save, foul, high-reward markers and progress fill map by match time identically with/without cinematics."""
+    bar_x_expected, bar_w_expected = 45, 1200
+    for cinematics in (True, False):
+        data = _halftime_replay(
+            goal_frames=[15, 40, 50], halftime_frame=30, n_frames=61, cinematics=cinematics
+        )
+        data["frames"][12]["events"].append(
+            {"type": "ESCAPE PRESS!", "x": 700.0, "y": 420.0, "team": 1, "agent": "b_mid_1", "reward": 6.0}
+        )
+        data["frames"][36]["events"].append(
+            {"type": "5s KEEPER FOUL!", "x": 1355.0, "y": 420.0, "team": 1, "agent": "b_keeper", "reward": -5.5}
+        )
+        data["frames"][45]["events"].append(
+            {"type": "KEEPER SAVE!", "x": 1355.0, "y": 420.0, "team": 1, "agent": "b_keeper", "reward": 2.0}
+        )
+        viz = ReplayVisualizer(data, headless=True)
+        assert (viz.margin_x, viz.disp_field_w) == (bar_x_expected, bar_w_expected)
+        bar_y = viz.hud_height + viz.disp_field_h + 16
+        mid_y = bar_y + 5
+
+        viz.seek_to_frame(0)
+        surf = viz.render_frame()
+        # Quarter-match goal (frame 15 of 60 -> 0.25 * 1200 = 300) drawn in Team A red
+        assert any(
+            tuple(surf.get_at((bar_x_expected + 300 + dx, mid_y)))[:3] == (255, 60, 75)
+            for dx in (-1, 0, 1)
+        )
+        # High-reward at 20% (frame 12 -> 240), foul at 60% (frame 36 -> 720), save at 75% (frame 45 -> 900) in Team B blue
+        for offset in (240, 720, 900):
+            assert any(
+                tuple(surf.get_at((bar_x_expected + offset + dx, mid_y)))[:3] == (55, 155, 255)
+                for dx in (-1, 0, 1)
+            )
+
+        # Progress fill at halftime (t = 0.50 * T -> x = 45 + 600 = 645)
+        assert viz.halftime_frame_idx is not None
+        viz.seek_to_frame(viz.halftime_frame_idx)
+        surf_ht = viz.render_frame()
+        assert tuple(surf_ht.get_at((bar_x_expected + 585, mid_y)))[:3] == (255, 215, 70)
+        assert tuple(surf_ht.get_at((bar_x_expected + 615, mid_y)))[:3] == (40, 48, 60)
+
+
+def test_fulltime_cinematic_adds_zero_bar_width() -> None:
+    """Full-time cinematic frames belong to the final recorded timestamp and add no bar width."""
+    data = _halftime_replay(goal_frames=[], halftime_frame=30, n_frames=61, cinematics=True)
+    data["frames"][-1]["events"].append(
+        {"type": "FULLTIME!", "x": 700.0, "y": 420.0, "team": -1, "agent": "referee", "reward": None}
+    )
+    viz = ReplayVisualizer(data, headless=True)
+    # 61 raw + 240 HALFTIME + 150 FULLTIME = 451 frames; FULLTIME starts at index 300.
+    assert viz.num_frames == 451
+    assert viz.frames[300]["cinematic"]["event_type"] == "FULLTIME!"
+
+    viz.seek_to_frame(300)
+    surf = viz.render_frame()
+    bar_x, bar_w = viz.margin_x, viz.disp_field_w
+    bar_y = viz.hud_height + viz.disp_field_h + 16
+    # Progress fill reaches the right end even on the first FULLTIME cinematic frame
+    assert tuple(surf.get_at((bar_x + bar_w - 15, bar_y + 5)))[:3] == (255, 215, 70)
+    assert tuple(surf.get_at((bar_x + bar_w, bar_y + 5)))[:3] == (240, 244, 248)
+    # Halftime tick remains centered at bar_x + bar_w // 2
+    mid_x = bar_x + bar_w // 2
+    assert any(
+        tuple(surf.get_at((mid_x + dx, bar_y - 3)))[:3] == (235, 240, 245) for dx in (-1, 0, 1)
+    )
+
+
+def test_scrubber_click_and_drag_seek_by_match_time() -> None:
+    """Click/drag seeks to the first frame with time >= clicked time, landing on cinematic starts."""
+    data = _halftime_replay(goal_frames=[15], halftime_frame=30, n_frames=61, cinematics=True)
+    viz = ReplayVisualizer(data, headless=True)
+    bar_x, bar_w = viz.margin_x, viz.disp_field_w
+    click_y = viz.hud_height + viz.disp_field_h + 16
+
+    # 1. Click at 75% (t = 0.75s -> raw frame 45 -> viewer index 45 + 270 + 240 = 555)
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 900, click_y))
+    )
+    viz.handle_events()
+    assert viz.current_frame_idx == 555
+    assert viz.frames[viz.current_frame_idx]["time"] == pytest.approx(0.75)
+
+    # 2. Click on the goal's moment at 25% -> lands on the FIRST frame of the GOAL cinematic (index 15)
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 300, click_y))
+    )
+    viz.handle_events()
+    assert viz.current_frame_idx == 15
+    assert viz.frames[15]["cinematic"]["event_type"] == "GOAL!"
+    assert viz.frames[15]["cinematic"]["phase"] == "FREEZE"
+    assert viz.frames[15]["cinematic"]["progress"] == 0.0
+
+    # 3. Drag to 50% -> lands on the FIRST frame of the HALFTIME cinematic (index 300)
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEMOTION, pos=(bar_x + 600, click_y), buttons=(1, 0, 0))
+    )
+    viz.handle_events()
+    assert viz.current_frame_idx == 300
+    assert viz.frames[300]["cinematic"]["event_type"] == "HALFTIME!"
+
+    # 4. Drag past right edge clamps to last frame; release stops drag
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEMOTION, pos=(bar_x + bar_w + 40, click_y), buttons=(1, 0, 0))
+    )
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=(bar_x + bar_w + 40, click_y))
+    )
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEMOTION, pos=(bar_x + 100, click_y), buttons=(0, 0, 0))
+    )
+    viz.handle_events()
+    assert viz.current_frame_idx == viz.num_frames - 1
+
+    # 5. Float-precision boundary: n_frames=25 (T=24/60=0.4s), 0.75*0.4 exceeds 18/60 by 1 ULP;
+    # clicking 75% must still land on the first frame of raw frame 18's goal cinematic (index 18).
+    data_ulp = _halftime_replay(
+        goal_frames=[18], halftime_frame=10_000, n_frames=25, cinematics=True, with_halftime_event=False
+    )
+    viz_ulp = ReplayVisualizer(data_ulp, headless=True)
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 900, click_y))
+    )
+    viz_ulp.handle_events()
+    assert viz_ulp.current_frame_idx == 18
+    assert viz_ulp.frames[18]["cinematic"]["event_type"] == "GOAL!"
+
+
+def test_legacy_replay_without_time_and_metadata_duration() -> None:
+    """Replays without `time` fall back to `frame / physics_hz`; metadata `max_rl_steps / rl_hz` sets T."""
+    for cinematics in (True, False):
+        data = _halftime_replay(
+            goal_frames=[15, 40, 50], halftime_frame=30, n_frames=61, cinematics=cinematics
+        )
+        for fr in data["frames"]:
+            fr.pop("time", None)
+        data["metadata"]["physics_hz"] = 30
+        viz = ReplayVisualizer(data, headless=True)
+        bar_x, bar_w = viz.margin_x, viz.disp_field_w
+        bar_y = viz.hud_height + viz.disp_field_h + 16
+        click_y = bar_y
+
+        viz.seek_to_frame(0)
+        surf = viz.render_frame()
+        # Halftime at frame 30 / 60 -> midpoint (645); goal at frame 15 / 60 -> quarter (345)
+        assert any(
+            tuple(surf.get_at((bar_x + 600 + dx, bar_y - 3)))[:3] == (235, 240, 245)
+            for dx in (-1, 0, 1)
+        )
+        assert any(
+            tuple(surf.get_at((bar_x + 300 + dx, bar_y + 5)))[:3] == (255, 60, 75)
+            for dx in (-1, 0, 1)
+        )
+
+        # Clicking 75% seeks to raw frame 45 (index 45 without cinematics; 45 + 2*270 + 240 = 825 with)
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(bar_x + 900, click_y))
+        )
+        viz.handle_events()
+        expected_idx = 825 if cinematics else 45
+        assert viz.current_frame_idx == expected_idx
+
+    # Metadata max_rl_steps / rl_hz sets T=1.0s even when recorded frames stop at t=0.5s
+    data_meta = _halftime_replay(
+        goal_frames=[], halftime_frame=10_000, n_frames=31, cinematics=False, with_halftime_event=False
+    )
+    data_meta["metadata"]["max_rl_steps"] = 15
+    data_meta["metadata"]["rl_hz"] = 15
+    viz_meta = ReplayVisualizer(data_meta, headless=True)
+    viz_meta.seek_to_frame(30)  # t = 0.5s out of T = 1.0s -> fills half the bar
+    surf_meta = viz_meta.render_frame()
+    bar_x = viz_meta.margin_x
+    bar_y = viz_meta.hud_height + viz_meta.disp_field_h + 16
+    assert tuple(surf_meta.get_at((bar_x + 580, bar_y + 5)))[:3] == (255, 215, 70)
+    assert tuple(surf_meta.get_at((bar_x + 620, bar_y + 5)))[:3] == (40, 48, 60)
+
+    # Without `time` + metadata T=2.0s + physics_hz=30: frame 30 -> 30/30 = 1.0s (50% of bar, not 25%)
+    data_hz = _halftime_replay(
+        goal_frames=[], halftime_frame=10_000, n_frames=31, cinematics=False, with_halftime_event=False
+    )
+    for fr in data_hz["frames"]:
+        fr.pop("time", None)
+    data_hz["metadata"]["physics_hz"] = 30
+    data_hz["metadata"]["max_rl_steps"] = 30
+    data_hz["metadata"]["rl_hz"] = 15
+    viz_hz = ReplayVisualizer(data_hz, headless=True)
+    viz_hz.seek_to_frame(30)
+    surf_hz = viz_hz.render_frame()
+    assert tuple(surf_hz.get_at((bar_x + 580, bar_y + 5)))[:3] == (255, 215, 70)
+    assert tuple(surf_hz.get_at((bar_x + 620, bar_y + 5)))[:3] == (40, 48, 60)
+
+
+def test_single_frame_replay_scrubber_handles_zero_duration() -> None:
+    """A single-frame replay (T=0) renders and handles scrubber clicks without ZeroDivisionError."""
+    data = _halftime_replay(
+        goal_frames=[], halftime_frame=10_000, n_frames=1, cinematics=False, with_halftime_event=False
+    )
+    viz = ReplayVisualizer(data, headless=True)
+    surf = viz.render_frame()
+    assert isinstance(surf, pygame.Surface)
+    click_y = viz.hud_height + viz.disp_field_h + 16
+    pygame.event.post(
+        pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(viz.margin_x + 600, click_y))
+    )
+    viz.handle_events()
+    assert viz.current_frame_idx == 0
 
 
 def test_halftime_index_falls_back_to_half_two_then_none() -> None:
