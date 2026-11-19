@@ -18,18 +18,23 @@ branches:
         the previous point in the match), clones the env twice with identical generator seeds and
         loads policies via `tools/audit/harness.py` (supporting both `gaussian4` and `hybrid5`).
         Branch KICK forces the holder's env-space kick column to +1 on decision 0; branch HOLD
-        forces it to -1 for the first 15 decisions. Rolls 75 decisions (5 s) and 225 decisions
-        (15 s), reporting paired HOLD - KICK differences (overall, by pressure < 70 u / >= 120 u,
-        and by canonical third) for discounted non-shaping return, full return with gamma^H
-        team-mean critic bootstrap, P(team holds at 1 s), P(goal for), P(goal against), and the
-        non-shaping component split.
+        forces it to -1 for the first `--hold-steps` decisions (default 15). Rolls 75 decisions (5 s)
+        and 225 decisions (15 s), reporting paired HOLD - KICK differences (overall, by pressure
+        < 70 u / >= 120 u, by canonical third, and by the holder's kick intent) for discounted
+        non-shaping return, full return with gamma^H team-mean critic bootstrap, P(team holds at
+        1 s), P(goal for), P(goal against), and the non-shaping component split.
+        Kick intent is read from the trace at the decision (`mean` kick column of the holder; the
+        team's head from `head`, absent = gaussian4): hybrid5, p = (mean + 1) / 2, `kick` if
+        p > 0.5, `hold` if p < 0.05, else `mid`; gaussian4 (or a scripted team), `kick` if
+        mean > 0.35, else `hold`. Buckets `intent_kick`, `intent_mid`, `intent_hold`, and in the
+        defensive third `def_intent_kick`, `def_intent_hold`.
 
 Nothing is written to `checkpoints/`, `replays/`, checkpoint directories, or the trace directory.
 
 Usage:
   python tools/audit/rollouts.py gk --trace-dir DIR [--max-matches 48] [--workers 4] --out OUT
   python tools/audit/rollouts.py hold --trace-dir DIR --checkpoint-dir DIR [--max-matches 48]
-         [--workers 4] [--seed 1] --out OUT
+         [--workers 4] [--seed 1] [--hold-steps 15] --out OUT
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ __all__ = [
     "KICK_OVERRIDE_STEPS",
     "POS_ERR_LIMIT",
     "SPACING_STEPS",
+    "decision_intent",
     "eval_gk_opportunity",
     "find_gk_opportunities",
     "find_hold_decisions",
@@ -104,6 +110,17 @@ KICK_OVERRIDE_STEPS = 1
 HOLD_OVERRIDE_STEPS = 15
 HOLD_HORIZONS = (75, 225)
 ONE_SECOND_STEPS = 15
+
+KICK_INTENT_THR = float(DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
+FIRE_PROB_KICK = 0.5
+FIRE_PROB_HOLD = 0.05
+INTENT_BUCKETS = (
+    ("intent_kick", "intent=kick"),
+    ("intent_mid", "intent=mid"),
+    ("intent_hold", "intent=hold"),
+    ("def_intent_kick", "def&intent=kick"),
+    ("def_intent_hold", "def&intent=hold"),
+)
 
 PRESSURE_NEAR = 70.0
 PRESSURE_FAR = 120.0
@@ -502,6 +519,18 @@ def find_hold_decisions(trace: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
             "third": third,
         })
     return points
+
+
+def decision_intent(trace: Dict[str, np.ndarray], step: int, holder: int) -> str:
+    """Kick intent of `holder` at `step` from its recorded kick mean: `kick`, `mid` (hybrid5 only) or `hold`."""
+    mean_kick = float(np.asarray(trace["mean"])[step, holder, 2])
+    head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
+    if int(head[holder // TEAM_SIZE]) == 1:
+        p = (mean_kick + 1.0) / 2.0
+        if p > FIRE_PROB_KICK:
+            return "kick"
+        return "hold" if p < FIRE_PROB_HOLD else "mid"
+    return "kick" if mean_kick > KICK_INTENT_THR else "hold"
 
 
 def _non_shaping_rewards(env: Any, rew: np.ndarray) -> np.ndarray:
@@ -935,8 +964,8 @@ def _verify_checkpoint_matches_trace(
         )
 
 
-def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
-    match_idx, path_str, trace_seed, rollout_seed = task
+def _hold_worker(task: Tuple[int, str, int, int, int]) -> Dict[str, Any]:
+    match_idx, path_str, trace_seed, rollout_seed, hold_steps = task
     assert _HOLD_POLICIES is not None and _HOLD_SPEC_CFG is not None
     team_a, team_b = _HOLD_POLICIES
     mode, sigma_scale, shaping_mode = _HOLD_SPEC_CFG
@@ -968,6 +997,7 @@ def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
             mode=mode,
             sigma_scale=sigma_scale,
             horizons=HOLD_HORIZONS,
+            hold_steps=hold_steps,
         )
         records.append({
             "match_idx": match_idx,
@@ -977,6 +1007,7 @@ def _hold_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
             "nearest_opp": p["nearest_opp"],
             "pressure": p["pressure"],
             "third": p["third"],
+            "intent": decision_intent(trace, step, p["holder"]),
             "rollout": res,
         })
     return {"ok": True, "max_err": max_err, "records": records}
@@ -1010,6 +1041,7 @@ def summarize_hold(
     seed: int,
     shaping_mode: str = str(DEFAULT_CONFIG.rewards.shaping_mode),
     gamma: float = float(DEFAULT_CONFIG.ppo.gamma),
+    hold_steps: int = HOLD_OVERRIDE_STEPS,
 ) -> Dict[str, Any]:
     buckets = {
         "overall": lambda r: True,
@@ -1019,6 +1051,11 @@ def summarize_hold(
         "third_defensive": lambda r: r["third"] == "defensive",
         "third_middle": lambda r: r["third"] == "middle",
         "third_attacking": lambda r: r["third"] == "attacking",
+        "intent_kick": lambda r: r.get("intent") == "kick",
+        "intent_mid": lambda r: r.get("intent") == "mid",
+        "intent_hold": lambda r: r.get("intent") == "hold",
+        "def_intent_kick": lambda r: r["third"] == "defensive" and r.get("intent") == "kick",
+        "def_intent_hold": lambda r: r["third"] == "defensive" and r.get("intent") == "hold",
     }
     horizons_out: Dict[str, Any] = {}
     for h in HOLD_HORIZONS:
@@ -1036,6 +1073,7 @@ def summarize_hold(
         "n_matches_skipped": n_matches_skipped,
         "max_pos_err": max_pos_err,
         "n_decisions": len(records),
+        "hold_steps": int(hold_steps),
         "horizons": horizons_out,
     }
 
@@ -1053,9 +1091,12 @@ def run_hold(
     max_matches: Optional[int] = None,
     workers: int = 1,
     shaping_mode: Optional[str] = None,
+    hold_steps: int = HOLD_OVERRIDE_STEPS,
 ) -> Dict[str, Any]:
     if workers <= 0:
         raise ValueError(f"workers must be positive, got {workers}")
+    if int(hold_steps) < 1:
+        raise ValueError(f"hold_steps must be >= 1, got {hold_steps}")
     spec = harness.EvalSpec(
         checkpoint_dir=str(checkpoint_dir) if checkpoint_dir is not None else None,
         opponent=opponent,
@@ -1069,7 +1110,7 @@ def run_hold(
     spec.validate()
     t_seed = _resolve_trace_seed(trace_dir, trace_seed)
     items = _trace_paths_with_indices(trace_dir, max_matches=max_matches)
-    tasks = [(idx, str(path), t_seed, int(seed)) for idx, path in items]
+    tasks = [(idx, str(path), t_seed, int(seed), int(hold_steps)) for idx, path in items]
 
     if workers == 1 or len(tasks) == 1:
         prev_threads = torch.get_num_threads()
@@ -1104,6 +1145,7 @@ def run_hold(
         seed=int(seed),
         shaping_mode=_resolved_shaping_mode(shaping_mode),
         gamma=float(DEFAULT_CONFIG.ppo.gamma),
+        hold_steps=int(hold_steps),
     )
 
 
@@ -1121,6 +1163,7 @@ def format_hold_report(summary: Dict[str, Any], title: str = "") -> str:
         ("third_defensive", "defensive 1/3"),
         ("third_middle", "middle 1/3"),
         ("third_attacking", "attacking 1/3"),
+        *INTENT_BUCKETS,
     )
     for h in HOLD_HORIZONS:
         h_data = summary["horizons"][str(h)]
@@ -1141,6 +1184,16 @@ def format_hold_report(summary: Dict[str, Any], title: str = "") -> str:
 # ----------------------------------------------------------------------------
 # Command line
 # ----------------------------------------------------------------------------
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {value}")
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1165,6 +1218,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_hold.add_argument("--sigma-scale", type=float, default=1.0)
     p_hold.add_argument("--swap", action="store_true", help="team A plays red_*, team B plays blue_*")
     p_hold.add_argument("--seed", type=int, default=1, help="rollout RNG seed")
+    p_hold.add_argument(
+        "--hold-steps",
+        type=_positive_int,
+        default=HOLD_OVERRIDE_STEPS,
+        help=f"decisions the HOLD branch forces the holder not to kick (>= 1, default {HOLD_OVERRIDE_STEPS})",
+    )
     return ap
 
 
@@ -1201,6 +1260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_matches=args.max_matches,
             workers=args.workers,
             shaping_mode=args.shaping_mode,
+            hold_steps=args.hold_steps,
         )
         rep = format_hold_report(summary, title=str(args.trace_dir))
 

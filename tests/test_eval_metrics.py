@@ -4121,3 +4121,196 @@ class TestRunCompareE6:
         data = json.loads(out_json.read_text(encoding="utf-8"))
         assert data["history"]["runA"]["2"]["fire"]["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.03, abs=1e-12)
         assert set(data["history"]["runA"]["2"]["v_corr_mc"]) == set(roles)
+
+
+# ----------------------------------------------------------------------------
+# Pass options at the kick
+# ----------------------------------------------------------------------------
+def pass_scene(trace: dict, t0: int, *, kicker: int = 3, ball=(300.0, 420.0), bvel=(300.0, 0.0)) -> None:
+    """At row `t0`: every player parked on x = 1300 (>= 1000 u from the ball, so no candidate and, beyond every teammate
+    segment, no blocker), the ball at `ball`, the kicker 20 u behind it holding and kicking, and `bvel` on row `t0 + 1`."""
+    trace["pos"][t0, :, 0] = 1300.0
+    trace["pos"][t0, :, 1] = 100.0 + 50.0 * np.arange(12)
+    trace["ball"][t0] = ball
+    trace["pos"][t0, kicker] = (ball[0] - 20.0, ball[1])
+    trace["holder"][t0] = kicker
+    set_kick(trace, t0, kicker)
+    if t0 + 1 < trace["bvel"].shape[0]:
+        trace["bvel"][t0 + 1] = bvel
+
+
+def one_pass_kick(placements: dict, *, bvel=(300.0, 0.0), T: int = 80, t0: int = 5) -> dict:
+    tr = make_trace(T)
+    pass_scene(tr, t0, bvel=bvel)
+    for who, xy in placements.items():
+        tr["pos"][t0, who] = xy
+    recs = census.pass_options(tr)
+    assert len(recs) == 1
+    return recs[0]
+
+
+class TestPassOptions:
+    # Kicker A3 (global 3); ball (300, 420); teammate A4 (global 4) at (500, 420): segment length L = 200 along +x.
+    def test_lane_open_when_opponent_is_wide_of_the_segment(self):
+        # Opponent B1 (7) at (400, 500): projection s = 100 in (0, 200), perpendicular 80 > 50 -> open.
+        rec = one_pass_kick({4: (500.0, 420.0), 7: (400.0, 500.0)})
+        assert rec["candidates"] == [4] and rec["open"] == [4]
+
+    def test_lane_blocked_by_opponent_near_the_segment(self):
+        # (400, 450): s = 100, perpendicular 30 <= 50 -> blocked.
+        rec = one_pass_kick({4: (500.0, 420.0), 7: (400.0, 450.0)})
+        assert rec["candidates"] == [4] and rec["open"] == []
+
+    def test_lane_blocked_at_exactly_50(self):
+        # (400, 470): perpendicular exactly 50; the lane is open only for > 50 -> blocked.
+        rec = one_pass_kick({4: (500.0, 420.0), 7: (400.0, 470.0)})
+        assert rec["open"] == []
+        # (400, 470.5): 50.5 > 50 -> open.
+        rec = one_pass_kick({4: (500.0, 420.0), 7: (400.0, 470.5)})
+        assert rec["open"] == [4]
+
+    def test_opponent_beyond_the_receiver_or_behind_the_ball_does_not_block(self):
+        # (550, 420): on the line, s = 250 > L = 200 -> outside (0, L) -> open.
+        assert one_pass_kick({4: (500.0, 420.0), 7: (550.0, 420.0)})["open"] == [4]
+        # (250, 420): s = -50 < 0 -> open.
+        assert one_pass_kick({4: (500.0, 420.0), 7: (250.0, 420.0)})["open"] == [4]
+        # (500, 420), on the receiver: s = 200 = L is outside the open interval (0, L) -> open.
+        assert one_pass_kick({4: (500.0, 420.0), 7: (500.0, 420.0)})["open"] == [4]
+
+    def test_opposing_keeper_blocks_like_any_opponent(self):
+        # B's keeper (6) at (400, 450): s = 100, perpendicular 30 -> blocked.
+        assert one_pass_kick({4: (500.0, 420.0), 6: (400.0, 450.0)})["open"] == []
+
+    def test_one_blocked_lane_leaves_the_other_open(self):
+        # A4 at (500, 420) blocked by B1 at (400, 440) (perp 20); A5 at (300, 620): segment along +y, L = 200; B1 has
+        # s = 20, perpendicular 100 -> open for A5.
+        rec = one_pass_kick({4: (500.0, 420.0), 5: (300.0, 620.0), 7: (400.0, 440.0)})
+        assert rec["candidates"] == [4, 5] and rec["open"] == [5]
+
+    def test_distance_band_is_80_to_700_inclusive(self):
+        # Distances from the ball (300, 420): A1 79, A2 80, A4 700, A5 701; A's keeper (0) at 100 is not outfield.
+        rec = one_pass_kick({1: (379.0, 420.0), 2: (380.0, 420.0), 4: (1000.0, 420.0), 5: (1001.0, 420.0), 0: (300.0, 520.0)})
+        assert rec["candidates"] == [2, 4]
+        assert rec["open"] == [2, 4]
+
+    def test_kick_aimed_straight_at_an_open_teammate(self):
+        # bvel (300, 0) points along the segment to A4: angle 0 deg -> aimed.
+        rec = one_pass_kick({4: (500.0, 420.0)}, bvel=(300.0, 0.0))
+        assert rec["has_direction"] and rec["aimed_open"]
+
+    def test_aim_cone_is_15_degrees_inclusive(self):
+        def at(deg):
+            return (300.0 + 200.0 * math.cos(math.radians(deg)), 420.0 + 200.0 * math.sin(math.radians(deg)))
+        # Teammate at 15 deg (float32 positions land within 3e-6 deg of it) -> aimed; 15.01 deg and 16 deg -> not aimed.
+        assert one_pass_kick({4: at(15.0)})["aimed_open"] is True
+        assert one_pass_kick({4: at(15.01)})["aimed_open"] is False
+        assert one_pass_kick({4: at(16.0)})["aimed_open"] is False
+        # Below the x axis: -14 deg aimed, -16 deg not aimed.
+        assert one_pass_kick({4: at(-14.0)})["aimed_open"] is True
+        assert one_pass_kick({4: at(-16.0)})["aimed_open"] is False
+
+    def test_aim_at_a_blocked_teammate_is_not_aimed_open(self):
+        # Straight at A4, but B1 at (400, 450) blocks it -> no open candidate, so not aimed at an open one.
+        rec = one_pass_kick({4: (500.0, 420.0), 7: (400.0, 450.0)}, bvel=(300.0, 0.0))
+        assert rec["open"] == [] and rec["aimed_open"] is False
+
+    def test_kick_without_direction_counts_for_options_only(self):
+        # |bvel| = 40 < 50 -> no direction: in pass_option_share, not in aim_open_share. |bvel| = 50 has a direction.
+        rec = one_pass_kick({4: (500.0, 420.0)}, bvel=(40.0, 0.0))
+        assert rec["open"] == [4] and rec["has_direction"] is False and rec["aimed_open"] is False
+        counts = census.pass_option_counts([rec])
+        assert (counts["pass_opt_n"], counts["pass_opt_with"]) == (1, 1)
+        assert (counts["aim_open_den"], counts["aim_open_n"]) == (0, 0)
+        rec50 = one_pass_kick({4: (500.0, 420.0)}, bvel=(50.0, 0.0))
+        assert rec50["has_direction"] is True and rec50["aimed_open"] is True
+
+    def test_kick_on_the_last_row_and_keeper_kicks_are_in_no_key(self):
+        tr = make_trace(80)
+        pass_scene(tr, 79)                                 # last row: no row 80 for the kick direction
+        tr["pos"][79, 4] = (500.0, 420.0)
+        assert census.pass_options(tr) == []
+        tr = make_trace(80)
+        pass_scene(tr, 5, kicker=0)                        # A's keeper kicks
+        tr["pos"][5, 4] = (500.0, 420.0)
+        assert census.pass_options(tr) == []
+        assert census.pass_option_counts([]) == {
+            "pass_opt_n": 0, "pass_opt_with": 0, "aim_open_den": 0, "aim_open_n": 0,
+            "aim_comp_den": 0, "aim_comp_mate": 0, "noopt_den": 0, "noopt_opp": 0,
+        }
+
+    def test_outcome_is_the_kick_outcomes_result_and_censored_kicks_leave_the_outcome_keys(self):
+        # Kick at 5 received by A4 at 15 -> teammate. A kick at 60 of an 80-row trace with no event is censored by
+        # kick_outcomes: it still counts for the option and aim keys, not for completion.
+        tr = make_trace(80)
+        pass_scene(tr, 5)
+        tr["pos"][5, 4] = (500.0, 420.0)
+        tr["holder"][15] = 4
+        pass_scene(tr, 60)
+        tr["pos"][60, 4] = (500.0, 420.0)
+        recs = census.pass_options(tr)
+        assert [(r["step"], r["outcome"]) for r in recs] == [(5, "teammate"), (60, None)]
+        counts = census.pass_option_counts(recs)
+        assert counts == {
+            "pass_opt_n": 2, "pass_opt_with": 2, "aim_open_den": 2, "aim_open_n": 2,
+            "aim_comp_den": 1, "aim_comp_mate": 1, "noopt_den": 0, "noopt_opp": 0,
+        }
+
+    @staticmethod
+    def _three_matches():
+        """Kicks by A3 at rows 5, 80, 155 of 240-row traces; A4 at (500, 420); outcome set by the holder 10 rows later.
+        open = A4 open; blocked = B1 at (400, 450); aimed = bvel (300, 0); wide = bvel (0, 300); still = bvel (40, 0).
+          match 1: open aimed -> teammate;  blocked aimed -> opponent
+          match 2: open aimed -> opponent;  open wide -> teammate
+          match 3: blocked aimed -> teammate;  open still -> none;  open aimed -> teammate
+        """
+        plan = [
+            [("open", (300.0, 0.0), 4), ("blocked", (300.0, 0.0), 7)],
+            [("open", (300.0, 0.0), 7), ("open", (0.0, 300.0), 4)],
+            [("blocked", (300.0, 0.0), 4), ("open", (40.0, 0.0), None), ("open", (300.0, 0.0), 4)],
+        ]
+        traces = []
+        for kicks in plan:
+            tr = make_trace(240)
+            for t0, (lane, bvel, receiver) in zip((5, 80, 155), kicks):
+                pass_scene(tr, t0, bvel=bvel)
+                tr["pos"][t0, 4] = (500.0, 420.0)
+                if lane == "blocked":
+                    tr["pos"][t0, 7] = (400.0, 450.0)
+                if receiver is not None:
+                    tr["holder"][t0 + 10] = receiver
+            traces.append(tr)
+        return traces
+
+    def test_four_ratios_on_three_matches_with_hand_values(self):
+        per_match = [census.match_metrics(t) for t in self._three_matches()]
+        met = census.summarize(per_match)["metrics"]
+        # pass_option_share: (with, n) = (1, 2), (2, 2), (2, 3) -> r = 5/7; residuals -3/7, 4/7, -1/7; sum sq 26/49;
+        # se = sqrt(3/2 * 26/49) / 7 = sqrt(39) / 49.
+        assert met["pass_option_share"]["mean"] == pytest.approx(5 / 7)
+        assert met["pass_option_share"]["se"] == pytest.approx(math.sqrt(39) / 49)
+        assert met["pass_option_share"]["n"] == 3
+        # aim_open_share: (aimed, den) = (1, 1), (1, 2), (1, 1) (match 3's still kick has no direction) -> r = 3/4;
+        # residuals 1/4, -1/2, 1/4; sum sq 6/16; se = sqrt(3/2 * 6/16) / 4 = 3/16.
+        assert met["aim_open_share"]["mean"] == pytest.approx(3 / 4)
+        assert met["aim_open_share"]["se"] == pytest.approx(3 / 16)
+        assert met["aim_open_share"]["n"] == 3
+        # aim_open_completion: (teammate, aimed) = (1, 1), (0, 1), (1, 1) -> r = 2/3; residuals 1/3, -2/3, 1/3;
+        # sum sq 6/9; se = sqrt(3/2 * 6/9) / 3 = 1/3.
+        assert met["aim_open_completion"]["mean"] == pytest.approx(2 / 3)
+        assert met["aim_open_completion"]["se"] == pytest.approx(1 / 3)
+        assert met["aim_open_completion"]["n"] == 3
+        # no_option_opponent_share: (opponent, no option) = (1, 1), (0, 0) dropped, (0, 1) -> r = 1/2, n = 2;
+        # residuals 1/2, -1/2; se = sqrt(2 * 1/2) / 2 = 1/2.
+        assert met["no_option_opponent_share"]["mean"] == pytest.approx(1 / 2)
+        assert met["no_option_opponent_share"]["se"] == pytest.approx(1 / 2)
+        assert met["no_option_opponent_share"]["n"] == 2
+        # The kick outcomes behind these keys are unchanged: 7 outfield kicks, 4 teammate, 2 opponent, 1 none.
+        assert sum(m["kicks_n"] for m in per_match) == 7
+        assert met["kick_outcome_teammate"]["mean"] == pytest.approx(4 / 7)
+
+    def test_report_prints_the_four_keys(self):
+        per_match = [census.match_metrics(t) for t in self._three_matches()]
+        text = census.report(per_match, title="hand")
+        line = next(ln for ln in text.splitlines() if ln.startswith("pass options"))
+        assert "option 71.4%" in line and "aim_open 75.0%" in line
+        assert "completion 66.7%" in line and "no_option_opponent 50.0%" in line
