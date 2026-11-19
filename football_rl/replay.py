@@ -407,10 +407,37 @@ class ReplayViewer:
         idx = bisect_left(self.frame_times, lookup_time)
         return min(idx, self.num_frames - 1)
 
+    def _snap_scrubber_x_to_marker_frame(self, mx: int, bar_x: int, bar_w: int) -> Optional[int]:
+        """Return target frame index if `mx` lands on a goal marker (+-6 px) or half-time line (+-1 px)."""
+        best_goal_frame: Optional[int] = None
+        best_goal_dist: Optional[int] = None
+        for g_frame, _, _ in self.goal_frames:
+            gx = self._frame_idx_to_bar_x(g_frame, bar_x, bar_w)
+            dist = abs(mx - gx)
+            if dist <= 6 and (best_goal_dist is None or dist < best_goal_dist):
+                best_goal_dist = dist
+                best_goal_frame = g_frame
+                if dist == 0:
+                    break
+        if best_goal_frame is not None:
+            return best_goal_frame
+
+        if self.halftime_frame_idx is not None:
+            ht_x = self._frame_idx_to_bar_x(self.halftime_frame_idx, bar_x, bar_w)
+            if abs(mx - ht_x) <= 1:
+                return self.halftime_frame_idx
+
+        return None
+
     def _seek_to_scrubber_x(self, mx: int) -> None:
-        """Seek playback to the first frame at or after the match time at screen x-coordinate `mx`."""
+        """Seek to a snapped goal/halftime marker at `mx`, or the first frame at/after that match time."""
+        bar_x = self.margin_x
         bar_w = max(1, self.disp_field_w)
-        ratio = (mx - self.margin_x) / float(bar_w)
+        snapped_idx = self._snap_scrubber_x_to_marker_frame(mx, bar_x, bar_w)
+        if snapped_idx is not None:
+            self.seek_to_frame(snapped_idx)
+            return
+        ratio = (mx - bar_x) / float(bar_w)
         self.seek_to_frame(self._bar_ratio_to_frame_idx(ratio))
 
     def _init_possession_ribbon(self) -> None:
