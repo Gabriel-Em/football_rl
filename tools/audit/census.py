@@ -21,6 +21,20 @@ Metrics
                     again after more than 8 decisions; earlier holds are the release itself), otherwise
                     `none`. A kick whose window runs past the end of the trace without an event is
                     censored (omitted). Reported for outfield kicks.
+  pass options      for every outfield kick (both teams pooled) at step k by player i, from `pos[k]`, `ball[k]` and
+                    `bvel[k + 1]` (a kick on the last row has no k + 1 and enters no key):
+                    a candidate is an outfield teammate j != i with 80 <= |pos_j - ball| <= 700 u; its lane is open
+                    when every opponent (all six, keeper included) projects onto the segment ball -> pos_j outside the
+                    open interval (0, |pos_j - ball|) or lies strictly more than 50 u from the line; the kick direction
+                    is bvel[k + 1] / |bvel[k + 1]|, and a kick with |bvel[k + 1]| < 50 u/s has no direction; the kick is
+                    aimed at j when the angle between its direction and pos_j - ball is <= 15 deg.
+                    `pass_option_share`: kicks with at least one open candidate, over kicks.
+                    `aim_open_share`: kicks aimed at an open candidate, over kicks that have one and a direction.
+                    `aim_open_completion`: kicks aimed at an open candidate whose `kick_outcome` is `teammate`, over
+                    kicks aimed at an open candidate that have an outcome.
+                    `no_option_opponent_share`: kicks without an open candidate whose `kick_outcome` is `opponent`,
+                    over kicks without one that have an outcome.
+                    The outcome is the `kick_outcome` above; a censored kick enters only the first two keys.
   n_within(R)       mean number of a team's outfield players strictly closer than R u to the ball per
                     decision (per team). Uniform random placement gives 0.123 (R=100), 0.266 (R=150).
   cluster_ge4       fraction of decisions in which at least 4 of a team's 5 outfield players form one
@@ -62,7 +76,7 @@ from football_rl.config import DEFAULT_CONFIG  # noqa: E402
 
 __all__ = [
     "hold_share", "loose_share", "holder_spell_intervals", "holder_spells", "kick_events", "kick_outcomes",
-    "outfield_outcome_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
+    "outfield_outcome_counts", "pass_options", "pass_option_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
     "cluster_ge4", "role_inversion", "gk_geometry", "gk_opportunities", "goal_events", "goal_type_counts",
     "time_binned_counts", "time_binned_metrics", "match_metrics", "mean_se", "ratio_se", "summarize", "report",
     "load_traces", "main",
@@ -89,6 +103,15 @@ GK_CLOSE = 30.0
 GK_BOX_RADIUS = 195.0
 GK_GOAL_LINE_X = 19.5
 GK_QUICK_KICK_S = 0.5
+PASS_MIN_DIST = 80.0
+PASS_MAX_DIST = 700.0
+LANE_HALF_WIDTH = 50.0
+AIM_MIN_SPEED = 50.0
+AIM_CONE_DEG = 15.0
+PASS_OPTION_COUNT_KEYS = (
+    "pass_opt_n", "pass_opt_with", "aim_open_den", "aim_open_n",
+    "aim_comp_den", "aim_comp_mate", "noopt_den", "noopt_opp",
+)
 LATE_WINDOW_STEPS = 225
 TEAM_SIZE = 6
 TEAMS = ("A", "B")
@@ -191,6 +214,83 @@ def outfield_outcome_counts(kicks: Iterable[Dict[str, Any]]) -> Dict[str, int]:
             n += 1
     counts["n"] = n
     return counts
+
+
+def pass_options(
+    trace: Dict[str, np.ndarray],
+    kicks: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    outcomes: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Passing options of every outfield kick that has a next row (see `pass options` in the module docstring).
+
+    Each record: `step`, `player`, `candidates` and `open` (sorted player indices), `has_direction`, `aimed_open`, and
+    `outcome` (the `kick_outcomes` result, or None for a censored kick).
+    """
+    steps, players = kick_events(trace) if kicks is None else kicks
+    n = int(np.asarray(trace["holder"]).shape[0])
+    keep = (players % TEAM_SIZE != 0) & (steps + 1 < n)
+    k, i = steps[keep], players[keep]
+    if k.size == 0:
+        return []
+    by_kick = {
+        (o["step"], o["player"]): o["outcome"]
+        for o in (kick_outcomes(trace, kicks=(steps, players)) if outcomes is None else outcomes)
+    }
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)[k]                        # (K, 2)
+    bvel = np.asarray(trace["bvel"], dtype=np.float64)[k + 1]                    # (K, 2)
+    team = i // TEAM_SIZE
+    mates = team[:, None] * TEAM_SIZE + np.arange(1, TEAM_SIZE)[None, :]          # (K, 5)
+    opps = (1 - team)[:, None] * TEAM_SIZE + np.arange(TEAM_SIZE)[None, :]        # (K, 6)
+    seg = pos[k[:, None], mates] - ball[:, None, :]                              # (K, 5, 2) ball -> teammate
+    length = np.hypot(seg[..., 0], seg[..., 1])                                  # (K, 5)
+    cand = (mates != i[:, None]) & (length >= PASS_MIN_DIST) & (length <= PASS_MAX_DIST)
+    rel = pos[k[:, None], opps] - ball[:, None, :]                               # (K, 6, 2) ball -> opponent
+    safe = np.where(length > 0.0, length, 1.0)[:, :, None]
+    proj = (seg[:, :, None, 0] * rel[:, None, :, 0] + seg[:, :, None, 1] * rel[:, None, :, 1]) / safe
+    perp = np.abs(seg[:, :, None, 0] * rel[:, None, :, 1] - seg[:, :, None, 1] * rel[:, None, :, 0]) / safe
+    blocked = ((proj > 0.0) & (proj < length[:, :, None]) & (perp <= LANE_HALF_WIDTH)).any(axis=2)
+    open_ = cand & ~blocked
+    speed = np.hypot(bvel[:, 0], bvel[:, 1])
+    has_dir = speed >= AIM_MIN_SPEED
+    angle = np.degrees(np.abs(np.arctan2(
+        bvel[:, None, 0] * seg[..., 1] - bvel[:, None, 1] * seg[..., 0],
+        bvel[:, None, 0] * seg[..., 0] + bvel[:, None, 1] * seg[..., 1],
+    )))
+    aimed_open = (open_ & (angle <= AIM_CONE_DEG)).any(axis=1) & has_dir
+    return [
+        {
+            "step": int(k[r]),
+            "player": int(i[r]),
+            "candidates": mates[r][cand[r]].tolist(),
+            "open": mates[r][open_[r]].tolist(),
+            "has_direction": bool(has_dir[r]),
+            "aimed_open": bool(aimed_open[r]),
+            "outcome": by_kick.get((int(k[r]), int(i[r]))),
+        }
+        for r in range(k.size)
+    ]
+
+
+def pass_option_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    """Per-match numerators and denominators of the four pass-option shares."""
+    c = {key: 0 for key in PASS_OPTION_COUNT_KEYS}
+    for rec in records:
+        option = bool(rec["open"])
+        c["pass_opt_n"] += 1
+        c["pass_opt_with"] += int(option)
+        if option and rec["has_direction"]:
+            c["aim_open_den"] += 1
+            c["aim_open_n"] += int(rec["aimed_open"])
+        if rec["outcome"] is None:
+            continue
+        if rec["aimed_open"]:
+            c["aim_comp_den"] += 1
+            c["aim_comp_mate"] += int(rec["outcome"] == "teammate")
+        if not option:
+            c["noopt_den"] += 1
+            c["noopt_opp"] += int(rec["outcome"] == "opponent")
+    return c
 
 
 def kick_propensity_counts(
@@ -428,6 +528,13 @@ def goal_type_counts(goals: Iterable[Dict[str, Any]]) -> Dict[str, float]:
     return out
 
 
+PASS_OPTION_SHARES = {
+    "pass_option_share": ("pass_opt_with", "pass_opt_n"),
+    "aim_open_share": ("aim_open_n", "aim_open_den"),
+    "aim_open_completion": ("aim_comp_mate", "aim_comp_den"),
+    "no_option_opponent_share": ("noopt_opp", "noopt_den"),
+}
+
 KICK_PROP_KEYS = (
     "A", "B", "pooled", "GK", "D", "M", "ST",
     "A_GK", "A_D", "A_M", "A_ST", "B_GK", "B_D", "B_M", "B_ST",
@@ -618,6 +725,7 @@ def match_metrics(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     m["kicks_n"] = counts["n"]
     for name in OUTCOMES:
         m[f"kick_{name}"] = counts[name]
+    m.update(pass_option_counts(pass_options(trace, kicks=kicks, outcomes=outcomes)))
 
     kp_counts = kick_propensity_counts(trace, holder=holder, kicks=kicks)
     for k, (kn, hn) in kp_counts.items():
@@ -718,6 +826,9 @@ def summarize(per_match: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     for name in OUTCOMES:
         metrics[f"kick_outcome_{name}"] = _stat_dict(ratio_se(col(f"kick_{name}"), col("kicks_n")))
 
+    for key, (num, den) in PASS_OPTION_SHARES.items():
+        metrics[key] = _stat_dict(ratio_se(col(num), col(den)))
+
     for k in KICK_PROP_KEYS:
         metrics[f"kick_propensity_{k}"] = _stat_dict(ratio_se(col(f"kick_prop_kicks_{k}"), col(f"kick_prop_holds_{k}")))
 
@@ -797,6 +908,13 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
     total_kicks = sum(col("kicks_n"))
     shares = " | ".join(f"{name} {_fmt_d(met[f'kick_outcome_{name}'], 1, 100.0, '%')}" for name in OUTCOMES)
     lines.append(f"kick outcome (outfield, {total_kicks} kicks): {shares}")
+    lines.append(
+        f"pass options ({sum(col('pass_opt_n'))} kicks)    : "
+        f"option {_fmt_d(met['pass_option_share'], 1, 100.0, '%')} | "
+        f"aim_open {_fmt_d(met['aim_open_share'], 1, 100.0, '%')} | "
+        f"completion {_fmt_d(met['aim_open_completion'], 1, 100.0, '%')} | "
+        f"no_option_opponent {_fmt_d(met['no_option_opponent_share'], 1, 100.0, '%')}"
+    )
     lines.append(
         "kick_propensity A/B/pooled : "
         + " / ".join(_fmt_d(met[f"kick_propensity_{k}"], 4) for k in ("A", "B", "pooled"))

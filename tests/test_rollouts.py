@@ -935,3 +935,221 @@ class TestRolloutsE5:
         assert hold_data["shaping_mode"] == "ball"
         assert hold_data["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
 
+
+
+# ----------------------------------------------------------------------------
+# 5. Intent split and forced-hold length in `hold`
+# ----------------------------------------------------------------------------
+HOLD_GOLDEN_DIR = REPO_ROOT / "tests" / "golden" / "rollouts_hold_default"
+INTENT_BUCKETS = ("intent_kick", "intent_mid", "intent_hold", "def_intent_kick", "def_intent_hold")
+INTENT_LABELS = ("intent=kick", "intent=mid", "intent=hold", "def&intent=kick", "def&intent=hold")
+
+
+def _hold_fixture(tmp_path: Path, head: str):
+    torch.manual_seed(20261119)  # the hybrid5 helper leaves the critic at its random init; seed it so `val` is reproducible
+    if head == "hybrid5":
+        return _make_hybrid_trace_run(tmp_path, max_steps=120, n=2, seed=11, z_kick=-2.0)
+    return _make_gaussian_trace_run(tmp_path, max_steps=120, n=2, seed=11)
+
+
+def _without_intent_buckets(summary: dict) -> dict:
+    out = copy.deepcopy(summary)
+    out.pop("hold_steps", None)
+    for h_data in out["horizons"].values():
+        for bucket in INTENT_BUCKETS:
+            h_data.pop(bucket, None)
+    return out
+
+
+def _report_without_intent_lines(text: str) -> list[str]:
+    lines = text.splitlines()
+    kept: list[str] = []
+    skip_components = False
+    for line in lines:
+        if skip_components and line.strip().startswith("components:"):
+            skip_components = False
+            continue
+        skip_components = False
+        if line.strip().startswith(INTENT_LABELS):
+            skip_components = True
+            continue
+        kept.append(line)
+    return kept
+
+
+class TestHoldIntentSplit:
+    @pytest.mark.parametrize("head", ["hybrid5", "gaussian4"])
+    def test_default_hold_output_matches_frozen_golden(self, tmp_path, head):
+        """[GUARD] Default `rollouts hold` (no `--hold-steps`) keeps every pre-existing key and value and every pre-existing
+        report line, in order. The only additions allowed are the intent buckets under each horizon (and their report lines,
+        after the existing buckets) and the top-level `hold_steps`.
+
+        Golden produced at commit f6cd858 (unmodified `tools/audit/rollouts.py`) on the fixtures of `_hold_fixture`
+        (`torch.manual_seed(20261119)`, then `_make_hybrid_trace_run(max_steps=120, n=2, seed=11, z_kick=-2.0)`, `_make_gaussian_trace_run(max_steps=120, n=2,
+        seed=11)`) with `rollouts.main(["hold", "--trace-dir", T, "--checkpoint-dir", C, "--trace-seed", "11", "--seed", "77",
+        "--workers", "1", "--out", OUT])`; `OUT/rollouts.json` and `OUT/report.txt` were copied to
+        `tests/golden/rollouts_hold_default/<head>.json` and `<head>_report.txt`.
+        """
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _hold_fixture(tmp_path, head)
+        out = tmp_path / "out"
+        assert rollouts.main([
+            "hold", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt),
+            "--trace-seed", "11", "--seed", "77", "--workers", "1", "--out", str(out),
+        ]) == 0
+        data = json.loads((out / "rollouts.json").read_text(encoding="utf-8"))
+        frozen = json.loads((HOLD_GOLDEN_DIR / f"{head}.json").read_text(encoding="utf-8"))
+        assert frozen["n_decisions"] >= 1
+
+        assert set(data) - set(frozen) <= {"hold_steps"}
+        assert set(data["horizons"]) == set(frozen["horizons"])
+        for h, h_data in data["horizons"].items():
+            assert set(h_data) - set(frozen["horizons"][h]) <= set(INTENT_BUCKETS)
+        assert _without_intent_buckets(data) == frozen
+
+        new_lines = _report_without_intent_lines((out / "report.txt").read_text(encoding="utf-8"))
+        old_lines = (HOLD_GOLDEN_DIR / f"{head}_report.txt").read_text(encoding="utf-8").splitlines()
+        assert len(new_lines) == len(old_lines)
+        assert new_lines[0].split("  matches ok=", 1)[1] == old_lines[0].split("  matches ok=", 1)[1]
+        assert new_lines[1:] == old_lines[1:]
+
+    @staticmethod
+    def _intent_trace(head):
+        tr = make_trace(10)
+        tr["mean"] = np.zeros((10, 12, 4), dtype=np.float64)
+        if head is not None:
+            tr["head"] = np.asarray(head, dtype=np.int8)
+        return tr
+
+    def test_intent_hybrid5_reads_p_from_the_kick_mean(self):
+        """[RED] hybrid5 (`head[team] == 1`): p = (mean_kick + 1) / 2; kick if p > 0.5, hold if p < 0.05, else mid."""
+        from tools.audit import rollouts
+
+        tr = self._intent_trace([1, 0])
+        cases = {
+            0.2: "kick",     # p = 0.60
+            0.0: "mid",      # p = 0.50, not > 0.5
+            -0.88: "mid",    # p = 0.06
+            -0.92: "hold",   # p = 0.04
+            -1.0: "hold",    # p = 0
+        }
+        for step, (mean_kick, expected) in enumerate(cases.items()):
+            tr["mean"][step, 3, 2] = mean_kick
+            tr["mean"][step, 9, 2] = 0.9            # the other team's seat is never read for holder 3
+            assert rollouts.decision_intent(tr, step, 3) == expected, (mean_kick, expected)
+
+    def test_intent_gaussian4_threshold_is_strict_at_0_35(self):
+        """[RED] gaussian4 (`head[team] == 0`, or no `head` field): kick if mean_kick > 0.35, else hold (never mid)."""
+        from tools.audit import rollouts
+
+        for head in ([1, 0], None):
+            tr = self._intent_trace(head)
+            for step, (mean_kick, expected) in enumerate(((0.35, "hold"), (0.3500001, "kick"), (0.9, "kick"), (-0.95, "hold"), (0.2, "hold"))):
+                tr["mean"][step, 9, 2] = mean_kick
+                tr["mean"][step, 3, 2] = -1.0 if mean_kick > 0.35 else 1.0   # the other team's seat is never read
+                assert rollouts.decision_intent(tr, step, 9) == expected, (head, mean_kick, expected)
+
+    @staticmethod
+    def _hand_record(intent, third, value):
+        diff = {m: value for m in ("non_shaping_return", "full_return_bootstrap", "p_team_ball_1s", "p_goal_for", "p_goal_against")}
+        diff["components"] = {ck: value for ck in ("turnover", "pass_bonus", "shot_on_target", "goal", "failed_tackle", "five_s_rule", "save", "other")}
+        return {"intent": intent, "third": third, "pressure": "mid", "rollout": {"diff": {75: diff, 225: diff}}}
+
+    def test_summary_intent_buckets_on_hand_records(self):
+        """[RED] Five records: kick/defensive 0.3, kick/middle 0.1, mid/defensive -0.2, hold/defensive 0.5, hold/attacking 0.7.
+        intent_kick = {0.3, 0.1}: mean 0.2, sd 0.141421, se 0.1; intent_mid = {-0.2}; intent_hold = {0.5, 0.7}: mean 0.6, se 0.1;
+        def_intent_kick = {0.3}; def_intent_hold = {0.5}; overall n = 5 and third_defensive = {0.3, -0.2, 0.5} as before."""
+        from tools.audit import rollouts
+
+        records = [
+            self._hand_record("kick", "defensive", 0.3),
+            self._hand_record("kick", "middle", 0.1),
+            self._hand_record("mid", "defensive", -0.2),
+            self._hand_record("hold", "defensive", 0.5),
+            self._hand_record("hold", "attacking", 0.7),
+        ]
+        s = rollouts.summarize_hold(records, 1, 1, 0, 0.0, seed=1)
+        for h in ("75", "225"):
+            b = s["horizons"][h]
+            for bucket, n, mean, se in (
+                ("intent_kick", 2, 0.2, 0.1),
+                ("intent_mid", 1, -0.2, None),
+                ("intent_hold", 2, 0.6, 0.1),
+                ("def_intent_kick", 1, 0.3, None),
+                ("def_intent_hold", 1, 0.5, None),
+                ("overall", 5, 0.28, None),
+                ("third_defensive", 3, 0.2, None),
+            ):
+                stat = b[bucket]["non_shaping_return"]
+                assert b[bucket]["n"] == n and stat["n"] == n, bucket
+                assert stat["mean"] == pytest.approx(mean), bucket
+                if se is not None:
+                    assert stat["se"] == pytest.approx(se), bucket
+                assert b[bucket]["components"]["goal"]["mean"] == pytest.approx(mean), bucket
+        assert "def_intent_mid" not in s["horizons"]["75"]
+
+        lines = rollouts.format_hold_report(s, title="hand").splitlines()
+        labels = [ln.strip().split(":", 1)[0].strip() for ln in lines if ln.startswith("    ") and not ln.startswith("      ")]
+        per_horizon = ["overall", "opp < 70 u", "opp >= 120 u", "defensive 1/3", "middle 1/3", "attacking 1/3", *INTENT_LABELS]
+        assert labels == per_horizon * 2
+
+    def test_records_carry_intent_end_to_end(self, tmp_path):
+        """[RED] On the z_kick = -2 hybrid5 fixture every hold decision records mean_kick = -0.73883 (p = 0.1306): both decisions
+        land in intent_mid, none in intent_kick or intent_hold."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _hold_fixture(tmp_path, "hybrid5")
+        res = rollouts.run_hold(trace_dir=trace_dir, checkpoint_dir=ckpt, trace_seed=11, seed=77, workers=1)
+        for h in ("75", "225"):
+            b = res["horizons"][h]
+            assert (b["overall"]["n"], b["intent_mid"]["n"], b["intent_kick"]["n"], b["intent_hold"]["n"]) == (2, 2, 0, 0)
+
+    @staticmethod
+    def _observe_hold_branch_kicks(monkeypatch, rollouts):
+        """Wrap `roll_hold_branches` with a HOLD-branch hook reading the env's kick counter after every decision."""
+        real = rollouts.roll_hold_branches
+        logs = []
+
+        def observed(snap, **kw):
+            start = int(snap.stats["kicks"])
+            seen = []
+            logs.append(seen)
+            return real(snap, after_hold_step=lambda k, env: seen.append(int(env.stats["kicks"]) - start), **kw)
+
+        monkeypatch.setattr(rollouts, "roll_hold_branches", observed)
+        return logs
+
+    def test_hold_steps_option_sets_the_forced_hold_length(self, tmp_path, monkeypatch):
+        """[RED] z_kick = +1 hybrid5 fixture (1 match): one hold decision (step 2, holder 5, p = 0.7269 -> intent kick). In
+        greedy branches that policy fires whenever it may, so the HOLD branch's first kick comes on the first unforced
+        decision: index 1 with `--hold-steps 1`, index 15 by default."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _make_hybrid_trace_run(tmp_path, max_steps=120, n=1, seed=11, z_kick=1.0)
+        logs = self._observe_hold_branch_kicks(monkeypatch, rollouts)
+        for flag, first_kick in ((["--hold-steps", "1"], 1), ([], 15)):
+            logs.clear()
+            out = tmp_path / f"hold{len(flag)}.json"
+            assert rollouts.main([
+                "hold", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt), "--trace-seed", "11",
+                "--mode", "greedy", "--workers", "1", *flag, "--out", str(out),
+            ]) == 0
+            assert len(logs) == 1
+            assert logs[0].index(1) == first_kick
+            assert logs[0][:first_kick] == [0] * first_kick
+            data = json.loads(out.read_text(encoding="utf-8"))
+            assert data["hold_steps"] == first_kick
+            assert data["horizons"]["75"]["intent_kick"]["n"] == 1
+
+    def test_hold_steps_below_one_is_rejected(self, tmp_path, capsys):
+        """[RED] `--hold-steps` 0 and -1 are argparse errors naming the flag; `run_hold(hold_steps=0)` raises ValueError."""
+        from tools.audit import rollouts
+
+        for bad in ("0", "-1", "x"):
+            with pytest.raises(SystemExit):
+                rollouts.main(["hold", "--trace-dir", str(tmp_path), "--checkpoint-dir", str(tmp_path),
+                               "--hold-steps", bad, "--out", str(tmp_path / "o.json")])
+            assert "--hold-steps" in capsys.readouterr().err
+        with pytest.raises(ValueError, match="hold_steps"):
+            rollouts.run_hold(trace_dir=tmp_path, checkpoint_dir=tmp_path, hold_steps=0)

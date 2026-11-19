@@ -1,0 +1,997 @@
+{
+  "gamma": 0.995,
+  "horizons": {
+    "225": {
+      "overall": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": 7.89745528744206e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.83457499715389,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": 3.4597413852773096e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      },
+      "pressure_ge120": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": 7.89745528744206e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.83457499715389,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": 3.4597413852773096e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      },
+      "pressure_lt70": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "pressure_mid": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_attacking": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_defensive": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_middle": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": 7.89745528744206e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.83457499715389,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": 3.4597413852773096e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      }
+    },
+    "75": {
+      "overall": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": -3.5284639977383716e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.8098208645052472,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": -6.461965190613225e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      },
+      "pressure_ge120": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": -3.5284639977383716e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.8098208645052472,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": -6.461965190613225e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      },
+      "pressure_lt70": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "pressure_mid": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_attacking": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_defensive": {
+        "components": {
+          "failed_tackle": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "goal": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "other": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "save": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          },
+          "turnover": {
+            "mean": null,
+            "n": 0,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "n": 0,
+        "non_shaping_return": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": null,
+          "n": 0,
+          "se": null
+        }
+      },
+      "third_middle": {
+        "components": {
+          "failed_tackle": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "five_s_rule": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "goal": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "other": {
+            "mean": -3.5284639977383716e-09,
+            "n": 1,
+            "se": null
+          },
+          "pass_bonus": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "save": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "shot_on_target": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          },
+          "turnover": {
+            "mean": 0.0,
+            "n": 1,
+            "se": null
+          }
+        },
+        "full_return_bootstrap": {
+          "mean": 0.8098208645052472,
+          "n": 1,
+          "se": null
+        },
+        "n": 1,
+        "non_shaping_return": {
+          "mean": -6.461965190613225e-09,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_against": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_goal_for": {
+          "mean": 0.0,
+          "n": 1,
+          "se": null
+        },
+        "p_team_ball_1s": {
+          "mean": 1.0,
+          "n": 1,
+          "se": null
+        }
+      }
+    }
+  },
+  "max_pos_err": 6.540023086425515e-05,
+  "mode": "hold",
+  "n_decisions": 1,
+  "n_matches_ok": 2,
+  "n_matches_skipped": 0,
+  "n_matches_total": 2,
+  "seed": 77,
+  "shaping_mode": "legacy"
+}
