@@ -325,6 +325,142 @@ def test_select_archive_replays() -> None:
     assert len(set(mid_gens)) == 5
 
 
+def test_select_archive_replays_prefers_uniform_over_higher_scoring_best() -> None:
+    """[RED] When both best and `_uniform_` exist in a generation, `_uniform_` wins regardless of score."""
+    files = []
+    for g in range(1, 21):
+        files.append(f"match_{2 * g - 1:04d}_gen{g:04d}_score99_0_20261119_120000.json")
+        files.append(f"match_{2 * g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json")
+
+    kept = select_archive_replays(files, seed=7)
+    expected_gens = [1, 2, 3, 4, 5, 7, 8, 11, 12, 14, 16, 17, 18, 19, 20]
+    expected = [f"match_{2 * g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json" for g in expected_gens]
+    assert kept == expected
+    assert all("_uniform_" in f for f in kept)
+
+
+def test_select_archive_replays_best_only_and_mixed_fallback_unchanged() -> None:
+    """[RED] Best-only generations still select the highest-scoring best file, matching legacy order."""
+    expected_gens = [1, 2, 3, 4, 5, 7, 8, 11, 12, 14, 16, 17, 18, 19, 20]
+    best_only_files = []
+    for g in range(1, 21):
+        best_only_files.append(f"match_{2 * g - 1:04d}_gen{g:04d}_score5_0_20261119_120000.json")
+        best_only_files.append(f"match_{2 * g:04d}_gen{g:04d}_score12_0_20261119_120000.json")
+    expected_best_only = [f"match_{2 * g:04d}_gen{g:04d}_score12_0_20261119_120000.json" for g in expected_gens]
+    assert select_archive_replays(best_only_files, seed=7) == expected_best_only
+
+    # Mixed: gen 3 has only best, other chosen gens have both; generation list is unchanged.
+    mixed_files = []
+    for g in range(1, 21):
+        mixed_files.append(f"match_{2 * g - 1:04d}_gen{g:04d}_score99_0_20261119_120000.json")
+        if g != 3:
+            mixed_files.append(f"match_{2 * g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json")
+    kept_mixed = select_archive_replays(mixed_files, seed=7)
+    kept_gens = [int(re.search(r"gen(\d+)", f).group(1)) for f in kept_mixed]
+    assert kept_gens == expected_gens
+    assert kept_mixed[2] == "match_0005_gen0003_score99_0_20261119_120000.json"
+    assert all("_uniform_" in f for idx, f in enumerate(kept_mixed) if idx != 2)
+
+
+def test_select_archive_replays_orders_multiple_uniform_files_by_score_then_match_id() -> None:
+    """[RED] Among multiple `_uniform_` files in one generation, higher `(score, match_id)` wins."""
+    files = []
+    for g in range(1, 21):
+        if g == 1:
+            files.append("match_0010_gen0001_score2_0_uniform_20261119_120000.json")
+            files.append("match_0020_gen0001_score8_0_uniform_20261119_120000.json")
+            files.append("match_0099_gen0001_score50_0_20261119_120000.json")
+        elif g == 2:
+            files.append("match_0011_gen0002_score5_0_uniform_20261119_120000.json")
+            files.append("match_0025_gen0002_score5_0_uniform_20261119_120000.json")
+        else:
+            files.append(f"match_{100 + g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json")
+    kept = select_archive_replays(files, seed=7)
+    assert kept[0] == "match_0020_gen0001_score8_0_uniform_20261119_120000.json"
+    assert kept[1] == "match_0025_gen0002_score5_0_uniform_20261119_120000.json"
+
+
+def test_select_archive_replays_small_gen_count_fillup_prefers_uniform_first_no_duplicates() -> None:
+    """[RED] When N <= 15 with >15 files of both kinds, first pass takes every uniform file once, fill-up takes remaining bests."""
+    files = []
+    for g in range(1, 11):
+        files.append(f"match_{2 * g - 1:04d}_gen{g:04d}_score{10 + g}_0_20261119_120000.json")
+        files.append(f"match_{2 * g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json")
+
+    kept = select_archive_replays(files, seed=7)
+    expected_first_10 = [f"match_{2 * g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json" for g in range(1, 11)]
+    expected_fillup_5 = [f"match_{2 * g - 1:04d}_gen{g:04d}_score{10 + g}_0_20261119_120000.json" for g in (10, 9, 8, 7, 6)]
+    assert kept == expected_first_10 + expected_fillup_5
+    assert len(set(kept)) == 15
+
+
+def test_select_archive_replays_ignores_uniform_in_directory_name() -> None:
+    """[RED] Only `_uniform_` in the file basename counts; directory names containing `_uniform_` do not."""
+    files = []
+    for g in range(1, 21):
+        if g == 1:
+            files.append("runs_uniform_/match_0001_gen0001_score90_0_20261119_120000.json")
+            files.append("plain_dir/match_0002_gen0001_score1_0_uniform_20261119_120000.json")
+        elif g == 2:
+            files.append("runs_uniform_/match_0003_gen0002_score1_0_20261119_120000.json")
+            files.append("plain_dir/match_0004_gen0002_score90_0_20261119_120000.json")
+        else:
+            files.append(f"plain_dir/match_{100 + g:04d}_gen{g:04d}_score1_0_uniform_20261119_120000.json")
+    kept = select_archive_replays(files, seed=7)
+    assert kept[0] == "plain_dir/match_0002_gen0001_score1_0_uniform_20261119_120000.json"
+    assert kept[1] == "plain_dir/match_0004_gen0002_score90_0_20261119_120000.json"
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_select_archive_replays_mixed_property_invariants(seed: int) -> None:
+    """[RED] Property: random mixed file lists return unique input members of length min(15, len(files))."""
+    import random
+
+    rng = random.Random(seed + 100)
+    files = []
+    n_gens = rng.randint(6, 25)
+    for g in range(1, n_gens + 1):
+        if rng.random() < 0.8:
+            files.append(f"match_{rng.randint(1, 9999):04d}_gen{g:04d}_score{rng.randint(1, 99)}_0_20261119_120000.json")
+        if rng.random() < 0.7:
+            files.append(f"match_{rng.randint(1, 9999):04d}_gen{g:04d}_score{rng.randint(0, 20)}_0_uniform_20261119_120000.json")
+    rng.shuffle(files)
+
+    kept = select_archive_replays(files, seed=seed)
+    assert len(kept) == min(15, len(files))
+    assert len(set(kept)) == len(kept)
+    assert all(f in files for f in kept)
+
+
+def test_archive_and_restore_both_kinds_keeps_uniform_replays(tmp_path: Path) -> None:
+    """[RED] `archive_batch` + `load_archived_batch` on a `--replay-kind both` run keeps only `_uniform_` replays."""
+    from football_rl.train_ppo import load_archived_batch
+
+    trainer = _replay_cap_trainer(tmp_path, name="both_arch", num_envs=1, max_rl_steps=5, rollout_steps=5, replay_kind="both")
+    try:
+        trainer.train(total_updates=16)
+    finally:
+        trainer.close()
+
+    rep_dir = tmp_path / "rep_both_arch"
+    ckpt_dir = tmp_path / "ckpt_both_arch"
+    arch_root = tmp_path / "archives"
+    all_files = sorted(p.name for p in rep_dir.glob("match_*.json"))
+    assert len(all_files) == 32
+
+    dest = Path(archive_batch("both_run", str(ckpt_dir), str(rep_dir), str(arch_root)))
+    archived_names = sorted(p.name for p in (dest / "replays").glob("match_*.json"))
+    assert len(archived_names) == 15
+    assert all("_uniform_" in name for name in archived_names)
+
+    restored_ckpt = tmp_path / "restored_both_ckpt"
+    restored_rep = tmp_path / "restored_both_rep"
+    load_archived_batch("both_run", str(restored_ckpt), str(restored_rep), str(arch_root))
+    assert sorted(p.name for p in restored_rep.glob("match_*.json")) == archived_names
+    assert (restored_ckpt / "training_state.pt").exists()
+
+
+
 def test_archive_batch_keeps_fifteen_matches(tmp_path: Path) -> None:
     """Verify archive_batch preserves only 15 matches and non-match files in archives."""
     ckpt_dir = tmp_path / "checkpoints"
@@ -4546,3 +4682,356 @@ def test_a_pool_snapshot_with_only_some_of_the_statistics_is_refused(tmp_path: P
             trainer._load_pool_member(50, "A")
     finally:
         trainer.close()
+
+
+# --------------------------------------------------------------------------------------
+# Replay cap (--replay-every, --replay-kind)
+# --------------------------------------------------------------------------------------
+
+
+def _replay_cap_cfg(save_dir: Path, max_rl_steps: int = 10, save_best_only: bool = True):
+    return replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=max_rl_steps),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            save_dir=str(save_dir),
+            enable_recording=True,
+            interest_threshold=0.0,
+            save_best_only=save_best_only,
+        ),
+    )
+
+
+def _replay_cap_trainer(
+    tmp_path: Path,
+    name: str = "cap",
+    num_envs: int = 2,
+    max_rl_steps: int = 10,
+    rollout_steps: int = 10,
+    save_best_only: bool = True,
+    seed: int = 7,
+    **kwargs,
+) -> ParameterSharingPPOTrainer:
+    rep_dir = tmp_path / f"rep_{name}"
+    ckpt_dir = tmp_path / f"ckpt_{name}"
+    return ParameterSharingPPOTrainer(
+        config=_replay_cap_cfg(rep_dir, max_rl_steps=max_rl_steps, save_best_only=save_best_only),
+        num_envs=num_envs,
+        rollout_steps=rollout_steps,
+        device="cpu",
+        checkpoint_dir=str(ckpt_dir),
+        seed=seed,
+        save_best_only=save_best_only,
+        **kwargs,
+    )
+
+
+def _replay_names_by_gen(rep_dir: Path) -> dict[int, list[str]]:
+    by_gen: dict[int, list[str]] = {}
+    for p in sorted(rep_dir.glob("match_*.json")):
+        m = re.search(r"_gen(\d+)_", p.name)
+        assert m is not None, p.name
+        by_gen.setdefault(int(m.group(1)), []).append(p.name)
+    return by_gen
+
+
+def test_replay_cap_defaults_write_both_kinds_every_generation(tmp_path: Path) -> None:
+    """[GUARD] Defaults: a 3-generation run writes both best and uniform replays in every generation."""
+    trainer = _replay_cap_trainer(tmp_path, name="guard", num_envs=2)
+    try:
+        trainer.train(total_updates=3)
+    finally:
+        trainer.close()
+
+    by_gen = _replay_names_by_gen(tmp_path / "rep_guard")
+    assert sorted(by_gen.keys()) == [1, 2, 3]
+    for gen in (1, 2, 3):
+        names = by_gen[gen]
+        uniform_names = [n for n in names if "_uniform_" in n]
+        best_names = [n for n in names if "_uniform_" not in n]
+        assert len(uniform_names) == 1 and len(best_names) == 1
+        assert re.match(rf"^match_\d{{4}}_gen{gen:04d}_score\d+_\d+_uniform_\d{{8}}_\d{{6}}\.json$", uniform_names[0])
+        assert re.match(rf"^match_\d{{4}}_gen{gen:04d}_score\d+_\d+_\d{{8}}_\d{{6}}\.json$", best_names[0])
+
+    assert len(trainer.generation_history) == 3
+    for rec in trainer.generation_history:
+        assert rec["uniform_replay"] is not None and os.path.exists(rec["uniform_replay"])
+    assert len(trainer.match_history) == 6
+    saved_paths = [m["replay_path"] for m in trainer.match_history if m["replay_path"]]
+    assert len(saved_paths) == 3 and all(os.path.exists(p) for p in saved_paths)
+
+
+def test_replay_every_five_over_seven_generations_writes_only_five_and_seven(tmp_path: Path) -> None:
+    """[RED] `--replay-every 5` over 7 generations writes replays only for generations 5 and 7."""
+    trainer = _replay_cap_trainer(tmp_path, name="every5", num_envs=2, replay_every=5)
+    try:
+        trainer.train(total_updates=7)
+    finally:
+        trainer.close()
+
+    by_gen = _replay_names_by_gen(tmp_path / "rep_every5")
+    assert sorted(by_gen.keys()) == [5, 7]
+    for gen in (5, 7):
+        assert len([n for n in by_gen[gen] if "_uniform_" in n]) == 1
+        assert len([n for n in by_gen[gen] if "_uniform_" not in n]) == 1
+    for rec in trainer.generation_history:
+        if rec["generation"] in (5, 7):
+            assert rec["uniform_replay"] is not None and os.path.exists(rec["uniform_replay"])
+        else:
+            assert rec["uniform_replay"] is None
+
+
+@pytest.mark.parametrize("save_best_only", [True, False])
+def test_replay_kind_filters_uniform_and_best(tmp_path: Path, save_best_only: bool) -> None:
+    """[RED] `uniform` writes only `*_uniform_*` files; `best` writes no `*_uniform_*` files."""
+    t_uni = _replay_cap_trainer(
+        tmp_path, name=f"uni_{save_best_only}", num_envs=2, save_best_only=save_best_only, replay_kind="uniform"
+    )
+    try:
+        t_uni.train(total_updates=3)
+    finally:
+        t_uni.close()
+
+    uni_files = sorted(p.name for p in (tmp_path / f"rep_uni_{save_best_only}").glob("match_*.json"))
+    assert len(uni_files) == 3
+    assert all("_uniform_" in name for name in uni_files)
+    assert all(m["replay_path"] is None for m in t_uni.match_history)
+    assert all(rec["uniform_replay"] is not None for rec in t_uni.generation_history)
+
+    t_best = _replay_cap_trainer(
+        tmp_path, name=f"best_{save_best_only}", num_envs=2, save_best_only=save_best_only, replay_kind="best"
+    )
+    try:
+        t_best.train(total_updates=3)
+    finally:
+        t_best.close()
+
+    best_files = sorted(p.name for p in (tmp_path / f"rep_best_{save_best_only}").glob("match_*.json"))
+    expected_count = 3 if save_best_only else 6
+    assert len(best_files) == expected_count
+    assert all("_uniform_" not in name for name in best_files)
+    assert all(rec["uniform_replay"] is None for rec in t_best.generation_history)
+
+
+@pytest.mark.parametrize("save_best_only", [True, False])
+def test_skipped_generation_calls_replay_writer_zero_times_and_keeps_no_deferred_export(
+    tmp_path: Path, monkeypatch, save_best_only: bool
+) -> None:
+    """[RED] A skipped generation invokes `_write_replay_to_disk` zero times and leaves no deferred/uniform payload."""
+    calls: list[tuple[int, int, str]] = []
+    orig_write = FootballParallelEnv._write_replay_to_disk
+
+    def spy_write(self, match_id, generation, interest_score, stats, frames, tag=""):
+        calls.append((int(generation), int(match_id), tag))
+        return orig_write(self, match_id, generation, interest_score, stats, frames, tag=tag)
+
+    monkeypatch.setattr(FootballParallelEnv, "_write_replay_to_disk", spy_write)
+
+    trainer = _replay_cap_trainer(
+        tmp_path, name=f"spy_{save_best_only}", num_envs=1, save_best_only=save_best_only, replay_every=5
+    )
+    try:
+        # Standalone skipped generation (gen 1, not last of train): zero writes and nothing deferred.
+        rollout_1 = trainer.collect_rollouts(active_generation=1)
+        assert calls == []
+        assert rollout_1["exported_replays"] == []
+        env0 = trainer.vec_env.envs[0]
+        assert env0._deferred_replay is None
+        assert env0._uniform_replay is None
+
+        # Full 2-generation train() with replay_every=5: gen 1 is skipped (0 writes), gen 2 is last (writes).
+        trainer.match_history.clear()
+        trainer.train(total_updates=2)
+        assert [c for c in calls if c[0] == 1] == []
+        assert len([c for c in calls if c[0] == 2]) == 2
+        assert env0._deferred_replay is None
+        assert env0._uniform_replay is None
+    finally:
+        trainer.close()
+
+
+def test_skipped_matches_stay_in_history_and_summary_with_none_replay_path(tmp_path: Path) -> None:
+    """[RED] Skipped matches enter `match_history` (replay_path=None) and `matches_summary.md`; lookup returns None."""
+    from football_rl.replay import find_replay_by_match_id
+
+    trainer = _replay_cap_trainer(tmp_path, name="hist", num_envs=2, replay_every=5)
+    try:
+        trainer.train(total_updates=5)
+    finally:
+        trainer.close()
+
+    rep_dir = tmp_path / "rep_hist"
+    ckpt_dir = tmp_path / "ckpt_hist"
+    assert len(trainer.match_history) == 10
+    for m in trainer.match_history:
+        if m["generation"] < 5:
+            assert m["replay_path"] is None
+            assert find_replay_by_match_id(m["match_id"], str(rep_dir), str(ckpt_dir)) is None
+
+    gen5_paths = [m["replay_path"] for m in trainer.match_history if m["generation"] == 5 and m["replay_path"]]
+    assert len(gen5_paths) == 1 and os.path.exists(gen5_paths[0])
+    gen5_best_id = next(m["match_id"] for m in trainer.match_history if m["replay_path"] == gen5_paths[0])
+    assert find_replay_by_match_id(gen5_best_id, str(rep_dir), str(ckpt_dir)) == gen5_paths[0]
+
+    summary_text = (rep_dir / "matches_summary.md").read_text(encoding="utf-8")
+    assert "Total Completed Matches:** `10`" in summary_text
+    assert "**Match 1**" in summary_text and "_(not saved)_" in summary_text
+
+
+def test_archive_and_restore_sparse_replay_run(tmp_path: Path) -> None:
+    """[RED] Archiving a sparse run keeps existing files (fewer than 15 or >15 sparse gens) and restores cleanly."""
+    from football_rl.train_ppo import load_archived_batch
+
+    # 1. Fewer than 15 files from a real capped run (gens 5 and 7 out of 7)
+    trainer = _replay_cap_trainer(tmp_path, name="sparse", num_envs=2, replay_every=5)
+    try:
+        trainer.train(total_updates=7)
+    finally:
+        trainer.close()
+
+    rep_dir = tmp_path / "rep_sparse"
+    ckpt_dir = tmp_path / "ckpt_sparse"
+    arch_root = tmp_path / "archives"
+    expected_files = sorted(p.name for p in rep_dir.glob("match_*.json"))
+    assert len(expected_files) == 4
+
+    dest = Path(archive_batch("sparse_run", str(ckpt_dir), str(rep_dir), str(arch_root)))
+    assert sorted(p.name for p in (dest / "replays").glob("match_*.json")) == expected_files
+    assert (dest / "replays" / "matches_summary.md").exists()
+
+    restored_ckpt = tmp_path / "restored_ckpt"
+    restored_rep = tmp_path / "restored_rep"
+    load_archived_batch("sparse_run", str(restored_ckpt), str(restored_rep), str(arch_root))
+    assert sorted(p.name for p in restored_rep.glob("match_*.json")) == expected_files
+    assert (restored_ckpt / "training_state.pt").exists()
+
+    # 2. More than 15 sparse generations (20 files at gens 5, 10, ..., 100)
+    sparse_20 = [f"match_{g:04d}_gen{g:04d}_score10_0_uniform_20261119_120000.json" for g in range(5, 105, 5)]
+    kept = select_archive_replays(sparse_20, seed=11)
+    assert len(kept) == 15
+    assert all(f in sparse_20 for f in kept)
+    kept_gens = [int(re.search(r"gen(\d+)", f).group(1)) for f in kept]
+    assert kept_gens[:5] == [5, 10, 15, 20, 25]
+    assert kept_gens[-5:] == [80, 85, 90, 95, 100]
+
+
+def test_replay_cap_persists_resumes_without_accept_flag_and_defaults_on_legacy_state(
+    tmp_path: Path, capsys
+) -> None:
+    """[RED] `replay_every` and `replay_kind` persist; resume with different values prints one line and continues; legacy state defaults."""
+    first = _replay_cap_trainer(tmp_path, name="res", num_envs=1, replay_every=5, replay_kind="uniform")
+    try:
+        first.train(total_updates=1)
+    finally:
+        first.close()
+
+    state_path = tmp_path / "ckpt_res" / "training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert (state["replay_every"], state["replay_kind"]) == (5, "uniform")
+    assert (first.generation_history[0]["replay_every"], first.generation_history[0]["replay_kind"]) == (5, "uniform")
+
+    resumed = _replay_cap_trainer(
+        tmp_path, name="res", num_envs=1, replay_every=2, replay_kind="best", accept_config_change=False
+    )
+    try:
+        capsys.readouterr()
+        assert resumed.load_checkpoints() is True
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(lines) == 1
+        assert (
+            "replay_every=5" in lines[0]
+            and "replay_every=2" in lines[0]
+            and "replay_kind='uniform'" in lines[0]
+            and "replay_kind='best'" in lines[0]
+        )
+        resumed.train(total_updates=1)
+    finally:
+        resumed.close()
+
+    state2 = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert (state2["replay_every"], state2["replay_kind"]) == (2, "best")
+    assert (resumed.generation_history[-1]["replay_every"], resumed.generation_history[-1]["replay_kind"]) == (2, "best")
+
+    # Legacy checkpoint without the two keys reads as (1, "both")
+    del state2["replay_every"], state2["replay_kind"]
+    torch.save(state2, state_path)
+
+    legacy_default = _replay_cap_trainer(tmp_path, name="res", num_envs=1, replay_every=1, replay_kind="both")
+    try:
+        capsys.readouterr()
+        assert legacy_default.load_checkpoints() is True
+        assert capsys.readouterr().out.strip() == ""
+    finally:
+        legacy_default.close()
+
+    legacy_diff = _replay_cap_trainer(tmp_path, name="res", num_envs=1, replay_every=3, replay_kind="uniform")
+    try:
+        capsys.readouterr()
+        assert legacy_diff.load_checkpoints() is True
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert (
+            len(lines) == 1
+            and "replay_every=1" in lines[0]
+            and "replay_kind='both'" in lines[0]
+            and "replay_every=3" in lines[0]
+            and "replay_kind='uniform'" in lines[0]
+        )
+    finally:
+        legacy_diff.close()
+
+
+def test_replay_cap_cli_defaults_and_flags() -> None:
+    """[RED] CLI defaults: `--replay-every 1`, `--replay-kind both`; explicit flags parse cleanly."""
+    import football_rl.train_ppo as tp
+
+    parser = tp.build_arg_parser()
+    defaults = parser.parse_args([])
+    assert (defaults.replay_every, defaults.replay_kind) == (1, "both")
+    parsed = parser.parse_args(["--replay-every", "5", "--replay-kind", "uniform"])
+    assert (parsed.replay_every, parsed.replay_kind) == (5, "uniform")
+
+
+@pytest.mark.parametrize(
+    "argv_extra,flag_name",
+    [
+        (["--replay-every", "0"], "--replay-every"),
+        (["--replay-every", "-1"], "--replay-every"),
+        (["--replay-kind", "bogus"], "--replay-kind"),
+    ],
+)
+def test_replay_cap_cli_rejects_invalid_values(tmp_path: Path, monkeypatch, capsys, argv_extra, flag_name) -> None:
+    """[RED] Invalid `--replay-every` (0, -1) and unknown `--replay-kind` are rejected before touching disk."""
+    import football_rl.train_ppo as tp
+
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "checkpoints" / "marker.txt"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["train_ppo", "--from-scratch", "--total-updates", "1"] + argv_extra)
+    with pytest.raises((SystemExit, ValueError)) as exc:
+        tp.main()
+    captured = capsys.readouterr()
+    assert "unrecognized arguments" not in captured.err
+    error_lines = [ln for ln in captured.err.splitlines() if "error:" in ln]
+    if isinstance(exc.value, ValueError):
+        assert flag_name in str(exc.value)
+    else:
+        assert error_lines and any(flag_name in ln for ln in error_lines)
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert not (tmp_path / "replays").exists()
+
+
+@pytest.mark.parametrize(
+    "kwargs,flag_name",
+    [
+        ({"replay_every": 0}, "replay_every"),
+        ({"replay_every": -1}, "replay_every"),
+        ({"replay_kind": "bogus"}, "replay_kind"),
+    ],
+)
+def test_replay_cap_trainer_rejects_invalid_values(tmp_path: Path, kwargs, flag_name) -> None:
+    """[RED] Trainer validation rejects invalid `replay_every` (0, -1) and `replay_kind` naming the flag."""
+    with pytest.raises(ValueError, match=flag_name):
+        _replay_cap_trainer(tmp_path, name="invalid", num_envs=1, **kwargs)
+

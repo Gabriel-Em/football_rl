@@ -807,3 +807,74 @@ def test_pipe_command_picked_up_by_idle_poll_does_not_cause_a_spurious_step() ->
         assert vec._done_sem.get_value() == 0
     finally:
         vec.close()
+
+
+@pytest.mark.parametrize("num_envs", [1, 2])
+@pytest.mark.parametrize("save_best_only", [False, True])
+def test_set_export_replays_false_skips_writes_and_holds_no_payloads(
+    tmp_path: Path, num_envs: int, save_best_only: bool
+) -> None:
+    """[RED] With `export_replays=False`, both Dummy and Subproc vec envs write nothing and hold no payloads."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    blocked_save_dir = blocker / "replays"
+
+    # interest_threshold=0.5 > 0.0 ensures post-reset compute_interest_score()==0.0 does not trigger the
+    # export_deferred_replay buffer fallback, while the completed match (seed=2, 20 steps) scores >= 0.5.
+    cfg = replace(
+        DEFAULT_CONFIG,
+        physics=replace(DEFAULT_CONFIG.physics, max_rl_steps=20),
+        replay=replace(
+            DEFAULT_CONFIG.replay,
+            save_dir=str(blocked_save_dir),
+            enable_recording=True,
+            interest_threshold=0.5,
+            save_best_only=save_best_only,
+        ),
+    )
+    vec = make_vec_football_env(cfg, num_envs=num_envs)
+    try:
+        expected_cls = DummyVecFootballEnv if num_envs == 1 else SubprocVecFootballEnv
+        assert isinstance(vec, expected_cls)
+
+        vec.set_generation(1)
+        vec.set_uniform_capture(None)
+        vec.set_export_replays(False)
+        vec.reset_array(
+            seeds=[2] * num_envs,
+            options_list=[{"generation": 1, "match_id": i + 1} for i in range(num_envs)],
+        )
+
+        rng = np.random.default_rng(2)
+        completed = [False] * num_envs
+        for _ in range(20):
+            step_act = rng.uniform(-1.0, 1.0, size=(12, ACTION_DIM)).astype(np.float32)
+            actions = np.broadcast_to(step_act, (num_envs, 12, ACTION_DIM)).copy()
+            _, _, _, done_batch, ep_summaries = vec.step_array(actions)
+            for idx, done in enumerate(done_batch):
+                if done:
+                    completed[idx] = True
+                    assert ep_summaries[idx] is not None
+                    assert ep_summaries[idx]["interest_score"] >= 0.5
+                    assert ep_summaries[idx]["last_saved_replay"] is None
+        assert all(completed)
+
+        # Reset clears _replay_buffer (mirroring trainer auto-reset) while preserving any held deferred/uniform payload.
+        vec.reset_array(
+            seeds=[200 + i for i in range(num_envs)],
+            options_list=[{"generation": 1, "match_id": num_envs + i + 1} for i in range(num_envs)],
+        )
+        for idx in range(num_envs):
+            assert vec.export_replay(idx) is None
+            assert vec.export_uniform_replay(idx) is None
+
+        if isinstance(vec, DummyVecFootballEnv):
+            for env in vec.envs:
+                assert env._deferred_replay is None
+                assert env._uniform_replay is None
+
+        assert not blocked_save_dir.exists()
+        assert blocker.read_text(encoding="utf-8") == "x"
+    finally:
+        vec.close()
+

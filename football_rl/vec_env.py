@@ -140,6 +140,9 @@ def _worker(
             elif cmd == "set_uniform_capture":
                 env.uniform_capture = bool(data)
                 remote.send(True)
+            elif cmd == "set_export_replays":
+                env.export_replays = bool(data)
+                remote.send(True)
             elif cmd == "set_generation":
                 env._deferred_replay = None
                 env._uniform_replay = None
@@ -444,6 +447,15 @@ class SubprocVecFootballEnv:
         for idx in range(self.num_envs):
             self._recv(idx)
 
+    def set_export_replays(self, enabled: bool) -> None:
+        """Enable or disable non-uniform replay export and deferral across all workers."""
+        flag = bool(enabled)
+        for idx in range(self.num_envs):
+            self._send(idx, ("set_export_replays", flag))
+        self._recv_failed_sends()
+        for idx in range(self.num_envs):
+            self._recv(idx)
+
     def export_uniform_replay(self, env_idx: int) -> Optional[str]:
         """Instruct worker `env_idx` to write its captured uniform replay to disk."""
         self._send(env_idx, ("export_uniform_replay", None))
@@ -573,6 +585,12 @@ class DummyVecFootballEnv:
     def set_uniform_capture(self, env_idx: Optional[int]) -> None:
         for idx, env in enumerate(self.envs):
             env.uniform_capture = idx == env_idx
+
+    def set_export_replays(self, enabled: bool) -> None:
+        """Enable or disable non-uniform replay export and deferral across all environments."""
+        flag = bool(enabled)
+        for env in self.envs:
+            env.export_replays = flag
 
     def export_uniform_replay(self, env_idx: int) -> Optional[str]:
         return self.envs[env_idx].export_uniform_replay()

@@ -460,6 +460,8 @@ class FootballParallelEnv(ParallelEnv):
         self._frame_events: List[Dict[str, Any]] = []
         self.last_saved_replay_path: Optional[str] = None
         self._deferred_replay: Optional[Dict[str, Any]] = None
+        # When cleared, non-uniform replay export and deferral are skipped without disabling recording.
+        self.export_replays: bool = True
         # When set, every completed match is kept (whatever its interest score) until exported.
         self.uniform_capture: bool = False
         self._uniform_replay: Optional[Dict[str, Any]] = None
@@ -3413,6 +3415,9 @@ class FootballParallelEnv(ParallelEnv):
 
     def _maybe_export_replay(self) -> Optional[str]:
         """Export or defer the full 60 Hz JSON trajectory if `interest_score >= threshold`."""
+        if not self.uniform_capture and not self.export_replays:
+            self.last_saved_replay_path = None
+            return None
         interest_score = self.compute_interest_score()
         if self.uniform_capture:
             self._uniform_replay = {
@@ -3422,6 +3427,9 @@ class FootballParallelEnv(ParallelEnv):
                 "stats": copy.deepcopy(self.stats),
                 "frames": self._ensure_replay_buffer().snapshot(),
             }
+        if not self.export_replays:
+            self.last_saved_replay_path = None
+            return None
         if interest_score < self.cfg.replay.interest_threshold:
             return None
 

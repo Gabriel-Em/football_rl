@@ -602,6 +602,18 @@ def validate_pool_settings(
         raise ValueError(f"seed must be non-negative when pool_envs > 0, got {seed}")
 
 
+REPLAY_KINDS = ("both", "uniform", "best")
+
+
+def validate_replay_settings(replay_every: Any, replay_kind: Any) -> Tuple[int, str]:
+    """Validate `--replay-every` (integer >= 1) and `--replay-kind` (`both`, `uniform`, `best`)."""
+    if isinstance(replay_every, bool) or not isinstance(replay_every, int) or replay_every < 1:
+        raise ValueError(f"--replay-every / replay_every must be an integer >= 1, got {replay_every!r}")
+    if not isinstance(replay_kind, str) or replay_kind not in REPLAY_KINDS:
+        raise ValueError(f"--replay-kind / replay_kind must be one of {REPLAY_KINDS}, got {replay_kind!r}")
+    return int(replay_every), replay_kind
+
+
 def list_pool_generations(checkpoint_dir: str, last_completed: int, pool_size: int) -> List[int]:
     """Generations of the newest `pool_size` snapshots `<checkpoint_dir>/snapshots/genNNNN` with generation <= `last_completed`.
 
@@ -1051,8 +1063,14 @@ class ParameterSharingPPOTrainer:
         accept_config_change: bool = False,
         pool_envs: int = 0,
         pool_size: int = DEFAULT_POOL_SIZE,
+        replay_every: int = 1,
+        replay_kind: str = "both",
     ) -> None:
         validate_pool_settings(int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed))
+        self.replay_every, self.replay_kind = validate_replay_settings(replay_every, replay_kind)
+        self._export_replays_active: bool = True
+        self._uniform_capture_active: bool = False
+        self._forced_replay_generation: Optional[int] = None
         self.cfg = config
         self.num_envs = num_envs
         self.rollout_steps = rollout_steps
@@ -1488,6 +1506,23 @@ class ParameterSharingPPOTrainer:
         groups = [(np.array(envs), seats, net) for _, (net, seats, envs) in sorted(grouped.items())]
         return played, frozen, FrozenSeatBatch(groups)
 
+    def _replay_flags(self, generation: int) -> Tuple[bool, bool]:
+        """Return `(write_uniform, write_regular)` for `generation` under the configured replay cap."""
+        is_last_gen = self._forced_replay_generation == generation
+        write_gen = (generation % self.replay_every == 0) or is_last_gen
+        if not write_gen:
+            return False, False
+        return (
+            self.replay_kind in ("both", "uniform"),
+            self.replay_kind in ("both", "best"),
+        )
+
+    def _sync_export_replays(self, enabled: bool) -> None:
+        """Update worker replay export/deferral gating only when the flag changes."""
+        if enabled != self._export_replays_active:
+            self.vec_env.set_export_replays(enabled)
+            self._export_replays_active = enabled
+
     def collect_rollouts(self, active_generation: int) -> Dict[str, Any]:
         """Collect `self.rollout_steps` across all parallel environments and compute per-agent GAE."""
         previous_threads = torch.get_num_threads()
@@ -1516,6 +1551,8 @@ class ParameterSharingPPOTrainer:
 
         self.vec_env.set_generation(active_generation)
         recording = bool(self.cfg.replay.enable_recording)
+        _, write_regular = self._replay_flags(active_generation)
+        self._sync_export_replays(recording and write_regular)
 
         pool_played, frozen_seats, pool_batch = (
             self._prepare_pool(active_generation) if self.pool_envs > 0 else ([], None, None)
@@ -1611,7 +1648,7 @@ class ParameterSharingPPOTrainer:
                         "kick_to_opponent": int(fstats.get("kick_to_opponent", 0)),
                         "kick_other": int(fstats.get("kick_other", 0)),
                         "pool": dict(self._pool_match_tags[env_i]) if self._pool_match_tags[env_i] else None,
-                        "replay_path": rpath or "",
+                        "replay_path": (rpath or "") if write_regular else None,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     self.match_history.append(match_record)
@@ -1636,7 +1673,7 @@ class ParameterSharingPPOTrainer:
             self.current_central_state[:] = central_batch
 
         # If save_best_only is enabled, export only the single best match replay from the winning worker
-        if self.save_best_only and gen_completed_matches and self.cfg.replay.enable_recording:
+        if write_regular and self.save_best_only and gen_completed_matches and self.cfg.replay.enable_recording:
             eligible = [
                 (env_idx, m)
                 for env_idx, m in gen_completed_matches
@@ -2054,6 +2091,8 @@ class ParameterSharingPPOTrainer:
                 "policy_head": self.policy_head,
                 "pool_envs": self.pool_envs,
                 "pool_size": self.pool_size,
+                "replay_every": self.replay_every,
+                "replay_kind": self.replay_kind,
                 "field_policy": self.blue_field_policy.state_dict(),
                 "keeper_policy": self.blue_keeper_policy.state_dict(),
                 "field_optimizer": self.blue_field_optimizer.state_dict(),
@@ -2331,6 +2370,15 @@ class ParameterSharingPPOTrainer:
                         "Pass --accept-config-change to resume anyway."
                     )
                 print(f"[Resume] Pool settings changed: {described}; continuing with the requested settings.")
+            stored_replay_every = int(state.get("replay_every", 1))
+            stored_replay_kind = str(state.get("replay_kind", "both"))
+            if (stored_replay_every, stored_replay_kind) != (self.replay_every, self.replay_kind):
+                print(
+                    f"[Resume] Replay cap changed: "
+                    f"stored replay_every={stored_replay_every}, replay_kind={stored_replay_kind!r}, "
+                    f"requested replay_every={self.replay_every}, replay_kind={self.replay_kind!r}; "
+                    "continuing with the requested settings."
+                )
             saved_seed = state.get("seed")
             if saved_seed is not None and int(saved_seed) != int(self.seed):
                 print(f"[Resume] Checkpoint seed was {int(saved_seed)}; continuing with seed={int(self.seed)}.")
@@ -2518,14 +2566,21 @@ class ParameterSharingPPOTrainer:
             for gen in range(start_gen, end_gen + 1):
                 matches_before = len(self.match_history)
                 recording = bool(self.cfg.replay.enable_recording)
+                self._forced_replay_generation = gen if gen == end_gen else None
+                write_uniform, _ = self._replay_flags(gen)
                 uniform_env = uniform_env_index(self.seed, gen, self.num_envs)
-                if recording:
+                if recording and write_uniform:
                     self.vec_env.set_uniform_capture(uniform_env)
+                    self._uniform_capture_active = True
+                elif self._uniform_capture_active:
+                    self.vec_env.set_uniform_capture(None)
+                    self._uniform_capture_active = False
                 rollout = self.collect_rollouts(active_generation=gen)
                 uniform_replay = None
-                if recording:
+                if recording and write_uniform:
                     uniform_replay = self.vec_env.export_uniform_replay(uniform_env)
                     self.vec_env.set_uniform_capture(None)
+                    self._uniform_capture_active = False
                 critic_only = gen <= self.critic_only_until_gen
                 metrics = self.update_policies(rollout, critic_only=critic_only)
                 elapsed = max(1e-6, time.time() - start_time)
@@ -2594,6 +2649,8 @@ class ParameterSharingPPOTrainer:
                     "pool_envs": self.pool_envs,
                     "pool_size": self.pool_size,
                     "pool_schedule": list(rollout.get("pool_schedule", [])),
+                    "replay_every": self.replay_every,
+                    "replay_kind": self.replay_kind,
                 }
                 if self.cfg.ppo.value_norm:
                     role_policies = {
@@ -2656,6 +2713,8 @@ class ParameterSharingPPOTrainer:
                 f"[Checkpoint Saved] State safely preserved at Generation {self.current_generation} "
                 f"(Completed Matches: {len(self.match_history)}). Exiting gracefully."
             )
+        finally:
+            self._forced_replay_generation = None
 
         return last_metrics
 
@@ -2730,14 +2789,14 @@ def select_archive_replays(
         if gen is None:
             gen = mid if mid > 0 else 0
 
-        items.append({"file": f, "gen": gen, "mid": mid, "score": score})
+        items.append({"file": f, "gen": gen, "mid": mid, "score": score, "is_uniform": "_uniform_" in base})
 
     gen_to_items = defaultdict(list)
     for item in items:
         gen_to_items[item["gen"]].append(item)
 
     for gen in gen_to_items:
-        gen_to_items[gen].sort(key=lambda x: (x["score"], x["mid"]), reverse=True)
+        gen_to_items[gen].sort(key=lambda x: (x["is_uniform"], x["score"], x["mid"]), reverse=True)
 
     sorted_gens = sorted(gen_to_items.keys())
     N = len(sorted_gens)
@@ -2979,6 +3038,17 @@ def resume_num_envs_warning(checkpoint_dir: str, num_envs: int) -> Optional[str]
     )
 
 
+def _positive_int(raw: str) -> int:
+    """Argparse type parser accepting integers >= 1."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer value: {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train 6v6 MARL Football with Independent Red vs. Blue Team PPO Policies."
@@ -3014,6 +3084,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="save_best_only",
         action="store_true",
         help="Only save the single best match replay (highest interest score) per generation when running with num_envs > 1.",
+    )
+    parser.add_argument(
+        "--replay-every",
+        type=_positive_int,
+        default=1,
+        help="Write replays only when generation %% N == 0 or on the last generation of this invocation (default: 1 = every generation).",
+    )
+    parser.add_argument(
+        "--replay-kind",
+        type=str,
+        choices=REPLAY_KINDS,
+        default="both",
+        help="Which replay kinds to write on writing generations: `both`, `uniform`, or `best` (default: both).",
     )
     parser.add_argument(
         "--shared-teams",
@@ -3155,6 +3238,7 @@ def main() -> None:
     )
 
     validate_pool_settings(args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed)
+    validate_replay_settings(args.replay_every, args.replay_kind)
 
     # 3. Handle `--from-scratch` vs automatic/explicit `--resume`
     if args.from_scratch:
@@ -3176,6 +3260,8 @@ def main() -> None:
         accept_config_change=args.accept_config_change,
         pool_envs=args.pool_envs,
         pool_size=args.pool_size,
+        replay_every=args.replay_every,
+        replay_kind=args.replay_kind,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")
