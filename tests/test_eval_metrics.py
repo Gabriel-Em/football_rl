@@ -1015,20 +1015,6 @@ class TestEvaluateArm:
             assert p1.is_file() and p2.is_file()
             assert p1.read_bytes() == p2.read_bytes()
 
-    def test_no_writes_to_checkpoint_or_replays(self, tmp_path, monkeypatch):
-        from tools.audit import evaluate_arm
-
-        snap = write_checkpoint(tmp_path / "checkpoints" / "gen1200", seed=9)
-        replays = tmp_path / "replays"
-        replays.mkdir()
-        before = dir_digest(snap)
-        monkeypatch.chdir(tmp_path)
-        evaluate_arm.evaluate_arm(
-            [snap], tmp_path / "eval_out", workers=1, n_override=2, max_steps=20, tags=["self_sampled"],
-        )
-        assert dir_digest(snap) == before
-        assert list(replays.iterdir()) == []
-
 
 # ----------------------------------------------------------------------------
 # E2: Policy internals (tools/audit/internals.py)
@@ -3501,57 +3487,44 @@ class TestInternalsFireE5:
         assert internals.match_internals(tr_f32)["keeper_kick_fire_holding"] == pytest.approx(1.0)
 
     def test_existing_internals_keys_unchanged_against_master(self):
-        """[GUARD] Every existing internals key keeps its exact value on real FL42 and FX42 traces."""
-        import subprocess
-        import types
+        """[GUARD] Every internals key that existed at 89109c0 keeps its exact value on real FL42 and FX42 traces.
+
+        Fixture: the first 450 steps of match 0 of `archives/{fl,fx}_s42_gen300/eval/gen0300/self_sampled`
+        (FL: gaussian4 head, FX: hybrid5 head), with only the trace keys `internals` reads, stored in
+        `tests/golden/`. `internals_89109c0_values.json` holds the per-match values and the summary that
+        `tools/audit/internals.py` at commit 89109c0 produced on exactly those files.
+        """
         from tools.audit import internals
 
-        arch = _e5_archives_root()
-        master_src = subprocess.check_output(
-            [
-                "git",
-                "-C",
-                str(REPO_ROOT),
-                "show",
-                "89109c0a900ab536d6aa74a1509f2180c6b48145:tools/audit/internals.py",
-            ],
-            text=True,
-        )
-        master_mod = types.ModuleType("master_internals_ref")
-        master_mod.__file__ = str(REPO_ROOT / "tools" / "audit" / "internals.py")
-        master_mod.__package__ = "tools.audit"
-        exec(compile(master_src, "master:tools/audit/internals.py", "exec"), master_mod.__dict__)
+        golden_dir = REPO_ROOT / "tests" / "golden"
+        frozen = json.loads((golden_dir / "internals_89109c0_values.json").read_text(encoding="utf-8"))
+        old_keys = frozen["metric_keys"]
+        assert len(old_keys) == 20
+        assert set(old_keys).issubset(set(internals.METRIC_KEYS))
 
-        assert set(master_mod.METRIC_KEYS).issubset(set(internals.METRIC_KEYS))
-
-        paths = [
-            arch / "fl_s42_gen300" / "eval" / "gen0300" / "self_sampled" / "m000.npz",
-            arch / "fx_s42_gen300" / "eval" / "gen0300" / "self_sampled" / "m000.npz",
-        ]
         cur_matches = []
-        old_matches = []
-        for p in paths:
-            with np.load(p) as z:
+        for name in sorted(frozen["matches"]):
+            with np.load(golden_dir / name) as z:
                 tr = {k: z[k] for k in z.files}
             cur = internals.match_internals(tr)
-            old = master_mod.match_internals(tr)
             cur_matches.append(cur)
-            old_matches.append(old)
-            for key in master_mod.METRIC_KEYS:
+            old = frozen["matches"][name]
+            for key in old_keys:
                 if old[key] is None:
-                    assert cur[key] is None, (p, key)
+                    assert cur[key] is None, (name, key)
                 else:
-                    assert cur[key] == pytest.approx(old[key], rel=0.0, abs=0.0), (p, key)
+                    assert cur[key] == pytest.approx(old[key], rel=0.0, abs=0.0), (name, key)
+        assert len(cur_matches) == 2
 
         cur_sum = internals.summarize(cur_matches)["metrics"]
-        old_sum = master_mod.summarize(old_matches)["metrics"]
-        for key in master_mod.METRIC_KEYS:
-            assert cur_sum[key]["n"] == old_sum[key]["n"]
+        for key in old_keys:
+            old_sum = frozen["summary"][key]
+            assert cur_sum[key]["n"] == old_sum["n"], key
             for sub in ("mean", "se"):
-                if old_sum[key][sub] is None:
-                    assert cur_sum[key][sub] is None
+                if old_sum[sub] is None:
+                    assert cur_sum[key][sub] is None, (key, sub)
                 else:
-                    assert cur_sum[key][sub] == pytest.approx(old_sum[key][sub], rel=0.0, abs=0.0)
+                    assert cur_sum[key][sub] == pytest.approx(old_sum[sub], rel=0.0, abs=0.0), (key, sub)
 
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,173 @@
+{
+ "source": "tools/audit/internals.py at commit 89109c0, run on the first 450 steps of match 0 of archives/{fl,fx}_s42_gen300/eval/gen0300/self_sampled",
+ "metric_keys": [
+  "sat99_throttle",
+  "sat99_steer",
+  "sat99_kick",
+  "sat99_special",
+  "grad_scale_throttle",
+  "grad_scale_steer",
+  "grad_scale_kick",
+  "grad_scale_special",
+  "p_kick_obs",
+  "p_kick_intent",
+  "kick_from_intent",
+  "p_kick_given_intent",
+  "p_kick_given_no_intent",
+  "power_mean",
+  "power_sd",
+  "full_power_share",
+  "aim_teammate_share_sampled",
+  "aim_teammate_share_mean",
+  "special_rate",
+  "special_from_intent"
+ ],
+ "matches": {
+  "internals_fl_s42_gen300_m000_first450.npz": {
+   "sat99_throttle": 0.22377777777777777,
+   "sat99_steer": 0.03311111111111111,
+   "sat99_kick": 0.1831111111111111,
+   "sat99_special": 0.10488888888888889,
+   "grad_scale_throttle": 0.31427312495578746,
+   "grad_scale_steer": 0.68145760746913,
+   "grad_scale_kick": 0.3577156912444153,
+   "grad_scale_special": 0.2909338889347879,
+   "p_kick_obs": 0.23880597014925373,
+   "p_kick_intent": 0.208955223880597,
+   "kick_from_intent": 0.625,
+   "p_kick_given_intent": 0.7142857142857143,
+   "p_kick_given_no_intent": 0.11320754716981132,
+   "power_mean": 0.6215116834411254,
+   "power_sd": 0.307960216396676,
+   "full_power_share": 0.25,
+   "aim_teammate_share_sampled": 0.125,
+   "aim_teammate_share_mean": 0.125,
+   "special_rate": 0.08466666666666667,
+   "special_from_intent": 0.4041994750656168
+  },
+  "internals_fx_s42_gen300_m000_first450.npz": {
+   "sat99_throttle": 0.2897777777777778,
+   "sat99_steer": 0.005111111111111111,
+   "sat99_kick": null,
+   "sat99_special": null,
+   "grad_scale_throttle": 0.2744491483468528,
+   "grad_scale_steer": 0.7622039432791817,
+   "grad_scale_kick": null,
+   "grad_scale_special": null,
+   "p_kick_obs": 0.1506849315068493,
+   "p_kick_intent": 0.0136986301369863,
+   "kick_from_intent": 0.09090909090909091,
+   "p_kick_given_intent": 1.0,
+   "p_kick_given_no_intent": 0.1388888888888889,
+   "power_mean": 0.6857064795660807,
+   "power_sd": 0.32209074645243096,
+   "full_power_share": 0.2727272727272727,
+   "aim_teammate_share_sampled": 0.09090909090909091,
+   "aim_teammate_share_mean": 0.18181818181818182,
+   "special_rate": 0.338,
+   "special_from_intent": 0.42077580539119
+  }
+ },
+ "summary": {
+  "sat99_throttle": {
+   "n": 2,
+   "mean": 0.25677777777777777,
+   "se": 0.033000000000000015
+  },
+  "sat99_steer": {
+   "n": 2,
+   "mean": 0.019111111111111113,
+   "se": 0.013999999999999999
+  },
+  "sat99_kick": {
+   "n": 1,
+   "mean": 0.1831111111111111,
+   "se": null
+  },
+  "sat99_special": {
+   "n": 1,
+   "mean": 0.10488888888888889,
+   "se": null
+  },
+  "grad_scale_throttle": {
+   "n": 2,
+   "mean": 0.29436113665132013,
+   "se": 0.019911988304467332
+  },
+  "grad_scale_steer": {
+   "n": 2,
+   "mean": 0.7218307753741559,
+   "se": 0.04037316790502587
+  },
+  "grad_scale_kick": {
+   "n": 1,
+   "mean": 0.3577156912444153,
+   "se": null
+  },
+  "grad_scale_special": {
+   "n": 1,
+   "mean": 0.2909338889347879,
+   "se": null
+  },
+  "p_kick_obs": {
+   "n": 2,
+   "mean": 0.1947454508280515,
+   "se": 0.0440605193212022
+  },
+  "p_kick_intent": {
+   "n": 2,
+   "mean": 0.11132692700879165,
+   "se": 0.09762829687180534
+  },
+  "kick_from_intent": {
+   "n": 2,
+   "mean": 0.35795454545454547,
+   "se": 0.26704545454545453
+  },
+  "p_kick_given_intent": {
+   "n": 2,
+   "mean": 0.8571428571428572,
+   "se": 0.14285714285714285
+  },
+  "p_kick_given_no_intent": {
+   "n": 2,
+   "mean": 0.12604821802935012,
+   "se": 0.012840670859538784
+  },
+  "power_mean": {
+   "n": 2,
+   "mean": 0.6536090815036031,
+   "se": 0.03209739806247763
+  },
+  "power_sd": {
+   "n": 2,
+   "mean": 0.31502548142455344,
+   "se": 0.007065265027877493
+  },
+  "full_power_share": {
+   "n": 2,
+   "mean": 0.26136363636363635,
+   "se": 0.011363636363636352
+  },
+  "aim_teammate_share_sampled": {
+   "n": 2,
+   "mean": 0.10795454545454546,
+   "se": 0.017045454545454544
+  },
+  "aim_teammate_share_mean": {
+   "n": 2,
+   "mean": 0.1534090909090909,
+   "se": 0.028409090909090908
+  },
+  "special_rate": {
+   "n": 2,
+   "mean": 0.21133333333333335,
+   "se": 0.12666666666666668
+  },
+  "special_from_intent": {
+   "n": 2,
+   "mean": 0.41248764022840345,
+   "se": 0.008288165162786604
+  }
+ }
+}

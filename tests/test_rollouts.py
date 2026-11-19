@@ -777,13 +777,6 @@ class TestHoldRollouts:
 # ----------------------------------------------------------------------------
 # 4. E5: X4 leftovers (F5b limit boundary, F6 checkpoint-trace match & metadata)
 # ----------------------------------------------------------------------------
-def _e5_rollouts_archives_root() -> Path:
-    for cand in (REPO_ROOT / "archives", REPO_ROOT.parent / "football_rl" / "archives"):
-        if cand.is_dir():
-            return cand
-    pytest.skip("archives directory not found")
-
-
 class TestRolloutsE5:
     def test_f5b_pos_err_limit_tight_bracket(self, tmp_path):
         """[GUARD] POS_ERR_LIMIT=1e-3 tightly bracketed: 9.0e-4 passes, 1.1e-3 is skipped and counted."""
@@ -831,18 +824,17 @@ class TestRolloutsE5:
         assert res_bad["n_matches_ok"] == 1
         assert res_bad["n_matches_skipped"] == 1
 
-    def test_f6_checkpoint_matches_real_trace_and_rejects_wrong_checkpoint(self):
-        """[RED] On archives/fl_s42_gen300 traces (1 match, workers=1), own checkpoint passes and fl_s45 raises."""
+    def test_f6_checkpoint_matches_its_own_trace_and_rejects_wrong_checkpoint(self, tmp_path):
+        """[RED] A gaussian4 trace (1 match, workers=1) passes with the checkpoint that played it; another checkpoint raises."""
         from tools.audit import rollouts
 
-        arch = _e5_rollouts_archives_root()
-        fl42_traces = arch / "fl_s42_gen300" / "eval" / "gen0300" / "self_sampled"
-        fl42_ckpt = arch / "fl_s42_gen300" / "checkpoints" / "snapshots" / "gen0300"
-        fl45_ckpt = arch / "fl_s45_gen300" / "checkpoints" / "snapshots" / "gen0300"
+        own_ckpt, trace_dir, traces = _make_gaussian_trace_run(tmp_path, max_steps=120, n=1, seed=11)
+        other_ckpt = write_head_checkpoint(tmp_path / "ckpt_other", {"blue": "gaussian4", "red": "gaussian4"}, seed=4)
+        assert len(rollouts.find_hold_decisions(traces[0])) >= 1
 
         res = rollouts.run_hold(
-            trace_dir=fl42_traces,
-            checkpoint_dir=fl42_ckpt,
+            trace_dir=trace_dir,
+            checkpoint_dir=own_ckpt,
             trace_seed=11,
             seed=1,
             max_matches=1,
@@ -850,13 +842,14 @@ class TestRolloutsE5:
         )
         assert res["n_matches_ok"] == 1
         assert res["n_matches_skipped"] == 0
+        assert res["n_decisions"] >= 1
         assert res["shaping_mode"] == str(DEFAULT_CONFIG.rewards.shaping_mode)
         assert res["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
 
         with pytest.raises(ValueError) as exc_info:
             rollouts.run_hold(
-                trace_dir=fl42_traces,
-                checkpoint_dir=fl45_ckpt,
+                trace_dir=trace_dir,
+                checkpoint_dir=other_ckpt,
                 trace_seed=11,
                 seed=1,
                 max_matches=1,
