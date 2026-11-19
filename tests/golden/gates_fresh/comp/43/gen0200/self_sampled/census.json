@@ -1,0 +1,1 @@
+{"summary":{"metrics":{"goal_no_pass_10s_share":{"mean":0.8,"n":96,"se":0.01},"hold_share_pooled":{"mean":0.21,"n":96,"se":0.01},"kick_outcome_opponent":{"mean":0.46,"n":96,"se":0.01},"kick_outcome_teammate":{"mean":0.31,"n":96,"se":0.01}},"n_matches":96}}

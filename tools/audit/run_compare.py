@@ -3,7 +3,9 @@
 Resolves each `(run, gen)` to the first supplied `EVAL_DIR` containing `gen<g:04d>/`,
 extracts target, style, census and internals metrics (mean +- SE), and averages
 `fire_sat`, `p_kick`, `p_spec` and `v_corr_mc` per role over `[g - window + 1, g]`
-from each run's `training_history.json`. Missing generations or files render as `-`.
+from each run's `training_history.json`. Missing generations or files render as `-`. The history
+table labels roles `A/red field`, `A/red keeper`, `B/blue field`, `B/blue keeper` (the stored
+`blue_*` and `red_*` keys, team A drawn red); the JSON keeps the stored keys.
 
 Usage:
   python -m tools.audit.run_compare --run NAME=EVAL_DIR[,EVAL_DIR...] [...]
@@ -283,7 +285,7 @@ def format_markdown(result: Dict[str, Any]) -> str:
                 lo, hi = _window_bounds(gi, window)
                 w_label = f"{lo}-{hi}"
                 cells = [_hist_value(result["history"][r].get(g), group, role) for r in runs]
-                lines.append(f"| {group} | {role} | {w_label} | {' | '.join(cells)} |")
+                lines.append(f"| {group} | {training_progress.ROLE_LABELS[role]} | {w_label} | {' | '.join(cells)} |")
 
     return "\n".join(lines)
 

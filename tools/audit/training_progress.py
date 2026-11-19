@@ -15,8 +15,9 @@ so the earliest possible value is first generation + window - 1. It uses the who
 `--gen-min` and `--gen-max`. Every generation needs a self-play match.
 
 With `--fire`, also prints per bucket the mean of the generation records' `fire_sat` (kick and
-special saturation), `p_kick` and `p_spec` for the four roles; histories of a trainer without fire
-telemetry print `fire: n/a (no hybrid5 telemetry)`.
+special saturation), `p_kick` and `p_spec` for the four roles, labelled by team and drawn colour
+(`A/red field`, `A/red keeper`, `B/blue field`, `B/blue keeper`; the JSON keeps the stored `blue_*` and
+`red_*` keys); histories of a trainer without fire telemetry print `fire: n/a (no hybrid5 telemetry)`.
 
 Usage:
   python tools/audit/training_progress.py [--history PATH] [--bucket 100]
@@ -42,6 +43,13 @@ from tools.audit._common import REPO_ROOT, fmt, load_json, write_json  # noqa: E
 __all__ = ["bucket_progress", "per_generation", "takeoff_summary", "takeoff_generation", "fire_progress", "main"]
 
 FIRE_ROLES = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+# Team A (seats 0-5) is stored under `blue_*` and drawn red; team B is stored under `red_*` and drawn blue.
+ROLE_LABELS = {
+    "blue_field": "A/red field",
+    "blue_keeper": "A/red keeper",
+    "red_field": "B/blue field",
+    "red_keeper": "B/blue keeper",
+}
 TAKEOFF_GOALS = 1.5
 TAKEOFF_WINDOW = 25
 
@@ -269,7 +277,7 @@ def _fire_lines(row: Dict[str, Any], fire: Optional[Dict[str, Any]]) -> List[str
         return [f"{head}: n/a"]
 
     def fields(values: Dict[str, float]) -> str:
-        return " ".join(f"{r}={values[r]:.3f}" for r in FIRE_ROLES)
+        return " ".join(f"{ROLE_LABELS[r]}={values[r]:.3f}" for r in FIRE_ROLES)
 
     return [
         f"{head} (n={fire['n']})",

@@ -946,47 +946,6 @@ class TestGates:
         non_sig = gates.delta_stat(0.091, 0.01, 0.085, 0.01)
         assert non_sig["significant"] is False
 
-    def test_two_consecutive_exceedances_rule_on_cluster_ge4(self):
-        from tools.audit import gates
-
-        pass_arm = {"s1": {
-            "1050": {"self_sampled": _fake_census_point(cluster_ge4_A=0.12)},
-            "1100": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
-            "1150": {"self_sampled": _fake_census_point(cluster_ge4_A=0.14)},
-            "1200": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
-        }}
-        fail_arm = {"s1": {
-            "1100": {"self_sampled": _fake_census_point(cluster_ge4_A=0.12)},
-            "1150": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
-            "1200": {"self_sampled": _fake_census_point(cluster_ge4_A=0.16)},
-        }}
-        assert gates.evaluate_gates(pass_arm)["gates"]["G3"]["passed"] is True
-        assert gates.evaluate_gates(fail_arm)["gates"]["G3"]["passed"] is False
-
-    def test_g9_prime_b_and_seed_ranges(self):
-        from tools.audit import gates
-
-        b3 = {
-            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.245)}},
-            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.240)}},
-        }
-        b4_pass = {
-            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.205)}},
-            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.200)}},
-        }
-        b4_fail = {
-            "s42": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.205)}},
-            "s43": {"1200": {"self_sampled": _fake_census_point(kick_propensity_pooled=0.242)}},
-        }
-        res_pass = gates.evaluate_gates(b4_pass, comparator=b3, gens=["1200"])
-        assert res_pass["gates"]["G9_prime_b"]["passed"] is True
-        assert res_pass["gates"]["G9_prime_b"]["points"]["1200"]["arm_range"] == pytest.approx([0.200, 0.205])
-        assert res_pass["gates"]["G9_prime_b"]["points"]["1200"]["comp_range"] == pytest.approx([0.240, 0.245])
-        md = gates.format_markdown(res_pass)
-        assert "0.200..0.205" in md or "0.200" in md
-
-        res_fail = gates.evaluate_gates(b4_fail, comparator=b3, gens=["1200"])
-        assert res_fail["gates"]["G9_prime_b"]["passed"] is False
 
 
 # ----------------------------------------------------------------------------
@@ -1185,91 +1144,69 @@ class TestGoalDiff:
 
 
 # ----------------------------------------------------------------------------
-# E2: fresh300 gates, EBE targets, and between-seed SD (tools/audit/gates.py)
+# E2: EBE targets and between-seed SD (tools/audit/gates.py)
 # ----------------------------------------------------------------------------
 class TestGatesE2:
-    def test_fresh300_g1_checks_last_gen_only(self):
+    def test_fresh_g1_checks_last_gen_only(self):
+        """Anchor hold share {0.18, 0.20, 0.19, 0.21} (mean 0.195, delta 0.02582): 0.15 at gen 200 followed by 0.19 at
+        gen 300 passes G1 (0.19 is inside the anchor range, so gen 200 is not judged); 0.19 at gen 200 followed by
+        0.15 at gen 300 fails (0.15 is below every anchor seed and 0.195 - 0.15 = 0.045 >= 0.02582)."""
         from tools.audit import gates
 
-        arm_pass = {"s42": {
-            "200": {"self_sampled": _fake_census_point(hold_share_pooled=0.16)},
-            "300": {"self_sampled": _fake_census_point(hold_share_pooled=0.18)},
-        }}
-        arm_fail = {"s42": {
-            "200": {"self_sampled": _fake_census_point(hold_share_pooled=0.18)},
-            "300": {"self_sampled": _fake_census_point(hold_share_pooled=0.16)},
-        }}
-        res_pass = gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="fresh300")
-        res_fail = gates.evaluate_gates(arm_fail, gens=["200", "300"], protocol="fresh300")
+        cal = _make_fake_calibration()
+        arm_pass = {"s42": _fresh_arm_seed({"200": {"hold_share_pooled": 0.15}, "300": {"hold_share_pooled": 0.19}})}
+        arm_fail = {"s42": _fresh_arm_seed({"200": {"hold_share_pooled": 0.19}, "300": {"hold_share_pooled": 0.15}})}
+        res_pass = gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="fresh", calibration=cal)
+        res_fail = gates.evaluate_gates(arm_fail, gens=["200", "300"], protocol="fresh", calibration=cal)
         assert res_pass["gates"]["G1"]["passed"] is True
         assert res_fail["gates"]["G1"]["passed"] is False
-        assert "G9_prime_b" not in res_pass["gates"]
-        # Under resume150, 0.16 at gen 200 fails G1.
-        assert gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="resume150")["gates"]["G1"]["passed"] is False
-
-    def test_fresh300_g3_checks_last_two_gens(self):
-        from tools.audit import gates
-
-        arm_pass = {"s42": {
-            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
-            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.09)},
-        }}
-        arm_fail = {"s42": {
-            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
-            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.11)},
-        }}
-        arm_recovered = {"s42": {
-            "100": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
-            "200": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.12)},
-            "300": {"self_sampled": _fake_census_point(cluster_ge4_pooled=0.09)},
-        }}
-        assert gates.evaluate_gates(arm_pass, gens=["200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is True
-        assert gates.evaluate_gates(arm_fail, gens=["200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is False
-        assert gates.evaluate_gates(arm_recovered, gens=["100", "200", "300"], protocol="fresh300")["gates"]["G3"]["passed"] is True
+        assert res_fail["gates"]["G1"]["metrics"]["hold_share_pooled"]["mean_diff"] == pytest.approx(-0.045, abs=1e-9)
 
     def _two_seed_target_arm(self, tag: str, key: str, v42: float, v43: float):
-        return {
-            "s42": {"300": {"self_sampled": _fake_census_point(), tag: _fake_census_point(**{key: (v42, 0.4)})}},
-            "s43": {"300": {"self_sampled": _fake_census_point(), tag: _fake_census_point(**{key: (v43, 0.4)})}},
-        }
+        out = {}
+        for seed, v in (("s42", v42), ("s43", v43)):
+            out[seed] = _fresh_arm_seed({"300": {}})
+            out[seed]["300"][tag]["summary"]["metrics"][key] = {"mean": v, "se": 0.4, "n": 48}
+        return out
 
     def test_ebe_targets_hand_cases(self):
         from tools.audit import gates
 
+        cal = _make_fake_calibration()
         comp = self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -10.5, -11.0)
         spec = "goals_A@vs_scripted_sampled:higher:2.0"
 
         beats = gates.evaluate_gates(
             self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -7.5),
-            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
-        )["targets"][0]
+            comparator=comp, gens=["300"], protocol="fresh", calibration=cal, targets=[spec],
+        )["targets"][-1]
         assert beats["verdict"] == "BEATS"
         assert beats["mean_diff"] == pytest.approx(3.0)
 
         split = gates.evaluate_gates(
             self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -10.8),
-            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
-        )["targets"][0]
+            comparator=comp, gens=["300"], protocol="fresh", calibration=cal, targets=[spec],
+        )["targets"][-1]
         assert split["verdict"] == "NEUTRAL"
 
         small_diff = gates.evaluate_gates(
             self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -9.9, -9.6),
-            comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
-        )["targets"][0]
+            comparator=comp, gens=["300"], protocol="fresh", calibration=cal, targets=[spec],
+        )["targets"][-1]
         assert small_diff["verdict"] == "NEUTRAL"
         assert small_diff["mean_diff"] == pytest.approx(1.0)
 
         arm_high = self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -8.0, -7.5)
         loses = gates.evaluate_gates(
             self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -10.5, -11.0),
-            comparator=arm_high, gens=["300"], protocol="fresh300", targets=[spec],
-        )["targets"][0]
+            comparator=arm_high, gens=["300"], protocol="fresh", calibration=cal, targets=[spec],
+        )["targets"][-1]
         assert loses["verdict"] == "LOSES"
 
-        one_seed = {"s42": {"300": {"self_sampled": _fake_census_point(), "vs_scripted_sampled": _fake_census_point(goals_A=(-5.0, 0.4))}}}
+        one_seed = {"s42": self._two_seed_target_arm("vs_scripted_sampled", "goals_A", -5.0, -5.0)["s42"]}
         under = gates.evaluate_gates(
-            one_seed, comparator=comp, gens=["300"], protocol="fresh300", targets=[spec],
-        )["targets"][0]
+            one_seed, comparator=comp, gens=["300"], protocol="fresh", calibration=cal, targets=[spec],
+        )["targets"][-1]
         assert under["verdict"] == "NEUTRAL"
         assert under["note"]
 
@@ -1277,48 +1214,49 @@ class TestGatesE2:
         lower_beats = gates.evaluate_gates(
             self._two_seed_target_arm("vs_scripted_sampled", "goals_B", 4.0, 5.0),
             comparator=self._two_seed_target_arm("vs_scripted_sampled", "goals_B", 8.0, 9.0),
-            gens=["300"], protocol="fresh300", targets=["goals_B@vs_scripted_sampled:lower:2.0"],
-        )["targets"][0]
+            gens=["300"], protocol="fresh", calibration=cal, targets=["goals_B@vs_scripted_sampled:lower:2.0"],
+        )["targets"][-1]
         assert lower_beats["verdict"] == "BEATS"
 
     def test_between_seed_sample_sd_at_last_gen(self):
+        """Two seeds at 0.1906 and 0.1739: mean 0.18225, deviations +-0.00835, sample SD 0.00835 * sqrt(2) = 0.0118087."""
         from tools.audit import gates
 
         arm = {
-            "s42": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=0.1906)}},
-            "s43": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=0.1739)}},
+            "s42": _fresh_arm_seed({"300": {"hold_share_pooled": 0.1906}}),
+            "s43": _fresh_arm_seed({"300": {"hold_share_pooled": 0.1739}}),
         }
-        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh300")
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration())
         sd = res["gates"]["G1"]["metrics"]["hold_share_pooled"]["points"]["300"]["arm_sd"]
         assert sd == pytest.approx(0.01180868, abs=1e-5)
         md = gates.format_markdown(res)
         assert "0.0118" in md
 
-    def test_cli_fresh300_with_multi_tag_target(self, tmp_path, capsys):
+    def test_cli_explicit_target_against_comparator(self, tmp_path, capsys):
+        """`--target goal_diff@vs_scripted_sampled:higher:2.0` is judged after T1-T3: arm {-8.0, -7.5} against comparator
+        {-10.5, -11.0} on the blue tag gives mean diff +3.000 and BEATS (the arm's lowest seed beats the comparator's highest,
+        and 3.0 >= 2.0). The red tag is the same in both runs, so T1 (the blue/red average) moves by only +1.5."""
         from tools.audit import gates
 
-        for seed, gd, hs in (("s42", -8.0, 0.19), ("s43", -7.5, 0.18)):
-            for tag, pt in (("self_sampled", _fake_census_point(hold_share_pooled=hs)),
-                            ("vs_scripted_sampled", {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": gd, "se": 0.4, "n": 48}}}})):
-                p = tmp_path / "arm" / seed / "gen300" / tag
-                p.mkdir(parents=True)
-                (p / "census.json").write_text(json.dumps(pt), encoding="utf-8")
-        for seed, gd, hs in (("s42", -10.5, 0.18), ("s43", -11.0, 0.18)):
-            for tag, pt in (("self_sampled", _fake_census_point(hold_share_pooled=hs)),
-                            ("vs_scripted_sampled", {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": gd, "se": 0.4, "n": 48}}}})):
-                p = tmp_path / "comp" / seed / "gen300" / tag
-                p.mkdir(parents=True)
-                (p / "census.json").write_text(json.dumps(pt), encoding="utf-8")
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration()), encoding="utf-8")
+        for name, values in (("arm", {"s42": -8.0, "s43": -7.5}), ("comp", {"s42": -10.5, "s43": -11.0})):
+            for seed, gd in values.items():
+                _write_e3_anchor_dir(tmp_path / name / seed, "300", self_overrides=_FRESH_SELF_BASE, bot_blue_gd=gd, bot_red_gd=-20.0)
 
         rc = gates.main([
             "--arm", f"s42={tmp_path}/arm/s42", f"s43={tmp_path}/arm/s43",
             "--comparator", f"s42={tmp_path}/comp/s42", f"s43={tmp_path}/comp/s43",
-            "--protocol", "fresh300", "--gens", "300",
+            "--protocol", "fresh", "--calibration", str(cal_path), "--gens", "300",
             "--target", "goal_diff@vs_scripted_sampled:higher:2.0",
         ])
         assert rc == 0
-        out = capsys.readouterr().out
-        assert "BEATS" in out and "+3.000" in out
+        rows = {ln.split("|")[1].strip(): [c.strip() for c in ln.split("|")[1:-1]] for ln in capsys.readouterr().out.splitlines()
+                if ln.startswith("| T1 (") or ln.startswith("| goal_diff@")}
+        explicit = rows["goal_diff@vs_scripted_sampled"]
+        assert explicit[6] == "+3.000" and explicit[7] == "BEATS"
+        t1 = rows["T1 (informational at gen 300)"]
+        assert t1[6] == "+1.500" and t1[7] == "NEUTRAL"
 
 
 # ----------------------------------------------------------------------------
@@ -2119,18 +2057,19 @@ class TestGatesFreshE3:
         msg_t_comp = str(exc_t_comp.value)
         assert "c91" in msg_t_comp and "300" in msg_t_comp and "vs_frozen" in msg_t_comp and "goal_diff" in msg_t_comp
 
-    def test_resume150_and_fresh300_unchanged_with_missing_data(self):
-        """resume150 and fresh300 keep their missing-data behaviour unchanged."""
+    def test_explicit_target_on_an_absent_tag_is_neutral_not_an_error(self):
+        """[GUARD] An explicit `--target` whose tag no arm seed has is reported NEUTRAL with a note (no seed has a value),
+        while the gates themselves fail closed on missing data (see `test_fresh_protocol_fails_closed_on_missing_data`)."""
         from tools.audit import gates
 
-        arm = {"s42": {"300": {"self_sampled": _fake_census_point(hold_share_pooled=(None, 0.0))}}}
-        res_f300 = gates.evaluate_gates(arm, gens=["200", "300"], protocol="fresh300", targets=["goal_diff@vs_frozen:higher:0.5"])
-        assert res_f300["gates"]["G1"]["metrics"]["hold_share_pooled"]["passed"] is None
-        assert res_f300["targets"][0]["verdict"] == "NEUTRAL"
-
-        res_r150 = gates.evaluate_gates(arm, gens=["300", "1200"], protocol="resume150", targets=["goal_diff@vs_frozen:higher:0.5"])
-        assert res_r150["gates"]["G1"]["metrics"]["hold_share_pooled"]["passed"] is None
-        assert res_r150["targets"][0]["verdict"] == "NEUTRAL"
+        arm = {s: _fresh_arm_seed({"300": {}}) for s in ("s42", "s43")}
+        res = gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(),
+                                   targets=["goal_diff@absent_tag:higher:0.5"])
+        target = res["targets"][-1]
+        assert target["key"] == "goal_diff" and target["tag"] == "absent_tag"
+        assert target["verdict"] == "NEUTRAL"
+        assert target["mean_diff"] is None
+        assert "fewer than 2 seeds (arm=0, comparator=0)" in target["note"]
 
     def test_fresh_protocol_rejects_mismatched_calibration_constants(self, tmp_path):
         """[RED] Loading/evaluating calibration rejects guard key, worse direction, or target tag mismatch."""
@@ -2596,14 +2535,6 @@ class TestLearningFloor:
         assert "| 42 | -4.000 | -3.450 | +0.550 | PASS |" in lines
         assert "| 43 | -4.000 | -3.550 | +0.450 | FAIL |" in lines
 
-    def test_fresh300_and_resume150_have_no_learning_floor(self):
-        """[GUARD] The older protocols carry neither C0L, G6 nor a primary target."""
-        from tools.audit import gates
-
-        arm = {"42": {"300": {"self_sampled": _fake_census_point()}}}
-        for protocol in ("fresh300", "resume150"):
-            res = gates.evaluate_gates(arm, gens=["300"], protocol=protocol)
-            assert "C0L" not in res["gates"] and "G6" not in res["gates"] and "primary_target" not in res
 
 
 class TestTakeoffGeneration:
@@ -2793,12 +2724,12 @@ class TestFireSummary:
                 assert fire["p_spec"][role] == pytest.approx(exp["p_spec"][i], abs=1e-12)
         lines = out.splitlines()
         assert "  fire gens     1-    2 (n=2)" in lines
-        assert "    fire_sat.kick  blue_field=0.030 blue_keeper=0.130 red_field=0.230 red_keeper=0.330" in lines
-        assert "    fire_sat.spec  blue_field=0.530 blue_keeper=0.630 red_field=0.730 red_keeper=0.830" in lines
-        assert "    p_kick         blue_field=0.215 blue_keeper=0.315 red_field=0.415 red_keeper=0.515" in lines
-        assert "    p_spec         blue_field=0.585 blue_keeper=0.485 red_field=0.385 red_keeper=0.285" in lines
+        assert "    fire_sat.kick  A/red field=0.030 A/red keeper=0.130 B/blue field=0.230 B/blue keeper=0.330" in lines
+        assert "    fire_sat.spec  A/red field=0.530 A/red keeper=0.630 B/blue field=0.730 B/blue keeper=0.830" in lines
+        assert "    p_kick         A/red field=0.215 A/red keeper=0.315 B/blue field=0.415 B/blue keeper=0.515" in lines
+        assert "    p_spec         A/red field=0.585 A/red keeper=0.485 B/blue field=0.385 B/blue keeper=0.285" in lines
         assert "  fire gens     3-    4 (n=2)" in lines
-        assert "    fire_sat.kick  blue_field=0.070 blue_keeper=0.170 red_field=0.270 red_keeper=0.370" in lines
+        assert "    fire_sat.kick  A/red field=0.070 A/red keeper=0.170 B/blue field=0.270 B/blue keeper=0.370" in lines
         assert "fire: n/a (no hybrid5 telemetry)" not in out
 
     def test_gaussian_history_prints_not_available_and_exits_zero(self, tmp_path, capsys):
@@ -2836,6 +2767,22 @@ class TestFireSummary:
         assert data["buckets"][0]["fire"] is None
         assert data["buckets"][1]["fire"]["n"] == 2
         assert "  fire gens     1-    2: n/a" in out.splitlines()
+
+
+    def test_fire_lines_label_the_teams_by_drawn_colour(self, tmp_path, capsys):
+        """[RED] Team A (stored `blue_*`, seats 0-5) is drawn red and team B (stored `red_*`) blue, so the fire lines print
+        `A/red field`, `A/red keeper`, `B/blue field`, `B/blue keeper`. Two generations, one bucket, hand values:
+        fire_sat.kick of role i is 0.10*i + 0.02*g averaged over g = 1, 2, i.e. 0.03, 0.13, 0.23, 0.33; the JSON keys stay the stored names."""
+        rc, out, data = self._run(tmp_path, capsys, _hybrid_history(2))
+        assert rc == 0
+        lines = out.splitlines()
+        assert "    fire_sat.kick  A/red field=0.030 A/red keeper=0.130 B/blue field=0.230 B/blue keeper=0.330" in lines
+        assert "    p_kick         A/red field=0.215 A/red keeper=0.315 B/blue field=0.415 B/blue keeper=0.515" in lines
+        assert not any(name in out for name in FIRE_ROLES)
+        fire = data["buckets"][0]["fire"]
+        assert set(fire["p_kick"]) == set(FIRE_ROLES)
+        assert fire["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.03, abs=1e-12)
+        assert fire["fire_sat"]["red_keeper"]["kick"] == pytest.approx(0.33, abs=1e-12)
 
 
 class TestGatesTakeoff:
@@ -2886,13 +2833,6 @@ class TestGatesTakeoff:
         hist = {"42": _takeoff_history(37), "99": _takeoff_history(37)}
         with pytest.raises(ValueError, match="99"):
             gates.evaluate_gates(arm, gens=["300"], protocol="fresh", calibration=_make_fake_calibration(), histories=hist)
-
-    def test_histories_with_other_protocols_are_an_error(self):
-        from tools.audit import gates
-
-        arm = {"42": {"300": {"self_sampled": _fake_census_point()}}}
-        with pytest.raises(ValueError, match="history|histories"):
-            gates.evaluate_gates(arm, gens=["300"], protocol="fresh300", histories={"42": _takeoff_history(37)})
 
     def test_markdown_takeoff_table(self):
         """[RED] The Takeoff section lists seed, takeoff generation (none when absent) and the history range."""
@@ -2994,37 +2934,46 @@ class TestExitOnFailure:
         argv = _fresh_cli_argv(tmp_path, {"300": (-1.0, -1.0)})
         assert gates.main([*argv, "--exit-on-c0"]) == 0
 
-    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
-    def test_flag_with_other_protocols_is_an_error(self, tmp_path, protocol):
-        """[RED] --exit-on-c0 belongs to the fresh protocol only."""
-        from tools.audit import gates
-
-        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
-        with pytest.raises(ValueError, match="exit-on-c0"):
-            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--exit-on-c0"])
 
 
 class TestFreshCliFlags:
-    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
-    def test_calibration_with_other_protocols_is_an_error(self, tmp_path, protocol):
-        """[RED] --calibration is only read by the fresh protocol, so giving it with another one is an error."""
+    def test_default_protocol_is_fresh(self, tmp_path, capsys):
+        """[RED] Without `--protocol` the fresh protocol runs: the report header names it and the C0L, G6 and style sections exist."""
         from tools.audit import gates
 
-        cal_path = tmp_path / "cal.json"
-        cal_path.write_text(json.dumps(_make_fake_calibration()), encoding="utf-8")
-        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
-        with pytest.raises(ValueError, match="calibration"):
-            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--calibration", str(cal_path)])
+        argv = _fresh_cli_argv(tmp_path, {"100": (-4.0, -4.0), "300": (-1.0, -1.0)})
+        i = argv.index("--protocol")
+        del argv[i:i + 2]
+        out_json = tmp_path / "g.json"
+        assert gates.main([*argv, "--json", str(out_json)]) == 0
+        out = capsys.readouterr().out
+        assert "protocol=fresh" in out.splitlines()[0]
+        assert "## C0L Learning Floor" in out and "## Takeoff (G6)" in out
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["protocol"] == "fresh" and data["primary_target"] == "T2"
 
-    @pytest.mark.parametrize("protocol", ["fresh300", "resume150"])
-    def test_history_with_other_protocols_is_an_error(self, tmp_path, protocol):
-        """[RED] --history is only read by the fresh protocol."""
+    def test_bare_call_without_calibration_raises_the_required_error(self, tmp_path):
+        """[RED] `gates` with neither `--protocol` nor `--calibration` raises the fresh protocol's "--calibration is required" error."""
         from tools.audit import gates
 
         _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
-        h = _write_history(tmp_path / "h.json", _takeoff_history(37))
-        with pytest.raises(ValueError, match="history"):
-            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300", "--history", f"42={h}"])
+        with pytest.raises(ValueError, match="--calibration is required"):
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--gens", "300"])
+
+    @pytest.mark.parametrize("protocol", ["resume150", "fresh300"])
+    def test_retired_protocol_names_are_rejected(self, tmp_path, capsys, protocol):
+        """[RED] argparse rejects `--protocol resume150|fresh300` (exit status 2, "invalid choice"), and so does `evaluate_gates`;
+        the only protocol left is `fresh`."""
+        from tools.audit import gates
+
+        assert gates.PROTOCOLS == ("fresh",)
+        _write_e3_anchor_dir(tmp_path / "arm" / "42", "300", self_overrides=_FRESH_SELF_BASE)
+        with pytest.raises(SystemExit) as exc:
+            gates.main(["--arm", f"42={tmp_path}/arm/42", "--protocol", protocol, "--gens", "300"])
+        assert exc.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+        with pytest.raises(ValueError, match="protocol"):
+            gates.evaluate_gates({"42": _fresh_arm_seed({"300": {}})}, gens=["300"], protocol=protocol, calibration=_make_fake_calibration())
 
 
 class TestCalibrationValidation:
@@ -3286,13 +3235,6 @@ class TestPoolMatchExclusion:
 # ----------------------------------------------------------------------------
 # E5: Fire-behaviour internals (tools/audit/internals.py)
 # ----------------------------------------------------------------------------
-def _e5_archives_root() -> Path:
-    for cand in (REPO_ROOT / "archives", REPO_ROOT.parent / "football_rl" / "archives"):
-        if cand.is_dir():
-            return cand
-    pytest.skip("archives directory not found")
-
-
 class TestInternalsFireE5:
     def test_fire_internals_hand_trace_and_aggregation(self, tmp_path, monkeypatch):
         """[RED] Hand-solved 4-decision trace for keeper_special_rate, field_special_rate_far,
@@ -3886,99 +3828,69 @@ class TestStyleTargetsE6:
         assert all(r["verdict"] == "LOSES" for r in res_lose["style_targets"])
         assert all(g["passed"] is not False for g in res_lose["gates"].values())
 
-    def test_real_archives_preexisting_outputs_byte_identical_to_master(self, tmp_path):
-        """[GUARD] Pre-existing JSON keys and MD sections on FE vs FL match pre-E6 commit 4b25141 byte-for-byte."""
-        import subprocess
-        import sys
-        import types
+    FRESH_GOLDEN_SEEDS = ("42", "43", "44", "45")
+
+    @classmethod
+    def _run_fresh_golden(cls, fixture: Path, out_dir: Path, monkeypatch, capsys):
+        """Run `gates` with relative paths from the fixture root; return (exit code, stdout, Markdown bytes, JSON bytes)."""
         from tools.audit import gates
 
-        arch = _e5_archives_root()
-        cal_path = arch / "fl_anchor_calibration.json"
-        if not cal_path.is_file():
-            pytest.skip("fl_anchor_calibration.json not found")
-
-        ref_commit = "4b25141"
-        ref_src = subprocess.check_output(
-            ["git", "-C", str(REPO_ROOT), "show", f"{ref_commit}:tools/audit/gates.py"],
-            text=True,
-        )
-        ref_mod = types.ModuleType("ref_gates_4b25141")
-        ref_mod.__file__ = str(REPO_ROOT / "tools" / "audit" / "gates.py")
-        ref_mod.__package__ = "tools.audit"
-        sys.modules["ref_gates_4b25141"] = ref_mod
-        try:
-            exec(compile(ref_src, f"{ref_commit}:tools/audit/gates.py", "exec"), ref_mod.__dict__)
-        finally:
-            sys.modules.pop("ref_gates_4b25141", None)
-
-        seeds = ("42", "43", "44", "45")
-        cur_json = tmp_path / "cur.json"
-        cur_md = tmp_path / "cur.md"
-        old_json = tmp_path / "old.json"
-        old_md = tmp_path / "old.md"
-        arm_dirs = {s: arch / f"fe_s{s}_gen300" / "eval" for s in seeds}
-        common_tail = [
-            "--comparator", *[f"{s}={arch / f'fl_s{s}_gen300' / 'eval'}" for s in seeds],
-            "--history", *[f"{s}={arch / f'fe_s{s}_gen300' / 'checkpoints' / 'training_history.json'}" for s in seeds],
+        monkeypatch.chdir(fixture)
+        seeds = cls.FRESH_GOLDEN_SEEDS
+        rc = gates.main([
+            "--arm", *[f"{s}=arm/{s}" for s in seeds],
+            "--comparator", *[f"{s}=comp/{s}" for s in seeds],
+            "--history", *[f"{s}=histories/{s}.json" for s in seeds],
+            "--calibration", "calibration.json",
             "--gens", "100", "200", "300",
             "--protocol", "fresh",
-            "--calibration", str(cal_path),
             "--exit-on-c0",
-        ]
-        common_argv = ["--arm", *[f"{s}={arm_dirs[s]}" for s in seeds], *common_tail]
-        assert gates.main([*common_argv, "--json", str(cur_json), "--md", str(cur_md)]) == 0
-        assert ref_mod.main([*common_argv, "--json", str(old_json), "--md", str(old_md)]) == 0
+            "--json", str(out_dir / "report.json"), "--md", str(out_dir / "report.md"),
+        ])
+        out = capsys.readouterr().out
+        return rc, out, (out_dir / "report.md").read_bytes(), (out_dir / "report.json").read_bytes()
 
-        old_json_text = old_json.read_text(encoding="utf-8")
-        old_data = json.loads(old_json_text)
-        old_md_text = old_md.read_text(encoding="utf-8")
+    def test_fresh_gates_output_matches_the_frozen_golden(self, tmp_path, monkeypatch, capsys):
+        """[GUARD] The whole fresh-protocol report (Markdown, JSON and exit code) on the synthetic fixture
+        `tests/golden/gates_fresh/` is byte-identical to `tests/golden/gates_fresh_expected.{md,json,exit}`.
 
-        def strip_style_section(md_text: str) -> str:
-            marker = "\n\n## Style Targets\n"
-            next_marker = "\n\n## Per-team Informational"
-            i = md_text.index(marker)
-            j = md_text.index(next_marker, i)
-            return md_text[:i] + md_text[j:]
+        The fixture holds invented values for 4 arm and 4 comparator seeds at gens 100, 200, 300, four training
+        histories and a calibration file. It makes C0 fail on seed 44, C0L pass on three seeds and fail on seed 43,
+        G3 fail, G6 pass with one seed without takeoff, T1 BEATS with T2 and T3 NEUTRAL, S1 BEATS, S3 LOSES, S2 and
+        S4 NEUTRAL, and fills the per-team section. The expected files were produced at commit 5bbfa72, before
+        the resume protocols were removed, by running from `tests/golden/gates_fresh/`:
+            python -m tools.audit.gates --arm 42=arm/42 43=arm/43 44=arm/44 45=arm/45
+              --comparator 42=comp/42 ... 45=comp/45 --history 42=histories/42.json ... 45=histories/45.json
+              --calibration calibration.json --gens 100 200 300 --protocol fresh --exit-on-c0
+              --json gates_fresh_expected.json --md gates_fresh_expected.md
+        (exit status 2, stored in `gates_fresh_expected.exit`).
+        """
+        golden = REPO_ROOT / "tests" / "golden"
+        rc, out, md, js = self._run_fresh_golden(golden / "gates_fresh", tmp_path, monkeypatch, capsys)
+        assert md == (golden / "gates_fresh_expected.md").read_bytes()
+        assert js == (golden / "gates_fresh_expected.json").read_bytes()
+        assert rc == int((golden / "gates_fresh_expected.exit").read_text(encoding="utf-8"))
+        assert out.encode("utf-8") == md + b"\n"
 
-        def compare_preexisting(json_path: Path, md_path: Path) -> tuple[bool, bool]:
-            cand_data = json.loads(json_path.read_text(encoding="utf-8"))
-            assert set(old_data).issubset(set(cand_data))
-            cand_stripped_json = json.dumps({k: cand_data[k] for k in old_data}, indent=2, sort_keys=True)
-            cand_stripped_md = strip_style_section(md_path.read_text(encoding="utf-8"))
-            return cand_stripped_json == old_json_text, cand_stripped_md == old_md_text
+    def test_fresh_gates_golden_fails_when_one_census_value_changes(self, tmp_path, monkeypatch, capsys):
+        """[GUARD] Changing one census input in a copy of the fixture (seed 42, gen 300, `self_sampled`
+        `hold_share_pooled` 0.25 -> 0.35) changes both reports, so the golden comparison is not vacuous."""
+        import shutil
 
-        assert compare_preexisting(cur_json, cur_md) == (True, True)
-
-        # Real planted-change check: perturb one pre-existing input value (seed 42 gen 300 vs_frozen goal_diff)
-        # in a scratch symlinked copy of fe_s42_gen300/eval and re-run the same comparison routine.
-        planted_eval = tmp_path / "planted_fe_s42_eval"
-        src_eval = arm_dirs["42"]
-        for gen_dir in src_eval.iterdir():
-            if not gen_dir.is_dir():
-                continue
-            if gen_dir.name != "gen0300":
-                (planted_eval / gen_dir.name).parent.mkdir(parents=True, exist_ok=True)
-                (planted_eval / gen_dir.name).symlink_to(gen_dir)
-                continue
-            dst_g300 = planted_eval / "gen0300"
-            dst_g300.mkdir(parents=True, exist_ok=True)
-            for tag_dir in gen_dir.iterdir():
-                if tag_dir.name != "vs_frozen":
-                    (dst_g300 / tag_dir.name).symlink_to(tag_dir)
-                    continue
-                dst_vf = dst_g300 / "vs_frozen"
-                dst_vf.mkdir(parents=True, exist_ok=True)
-                vf_payload = json.loads((tag_dir / "census.json").read_text(encoding="utf-8"))
-                vf_payload["summary"]["metrics"]["goal_diff"]["mean"] += 0.5
-                (dst_vf / "census.json").write_text(json.dumps(vf_payload), encoding="utf-8")
-
-        planted_json = tmp_path / "planted.json"
-        planted_md = tmp_path / "planted.md"
-        planted_arm_dirs = {**arm_dirs, "42": planted_eval}
-        planted_argv = ["--arm", *[f"{s}={planted_arm_dirs[s]}" for s in seeds], *common_tail]
-        assert gates.main([*planted_argv, "--json", str(planted_json), "--md", str(planted_md)]) == 0
-        assert compare_preexisting(planted_json, planted_md) == (False, False)
+        golden = REPO_ROOT / "tests" / "golden"
+        fixture = tmp_path / "fixture"
+        shutil.copytree(golden / "gates_fresh", fixture)
+        census_path = fixture / "arm" / "42" / "gen0300" / "self_sampled" / "census.json"
+        payload = json.loads(census_path.read_text(encoding="utf-8"))
+        assert payload["summary"]["metrics"]["hold_share_pooled"]["mean"] == 0.25
+        payload["summary"]["metrics"]["hold_share_pooled"]["mean"] = 0.35
+        census_path.write_text(json.dumps(payload), encoding="utf-8")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        _, _, md, js = self._run_fresh_golden(fixture, out_dir, monkeypatch, capsys)
+        assert md != (golden / "gates_fresh_expected.md").read_bytes()
+        assert js != (golden / "gates_fresh_expected.json").read_bytes()
+        assert "42=0.350" in md.decode("utf-8")
 
     def test_load_arm_dir_payload_has_no_bookkeeping_and_is_json_serializable(self, tmp_path):
         """[RED] load_arm_dir returns clean JSON-serializable payloads with no internal bookkeeping keys."""
@@ -4183,3 +4095,29 @@ class TestRunCompareE6:
         assert " - |" in md or "| - |" in md
 
 
+    def test_run_compare_labels_the_teams_by_drawn_colour(self, tmp_path):
+        """[RED] The history table prints `A/red field`, `A/red keeper`, `B/blue field`, `B/blue keeper` for the stored roles
+        `blue_field`, `blue_keeper`, `red_field`, `red_keeper`; the JSON keys keep the stored names. Two generations, window 2, hand
+        values: fire_sat.kick of role i is 0.10*i + 0.02*g averaged over g = 1, 2 (0.03, 0.13, 0.23, 0.33), v_corr_mc is 0.5 + 0.1*i."""
+        from tools.audit import run_compare
+
+        roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+        hist = _hybrid_history(2)
+        for rec in hist["generations"]:
+            rec["v_corr_mc"] = {r: 0.5 + 0.1 * i for i, r in enumerate(roles)}
+        h = _write_history(tmp_path / "h.json", hist)
+        ev = _write_e6_eval_dir(tmp_path / "runA", 2)
+        out_json = tmp_path / "cmp.json"
+        out_md = tmp_path / "cmp.md"
+        assert run_compare.main(["--run", f"runA={ev}", "--history", f"runA={h}", "--gens", "2", "--window", "2",
+                                 "--md", str(out_md), "--json", str(out_json)]) == 0
+        lines = out_md.read_text(encoding="utf-8").splitlines()
+        assert "| fire_sat.kick | A/red field | 1-2 | 0.030 |" in lines
+        assert "| fire_sat.kick | A/red keeper | 1-2 | 0.130 |" in lines
+        assert "| fire_sat.kick | B/blue field | 1-2 | 0.230 |" in lines
+        assert "| fire_sat.kick | B/blue keeper | 1-2 | 0.330 |" in lines
+        assert "| v_corr_mc | B/blue keeper | 1-2 | 0.800 |" in lines
+        assert not any(f"| {name} |" in ln for ln in lines for name in roles)
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["history"]["runA"]["2"]["fire"]["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.03, abs=1e-12)
+        assert set(data["history"]["runA"]["2"]["v_corr_mc"]) == set(roles)
