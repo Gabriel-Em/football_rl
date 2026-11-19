@@ -8,8 +8,9 @@ Supports `--protocol`:
   fresh300   guards G1-G5 over the final points (superseded by `fresh`)
   fresh      requires `--calibration PATH`: C0 catastrophe floors (gens >= 200), C0L learning
              floor (T2 gain from gen 100 to the last generation), G1-G5 relative guards vs
-             calibration anchor, G6 takeoff (with `--history`), and targets T1-T3 vs
-             `--comparator` or anchor; T2 is the primary target
+             calibration anchor, G6 takeoff (with `--history`), targets T1-T3 vs
+             `--comparator` or anchor (T2 is primary), and style targets S1-S4 at the last
+             generation when `--comparator` is given (never alter gate status or exit code)
 
 C0 floors (per arm seed, gens >= 200, strict; `gk_*` rows apply to each keeper):
   hold_share_pooled < 0.05      holder_spell_s_pooled < 0.15
@@ -58,6 +59,7 @@ __all__ = [
     "LEARNING_FLOOR_GAIN",
     "TAKEOFF_FAIL_SHARE",
     "PRIMARY_TARGET",
+    "STYLE_TARGET_SPECS",
     "TargetSpec",
     "parse_target_spec",
     "delta_stat",
@@ -120,6 +122,14 @@ FRESH_TARGET_TAGS: Dict[str, Tuple[str, ...]] = {
 }
 
 FRESH_TARGET_DIRECTION: Dict[str, str] = {"T1": "higher", "T2": "higher", "T3": "higher"}
+
+STYLE_TARGET_TAG = "self_sampled"
+STYLE_TARGET_SPECS: Tuple[Tuple[str, str, str, str, float], ...] = (
+    ("S1", "hold_share_pooled", "census.json", "higher", 0.01),
+    ("S2", "aim_teammate_share_sampled", "internals.json", "higher", 0.02),
+    ("S3", "kick_outcome_opponent", "census.json", "lower", 0.02),
+    ("S4", "goal_no_pass_10s_share", "census.json", "lower", 0.05),
+)
 
 FRESH_INFO_METRICS: List[str] = [
     "hold_share_A", "hold_share_B",
@@ -217,8 +227,11 @@ def _extract_metrics_dict(obj: Any) -> Dict[str, Dict[str, Any]]:
     raise ValueError("unrecognized census JSON layout")
 
 
-def load_arm_dir(root: Path | str, tag: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """Load `{gen: {tag: census_dict}}` from an `evaluate_arm.py` output directory."""
+def _load_arm_dir(
+    root: Path | str,
+    tag: Optional[str] = None,
+    meta_out: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
     base = Path(root)
     if not base.is_dir():
         raise FileNotFoundError(f"arm output directory not found: {base}")
@@ -233,15 +246,28 @@ def load_arm_dir(root: Path | str, tag: Optional[str] = None) -> Dict[str, Dict[
             if cj.is_file():
                 payload = json.loads(cj.read_text(encoding="utf-8"))
                 ij = tag_dir / "internals.json"
+                tag_meta: Dict[str, Any] = {"census_path": str(cj)}
                 if ij.is_file():
                     int_payload = json.loads(ij.read_text(encoding="utf-8"))
                     c_metrics = _extract_metrics_dict(payload)
-                    for k, v in _extract_metrics_dict(int_payload).items():
+                    int_metrics = _extract_metrics_dict(int_payload)
+                    for k, v in int_metrics.items():
                         c_metrics.setdefault(k, v)
+                    tag_meta["internals_path"] = str(ij)
+                    tag_meta["internals_keys"] = set(int_metrics)
+                else:
+                    tag_meta["internals_missing"] = str(ij)
+                if meta_out is not None:
+                    meta_out[(gen_key, tag_dir.name)] = tag_meta
                 tags_map[tag_dir.name] = payload
         if tags_map:
             out[gen_key] = tags_map
     return out
+
+
+def load_arm_dir(root: Path | str, tag: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Load `{gen: {tag: census_dict}}` from an `evaluate_arm.py` output directory."""
+    return _load_arm_dir(root, tag=tag)
 
 
 def _normalize_arm(raw_arm: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -564,6 +590,82 @@ def _multi_tag_per_seed(
     return out
 
 
+def _require_style_metric(
+    norm_data: Dict[str, Dict[str, Dict[str, Any]]],
+    seed: str,
+    gen: str,
+    tag: str,
+    metric: str,
+    source_file: str,
+    *,
+    role: str = "arm",
+    meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+) -> float:
+    """Read one style-target metric, failing closed with seed, generation and file path."""
+    info = (meta or {}).get(seed, {}).get((gen, tag))
+    src_path: Optional[str] = None
+    if info is not None:
+        if source_file == "internals.json" and info.get("internals_missing"):
+            raise ValueError(
+                f"{role} seed {seed!r} gen {gen!r} tag {tag!r} missing internals.json "
+                f"at {info['internals_missing']}"
+            )
+        src_path = info.get("internals_path") if source_file == "internals.json" else info.get("census_path")
+        if source_file == "internals.json" and "internals_keys" in info and metric not in info["internals_keys"]:
+            raise ValueError(
+                f"{role} seed {seed!r} gen {gen!r} tag {tag!r} metric {metric!r} is missing "
+                f"in {src_path}"
+            )
+    try:
+        return _require_seed_metric(norm_data, seed, gen, tag, metric, role=role)
+    except ValueError as exc:
+        if src_path:
+            raise ValueError(f"{exc} ({src_path})") from exc
+        raise
+
+
+def _evaluate_style_targets(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    gen: str,
+    *,
+    arm_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+    comp_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Evaluate S1-S4 at `gen` against `comp_norm` using comparator ddof=1 SD and `_ebe_verdict`."""
+    if comp_norm is None:
+        return None
+    out: List[Dict[str, Any]] = []
+    for sid, key, source_file, direction, floor in STYLE_TARGET_SPECS:
+        arm_seed_vals: Dict[str, Optional[float]] = {
+            s: _require_style_metric(arm_norm, s, gen, STYLE_TARGET_TAG, key, source_file, role="arm", meta=arm_meta)
+            for s in sorted(arm_norm)
+        }
+        comp_seed_vals: Dict[str, Optional[float]] = {
+            s: _require_style_metric(comp_norm, s, gen, STYLE_TARGET_TAG, key, source_file, role="comparator", meta=comp_meta)
+            for s in sorted(comp_norm)
+        }
+        c_vals = [v for v in comp_seed_vals.values() if v is not None]
+        if len(c_vals) >= 2:
+            c_mean = sum(c_vals) / len(c_vals)
+            comp_sd = math.sqrt(sum((v - c_mean) ** 2 for v in c_vals) / (len(c_vals) - 1))
+            delta = max(2.0 * comp_sd, floor)
+        else:
+            delta = floor
+        verdict = _ebe_verdict(arm_seed_vals, comp_seed_vals, direction, delta)
+        out.append({
+            "id": sid,
+            "key": key,
+            "tag": STYLE_TARGET_TAG,
+            "direction": direction,
+            "floor": floor,
+            "delta": delta,
+            "gen": gen,
+            **verdict,
+        })
+    return out
+
+
 def _evaluate_learning_floor(
     arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
     eval_gens: List[str],
@@ -638,6 +740,8 @@ def _evaluate_fresh(
     calibration: Optional[Dict[str, Any]],
     calibration_path: Optional[str],
     histories: Optional[Dict[str, Dict[str, Any]]] = None,
+    arm_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+    comp_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     if calibration is None:
         raise ValueError("--calibration is required when protocol='fresh'")
@@ -764,6 +868,8 @@ def _evaluate_fresh(
     for spec in parsed_targets:
         targets_out.append(_evaluate_ebe_target(arm_norm, comp_norm, last_gen, spec))
 
+    style_targets = _evaluate_style_targets(arm_norm, comp_norm, last_gen, arm_meta=arm_meta, comp_meta=comp_meta)
+
     info_metrics = {
         metric: _aggregate_seeds(arm_norm, last_gen, tag, metric)
         for metric in FRESH_INFO_METRICS
@@ -780,6 +886,7 @@ def _evaluate_fresh(
         "comparator_seeds": sorted(comp_norm) if comp_norm else list(calibration.get("anchor_seeds", [])),
         "gates": gates_out,
         "targets": targets_out,
+        "style_targets": style_targets,
         "info_metrics": info_metrics,
     }
 
@@ -794,6 +901,9 @@ def evaluate_gates(
     calibration: Optional[Dict[str, Any]] = None,
     calibration_path: Optional[str] = None,
     histories: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    _arm_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+    _comp_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate guard and target gates over `arm` (and optional `comparator`).
 
@@ -823,6 +933,8 @@ def evaluate_gates(
             calibration,
             calibration_path,
             histories,
+            arm_meta=_arm_meta,
+            comp_meta=_comp_meta,
         )
 
     gates_out: Dict[str, Any] = {}
@@ -965,6 +1077,25 @@ def _append_targets_table(lines: List[str], result: Dict[str, Any]) -> None:
             )
 
 
+def _append_style_targets(lines: List[str], result: Dict[str, Any]) -> None:
+    lines.extend(["", "## Style Targets", ""])
+    style_targets = result.get("style_targets")
+    if style_targets is None:
+        lines.append("not evaluated (no comparator)")
+        return
+    lines.extend([
+        "| ID | Key | Dir | Floor | Delta | Arm seeds | Comp seeds | Mean diff | Verdict |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ])
+    for st in style_targets:
+        mdiff = "-" if st["mean_diff"] is None else f"{st['mean_diff']:+.4f}"
+        lines.append(
+            f"| {st['id']} | {st['key']} | {st['direction']} | {st['floor']:.2f} | "
+            f"{st['delta']:.4f} | {_fmt_seeds(st['arm_per_seed'])} | "
+            f"{_fmt_seeds(st['comp_per_seed'])} | {mdiff} | {st['verdict']} |"
+        )
+
+
 def _format_fresh_markdown(result: Dict[str, Any]) -> str:
     cal_path = result.get("calibration_path", "<in-memory>")
     cal_gen = result.get("calibration_gen", "-")
@@ -1040,6 +1171,7 @@ def _format_fresh_markdown(result: Dict[str, Any]) -> str:
 
     _append_between_seed_sd(lines, result)
     _append_targets_table(lines, result)
+    _append_style_targets(lines, result)
 
     info = result.get("info_metrics") or {}
     if info:
@@ -1096,14 +1228,21 @@ def format_markdown(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _parse_seed_dirs(items: Sequence[str], tag: Optional[str]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def _parse_seed_dirs(
+    items: Sequence[str],
+    tag: Optional[str],
+    meta_out: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for idx, item in enumerate(items):
         if "=" in item:
             seed, path = item.split("=", 1)
         else:
             seed, path = f"s{idx}", item
-        out[seed] = load_arm_dir(path, tag=tag)
+        seed_meta: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = {} if meta_out is not None else None
+        out[seed] = _load_arm_dir(path, tag=tag, meta_out=seed_meta)
+        if meta_out is not None and seed_meta is not None:
+            meta_out[seed] = seed_meta
     return out
 
 
@@ -1141,8 +1280,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise ValueError(f"{flag} requires --protocol fresh, got {args.protocol!r}")
 
     load_tag = None if (args.target or args.protocol == "fresh") else args.tag
-    arm_data = _parse_seed_dirs(args.arm, load_tag)
-    comp_data = _parse_seed_dirs(args.comparator, load_tag) if args.comparator else None
+    arm_meta: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+    comp_meta: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+    arm_data = _parse_seed_dirs(args.arm, load_tag, meta_out=arm_meta)
+    comp_data = _parse_seed_dirs(args.comparator, load_tag, meta_out=comp_meta) if args.comparator else None
     cal_data = json.loads(Path(args.calibration).read_text(encoding="utf-8")) if args.calibration else None
     history_data = _parse_history_args(args.history) if args.history else None
     result = evaluate_gates(
@@ -1155,6 +1296,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         calibration=cal_data,
         calibration_path=args.calibration,
         histories=history_data,
+        _arm_meta=arm_meta,
+        _comp_meta=comp_meta if comp_data is not None else None,
     )
     md = format_markdown(result)
     print(md)

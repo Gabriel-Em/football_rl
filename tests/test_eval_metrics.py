@@ -922,6 +922,8 @@ def _fake_census_point(**overrides):
         "goals_total": {"mean": 2.2, "se": 0.1, "n": 96},
         "scoreless": {"mean": 0.10, "se": 0.03, "n": 96},
         "kick_propensity_pooled": {"mean": 0.245, "se": 0.003, "n": 96},
+        "kick_outcome_opponent": {"mean": 0.48, "se": 0.01, "n": 96},
+        "goal_no_pass_10s_share": {"mean": 0.30, "se": 0.02, "n": 96},
     }
     for k, v in overrides.items():
         if isinstance(v, tuple):
@@ -1647,6 +1649,11 @@ def _write_e3_anchor_dir(
         tdir = gen_dir / tag
         tdir.mkdir(parents=True, exist_ok=True)
         (tdir / "census.json").write_text(json.dumps(payload), encoding="utf-8")
+        if tag == "self_sampled":
+            (tdir / "internals.json").write_text(
+                json.dumps({"summary": {"n_matches": 96, "metrics": {"aim_teammate_share_sampled": {"mean": 0.12, "se": 0.004, "n": 96}}}}),
+                encoding="utf-8",
+            )
     return root
 
 
@@ -1692,7 +1699,13 @@ def _make_fake_calibration(
 def _fresh_arm_seed(gens_vals: dict[str, dict], *, bot_b: float = -18.0, bot_r: float = -18.0, fr_b: float = -1.0, fr_r: float = -1.0, kot: float = 0.31) -> dict:
     out = {}
     for g, ov in gens_vals.items():
-        self_ov = {"kick_outcome_teammate": (kot, 0.01), "gk_in_box_pooled": (0.99, 0.002), "gk_goal_line_pooled": (0.175, 0.01), **ov}
+        self_ov = {
+            "kick_outcome_teammate": (kot, 0.01),
+            "gk_in_box_pooled": (0.99, 0.002),
+            "gk_goal_line_pooled": (0.175, 0.01),
+            "aim_teammate_share_sampled": (0.12, 0.004),
+            **ov,
+        }
         out[g] = {
             "self_sampled": _fake_census_point(**self_ov),
             "vs_scripted_sampled": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": bot_b, "se": 0.4, "n": 48}}}},
@@ -3539,4 +3552,661 @@ class TestInternalsFireE5:
                     assert cur_sum[key][sub] is None
                 else:
                     assert cur_sum[key][sub] == pytest.approx(old_sum[key][sub], rel=0.0, abs=0.0)
+
+
+# ----------------------------------------------------------------------------
+# E6: Style targets in gates.py and paired readout tools/audit/run_compare.py
+# ----------------------------------------------------------------------------
+def _write_e6_eval_dir(
+    root: Path,
+    gen: str | int,
+    *,
+    s1: float = 0.20,
+    s2: float | None = 0.12,
+    s3: float = 0.48,
+    s4: float = 0.80,
+    write_internals: bool = True,
+    omit_internals_key: bool = False,
+    omit_census_key: str | None = None,
+    t1_blue: float = -10.0,
+    t1_red: float = -12.0,
+    t2_blue: float = -0.5,
+    t2_red: float = -0.7,
+    t3: float = 0.30,
+    extra_census: dict | None = None,
+    extra_internals: dict | None = None,
+) -> Path:
+    """Write tiny census.json and internals.json files for one seed and generation."""
+    gen_dir = root / f"gen{int(gen):04d}"
+    census_ov = {
+        "hold_share_pooled": (s1, 0.002),
+        "kick_outcome_teammate": (t3, 0.004),
+        "kick_outcome_opponent": (s3, 0.005),
+        "goal_no_pass_10s_share": (s4, 0.04),
+        "gk_in_box_pooled": (0.99, 0.002),
+        "gk_goal_line_pooled": (0.175, 0.01),
+    }
+    if extra_census:
+        for k, v in extra_census.items():
+            census_ov[k] = v if isinstance(v, tuple) else (v, 0.01)
+    self_payload = _fake_census_point(**census_ov)
+    if omit_census_key is not None:
+        self_payload["summary"]["metrics"].pop(omit_census_key, None)
+
+    ss_dir = gen_dir / "self_sampled"
+    ss_dir.mkdir(parents=True, exist_ok=True)
+    (ss_dir / "census.json").write_text(json.dumps(self_payload), encoding="utf-8")
+
+    if write_internals:
+        int_metrics = {
+            "power_mean": {"mean": 0.80, "se": 0.003, "n": 96},
+            "full_power_share": {"mean": 0.45, "se": 0.005, "n": 96},
+            "keeper_special_rate": {"mean": 0.03, "se": 0.001, "n": 96},
+            "special_rate": {"mean": 0.04, "se": 0.001, "n": 96},
+            "successful_tackles_pm": {"mean": 2.5, "se": 0.15, "n": 96},
+            "failed_tackles_pm": {"mean": 12.0, "se": 0.40, "n": 96},
+        }
+        if not omit_internals_key:
+            int_metrics["aim_teammate_share_sampled"] = {"mean": s2, "se": 0.004, "n": 96}
+        if extra_internals:
+            for k, v in extra_internals.items():
+                int_metrics[k] = {"mean": v[0], "se": v[1], "n": 96} if isinstance(v, tuple) else {"mean": v, "se": 0.001, "n": 96}
+        (ss_dir / "internals.json").write_text(
+            json.dumps({"summary": {"n_matches": 96, "metrics": int_metrics}}),
+            encoding="utf-8",
+        )
+
+    tag_payloads = {
+        "vs_scripted_sampled": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": t1_blue, "se": 0.4, "n": 48}}}},
+        "vs_scripted_sampled_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": t1_red, "se": 0.5, "n": 48}}}},
+        "vs_frozen": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": t2_blue, "se": 0.2, "n": 48}}}},
+        "vs_frozen_red": {"summary": {"n_matches": 48, "metrics": {"goal_diff": {"mean": t2_red, "se": 0.3, "n": 48}}}},
+    }
+    for tag, payload in tag_payloads.items():
+        tdir = gen_dir / tag
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / "census.json").write_text(json.dumps(payload), encoding="utf-8")
+    return root
+
+
+class TestStyleTargetsE6:
+    def _build_arm(self, base: Path, per_seed: dict, **common) -> list[str]:
+        args = []
+        for seed in sorted(per_seed):
+            d = _write_e6_eval_dir(base / seed, 300, **common, **per_seed[seed])
+            args.append(f"{seed}={d}")
+        return args
+
+    def test_style_targets_beats_loses_and_report_schema(self, tmp_path, capsys):
+        """[RED] S1-S4 compute comparator ddof=1 SD delta, call _ebe_verdict, and emit MD + JSON."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+
+        # Comparator series: {x, x+0.02, x+0.04, x+0.06} -> deviations {-0.03, -0.01, +0.01, +0.03}
+        # sum_sq = 0.0020, s = sqrt(0.0020 / 3) = 0.025819888974716113, 2*s = 0.051639777949432225 (> all floors)
+        # S1 (higher): arm [0.18..0.24] mean 0.21 vs comp [0.10..0.16] mean 0.13 -> diff +0.08 -> BEATS
+        # S2 (higher): arm [0.10..0.16] mean 0.13 vs comp [0.20..0.26] mean 0.23 -> diff -0.10 -> LOSES
+        # S3 (lower):  arm [0.40..0.46] mean 0.43 vs comp [0.50..0.56] mean 0.53 -> diff -0.10 -> BEATS
+        # S4 (lower):  arm [0.70..0.76] mean 0.73 vs comp [0.60..0.66] mean 0.63 -> diff +0.10 -> LOSES
+        arm_specs = {
+            "42": dict(s1=0.18, s2=0.10, s3=0.40, s4=0.70),
+            "43": dict(s1=0.20, s2=0.12, s3=0.42, s4=0.72),
+            "44": dict(s1=0.22, s2=0.14, s3=0.44, s4=0.74),
+            "45": dict(s1=0.24, s2=0.16, s3=0.46, s4=0.76),
+        }
+        comp_specs = {
+            "42": dict(s1=0.10, s2=0.20, s3=0.50, s4=0.60),
+            "43": dict(s1=0.12, s2=0.22, s3=0.52, s4=0.62),
+            "44": dict(s1=0.14, s2=0.24, s3=0.54, s4=0.64),
+            "45": dict(s1=0.16, s2=0.26, s3=0.56, s4=0.66),
+        }
+        arm_args = self._build_arm(tmp_path / "arm", arm_specs)
+        comp_args = self._build_arm(tmp_path / "comp", comp_specs)
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+
+        rc = gates.main([
+            "--arm", *arm_args,
+            "--comparator", *comp_args,
+            "--gens", "300",
+            "--protocol", "fresh",
+            "--calibration", str(cal_path),
+            "--json", str(out_json),
+            "--md", str(out_md),
+        ])
+        assert rc == 0
+        md = out_md.read_text(encoding="utf-8")
+        stdout = capsys.readouterr().out
+        assert md + "\n" == stdout and "## Style Targets" in md
+        assert md.index("## Targets") < md.index("## Style Targets") < md.index("## Per-team Informational")
+
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        st = data["style_targets"]
+        assert len(st) == 4
+        expected_delta = 2.0 * math.sqrt(0.0020 / 3.0)  # 0.051639777949432225
+        expected = [
+            ("S1", "hold_share_pooled", "higher", 0.01, +0.08, "BEATS"),
+            ("S2", "aim_teammate_share_sampled", "higher", 0.02, -0.10, "LOSES"),
+            ("S3", "kick_outcome_opponent", "lower", 0.02, -0.10, "BEATS"),
+            ("S4", "goal_no_pass_10s_share", "lower", 0.05, +0.10, "LOSES"),
+        ]
+        for row, (sid, key, direction, floor, mdiff, verdict) in zip(st, expected):
+            assert row["id"] == sid
+            assert row["key"] == key
+            assert row["direction"] == direction
+            assert row["floor"] == pytest.approx(floor)
+            assert row["delta"] == pytest.approx(expected_delta, abs=1e-9)
+            assert row["mean_diff"] == pytest.approx(mdiff, abs=1e-9)
+            assert row["verdict"] == verdict
+            assert set(row["arm_per_seed"]) == {"42", "43", "44", "45"}
+            assert set(row["comp_per_seed"]) == {"42", "43", "44", "45"}
+
+        style_block = md.split("## Style Targets", 1)[1].split("## Per-team Informational", 1)[0]
+        for sid, key, direction, _, _, verdict in expected:
+            assert any(
+                ln.startswith(f"| {sid} |") and key in ln and direction in ln and verdict in ln
+                for ln in style_block.splitlines()
+            )
+
+    def test_style_targets_overlap_exact_delta_boundary_and_floor_binding(self, tmp_path):
+        """[RED] Overlap gives NEUTRAL; diff == delta gives BEATS; floor binds when 2*s < floor; arm SD does not set delta."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+
+        # S1: comp constant 0.25 -> s=0, floor 0.01 binds -> delta=0.01.
+        #     arm [0.26, 0.26, 0.26, 0.26] -> diff = +0.010000000000000009 >= delta -> BEATS
+        # S2: comp [0.200, 0.202, 0.204, 0.206] -> s=0.002582, 2*s=0.005164 < floor 0.02 -> delta=0.02.
+        #     arm [0.215, 0.215, 0.215, 0.215] -> diff = +0.012 (< 0.02) -> NEUTRAL (even though > 2*s)
+        # S3: comp constant 0.50 -> s=0, floor 0.02 binds -> delta=0.02.
+        #     arm [0.48, 0.48, 0.48, 0.48] -> diff = -0.02, comp-arm = +0.02 >= delta -> BEATS
+        # S4: comp constant 0.60 -> s=0, floor 0.05 binds -> delta=0.05.
+        #     arm [0.40, 0.40, 0.40, 0.61] (overlap: max 0.61 > 0.60, diff -0.1475) -> NEUTRAL
+        # Also make arm S4 have large variance so using arm SD instead of comp SD changes delta.
+        arm_specs = {
+            "42": dict(s1=0.26, s2=0.215, s3=0.48, s4=0.40),
+            "43": dict(s1=0.26, s2=0.215, s3=0.48, s4=0.40),
+            "44": dict(s1=0.26, s2=0.215, s3=0.48, s4=0.40),
+            "45": dict(s1=0.26, s2=0.215, s3=0.48, s4=0.61),
+        }
+        comp_specs = {
+            "42": dict(s1=0.25, s2=0.200, s3=0.50, s4=0.60),
+            "43": dict(s1=0.25, s2=0.202, s3=0.50, s4=0.60),
+            "44": dict(s1=0.25, s2=0.204, s3=0.50, s4=0.60),
+            "45": dict(s1=0.25, s2=0.206, s3=0.50, s4=0.60),
+        }
+        out_json = tmp_path / "boundary.json"
+        rc = gates.main([
+            "--arm", *self._build_arm(tmp_path / "arm", arm_specs),
+            "--comparator", *self._build_arm(tmp_path / "comp", comp_specs),
+            "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            "--json", str(out_json),
+        ])
+        assert rc == 0
+        by_id = {r["id"]: r for r in json.loads(out_json.read_text(encoding="utf-8"))["style_targets"]}
+        assert by_id["S1"]["delta"] == pytest.approx(0.01)
+        assert by_id["S1"]["verdict"] == "BEATS"
+        assert by_id["S2"]["delta"] == pytest.approx(0.02)
+        assert by_id["S2"]["verdict"] == "NEUTRAL"
+        assert by_id["S3"]["delta"] == pytest.approx(0.02)
+        assert by_id["S3"]["verdict"] == "BEATS"
+        assert by_id["S4"]["delta"] == pytest.approx(0.05)
+        assert by_id["S4"]["verdict"] == "NEUTRAL"
+
+        # Just under exact boundary on S1 (0.2599 -> diff +0.0099 < 0.01) -> NEUTRAL
+        arm_just_under = {s: {**v, "s1": 0.2599} for s, v in arm_specs.items()}
+        out_json2 = tmp_path / "under.json"
+        gates.main([
+            "--arm", *self._build_arm(tmp_path / "arm2", arm_just_under),
+            "--comparator", *self._build_arm(tmp_path / "comp2", comp_specs),
+            "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            "--json", str(out_json2),
+        ])
+        by_id2 = {r["id"]: r for r in json.loads(out_json2.read_text(encoding="utf-8"))["style_targets"]}
+        assert by_id2["S1"]["verdict"] == "NEUTRAL"
+
+        # Bit-exact equality (no float rounding noise):
+        # S2 (higher): comp [0.5625, 0.5625, 0.5625, 0.3125] -> mean 0.5, ddof-1 SD 0.125 -> delta = 0.25;
+        #   arm [0.75, 0.75, 0.75, 0.75] -> mean 0.75, mean_diff = 0.75 - 0.5 = 0.25.
+        #   repr(mean_diff) == '0.25' == repr(delta), bit-equal (kills >= -> > in _ebe_verdict).
+        # S3 (lower): comp [0.4375, 0.4375, 0.4375, 0.6875] -> mean 0.5, ddof-1 SD 0.125 -> delta = 0.25;
+        #   arm [0.25, 0.25, 0.25, 0.25] -> mean 0.25, comp_mean - arm_mean = 0.5 - 0.25 = 0.25.
+        #   repr(-mean_diff) == '0.25' == repr(delta), bit-equal (kills >= -> > in _ebe_verdict lower branch).
+        exact_arm_specs = {
+            "42": dict(s1=0.75, s2=0.75, s3=0.25, s4=0.25),
+            "43": dict(s1=0.75, s2=0.75, s3=0.25, s4=0.25),
+            "44": dict(s1=0.75, s2=0.75, s3=0.25, s4=0.25),
+            "45": dict(s1=0.75, s2=0.75, s3=0.25, s4=0.25),
+        }
+        exact_comp_specs = {
+            "42": dict(s1=0.5625, s2=0.5625, s3=0.4375, s4=0.4375),
+            "43": dict(s1=0.5625, s2=0.5625, s3=0.4375, s4=0.4375),
+            "44": dict(s1=0.5625, s2=0.5625, s3=0.4375, s4=0.4375),
+            "45": dict(s1=0.3125, s2=0.3125, s3=0.6875, s4=0.6875),
+        }
+        out_exact = tmp_path / "exact.json"
+        rc_exact = gates.main([
+            "--arm", *self._build_arm(tmp_path / "arm_exact", exact_arm_specs),
+            "--comparator", *self._build_arm(tmp_path / "comp_exact", exact_comp_specs),
+            "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            "--json", str(out_exact),
+        ])
+        assert rc_exact == 0
+        by_id_exact = {r["id"]: r for r in json.loads(out_exact.read_text(encoding="utf-8"))["style_targets"]}
+        assert repr(by_id_exact["S2"]["mean_diff"]) == "0.25"
+        assert repr(by_id_exact["S2"]["delta"]) == "0.25"
+        assert by_id_exact["S2"]["mean_diff"] == by_id_exact["S2"]["delta"]
+        assert by_id_exact["S2"]["verdict"] == "BEATS"
+        assert repr(-by_id_exact["S3"]["mean_diff"]) == "0.25"
+        assert repr(by_id_exact["S3"]["delta"]) == "0.25"
+        assert -by_id_exact["S3"]["mean_diff"] == by_id_exact["S3"]["delta"]
+        assert by_id_exact["S3"]["verdict"] == "BEATS"
+
+    def test_style_targets_missing_internals_or_key_fails_closed(self, tmp_path):
+        """[RED] Missing internals.json or style key raises ValueError naming seed, gen and path."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+
+        base_arm = {s: {} for s in ("42", "43", "44", "45")}
+        comp_args = self._build_arm(tmp_path / "comp", base_arm)
+
+        # Missing internals.json on arm seed 43
+        arm_no_int = self._build_arm(tmp_path / "arm_no_int", {
+            "42": {}, "43": {"write_internals": False}, "44": {}, "45": {},
+        })
+        expected_path = str(tmp_path / "arm_no_int" / "43" / "gen0300" / "self_sampled" / "internals.json")
+        with pytest.raises(ValueError) as exc_arm:
+            gates.main([
+                "--arm", *arm_no_int, "--comparator", *comp_args,
+                "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            ])
+        msg_arm = str(exc_arm.value)
+        assert "43" in msg_arm and "300" in msg_arm and expected_path in msg_arm
+
+        # Missing internals.json on comparator seed 44
+        arm_ok = self._build_arm(tmp_path / "arm_ok", base_arm)
+        comp_no_int = self._build_arm(tmp_path / "comp_no_int", {
+            "42": {}, "43": {}, "44": {"write_internals": False}, "45": {},
+        })
+        expected_comp_path = str(tmp_path / "comp_no_int" / "44" / "gen0300" / "self_sampled" / "internals.json")
+        with pytest.raises(ValueError) as exc_comp:
+            gates.main([
+                "--arm", *arm_ok, "--comparator", *comp_no_int,
+                "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            ])
+        msg_comp = str(exc_comp.value)
+        assert "44" in msg_comp and "300" in msg_comp and expected_comp_path in msg_comp
+
+        # Missing key inside internals.json on arm seed 42
+        arm_no_key = self._build_arm(tmp_path / "arm_no_key", {
+            "42": {"omit_internals_key": True}, "43": {}, "44": {}, "45": {},
+        })
+        key_path = str(tmp_path / "arm_no_key" / "42" / "gen0300" / "self_sampled" / "internals.json")
+        with pytest.raises(ValueError) as exc_key:
+            gates.main([
+                "--arm", *arm_no_key, "--comparator", *comp_args,
+                "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            ])
+        msg_key = str(exc_key.value)
+        assert "42" in msg_key and "300" in msg_key and "aim_teammate_share_sampled" in msg_key and key_path in msg_key
+
+        # Missing census key (S3 kick_outcome_opponent) on comparator seed 45
+        comp_no_s3 = self._build_arm(tmp_path / "comp_no_s3", {
+            "42": {}, "43": {}, "44": {}, "45": {"omit_census_key": "kick_outcome_opponent"},
+        })
+        s3_path = str(tmp_path / "comp_no_s3" / "45" / "gen0300" / "self_sampled" / "census.json")
+        with pytest.raises(ValueError) as exc_s3:
+            gates.main([
+                "--arm", *arm_ok, "--comparator", *comp_no_s3,
+                "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            ])
+        msg_s3 = str(exc_s3.value)
+        assert "45" in msg_s3 and "300" in msg_s3 and "kick_outcome_opponent" in msg_s3 and s3_path in msg_s3
+
+    def test_style_targets_without_comparator_and_non_interference_with_exit_code(self, tmp_path):
+        """[RED] Without comparator -> style_targets is None + MD note; LOSES on S1-S4 never flips gate status or exit code."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+
+        arm_args = self._build_arm(tmp_path / "arm", {
+            "42": dict(s1=0.19, s2=0.05, s3=0.70, s4=0.90),
+            "43": dict(s1=0.19, s2=0.05, s3=0.70, s4=0.90),
+            "44": dict(s1=0.19, s2=0.05, s3=0.70, s4=0.90),
+            "45": dict(s1=0.19, s2=0.05, s3=0.70, s4=0.90),
+        })
+        # Without comparator
+        out_no_comp = tmp_path / "no_comp.json"
+        md_no_comp = tmp_path / "no_comp.md"
+        rc_no = gates.main([
+            "--arm", *arm_args,
+            "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            "--exit-on-c0", "--json", str(out_no_comp), "--md", str(md_no_comp),
+        ])
+        assert rc_no == 0
+        assert json.loads(out_no_comp.read_text(encoding="utf-8"))["style_targets"] is None
+        md_text = md_no_comp.read_text(encoding="utf-8")
+        assert "## Style Targets" in md_text
+        assert "not evaluated (no comparator)" in md_text.split("## Style Targets", 1)[1]
+
+        # With comparator where all 4 style targets LOSE (yet C0/G1-G5/G6 pass) -> exit code still 0
+        comp_args = self._build_arm(tmp_path / "comp", {
+            "42": dict(s1=0.30, s2=0.30, s3=0.40, s4=0.50),
+            "43": dict(s1=0.30, s2=0.30, s3=0.40, s4=0.50),
+            "44": dict(s1=0.30, s2=0.30, s3=0.40, s4=0.50),
+            "45": dict(s1=0.30, s2=0.30, s3=0.40, s4=0.50),
+        })
+        out_lose = tmp_path / "lose.json"
+        rc_lose = gates.main([
+            "--arm", *arm_args, "--comparator", *comp_args,
+            "--gens", "300", "--protocol", "fresh", "--calibration", str(cal_path),
+            "--exit-on-c0", "--json", str(out_lose),
+        ])
+        assert rc_lose == 0
+        res_lose = json.loads(out_lose.read_text(encoding="utf-8"))
+        assert all(r["verdict"] == "LOSES" for r in res_lose["style_targets"])
+        assert all(g["passed"] is not False for g in res_lose["gates"].values())
+
+    def test_real_archives_preexisting_outputs_byte_identical_to_master(self, tmp_path):
+        """[GUARD] Pre-existing JSON keys and MD sections on FE vs FL match pre-E6 commit 4b25141 byte-for-byte."""
+        import subprocess
+        import sys
+        import types
+        from tools.audit import gates
+
+        arch = _e5_archives_root()
+        cal_path = arch / "fl_anchor_calibration.json"
+        if not cal_path.is_file():
+            pytest.skip("fl_anchor_calibration.json not found")
+
+        ref_commit = "4b25141"
+        ref_src = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "show", f"{ref_commit}:tools/audit/gates.py"],
+            text=True,
+        )
+        ref_mod = types.ModuleType("ref_gates_4b25141")
+        ref_mod.__file__ = str(REPO_ROOT / "tools" / "audit" / "gates.py")
+        ref_mod.__package__ = "tools.audit"
+        sys.modules["ref_gates_4b25141"] = ref_mod
+        try:
+            exec(compile(ref_src, f"{ref_commit}:tools/audit/gates.py", "exec"), ref_mod.__dict__)
+        finally:
+            sys.modules.pop("ref_gates_4b25141", None)
+
+        seeds = ("42", "43", "44", "45")
+        cur_json = tmp_path / "cur.json"
+        cur_md = tmp_path / "cur.md"
+        old_json = tmp_path / "old.json"
+        old_md = tmp_path / "old.md"
+        arm_dirs = {s: arch / f"fe_s{s}_gen300" / "eval" for s in seeds}
+        common_tail = [
+            "--comparator", *[f"{s}={arch / f'fl_s{s}_gen300' / 'eval'}" for s in seeds],
+            "--history", *[f"{s}={arch / f'fe_s{s}_gen300' / 'checkpoints' / 'training_history.json'}" for s in seeds],
+            "--gens", "100", "200", "300",
+            "--protocol", "fresh",
+            "--calibration", str(cal_path),
+            "--exit-on-c0",
+        ]
+        common_argv = ["--arm", *[f"{s}={arm_dirs[s]}" for s in seeds], *common_tail]
+        assert gates.main([*common_argv, "--json", str(cur_json), "--md", str(cur_md)]) == 0
+        assert ref_mod.main([*common_argv, "--json", str(old_json), "--md", str(old_md)]) == 0
+
+        old_json_text = old_json.read_text(encoding="utf-8")
+        old_data = json.loads(old_json_text)
+        old_md_text = old_md.read_text(encoding="utf-8")
+
+        def strip_style_section(md_text: str) -> str:
+            marker = "\n\n## Style Targets\n"
+            next_marker = "\n\n## Per-team Informational"
+            i = md_text.index(marker)
+            j = md_text.index(next_marker, i)
+            return md_text[:i] + md_text[j:]
+
+        def compare_preexisting(json_path: Path, md_path: Path) -> tuple[bool, bool]:
+            cand_data = json.loads(json_path.read_text(encoding="utf-8"))
+            assert set(old_data).issubset(set(cand_data))
+            cand_stripped_json = json.dumps({k: cand_data[k] for k in old_data}, indent=2, sort_keys=True)
+            cand_stripped_md = strip_style_section(md_path.read_text(encoding="utf-8"))
+            return cand_stripped_json == old_json_text, cand_stripped_md == old_md_text
+
+        assert compare_preexisting(cur_json, cur_md) == (True, True)
+
+        # Real planted-change check: perturb one pre-existing input value (seed 42 gen 300 vs_frozen goal_diff)
+        # in a scratch symlinked copy of fe_s42_gen300/eval and re-run the same comparison routine.
+        planted_eval = tmp_path / "planted_fe_s42_eval"
+        src_eval = arm_dirs["42"]
+        for gen_dir in src_eval.iterdir():
+            if not gen_dir.is_dir():
+                continue
+            if gen_dir.name != "gen0300":
+                (planted_eval / gen_dir.name).parent.mkdir(parents=True, exist_ok=True)
+                (planted_eval / gen_dir.name).symlink_to(gen_dir)
+                continue
+            dst_g300 = planted_eval / "gen0300"
+            dst_g300.mkdir(parents=True, exist_ok=True)
+            for tag_dir in gen_dir.iterdir():
+                if tag_dir.name != "vs_frozen":
+                    (dst_g300 / tag_dir.name).symlink_to(tag_dir)
+                    continue
+                dst_vf = dst_g300 / "vs_frozen"
+                dst_vf.mkdir(parents=True, exist_ok=True)
+                vf_payload = json.loads((tag_dir / "census.json").read_text(encoding="utf-8"))
+                vf_payload["summary"]["metrics"]["goal_diff"]["mean"] += 0.5
+                (dst_vf / "census.json").write_text(json.dumps(vf_payload), encoding="utf-8")
+
+        planted_json = tmp_path / "planted.json"
+        planted_md = tmp_path / "planted.md"
+        planted_arm_dirs = {**arm_dirs, "42": planted_eval}
+        planted_argv = ["--arm", *[f"{s}={planted_arm_dirs[s]}" for s in seeds], *common_tail]
+        assert gates.main([*planted_argv, "--json", str(planted_json), "--md", str(planted_md)]) == 0
+        assert compare_preexisting(planted_json, planted_md) == (False, False)
+
+    def test_load_arm_dir_payload_has_no_bookkeeping_and_is_json_serializable(self, tmp_path):
+        """[RED] load_arm_dir returns clean JSON-serializable payloads with no internal bookkeeping keys."""
+        from tools.audit import gates
+
+        dir_with_int = _write_e6_eval_dir(tmp_path / "with_int", 300)
+        dir_no_int = _write_e6_eval_dir(tmp_path / "no_int", 300, write_internals=False)
+
+        for d in (dir_with_int, dir_no_int):
+            loaded = gates.load_arm_dir(d)
+            dumped = json.dumps(loaded)
+            assert isinstance(dumped, str)
+            for tag_map in loaded.values():
+                for payload in tag_map.values():
+                    assert not any(k.startswith("_") for k in payload), f"unexpected private keys in {list(payload)}"
+
+
+class TestRunCompareE6:
+    def test_run_compare_hand_fixture_window_and_fallback_order(self, tmp_path, capsys):
+        """[RED] Eval-dir fallback picks first dir containing gen<g:04d>/, window [g-w+1..g] is exact, missing prints '-'."""
+        from tools.audit import run_compare
+
+        # runA has two eval dirs: d1 (has gen0200 only) and d2 (has both gen0200 and gen0400).
+        # Expect gen0200 from d1 (s1=0.21, NOT d2's 0.99), gen0400 from d2 (s1=0.25).
+        d1 = tmp_path / "runA_d1"
+        d2 = tmp_path / "runA_d2"
+        _write_e6_eval_dir(
+            d1, 200,
+            s1=0.21, s2=0.14, s3=0.45, s4=0.75,
+            t1_blue=-10.0, t1_red=-12.0, t2_blue=-1.0, t2_red=-2.0, t3=0.28,
+            extra_census={
+                "role_inversion_pooled": (0.04, 0.002),
+                "gk_in_box_pooled": (0.98, 0.001),
+                "gk_pickup_rate": (0.35, 0.03),
+                "holder_spell_s_pooled": (0.41, 0.005),
+                "goals_total": (2.2, 0.12),
+            },
+            extra_internals={
+                "power_mean": (0.85, 0.002),
+                "full_power_share": (0.48, 0.006),
+                "keeper_special_rate": (0.025, 0.001),
+                "special_rate": (0.035, 0.001),
+                "successful_tackles_pm": (2.4, 0.15),
+                "failed_tackles_pm": (11.5, 0.45),
+            },
+        )
+        _write_e6_eval_dir(d2, 200, s1=0.99)  # shadowed by d1
+        _write_e6_eval_dir(d2, 400, s1=0.25, s2=0.16, s3=0.42, s4=0.70, t1_blue=-6.0, t1_red=-8.0, t2_blue=0.2, t2_red=0.6, t3=0.33)
+
+        # runB has only gen0200 (gen0400 missing), and no history file
+        rb_dir = tmp_path / "runB_d"
+        _write_e6_eval_dir(rb_dir, 200, s1=0.19, s2=0.11, s3=0.50, s4=0.82)
+
+        # History for runA with window=3:
+        # At gen 200, window is 198, 199, 200 (NOT 197, NOT 201).
+        # At gen 400, window is 398, 399, 400 (NOT 397, NOT 401).
+        # Put outlier 99.0 at gens 197, 201, 397, 401 so any off-by-one fails.
+        roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+        gen_recs = []
+        for g in (197, 198, 199, 200, 201, 397, 398, 399, 400, 401):
+            if g in (197, 201, 397, 401):
+                val_k = 99.0
+                val_s = 99.0
+                pk = 99.0
+                ps = 99.0
+                vc = 99.0
+            elif g in (198, 199, 200):
+                offset = g - 198  # 0, 1, 2 -> mean offset 1.0
+                val_k = 0.01 * (offset + 1)  # 0.01, 0.02, 0.03 -> mean 0.02
+                val_s = 0.02 * (offset + 1)  # 0.02, 0.04, 0.06 -> mean 0.04
+                pk = 0.10 + 0.01 * offset    # 0.10, 0.11, 0.12 -> mean 0.11
+                ps = 0.05 + 0.01 * offset    # 0.05, 0.06, 0.07 -> mean 0.06
+                vc = 0.40 + 0.03 * offset    # 0.40, 0.43, 0.46 -> mean 0.43
+            else:
+                offset = g - 398
+                val_k = 0.05 * (offset + 1)  # mean 0.10
+                val_s = 0.03 * (offset + 1)  # mean 0.06
+                pk = 0.20 + 0.02 * offset    # mean 0.22
+                ps = 0.08 + 0.02 * offset    # mean 0.10
+                vc = 0.50 + 0.02 * offset    # mean 0.52
+            gen_recs.append({
+                "generation": g,
+                "fire_sat": {r: {"kick": val_k + 0.001 * i, "spec": val_s + 0.001 * i} for i, r in enumerate(roles)},
+                "p_kick": {r: pk + 0.001 * i for i, r in enumerate(roles)},
+                "p_spec": {r: ps + 0.001 * i for i, r in enumerate(roles)},
+                "v_corr_mc": {r: vc + 0.001 * i for i, r in enumerate(roles)},
+            })
+        hist_a = tmp_path / "hist_a.json"
+        hist_a.write_text(json.dumps({"matches": [], "generations": gen_recs}), encoding="utf-8")
+
+        out_md = tmp_path / "cmp.md"
+        out_json = tmp_path / "cmp.json"
+        rc = run_compare.main([
+            "--run", f"runA={d1},{d2}", f"runB={rb_dir}",
+            "--history", f"runA={hist_a}",
+            "--gens", "200", "400",
+            "--window", "3",
+            "--md", str(out_md),
+            "--json", str(out_json),
+        ])
+        assert rc == 0
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["gens"] == ["200", "400"]
+        assert data["window"] == 3
+        assert data["eval_dirs"]["runA"]["200"] == str(d1)
+        assert data["eval_dirs"]["runA"]["400"] == str(d2)
+        assert data["eval_dirs"]["runB"]["400"] is None
+
+        ev_200 = data["eval"]["runA"]["200"]
+        assert ev_200["S1"]["mean"] == pytest.approx(0.21)
+        assert ev_200["S2"]["mean"] == pytest.approx(0.14)
+        assert ev_200["S3"]["mean"] == pytest.approx(0.45)
+        assert ev_200["S4"]["mean"] == pytest.approx(0.75)
+        assert ev_200["T1_blue"]["mean"] == pytest.approx(-10.0)
+        assert ev_200["T1_red"]["mean"] == pytest.approx(-12.0)
+        assert ev_200["T1"]["mean"] == pytest.approx(-11.0)
+        assert ev_200["T1"]["se"] == pytest.approx(0.5 * math.sqrt(0.4 ** 2 + 0.5 ** 2))
+        assert ev_200["T2_blue"]["mean"] == pytest.approx(-1.0)
+        assert ev_200["T2_red"]["mean"] == pytest.approx(-2.0)
+        assert ev_200["T2"]["mean"] == pytest.approx(-1.5)
+        assert ev_200["T2"]["se"] == pytest.approx(0.5 * math.sqrt(0.2 ** 2 + 0.3 ** 2))
+        assert ev_200["T3"]["mean"] == pytest.approx(0.28)
+        assert ev_200["role_inversion_pooled"]["mean"] == pytest.approx(0.04)
+        assert ev_200["gk_in_box_pooled"]["mean"] == pytest.approx(0.98)
+        assert ev_200["gk_pickup_rate"]["mean"] == pytest.approx(0.35)
+        assert ev_200["holder_spell_s_pooled"]["mean"] == pytest.approx(0.41)
+        assert ev_200["goals_total"]["mean"] == pytest.approx(2.2)
+        assert ev_200["power_mean"]["mean"] == pytest.approx(0.85)
+        assert ev_200["full_power_share"]["mean"] == pytest.approx(0.48)
+        assert ev_200["keeper_special_rate"]["mean"] == pytest.approx(0.025)
+        assert ev_200["special_rate"]["mean"] == pytest.approx(0.035)
+        assert ev_200["successful_tackles_pm"]["mean"] == pytest.approx(2.4)
+        assert ev_200["failed_tackles_pm"]["mean"] == pytest.approx(11.5)
+
+        assert data["eval"]["runA"]["400"]["S1"]["mean"] == pytest.approx(0.25)
+        assert data["eval"]["runB"]["400"] is None
+
+        h200 = data["history"]["runA"]["200"]
+        assert h200["gen_start"] == 198 and h200["gen_end"] == 200
+        assert h200["fire"]["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.020)
+        assert h200["fire"]["fire_sat"]["red_keeper"]["spec"] == pytest.approx(0.043)
+        assert h200["fire"]["p_kick"]["blue_keeper"] == pytest.approx(0.111)
+        assert h200["fire"]["p_spec"]["red_field"] == pytest.approx(0.062)
+        assert h200["v_corr_mc"]["blue_field"] == pytest.approx(0.430)
+        assert h200["v_corr_mc"]["red_keeper"] == pytest.approx(0.433)
+
+        h400 = data["history"]["runA"]["400"]
+        assert h400["gen_start"] == 398 and h400["gen_end"] == 400
+        assert h400["fire"]["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.100)
+        assert h400["v_corr_mc"]["blue_field"] == pytest.approx(0.520)
+
+        assert data["history"]["runB"]["200"] is None
+        md = out_md.read_text(encoding="utf-8")
+        assert "| - |" in md or " - |" in md
+
+    def test_run_compare_clamps_window_label_and_warns_missing_history(self, tmp_path, capsys):
+        """[RED] Window start clamps to 1 when g < window, and missing --history warns once on stderr while rendering '-'."""
+        from tools.audit import run_compare
+
+        ra_dir = _write_e6_eval_dir(tmp_path / "runA", 50)
+        rb_dir = _write_e6_eval_dir(tmp_path / "runB", 50)
+        roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+        gen_recs = [
+            {
+                "generation": g,
+                "fire_sat": {r: {"kick": 0.01 * g, "spec": 0.02} for r in roles},
+                "p_kick": {r: 0.10 for r in roles},
+                "p_spec": {r: 0.05 for r in roles},
+                "v_corr_mc": {r: 0.25 for r in roles},
+            }
+            for g in range(1, 51)
+        ]
+        hist_a = tmp_path / "hist_a.json"
+        hist_a.write_text(json.dumps({"matches": [], "generations": gen_recs}), encoding="utf-8")
+        missing_b = tmp_path / "missing_hist_b.json"
+
+        out_md = tmp_path / "cmp.md"
+        out_json = tmp_path / "cmp.json"
+        rc = run_compare.main([
+            "--run", f"runA={ra_dir}", f"runB={rb_dir}",
+            "--history", f"runA={hist_a}", f"runB={missing_b}",
+            "--gens", "50",
+            "--window", "100",
+            "--md", str(out_md),
+            "--json", str(out_json),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        err_lines = [ln for ln in captured.err.splitlines() if ln.strip()]
+        assert len(err_lines) == 1
+        assert "runB" in err_lines[0] and str(missing_b) in err_lines[0]
+
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        ha = data["history"]["runA"]["50"]
+        assert ha["gen_start"] == 1 and ha["gen_end"] == 50
+        assert ha["fire"]["fire_sat"]["blue_field"]["kick"] == pytest.approx(0.255)
+        assert data["history"]["runB"]["50"] is None
+
+        md = out_md.read_text(encoding="utf-8")
+        assert "| 1-50 |" in md
+        assert "-49-50" not in md
+        assert " - |" in md or "| - |" in md
+
 
