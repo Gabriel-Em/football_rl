@@ -142,6 +142,8 @@ Inspect generation count, cumulative matches, total steps, and Top 10 most excit
 | `--rollout-steps` | `2700` | RL steps per env per generation (`2700` = 1 full 180s match). |
 | `--interest-threshold`| `0.0` | Minimum `interest_score` to export a replay JSON (`0.0` = save all matches). |
 | `--save-best-only` | `False` | When running with `num_envs > 1`, only saves the single most interesting match per generation. |
+| `--replay-every` | `1` | Write replays only when `gen % N == 0` or on the final generation of the run (integer `>= 1`). |
+| `--replay-kind` | `both` | Which replay kinds to write (`both`, `uniform`, or `best`). |
 | `--device` | Auto | Execution device (`cpu` or `cuda`, auto-detects CUDA). |
 | `--resume` | Auto | Resume from `checkpoints/training_state.pt`. |
 | `--from-scratch` | `False` | Reset `checkpoints/` and `replays/` to start at Generation 1. |
