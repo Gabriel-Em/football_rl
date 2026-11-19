@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from dataclasses import dataclass, replace
 import glob
 import json
@@ -193,6 +194,8 @@ class ReplayViewer:
         self.num_frames = len(self.frames)
         if self.num_frames == 0:
             raise ValueError("Replay file contains 0 frames.")
+        self.frame_times: List[float] = self._build_frame_times(self.frames)
+        self.match_duration: float = self._resolve_match_duration(raw_frames)
 
         # Scaling: keep pitch crisp on standard screens (~1200 max width)
         self.scale: float = min(1.0, 1200.0 / self.field_w)
@@ -244,6 +247,7 @@ class ReplayViewer:
         self.paused: bool = False
         self.playback_speed: float = 1.0
         self.subframe_accumulator: float = 0.0
+        self._dragging_scrubber: bool = False
         self.show_vision_cones: bool = show_vision_cones
         self.selected_cone_players: Set[int] = set()
         self.show_reward_hud: bool = show_reward_hud
@@ -344,6 +348,71 @@ class ReplayViewer:
         self._ingest_frame_events(0)
         self._init_possession_ribbon()
 
+    def _extract_frame_time(self, frame: Dict[str, Any], fallback_raw_idx: int) -> float:
+        """Return match time in seconds from `time`, falling back to `frame / physics_hz`."""
+        raw_t = frame.get("time")
+        if raw_t is not None:
+            return float(raw_t)
+        raw_f = frame.get("frame")
+        if raw_f is not None:
+            return float(raw_f) / float(max(1, self.physics_hz))
+        return float(fallback_raw_idx) / float(max(1, self.physics_hz))
+
+    def _build_frame_times(self, frames: List[Dict[str, Any]]) -> List[float]:
+        """Build a sorted array of match times aligned with `self.frames`."""
+        times: List[float] = []
+        raw_idx = 0
+        prev_t = 0.0
+        for fr in frames:
+            t = self._extract_frame_time(fr, raw_idx)
+            if times and t < prev_t:
+                t = prev_t
+            times.append(t)
+            prev_t = t
+            if "cinematic" not in fr:
+                raw_idx += 1
+        return times
+
+    def _resolve_match_duration(self, raw_frames: List[Dict[str, Any]]) -> float:
+        """Return match length T from metadata `max_rl_steps / rl_hz` when present, else last recorded frame time."""
+        max_rl_steps = self.meta.get("max_rl_steps")
+        rl_hz = self.meta.get("rl_hz")
+        if max_rl_steps is not None and rl_hz is not None:
+            steps_f = float(max_rl_steps)
+            hz_f = float(rl_hz)
+            if steps_f > 0.0 and hz_f > 0.0:
+                return steps_f / hz_f
+        return max(0.0, self._extract_frame_time(raw_frames[-1], len(raw_frames) - 1))
+
+    def _time_to_bar_ratio(self, t: float) -> float:
+        """Map match time `t` to a clamped [0, 1] fraction of the scrubber bar."""
+        if self.match_duration <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, t / self.match_duration))
+
+    def _frame_idx_to_bar_offset(self, frame_idx: int, bar_w: int) -> int:
+        """Map a viewer frame index to its horizontal pixel offset within the scrubber bar."""
+        idx = max(0, min(self.num_frames - 1, frame_idx))
+        return int(round(self._time_to_bar_ratio(self.frame_times[idx]) * bar_w))
+
+    def _frame_idx_to_bar_x(self, frame_idx: int, bar_x: int, bar_w: int) -> int:
+        """Map a viewer frame index to its screen x-coordinate on the scrubber bar."""
+        return bar_x + self._frame_idx_to_bar_offset(frame_idx, bar_w)
+
+    def _bar_ratio_to_frame_idx(self, ratio: float) -> int:
+        """Map a scrubber bar fraction in [0, 1] to the first viewer frame at or after that time."""
+        clamped = max(0.0, min(1.0, ratio))
+        target_time = clamped * self.match_duration
+        lookup_time = max(0.0, target_time - 1e-12) if target_time > 0.0 else 0.0
+        idx = bisect_left(self.frame_times, lookup_time)
+        return min(idx, self.num_frames - 1)
+
+    def _seek_to_scrubber_x(self, mx: int) -> None:
+        """Seek playback to the first frame at or after the match time at screen x-coordinate `mx`."""
+        bar_w = max(1, self.disp_field_w)
+        ratio = (mx - self.margin_x) / float(bar_w)
+        self.seek_to_frame(self._bar_ratio_to_frame_idx(ratio))
+
     def _init_possession_ribbon(self) -> None:
         """Precompute 4px color-coded possession & dead-ball stall ribbon along timeline."""
         bar_w = max(1, self.disp_field_w)
@@ -356,10 +425,15 @@ class ReplayViewer:
         num_f = self.num_frames
         states = [2] * num_f
         stat_streak = 0
+        last_play_state = 2
         team_size = max(1, len(self.frames[0].get("players", [])) // 2)
 
         for f_idx in range(num_f):
             frame = self.frames[f_idx]
+            if "cinematic" in frame:
+                stat_streak = 0
+                states[f_idx] = last_play_state
+                continue
             players = frame.get("players", [])
             holder_team = -1
             for p_idx, p in enumerate(players):
@@ -384,6 +458,7 @@ class ReplayViewer:
                         states[k] = 3
                 else:
                     states[f_idx] = 2
+            last_play_state = states[f_idx]
 
         color_map = {
             0: COLOR_TEAM_A,
@@ -393,7 +468,7 @@ class ReplayViewer:
         }
 
         for px in range(bar_w):
-            f_idx = min(num_f - 1, int((px / float(bar_w)) * num_f))
+            f_idx = self._bar_ratio_to_frame_idx(px / float(bar_w))
             st = states[f_idx]
             col = color_map.get(st, (45, 55, 70))
             pygame.draw.line(self.possession_ribbon_surface, col, (px, 0), (px, 3))
@@ -524,8 +599,8 @@ class ReplayViewer:
                         self.show_gradient = not self.show_gradient
                 # 1. Left Click on Scrubber Bar -> Seek
                 elif event.button == 1 and bar_x <= mx <= bar_x + bar_w and bar_y - 10 <= my <= bar_y + 26:
-                    ratio = (mx - bar_x) / float(bar_w)
-                    self.seek_to_frame(int(ratio * (self.num_frames - 1)))
+                    self._dragging_scrubber = True
+                    self._seek_to_scrubber_x(mx)
                 # 2. Click in Side Telemetry Panel -> Toggle focus / inspect player
                 elif self.show_telemetry and self._find_player_at_telemetry_pos(mx, my) is not None:
                     if not self.auto_focus_carrier:
@@ -565,6 +640,14 @@ class ReplayViewer:
                             self.show_vision_cones = False
                         else:
                             self.show_vision_cones = not self.show_vision_cones
+            elif event.type == pygame.MOUSEMOTION and self._dragging_scrubber:
+                buttons = getattr(event, "buttons", None)
+                if buttons is not None and not buttons[0]:
+                    self._dragging_scrubber = False
+                else:
+                    self._seek_to_scrubber_x(event.pos[0])
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._dragging_scrubber = False
 
     def _is_pos_on_field(self, mx: int, my: int) -> bool:
         """Check if mouse coordinate is within the pitch turf rendering area."""
@@ -1263,6 +1346,8 @@ class ReplayViewer:
                 by_net = by0
 
             stage1_end_ball = [bx_net, by_net, b_col]
+            curr_time = curr_fr.get("time")
+            curr_raw_frame = curr_fr.get("frame", i)
 
             # Stage 1: Freeze & Celebration Hold
             for k in range(freeze_frames):
@@ -1276,7 +1361,7 @@ class ReplayViewer:
 
                 p_list = [[p[0], p[1], p[2], 0] for p in prev_fr.get("players", [])]
                 synth_fr = {
-                    "time": prev_fr.get("time", 0.0),
+                    "frame": curr_raw_frame,
                     "half": curr_fr.get("half", prev_fr.get("half", 1)),
                     "stats": curr_fr.get("stats", prev_fr.get("stats", {})),
                     "team_side": prev_fr.get("team_side", [0, 1]),
@@ -1293,6 +1378,8 @@ class ReplayViewer:
                         "progress": k / float(freeze_frames),
                     },
                 }
+                if curr_time is not None:
+                    synth_fr["time"] = curr_time
                 expanded_frames.append(synth_fr)
 
             # Stage 2: Walk to Set-Piece Positions
@@ -1331,7 +1418,7 @@ class ReplayViewer:
                 by = stage1_end_ball[1] + (by_end - stage1_end_ball[1]) * s
 
                 synth_fr = {
-                    "time": prev_fr.get("time", 0.0),
+                    "frame": curr_raw_frame,
                     "half": curr_fr.get("half", 1),
                     "stats": curr_fr.get("stats", {}),
                     "team_side": curr_fr.get("team_side", prev_fr.get("team_side", [0, 1])),
@@ -1348,13 +1435,15 @@ class ReplayViewer:
                         "progress": u,
                     },
                 }
+                if curr_time is not None:
+                    synth_fr["time"] = curr_time
                 expanded_frames.append(synth_fr)
 
             # Stage 3: Arbiter Whistle Hold
             for k in range(hold_frames):
                 p_list = [[p[0], p[1], p[2], 0] for p in curr_fr.get("players", [])]
                 synth_fr = {
-                    "time": prev_fr.get("time", 0.0),
+                    "frame": curr_raw_frame,
                     "half": curr_fr.get("half", 1),
                     "stats": curr_fr.get("stats", {}),
                     "team_side": curr_fr.get("team_side", [0, 1]),
@@ -1371,6 +1460,8 @@ class ReplayViewer:
                         "progress": k / float(hold_frames),
                     },
                 }
+                if curr_time is not None:
+                    synth_fr["time"] = curr_time
                 expanded_frames.append(synth_fr)
 
             # Finally, append curr_fr with events cleared
@@ -1667,8 +1758,7 @@ class ReplayViewer:
             border_radius=5,
         )
 
-        progress = self.current_frame_idx / float(max(1, self.num_frames - 1))
-        fill_w = int(bar_w * progress)
+        fill_w = self._frame_idx_to_bar_offset(self.current_frame_idx, bar_w)
         pygame.draw.rect(
             self.screen,
             COLOR_KEEPER_GOLD,
@@ -1676,16 +1766,16 @@ class ReplayViewer:
             border_radius=5,
         )
 
-        # Halftime marker at the first frame of the second half
+        # Halftime marker at the time of the first second-half frame
         if self.halftime_frame_idx is not None:
-            ht_x = bar_x + int((self.halftime_frame_idx / float(max(1, self.num_frames - 1))) * bar_w)
+            ht_x = self._frame_idx_to_bar_x(self.halftime_frame_idx, bar_x, bar_w)
             pygame.draw.line(
                 self.screen, COLOR_LINE, (ht_x, bar_y - 4), (ht_x, bar_y + bar_h + 4), width=2
             )
 
         # 1. High-reward (+5 or up) other event markers along timeline (triangle shaped: ▲)
         for h_frame, h_team, h_label, h_rew in self.high_reward_frames:
-            hx = bar_x + int((h_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            hx = self._frame_idx_to_bar_x(h_frame, bar_x, bar_w)
             hy = bar_y + bar_h // 2
             h_col = COLOR_TEAM_A if h_team == 0 else (COLOR_TEAM_B if h_team == 1 else (75, 255, 120))
             tri_pts = [
@@ -1699,7 +1789,7 @@ class ReplayViewer:
 
         # 2. Foul / violation markers along timeline (card shaped: ▮)
         for f_frame, f_team, f_type in self.foul_frames:
-            fx = bar_x + int((f_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            fx = self._frame_idx_to_bar_x(f_frame, bar_x, bar_w)
             fy = bar_y + bar_h // 2
             f_col = COLOR_TEAM_A if f_team == 0 else (COLOR_TEAM_B if f_team == 1 else (255, 80, 80))
             card_rect = pygame.Rect(fx - 3, fy - 6, 7, 12)
@@ -1708,7 +1798,7 @@ class ReplayViewer:
 
         # 3. Save markers along timeline (diamond shaped: ◆)
         for s_frame, s_team, is_lunge in self.save_frames:
-            sx = bar_x + int((s_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            sx = self._frame_idx_to_bar_x(s_frame, bar_x, bar_w)
             sy = bar_y + bar_h // 2
             s_col = COLOR_TEAM_A if s_team == 0 else COLOR_TEAM_B
             diamond_pts = [
@@ -1723,7 +1813,7 @@ class ReplayViewer:
 
         # 4. Goal markers along timeline (circular: ●)
         for g_frame, g_team, is_og in self.goal_frames:
-            gx = bar_x + int((g_frame / float(max(1, self.num_frames - 1))) * bar_w)
+            gx = self._frame_idx_to_bar_x(g_frame, bar_x, bar_w)
             g_col = COLOR_TEAM_A if g_team == 0 else COLOR_TEAM_B
             pygame.draw.circle(self.screen, g_col, (gx, bar_y + bar_h // 2), 6)
             ring_col = (255, 120, 50) if is_og else COLOR_LINE
