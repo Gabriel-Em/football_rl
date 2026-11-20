@@ -1,6 +1,6 @@
-"""Counterfactual rollouts over harness traces: keeper reach (`gk`) and hold-vs-kick (`hold`).
+"""Counterfactual rollouts over harness traces: keeper reach (`gk`), hold-vs-kick (`hold`) and kick aim (`aim`).
 
-From a harness trace directory (`m*.npz`) and (for `hold`) the checkpoint that produced it,
+From a harness trace directory (`m*.npz`) and (for `hold` and `aim`) the checkpoint that produced it,
 re-simulates each match from its harness seed (`trace_seed * 1000 + match_idx`), verifies position
 determinism (< 1e-3 u for players and ball across every recorded decision, skipping and counting
 any match that fails), clones the engine at target decision points, and rolls counterfactual
@@ -29,12 +29,40 @@ branches:
         mean > 0.35, else `hold`. Buckets `intent_kick`, `intent_mid`, `intent_hold`, and in the
         defensive third `def_intent_kick`, `def_intent_hold`.
 
+  aim   At real outfield kicks with an open teammate in the kickable arc: `tools/audit/census.py` pass-option records
+        with an open candidate and a direction, where the kicker holds the ball at the kick row k, k + 2 < the trace
+        length, and k is >= 45 decisions after the previous point of the match. The target is the open candidate with
+        the smallest |theta_j - facing| (theta_j = angle of pos_j - ball, facing = `ang[k, kicker]`, wrapped to
+        (-pi, pi]); it must be within 35 deg (`kick_steer_max_deflection_deg`), else the kick is no point. Points carry
+        the canonical third of the ball, the kicker's intent (`decision_intent`), `already` (census `aimed_open`), the
+        target distance and the signed deflection theta_target - facing. Three branches with one generator seed
+        `(seed * 1_000_003 + match_idx * 10_000 + k) & 0x7FFFFFFF`, rolled for 75 decisions (5 s):
+          POLICY  step 0 plays the recorded clipped actions `act[k]` (the real kick);
+          AIM     as POLICY, with the kicker's steer set to clip(deflection / 35 deg, -1, 1), so the kick points at the
+                  target with the recorded power;
+          AIMP    as AIM, with the kicker's kick column set to threshold + pn * (1 - threshold) + 1e-4, where
+                  pn = clip((v0 - v_min) / (v_max - v_min), 0, 1), v0 = min(v_max, sqrt(200^2 + 2 * friction * dist))
+                  (the ball reaches the target at about 200 u/s), v_max the kicker's role kick speed and v_min
+                  `ball_min_kick_speed`.
+        From step 1 on both teams sample from the checkpoint (`mode="sampled"`); every branch draws the policies at
+        step 0 too, so the generator stays aligned. Per branch: discounted team-mean non-shaping return and full return
+        with the gamma^h team-mean critic bootstrap at h = 15, 45, 75 (no bootstrap after a terminal step); the kicking
+        team in possession after decisions 15 and 30; the first holder other than the kicker after decisions 2..45
+        (`target`, `teammate`, `opponent` or `none`); goals for and against by the end; and the angle between the ball's
+        direction after step 0 and the ball -> target direction at the snapshot (None while a player holds the ball).
+        Buckets: `not_aimed`, `already_aimed`, and the not-aimed points by third (`not_aimed_third_<third>`) and by
+        intent (`not_aimed_intent_<intent>`); each gives per-branch shares and the paired AIM - POLICY and
+        AIMP - POLICY differences (mean +- SE). The loaded policies must reproduce `val` and `mean` of the trace at
+        decision 0 of every match within 1e-5, as in `hold`.
+
 Nothing is written to `checkpoints/`, `replays/`, checkpoint directories, or the trace directory.
 
 Usage:
   python tools/audit/rollouts.py gk --trace-dir DIR [--max-matches 48] [--workers 4] --out OUT
   python tools/audit/rollouts.py hold --trace-dir DIR --checkpoint-dir DIR [--max-matches 48]
          [--workers 4] [--seed 1] [--hold-steps 15] --out OUT
+  python tools/audit/rollouts.py aim --trace-dir DIR --checkpoint-dir DIR [--max-matches 32]
+         [--workers 4] [--seed 1] [--shaping-mode legacy] --out OUT
 """
 
 from __future__ import annotations
@@ -62,6 +90,9 @@ from football_rl.env import FootballParallelEnv  # noqa: E402
 from tools.audit import census, harness  # noqa: E402
 
 __all__ = [
+    "AIM_BRANCHES",
+    "AIM_HORIZONS",
+    "AIM_MAX_DEFLECTION_DEG",
     "COMPONENT_KEYS",
     "GK_HORIZON_STEPS",
     "GK_INERT_ACTION",
@@ -74,16 +105,22 @@ __all__ = [
     "KICK_OVERRIDE_STEPS",
     "POS_ERR_LIMIT",
     "SPACING_STEPS",
+    "aim_steer",
+    "aimp_power",
     "decision_intent",
     "eval_gk_opportunity",
+    "find_aim_points",
     "find_gk_opportunities",
     "find_hold_decisions",
     "gk_scripted_action",
     "main",
     "resimulate_match",
+    "roll_aim_branches",
     "roll_hold_branches",
+    "run_aim",
     "run_gk",
     "run_hold",
+    "summarize_aim",
     "summarize_gk",
     "summarize_hold",
 ]
@@ -125,6 +162,23 @@ INTENT_BUCKETS = (
 PRESSURE_NEAR = 70.0
 PRESSURE_FAR = 120.0
 PITCH_THIRD = FIELD_WIDTH / 3.0
+
+AIM_MAX_DEFLECTION_DEG = float(DEFAULT_CONFIG.mechanics.kick_steer_max_deflection_deg)
+AIM_HORIZONS = (15, 45, 75)
+AIM_POSSESSION_STEPS = (15, 30)
+AIM_FIRST_RECEIVER_STEPS = 45
+AIM_ARRIVE_SPEED = 200.0
+AIM_POWER_MARGIN = 1e-4
+AIM_BRANCHES = ("policy", "aim", "aimp")
+AIM_RECEIVERS = ("target", "teammate", "opponent", "none")
+AIM_THIRDS = ("defensive", "middle", "attacking")
+AIM_INTENTS = ("kick", "mid", "hold")
+AIM_SCALAR_KEYS = (
+    *(f"{m}_{h}" for h in AIM_HORIZONS for m in ("non_shaping_return", "full_return_bootstrap")),
+    *(f"possession_{s}" for s in AIM_POSSESSION_STEPS),
+    "goal_for",
+    "goal_against",
+)
 
 COMPONENT_KEYS = (
     "turnover",
@@ -1182,6 +1236,443 @@ def format_hold_report(summary: Dict[str, Any], title: str = "") -> str:
 
 
 # ----------------------------------------------------------------------------
+# Aim counterfactual at real kicks
+# ----------------------------------------------------------------------------
+def _wrap_angle(a: float) -> float:
+    """Angle wrapped to (-pi, pi]."""
+    return math.pi - (math.pi - a) % (2.0 * math.pi)
+
+
+def _third(trace: Dict[str, np.ndarray], step: int, team: int) -> str:
+    x = float(np.asarray(trace["ball"])[step, 0])
+    canon_x = x if int(np.asarray(trace["side"])[step, team]) == 0 else FIELD_WIDTH - x
+    if canon_x < PITCH_THIRD:
+        return "defensive"
+    return "middle" if canon_x < 2.0 * PITCH_THIRD else "attacking"
+
+
+def find_aim_points(trace: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    """Kicks with an open teammate in the kickable arc, >= 45 decisions apart (see `aim` in the module docstring)."""
+    holder = np.asarray(trace["holder"], dtype=np.int64)
+    n = int(holder.size)
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    ang = np.asarray(trace["ang"], dtype=np.float64)
+    limit = math.radians(AIM_MAX_DEFLECTION_DEG)
+    points: List[Dict[str, Any]] = []
+    last_step = -SPACING_STEPS - 1
+    for rec in census.pass_options(trace):
+        if not rec["open"] or not rec["has_direction"]:
+            continue
+        step, kicker = rec["step"], rec["player"]
+        if int(holder[step]) != kicker or step - last_step < SPACING_STEPS or step + 2 >= n:
+            continue
+        facing = float(ang[step, kicker])
+        best: Optional[Tuple[int, float, float]] = None
+        for mate in rec["open"]:
+            dx, dy = pos[step, mate] - ball[step]
+            deflection = _wrap_angle(math.atan2(dy, dx) - facing)
+            if abs(deflection) <= limit and (best is None or abs(deflection) < abs(best[1])):
+                best = (int(mate), deflection, math.hypot(dx, dy))
+        if best is None:
+            continue
+        last_step = step
+        team = kicker // TEAM_SIZE
+        points.append({
+            "step": step,
+            "kicker": kicker,
+            "team": team,
+            "target": best[0],
+            "deflection": best[1],
+            "target_dist": best[2],
+            "third": _third(trace, step, team),
+            "intent": decision_intent(trace, step, kicker),
+            "already": bool(rec["aimed_open"]),
+        })
+    return points
+
+
+def aim_steer(deflection: float, max_deflection_deg: float = AIM_MAX_DEFLECTION_DEG) -> float:
+    """Steer that turns a kick by `deflection` rad from the facing: clip(deflection / max deflection, -1, 1)."""
+    return float(min(1.0, max(-1.0, deflection / math.radians(max_deflection_deg))))
+
+
+def aimp_power(
+    dist: float,
+    v_max: float,
+    *,
+    v_min: float = float(DEFAULT_CONFIG.physics.ball_min_kick_speed),
+    decel: float = float(DEFAULT_CONFIG.physics.ball_friction_decel),
+    threshold: float = KICK_INTENT_THR,
+    arrive_speed: float = AIM_ARRIVE_SPEED,
+) -> Tuple[float, float, float]:
+    """`(v0, pn, power)`: the launch speed reaching `dist` at `arrive_speed` under linear friction (capped at `v_max`),
+    its normalised power and the env kick column that produces it."""
+    v0 = min(float(v_max), math.sqrt(arrive_speed ** 2 + 2.0 * decel * float(dist)))
+    pn = min(1.0, max(0.0, (v0 - v_min) / (v_max - v_min)))
+    return v0, pn, threshold + pn * (1.0 - threshold) + AIM_POWER_MARGIN
+
+
+def _team_holds(env: Any, team: int) -> float:
+    return 1.0 if (env.ball_holder is not None and env.ball_holder // TEAM_SIZE == team) else 0.0
+
+
+def _roll_aim_branch(
+    snap: Any,
+    *,
+    branch: str,
+    recorded_actions: np.ndarray,
+    kicker: int,
+    target: int,
+    branch_seed: int,
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    steer: Optional[float],
+    power: Optional[float],
+    mode: str,
+    sigma_scale: float,
+    after_step: Optional[Callable[[str, int, Any, np.ndarray], None]],
+) -> Dict[str, Any]:
+    env = copy.deepcopy(snap)
+    team = kicker // TEAM_SIZE
+    sl = slice(team * TEAM_SIZE, (team + 1) * TEAM_SIZE)
+    gamma = float(env.cfg.ppo.gamma)
+    max_h = max(AIM_HORIZONS)
+    gen = torch.Generator().manual_seed(int(branch_seed))
+    obs = env._get_observations_array()
+    cen = env.get_centralized_state()
+    start = (int(env.stats["score"][team]), int(env.stats["score"][1 - team]))
+    to_target = np.asarray(env.player_pos[target], dtype=np.float64) - np.asarray(env.ball_pos, dtype=np.float64)
+
+    disc_ns = 0.0
+    disc_full = 0.0
+    returns: Dict[int, Dict[str, float]] = {}
+    possession: Dict[int, float] = {}
+    first: Optional[str] = None
+    kick_err: Optional[float] = None
+    done = False
+    for k in range(max_h):
+        act_a, val_a = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        act_b, val_b = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        val = np.concatenate([val_a, val_b])
+        if k in AIM_HORIZONS:
+            returns[k] = {
+                "non_shaping_return": disc_ns,
+                "full_return_bootstrap": disc_full + gamma ** k * float(np.mean(val[sl])),
+            }
+        act = np.concatenate([act_a, act_b])
+        if k == 0:
+            act = np.array(recorded_actions, dtype=np.float32, copy=True)
+            if steer is not None:
+                act[kicker, 1] = steer
+            if power is not None:
+                act[kicker, 2] = power
+        obs, cen, rew, done, _ = env.step_array(act, val)
+        if after_step is not None:
+            after_step(branch, k, env, act)
+        if k == 0 and env.ball_holder is None:
+            bv = env.ball_vel
+            kick_err = abs(math.degrees(_wrap_angle(math.atan2(bv[1], bv[0]) - math.atan2(to_target[1], to_target[0]))))
+        r_ns = _non_shaping_rewards(env, rew)
+        disc_ns += gamma ** k * float(np.mean(r_ns[sl]))
+        disc_full += gamma ** k * float(np.mean(np.asarray(rew, dtype=np.float64)[sl]))
+        h = env.ball_holder
+        if first is None and 1 <= k < AIM_FIRST_RECEIVER_STEPS and h is not None and h != kicker:
+            first = "target" if h == target else ("teammate" if h // TEAM_SIZE == team else "opponent")
+        if k + 1 in AIM_POSSESSION_STEPS:
+            possession[k + 1] = _team_holds(env, team)
+        if done:
+            break
+    if not done:
+        _, val_a = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        _, val_b = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        returns[max_h] = {
+            "non_shaping_return": disc_ns,
+            "full_return_bootstrap": disc_full + gamma ** max_h * float(np.mean(np.concatenate([val_a, val_b])[sl])),
+        }
+    for h in AIM_HORIZONS:
+        returns.setdefault(h, {"non_shaping_return": disc_ns, "full_return_bootstrap": disc_full})
+    for s in AIM_POSSESSION_STEPS:
+        possession.setdefault(s, _team_holds(env, team))
+    return {
+        "returns": returns,
+        "possession": possession,
+        "first_receiver": first or "none",
+        "goal_for": 1.0 if int(env.stats["score"][team]) > start[0] else 0.0,
+        "goal_against": 1.0 if int(env.stats["score"][1 - team]) > start[1] else 0.0,
+        "kick_err_deg": kick_err,
+    }
+
+
+def roll_aim_branches(
+    snap: Any,
+    *,
+    recorded_actions: np.ndarray,
+    kicker: int,
+    target: int,
+    branch_seed: int,
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    steer: float,
+    power: float,
+    mode: str = "sampled",
+    sigma_scale: float = 1.0,
+    after_step: Optional[Callable[[str, int, Any, np.ndarray], None]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Roll POLICY, AIM (kicker steer `steer` at step 0) and AIMP (steer `steer`, kick column `power`) from `snap`,
+    all three from one generator seed. `after_step(branch, k, env, act)` sees every applied action."""
+    overrides = {"policy": (None, None), "aim": (steer, None), "aimp": (steer, power)}
+    return {
+        branch: _roll_aim_branch(
+            snap,
+            branch=branch,
+            recorded_actions=recorded_actions,
+            kicker=kicker,
+            target=target,
+            branch_seed=branch_seed,
+            team_a=team_a,
+            team_b=team_b,
+            steer=overrides[branch][0],
+            power=overrides[branch][1],
+            mode=mode,
+            sigma_scale=sigma_scale,
+            after_step=after_step,
+        )
+        for branch in AIM_BRANCHES
+    }
+
+
+def _aim_worker(task: Tuple[int, str, int, int]) -> Dict[str, Any]:
+    match_idx, path_str, trace_seed, rollout_seed = task
+    assert _HOLD_POLICIES is not None and _HOLD_SPEC_CFG is not None
+    team_a, team_b = _HOLD_POLICIES
+    mode, sigma_scale, shaping_mode = _HOLD_SPEC_CFG
+
+    trace = _load_trace(Path(path_str))
+    pts = find_aim_points(trace)
+    ok, max_err, snapshots = resimulate_match(
+        trace,
+        match_seed=trace_seed * 1000 + match_idx,
+        target_steps=sorted({0, *(p["step"] for p in pts)}),
+        shaping_mode=shaping_mode,
+    )
+    if not ok:
+        return {"ok": False, "max_err": max_err, "records": []}
+    _verify_checkpoint_matches_trace(match_idx, 0, snapshots[0], trace, team_a, team_b)
+
+    act = np.asarray(trace["act"], dtype=np.float32)
+    records = []
+    for p in pts:
+        step, kicker = p["step"], p["kicker"]
+        snap = snapshots[step]
+        phys, mech = snap.cfg.physics, snap.cfg.mechanics
+        steer = aim_steer(p["deflection"], float(mech.kick_steer_max_deflection_deg))
+        v_max, _ = snap._get_role_kick_params(kicker)
+        _, _, power = aimp_power(
+            p["target_dist"],
+            float(v_max),
+            v_min=float(phys.ball_min_kick_speed),
+            decel=float(phys.ball_friction_decel),
+            threshold=float(mech.kick_trigger_threshold),
+        )
+        branches = roll_aim_branches(
+            snap,
+            recorded_actions=act[step],
+            kicker=kicker,
+            target=p["target"],
+            branch_seed=(rollout_seed * 1_000_003 + match_idx * 10_000 + step) & 0x7FFF_FFFF,
+            team_a=team_a,
+            team_b=team_b,
+            steer=steer,
+            power=power,
+            mode=mode,
+            sigma_scale=sigma_scale,
+        )
+        records.append({
+            "match_idx": match_idx,
+            **p,
+            "recorded_steer": float(act[step, kicker, 1]),
+            "recorded_power": float(act[step, kicker, 2]),
+            "aim_steer": steer,
+            "aimp_power": power,
+            "branches": branches,
+        })
+    return {"ok": True, "max_err": max_err, "records": records}
+
+
+def _branch_scalars(res: Dict[str, Any]) -> Dict[str, float]:
+    out = {}
+    for h in AIM_HORIZONS:
+        for metric in ("non_shaping_return", "full_return_bootstrap"):
+            out[f"{metric}_{h}"] = float(res["returns"][h][metric])
+    for s in AIM_POSSESSION_STEPS:
+        out[f"possession_{s}"] = float(res["possession"][s])
+    out["goal_for"] = float(res["goal_for"])
+    out["goal_against"] = float(res["goal_against"])
+    return out
+
+
+def _summarize_aim_bucket(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    branches: Dict[str, Any] = {}
+    for b in AIM_BRANCHES:
+        res = [r["branches"][b] for r in records]
+        errs = [x["kick_err_deg"] for x in res]
+        loose = [e for e in errs if e is not None]
+        entry: Dict[str, Any] = {
+            f"first_receiver_{o}": _stat_dict(1.0 if x["first_receiver"] == o else 0.0 for x in res) for o in AIM_RECEIVERS
+        }
+        for s in AIM_POSSESSION_STEPS:
+            entry[f"possession_{s}"] = _stat_dict(float(x["possession"][s]) for x in res)
+        entry["goal_for"] = _stat_dict(float(x["goal_for"]) for x in res)
+        entry["goal_against"] = _stat_dict(float(x["goal_against"]) for x in res)
+        entry["ball_held_after_kick"] = _stat_dict(1.0 if e is None else 0.0 for e in errs)
+        entry["kick_within_15deg"] = _stat_dict(1.0 if (e is not None and e <= census.AIM_CONE_DEG) else 0.0 for e in errs)
+        entry["kick_err_median_deg"] = float(np.median(loose)) if loose else None
+        branches[b] = entry
+    paired: Dict[str, Any] = {}
+    for b in ("aim", "aimp"):
+        diffs = []
+        for r in records:
+            base, alt = _branch_scalars(r["branches"]["policy"]), _branch_scalars(r["branches"][b])
+            diffs.append({key: alt[key] - base[key] for key in AIM_SCALAR_KEYS})
+        paired[f"{b}_minus_policy"] = {key: _stat_dict(d[key] for d in diffs) for key in AIM_SCALAR_KEYS}
+    return {"n": len(records), "branches": branches, "paired": paired}
+
+
+def summarize_aim(
+    records: Sequence[Dict[str, Any]],
+    n_matches_total: int,
+    n_matches_ok: int,
+    n_matches_skipped: int,
+    max_pos_err: Optional[float],
+    *,
+    seed: int,
+    shaping_mode: str = str(DEFAULT_CONFIG.rewards.shaping_mode),
+    gamma: float = float(DEFAULT_CONFIG.ppo.gamma),
+) -> Dict[str, Any]:
+    buckets: Dict[str, Callable[[Dict[str, Any]], bool]] = {
+        "not_aimed": lambda r: not r["already"],
+        "already_aimed": lambda r: bool(r["already"]),
+    }
+    for t in AIM_THIRDS:
+        buckets[f"not_aimed_third_{t}"] = lambda r, t=t: (not r["already"]) and r["third"] == t
+    for i in AIM_INTENTS:
+        buckets[f"not_aimed_intent_{i}"] = lambda r, i=i: (not r["already"]) and r["intent"] == i
+    return {
+        "mode": "aim",
+        "seed": seed,
+        "shaping_mode": shaping_mode,
+        "gamma": float(gamma),
+        "n_matches_total": n_matches_total,
+        "n_matches_ok": n_matches_ok,
+        "n_matches_skipped": n_matches_skipped,
+        "max_pos_err": max_pos_err,
+        "n_points": len(records),
+        "buckets": {name: _summarize_aim_bucket([r for r in records if pred(r)]) for name, pred in buckets.items()},
+    }
+
+
+def run_aim(
+    *,
+    trace_dir: Path | str,
+    checkpoint_dir: Path | str,
+    trace_seed: Optional[int] = None,
+    seed: int = 1,
+    max_matches: Optional[int] = None,
+    workers: int = 1,
+    shaping_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Summary of `aim` over the traces, with the per-point records under `records`."""
+    if workers <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    spec = harness.EvalSpec(
+        checkpoint_dir=str(checkpoint_dir), opponent="self", mode="sampled", n=1, seed=int(seed), workers=int(workers)
+    )
+    spec.validate()
+    t_seed = _resolve_trace_seed(trace_dir, trace_seed)
+    items = _trace_paths_with_indices(trace_dir, max_matches=max_matches)
+    tasks = [(idx, str(path), t_seed, int(seed)) for idx, path in items]
+
+    if workers == 1 or len(tasks) == 1:
+        prev_threads = torch.get_num_threads()
+        try:
+            _init_hold_worker(spec, shaping_mode)
+            outputs = [_aim_worker(t) for t in tasks]
+        finally:
+            torch.set_num_threads(prev_threads)
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(min(workers, len(tasks)), initializer=_init_hold_worker, initargs=(spec, shaping_mode)) as pool:
+            outputs = list(pool.map(_aim_worker, tasks, chunksize=1))
+
+    records: List[Dict[str, Any]] = []
+    n_ok = 0
+    max_err: Optional[float] = None
+    for res in outputs:
+        if res["ok"]:
+            n_ok += 1
+            records.extend(res["records"])
+            err = float(res["max_err"])
+            max_err = err if max_err is None else max(max_err, err)
+    summary = summarize_aim(
+        records,
+        len(tasks),
+        n_ok,
+        len(tasks) - n_ok,
+        max_err,
+        seed=int(seed),
+        shaping_mode=_resolved_shaping_mode(shaping_mode),
+        gamma=float(DEFAULT_CONFIG.ppo.gamma),
+    )
+    summary["records"] = records
+    return summary
+
+
+def format_aim_report(summary: Dict[str, Any], title: str = "") -> str:
+    header = f"===== rollouts aim {title}".strip()
+    lines = [
+        f"{header}  matches ok={summary['n_matches_ok']}/{summary['n_matches_total']} "
+        f"skipped={summary['n_matches_skipped']} points={summary['n_points']} seed={summary['seed']} "
+        f"shaping={summary['shaping_mode']} max_pos_err={summary['max_pos_err'] if summary['max_pos_err'] is not None else '-'}"
+    ]
+    labels = {"not_aimed": "not already aimed", "already_aimed": "already aimed"}
+    labels.update({f"not_aimed_third_{t}": f"not already aimed, {t} third" for t in AIM_THIRDS})
+    labels.update({f"not_aimed_intent_{i}": f"not already aimed, intent={i}" for i in AIM_INTENTS})
+
+    def mean(stat: Dict[str, Any]) -> str:
+        return "-" if stat["mean"] is None else f"{stat['mean']:.3f}"
+
+    for key, label in labels.items():
+        b = summary["buckets"][key]
+        lines.append(f"  -- {label} (n={b['n']}) --")
+        if b["n"] == 0:
+            continue
+        for br in AIM_BRANCHES:
+            e = b["branches"][br]
+            med = "-" if e["kick_err_median_deg"] is None else f"{e['kick_err_median_deg']:.1f}"
+            lines.append(
+                f"    {br:6s}: first receiver target {mean(e['first_receiver_target'])} teammate "
+                f"{mean(e['first_receiver_teammate'])} opponent {mean(e['first_receiver_opponent'])} none "
+                f"{mean(e['first_receiver_none'])} | possession 1 s {mean(e['possession_15'])} 2 s {mean(e['possession_30'])}"
+                f" | gf {mean(e['goal_for'])} ga {mean(e['goal_against'])} | kick dir vs target: median {med} deg, "
+                f"<= 15 deg {mean(e['kick_within_15deg'])}, ball held {mean(e['ball_held_after_kick'])}"
+            )
+        for pk, plabel in (("aim_minus_policy", "AIM - POLICY"), ("aimp_minus_policy", "AIMP - POLICY")):
+            d = b["paired"][pk]
+            for h in AIM_HORIZONS:
+                lines.append(
+                    f"    {plabel:13s} H={h:2d}: non_shaping {census._fmt_d(d[f'non_shaping_return_{h}'], 4)} | "
+                    f"full_boot {census._fmt_d(d[f'full_return_bootstrap_{h}'], 4)}"
+                )
+            lines.append(
+                f"    {plabel:13s} possession 1 s {census._fmt_d(d['possession_15'], 3)} | "
+                f"2 s {census._fmt_d(d['possession_30'], 3)} | gf {census._fmt_d(d['goal_for'], 3)} | "
+                f"ga {census._fmt_d(d['goal_against'], 3)}"
+            )
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
 # Command line
 # ----------------------------------------------------------------------------
 def _positive_int(text: str) -> int:
@@ -1224,6 +1715,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=HOLD_OVERRIDE_STEPS,
         help=f"decisions the HOLD branch forces the holder not to kick (>= 1, default {HOLD_OVERRIDE_STEPS})",
     )
+
+    p_aim = sub.add_parser("aim", help="counterfactual aim of real kicks at an open teammate in the kickable arc")
+    add_common(p_aim)
+    p_aim.add_argument("--checkpoint-dir", required=True, help="checkpoint directory with blue_*/red_* policies (read only)")
+    p_aim.add_argument("--seed", type=int, default=1, help="rollout RNG seed")
     return ap
 
 
@@ -1247,6 +1743,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shaping_mode=args.shaping_mode,
         )
         rep = format_gk_report(summary, title=str(args.trace_dir))
+    elif args.command == "aim":
+        summary = run_aim(
+            trace_dir=args.trace_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            trace_seed=args.trace_seed,
+            seed=args.seed,
+            max_matches=args.max_matches,
+            workers=args.workers,
+            shaping_mode=args.shaping_mode,
+        )
+        rep = format_aim_report(summary, title=str(args.trace_dir))
     else:
         summary = run_hold(
             trace_dir=args.trace_dir,

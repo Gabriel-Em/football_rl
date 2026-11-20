@@ -35,6 +35,15 @@ Metrics
                     `no_option_opponent_share`: kicks without an open candidate whose `kick_outcome` is `opponent`,
                     over kicks without one that have an outcome.
                     The outcome is the `kick_outcome` above; a censored kick enters only the first two keys.
+                    Chance baselines for the aim, over kicks with an open candidate and a direction, with facing =
+                    `ang[k, i]` (the kicker's body angle at the kick row), theta_j = the angle of pos_j - ball for each open
+                    candidate j, and angle differences wrapped to (-pi, pi]:
+                    `open_reachable_share`: kicks with an open candidate within 50 deg of the facing (35 deg of kick
+                    deflection plus the 15 deg aim cone), over kicks with an open candidate and a direction.
+                    `aim_open_reachable_share`: kicks aimed at an open candidate among those reachable kicks, over them.
+                    `aim_open_arc_baseline`: over the reachable kicks, the mean share of the 71 angles facing + {-35, -34,
+                    ..., +35} deg lying within 15 deg (inclusive) of some open theta_j: the aim share of a kick sent in a
+                    uniformly random direction of the kickable arc. A trace without `ang` enters none of the three keys.
   n_within(R)       mean number of a team's outfield players strictly closer than R u to the ball per
                     decision (per team). Uniform random placement gives 0.123 (R=100), 0.266 (R=150).
   cluster_ge4       fraction of decisions in which at least 4 of a team's 5 outfield players form one
@@ -76,7 +85,7 @@ from football_rl.config import DEFAULT_CONFIG  # noqa: E402
 
 __all__ = [
     "hold_share", "loose_share", "holder_spell_intervals", "holder_spells", "kick_events", "kick_outcomes",
-    "outfield_outcome_counts", "pass_options", "pass_option_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
+    "outfield_outcome_counts", "pass_options", "pass_option_counts", "aim_reach_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
     "cluster_ge4", "role_inversion", "gk_geometry", "gk_opportunities", "goal_events", "goal_type_counts",
     "time_binned_counts", "time_binned_metrics", "match_metrics", "mean_se", "ratio_se", "summarize", "report",
     "load_traces", "main",
@@ -108,6 +117,9 @@ PASS_MAX_DIST = 700.0
 LANE_HALF_WIDTH = 50.0
 AIM_MIN_SPEED = 50.0
 AIM_CONE_DEG = 15.0
+REACH_DEG = 50.0
+ARC_GRID_DEG = np.arange(-35.0, 36.0, 1.0)  # kickable arc: facing + 35 deg of kick deflection either side, 1 deg apart
+AIM_REACH_COUNT_KEYS = ("open_reach_den", "open_reach_n", "aim_reach_n", "arc_reach_sum")
 PASS_OPTION_COUNT_KEYS = (
     "pass_opt_n", "pass_opt_with", "aim_open_den", "aim_open_n",
     "aim_comp_den", "aim_comp_mate", "noopt_den", "noopt_opp",
@@ -223,8 +235,10 @@ def pass_options(
 ) -> List[Dict[str, Any]]:
     """Passing options of every outfield kick that has a next row (see `pass options` in the module docstring).
 
-    Each record: `step`, `player`, `candidates` and `open` (sorted player indices), `has_direction`, `aimed_open`, and
-    `outcome` (the `kick_outcomes` result, or None for a censored kick).
+    Each record: `step`, `player`, `candidates` and `open` (sorted player indices), `has_direction`, `aimed_open`,
+    `outcome` (the `kick_outcomes` result, or None for a censored kick), `reachable` (an open candidate within `REACH_DEG`
+    of the facing) and `arc_cover` (the share of the kickable arc grid within `AIM_CONE_DEG` of an open candidate); the
+    last two are None for a kick without an open candidate or a direction, and for a trace without `ang`.
     """
     steps, players = kick_events(trace) if kicks is None else kicks
     n = int(np.asarray(trace["holder"]).shape[0])
@@ -258,6 +272,18 @@ def pass_options(
         bvel[:, None, 0] * seg[..., 0] + bvel[:, None, 1] * seg[..., 1],
     )))
     aimed_open = (open_ & (angle <= AIM_CONE_DEG)).any(axis=1) & has_dir
+    scored = open_.any(axis=1) & has_dir
+    reachable = np.zeros(k.size, dtype=bool)
+    arc_cover = np.zeros(k.size)
+    has_facing = "ang" in trace
+    if has_facing:
+        facing = np.asarray(trace["ang"], dtype=np.float64)[k, i]                # (K,) body angle at the kick row
+        theta = np.arctan2(seg[..., 1], seg[..., 0])                              # (K, 5) ball -> teammate
+        rel = _wrap_pi(theta - facing[:, None])
+        reachable = (open_ & (np.abs(rel) <= math.radians(REACH_DEG))).any(axis=1)
+        grid = facing[:, None] + np.radians(ARC_GRID_DEG)[None, :]                # (K, 71)
+        near = np.abs(_wrap_pi(grid[:, :, None] - theta[:, None, :])) <= math.radians(AIM_CONE_DEG)
+        arc_cover = (near & open_[:, None, :]).any(axis=2).mean(axis=1)
     return [
         {
             "step": int(k[r]),
@@ -267,9 +293,16 @@ def pass_options(
             "has_direction": bool(has_dir[r]),
             "aimed_open": bool(aimed_open[r]),
             "outcome": by_kick.get((int(k[r]), int(i[r]))),
+            "reachable": bool(reachable[r]) if has_facing and scored[r] else None,
+            "arc_cover": float(arc_cover[r]) if has_facing and scored[r] else None,
         }
         for r in range(k.size)
     ]
+
+
+def _wrap_pi(a: np.ndarray) -> np.ndarray:
+    """Angles wrapped to (-pi, pi]."""
+    return math.pi - np.mod(math.pi - a, 2.0 * math.pi)
 
 
 def pass_option_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
@@ -290,6 +323,21 @@ def pass_option_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
         if not option:
             c["noopt_den"] += 1
             c["noopt_opp"] += int(rec["outcome"] == "opponent")
+    return c
+
+
+def aim_reach_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-match numerators and denominators of the three aim chance-baseline shares."""
+    c: Dict[str, Any] = {key: 0 for key in AIM_REACH_COUNT_KEYS}
+    c["arc_reach_sum"] = 0.0
+    for rec in records:
+        if rec["reachable"] is None:
+            continue
+        c["open_reach_den"] += 1
+        if rec["reachable"]:
+            c["open_reach_n"] += 1
+            c["aim_reach_n"] += int(rec["aimed_open"])
+            c["arc_reach_sum"] += float(rec["arc_cover"])
     return c
 
 
@@ -533,6 +581,9 @@ PASS_OPTION_SHARES = {
     "aim_open_share": ("aim_open_n", "aim_open_den"),
     "aim_open_completion": ("aim_comp_mate", "aim_comp_den"),
     "no_option_opponent_share": ("noopt_opp", "noopt_den"),
+    "open_reachable_share": ("open_reach_n", "open_reach_den"),
+    "aim_open_reachable_share": ("aim_reach_n", "open_reach_n"),
+    "aim_open_arc_baseline": ("arc_reach_sum", "open_reach_n"),
 }
 
 KICK_PROP_KEYS = (
@@ -725,7 +776,9 @@ def match_metrics(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     m["kicks_n"] = counts["n"]
     for name in OUTCOMES:
         m[f"kick_{name}"] = counts[name]
-    m.update(pass_option_counts(pass_options(trace, kicks=kicks, outcomes=outcomes)))
+    options = pass_options(trace, kicks=kicks, outcomes=outcomes)
+    m.update(pass_option_counts(options))
+    m.update(aim_reach_counts(options))
 
     kp_counts = kick_propensity_counts(trace, holder=holder, kicks=kicks)
     for k, (kn, hn) in kp_counts.items():
@@ -913,7 +966,10 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
         f"option {_fmt_d(met['pass_option_share'], 1, 100.0, '%')} | "
         f"aim_open {_fmt_d(met['aim_open_share'], 1, 100.0, '%')} | "
         f"completion {_fmt_d(met['aim_open_completion'], 1, 100.0, '%')} | "
-        f"no_option_opponent {_fmt_d(met['no_option_opponent_share'], 1, 100.0, '%')}"
+        f"no_option_opponent {_fmt_d(met['no_option_opponent_share'], 1, 100.0, '%')} | "
+        f"reachable {_fmt_d(met['open_reachable_share'], 1, 100.0, '%')} | "
+        f"aim|reach {_fmt_d(met['aim_open_reachable_share'], 1, 100.0, '%')} | "
+        f"arc baseline {_fmt_d(met['aim_open_arc_baseline'], 1, 100.0, '%')}"
     )
     lines.append(
         "kick_propensity A/B/pooled : "
