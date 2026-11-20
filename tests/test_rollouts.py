@@ -1153,3 +1153,225 @@ class TestHoldIntentSplit:
             assert "--hold-steps" in capsys.readouterr().err
         with pytest.raises(ValueError, match="hold_steps"):
             rollouts.run_hold(trace_dir=tmp_path, checkpoint_dir=tmp_path, hold_steps=0)
+
+
+# ----------------------------------------------------------------------------
+# 6. Aim counterfactual (`aim`): POLICY / AIM / AIMP at real kicks with an open teammate in the kickable arc
+# ----------------------------------------------------------------------------
+from tests.test_eval_metrics import aim_scene  # noqa: E402
+
+
+def _aim_hand_trace(T: int) -> dict:
+    tr = make_trace(T)
+    tr["ang"] = np.zeros((T, 12), dtype=np.float32)
+    tr["mean"] = np.zeros((T, 12, 4), dtype=np.float32)
+    tr["head"] = np.array([1, 1], dtype=np.int8)
+    return tr
+
+
+class TestAimRollouts:
+    def test_point_selection_spacing_target_and_reach(self):
+        """[RED] Kicker A3 holds and kicks (ball (300, 420), facing 0 at the kick row, +90 deg on later rows):
+          5   open A4 +10, A5 -30, direction 0  -> point, target A4 (smallest |angle|), already aimed (A4 within 15 deg)
+          30  open A4 +10                        -> skipped: 25 decisions after 5
+          50  open A4 +40 only                   -> no point (40 > 35 deg); the spacing still counts from 5
+          60  open A4 -34.5                      -> point (55 after 5), not already aimed
+          104 open A4 +5                         -> skipped: 44 after 60
+          150 open A4 +5, but nobody holds       -> no point
+        Intent from the kick mean (hybrid5): 0.2 -> p 0.6 -> kick; -0.95 -> p 0.025 -> hold. Ball x 300, side 0 -> defensive."""
+        from tools.audit import rollouts
+
+        tr = _aim_hand_trace(200)
+        aim_scene(tr, 5, {4: 10.0, 5: -30.0})
+        aim_scene(tr, 30, {4: 10.0})
+        aim_scene(tr, 50, {4: 40.0})
+        aim_scene(tr, 60, {4: -34.5})
+        aim_scene(tr, 104, {4: 5.0})
+        aim_scene(tr, 150, {4: 5.0})
+        tr["holder"][150] = -1
+        tr["mean"][5, 3, 2] = 0.2
+        tr["mean"][60, 3, 2] = -0.95
+        pts = rollouts.find_aim_points(tr)
+        assert [(p["step"], p["kicker"], p["target"], p["already"]) for p in pts] == [(5, 3, 4, True), (60, 3, 4, False)]
+        assert pts[0]["deflection"] == pytest.approx(math.radians(10.0), abs=1e-6)
+        assert pts[1]["deflection"] == pytest.approx(math.radians(-34.5), abs=1e-6)
+        assert pts[0]["target_dist"] == pytest.approx(200.0, abs=1e-3)
+        assert [p["intent"] for p in pts] == ["kick", "hold"]
+        assert [p["third"] for p in pts] == ["defensive", "defensive"]
+        assert [p["team"] for p in pts] == [0, 0]
+
+    def test_point_needs_two_rows_after_the_kick(self):
+        """[RED] A kick at row 97 is a point in a 100-row trace (97 + 2 < 100), not in a 99-row one."""
+        from tools.audit import rollouts
+
+        for T, n_points in ((100, 1), (99, 0)):
+            tr = _aim_hand_trace(T)
+            aim_scene(tr, 97, {4: 10.0})
+            assert len(rollouts.find_aim_points(tr)) == n_points, T
+
+    def test_steer_and_power_hand_values(self):
+        """[RED] Steer = clip(deflection / 35 deg, -1, 1): +17.5 deg -> 0.5, -17.5 -> -0.5, 40 -> 1. AIMP power for a target
+        300 u away and v_max 600 (midfielder): v0 = sqrt(200^2 + 2 * 155 * 300) = sqrt(133000) = 364.69165,
+        pn = (364.69165 - 160) / 440 = 0.4652083, power = 0.35 + 0.65 * 0.4652083 + 0.0001 = 0.6524854. At 2000 u, v0 is
+        capped at v_max: pn 1, power 1.0001. At 0 u: v0 = 200, pn = 40 / 440 = 0.0909091."""
+        from tools.audit import rollouts
+
+        assert rollouts.aim_steer(math.radians(17.5)) == pytest.approx(0.5)
+        assert rollouts.aim_steer(math.radians(-17.5)) == pytest.approx(-0.5)
+        assert rollouts.aim_steer(math.radians(40.0)) == 1.0
+        v0, pn, power = rollouts.aimp_power(300.0, 600.0)
+        assert v0 == pytest.approx(364.69165, abs=1e-4)
+        assert pn == pytest.approx(0.4652083, abs=1e-6)
+        assert power == pytest.approx(0.6524854, abs=1e-6)
+        assert rollouts.aimp_power(2000.0, 600.0) == pytest.approx((600.0, 1.0, 1.0001))
+        assert rollouts.aimp_power(0.0, 600.0)[1] == pytest.approx(0.0909091, abs=1e-6)
+
+    @staticmethod
+    def _fixture_point(tmp_path):
+        """The hybrid5 `_hold_fixture` (z_kick = -2): match 0 has one aim point, step 2, striker A5 (global 5) kicking,
+        target A4 at +12.3 deg of its facing."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, traces = _hold_fixture(tmp_path, "hybrid5")
+        tr = traces[0]
+        pts = rollouts.find_aim_points(tr)
+        assert [(p["step"], p["kicker"], p["target"], p["already"]) for p in pts] == [(2, 5, 4, False)]
+        ok, _, snaps = rollouts.resimulate_match(tr, match_seed=11 * 1000 + 0, target_steps=[2])
+        assert ok
+        pols = (harness.TeamPolicy(str(ckpt), "blue"), harness.TeamPolicy(str(ckpt), "red"))
+        return ckpt, trace_dir, tr, pts[0], snaps[2], pols
+
+    def test_policy_branch_replays_the_kick_and_aim_points_at_the_target(self, tmp_path):
+        """[RED] POLICY's step 0 plays the recorded actions, so its ball velocity after step 0 equals the trace's bvel[3]
+        (< 1e-4). AIM differs from them only in the kicker's steer, AIMP only in its steer and power; AIM's ball is loose
+        after step 0 and leaves within 1 deg of the direction from the ball to the target."""
+        from tools.audit import rollouts
+
+        _, _, tr, p, snap, (team_a, team_b) = self._fixture_point(tmp_path)
+        steer = rollouts.aim_steer(p["deflection"])
+        _, _, power = rollouts.aimp_power(p["target_dist"], 640.0)          # striker: atk_max_kick_speed 640
+        seen = {}
+
+        def hook(branch, k, env, act):
+            if k == 0:
+                seen[branch] = (env.ball_vel.copy(), env.ball_holder, np.array(act, dtype=np.float32, copy=True))
+
+        res = rollouts.roll_aim_branches(
+            snap, recorded_actions=tr["act"][2], kicker=5, target=4, branch_seed=123,
+            team_a=team_a, team_b=team_b, steer=steer, power=power, after_step=hook,
+        )
+        np.testing.assert_allclose(seen["policy"][0], tr["bvel"][3], atol=1e-4)
+        assert np.array_equal(seen["policy"][2], tr["act"][2])
+        mask_aim = np.zeros((12, 4), dtype=bool)
+        mask_aim[5, 1] = True
+        mask_aimp = mask_aim.copy()
+        mask_aimp[5, 2] = True
+        assert np.array_equal(seen["aim"][2] != tr["act"][2], mask_aim)
+        assert np.array_equal(seen["aimp"][2] != tr["act"][2], mask_aimp)
+        assert seen["aim"][2][5, 1] == pytest.approx(steer, abs=1e-7)
+        assert seen["aimp"][2][5, 2] == pytest.approx(power, abs=1e-7)
+        assert seen["aim"][1] is None
+        tgt = snap.player_pos[4] - snap.ball_pos
+        v = seen["aim"][0]
+        err = abs((math.atan2(v[1], v[0]) - math.atan2(tgt[1], tgt[0]) + math.pi) % (2 * math.pi) - math.pi)
+        assert math.degrees(err) < 1.0
+        assert res["aim"]["kick_err_deg"] == pytest.approx(math.degrees(err), abs=1e-9)
+        assert res["policy"]["kick_err_deg"] > 15.0                          # the recorded kick was not aimed
+
+    def test_branches_share_one_generator_seed(self, tmp_path):
+        """[RED] With AIM's steer and AIMP's steer and power equal to the recorded ones, the three sampled branches are the
+        same rollout: every recorded value is identical."""
+        from tools.audit import rollouts
+
+        _, _, tr, p, snap, (team_a, team_b) = self._fixture_point(tmp_path)
+        rec = tr["act"][2]
+        res = rollouts.roll_aim_branches(
+            snap, recorded_actions=rec, kicker=5, target=4, branch_seed=987,
+            team_a=team_a, team_b=team_b, steer=float(rec[5, 1]), power=float(rec[5, 2]),
+        )
+        assert set(res) == {"policy", "aim", "aimp"}
+        assert set(res["policy"]["returns"]) == {15, 45, 75}
+        assert res["aim"] == res["policy"]
+        assert res["aimp"] == res["policy"]
+
+    @staticmethod
+    def _hand_record(already, third, intent, firsts, ns75):
+        branches = {}
+        for b, first, ns in zip(("policy", "aim", "aimp"), firsts, ns75):
+            branches[b] = {
+                "returns": {h: {"non_shaping_return": ns, "full_return_bootstrap": 2.0 * ns} for h in (15, 45, 75)},
+                "possession": {15: 1.0 if first == "target" else 0.0, 30: 0.0},
+                "first_receiver": first, "goal_for": 0.0, "goal_against": 0.0,
+                "kick_err_deg": None if first == "none" else 3.0,
+            }
+        return {"already": already, "third": third, "intent": intent, "branches": branches}
+
+    def test_summary_buckets_on_hand_records(self):
+        """[RED] Records (already, third, intent, first receiver P/AIM/AIMP, non-shaping return P/AIM/AIMP):
+          A  no,  defensive, kick  opponent/target/target  0.0/0.3/0.1
+          B  no,  middle,    kick  none/target/opponent    0.2/0.3/0.2
+          C  yes, defensive, hold  target/target/target    0.5/0.5/0.4
+        not_aimed (A, B): target share 0 / 1 / 0.5, opponent 0.5 / 0 / 0.5; AIM - POLICY {0.3, 0.1}: mean 0.2, se 0.1;
+        AIMP - POLICY {0.1, 0.0}: mean 0.05, se 0.05; full return doubles them. already_aimed (C): n 1, AIM - POLICY 0.
+        Thirds and intents split the not-aimed records only: defensive {A}, middle {B}, attacking {}; kick {A, B}, hold {}."""
+        from tools.audit import rollouts
+
+        recs = [
+            self._hand_record(False, "defensive", "kick", ("opponent", "target", "target"), (0.0, 0.3, 0.1)),
+            self._hand_record(False, "middle", "kick", ("none", "target", "opponent"), (0.2, 0.3, 0.2)),
+            self._hand_record(True, "defensive", "hold", ("target", "target", "target"), (0.5, 0.5, 0.4)),
+        ]
+        s = rollouts.summarize_aim(recs, 1, 1, 0, 0.0, seed=1)
+        assert s["mode"] == "aim" and s["n_points"] == 3
+        b = s["buckets"]["not_aimed"]
+        assert b["n"] == 2
+        assert [b["branches"][x]["first_receiver_target"]["mean"] for x in ("policy", "aim", "aimp")] == pytest.approx([0.0, 1.0, 0.5])
+        assert [b["branches"][x]["first_receiver_opponent"]["mean"] for x in ("policy", "aim", "aimp")] == pytest.approx([0.5, 0.0, 0.5])
+        assert b["branches"]["policy"]["ball_held_after_kick"]["mean"] == pytest.approx(0.5)
+        aim = b["paired"]["aim_minus_policy"]["non_shaping_return_75"]
+        assert (aim["mean"], aim["se"], aim["n"]) == (pytest.approx(0.2), pytest.approx(0.1), 2)
+        aimp = b["paired"]["aimp_minus_policy"]["non_shaping_return_75"]
+        assert (aimp["mean"], aimp["se"]) == (pytest.approx(0.05), pytest.approx(0.05))
+        assert b["paired"]["aim_minus_policy"]["full_return_bootstrap_75"]["mean"] == pytest.approx(0.4)
+        assert b["paired"]["aim_minus_policy"]["possession_15"]["mean"] == pytest.approx(1.0)
+        c = s["buckets"]["already_aimed"]
+        assert c["n"] == 1 and c["paired"]["aim_minus_policy"]["non_shaping_return_75"]["mean"] == pytest.approx(0.0)
+        n_of = {k: v["n"] for k, v in s["buckets"].items()}
+        assert n_of == {
+            "not_aimed": 2, "already_aimed": 1,
+            "not_aimed_third_defensive": 1, "not_aimed_third_middle": 1, "not_aimed_third_attacking": 0,
+            "not_aimed_intent_kick": 2, "not_aimed_intent_mid": 0, "not_aimed_intent_hold": 0,
+        }
+        assert s["buckets"]["not_aimed_third_middle"]["paired"]["aim_minus_policy"]["non_shaping_return_75"]["mean"] == pytest.approx(0.1)
+        text = rollouts.format_aim_report(s, title="hand")
+        assert text.splitlines()[0].startswith("===== rollouts aim hand")
+        assert "-- not already aimed (n=2) --" in text and "-- already aimed (n=1) --" in text
+
+    def test_aim_cli_end_to_end(self, tmp_path):
+        """[RED] `rollouts aim` on the hybrid5 fixture (2 matches, 1 point): JSON and report written, the same JSON with 1 and
+        2 workers, inputs untouched, protected outputs refused, and a missing --checkpoint-dir is an argparse error."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _hold_fixture(tmp_path, "hybrid5")
+        digests = (_dir_digest(ckpt), _dir_digest(trace_dir))
+        out1, out2 = tmp_path / "aim1", tmp_path / "aim2.json"
+        base = ["aim", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt), "--trace-seed", "11", "--seed", "5",
+                "--shaping-mode", "legacy"]
+        assert rollouts.main([*base, "--workers", "1", "--out", str(out1)]) == 0
+        assert rollouts.main([*base, "--workers", "2", "--max-matches", "2", "--out", str(out2)]) == 0
+        d1 = json.loads((out1 / "rollouts.json").read_text(encoding="utf-8"))
+        d2 = json.loads(out2.read_text(encoding="utf-8"))
+        assert d1 == d2
+        assert (d1["mode"], d1["seed"], d1["shaping_mode"], d1["n_matches_ok"], d1["n_points"]) == ("aim", 5, "legacy", 2, 1)
+        assert d1["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
+        rec = d1["records"][0]
+        assert (rec["match_idx"], rec["step"], rec["kicker"], rec["target"], rec["already"]) == (0, 2, 5, 4, False)
+        assert (rec["third"], rec["intent"]) == ("middle", "mid")
+        assert d1["buckets"]["not_aimed"]["n"] == 1 and d1["buckets"]["not_aimed_intent_mid"]["n"] == 1
+        assert (out1 / "report.txt").read_text(encoding="utf-8").startswith("===== rollouts aim")
+        assert (_dir_digest(ckpt), _dir_digest(trace_dir)) == digests
+        for bad in (trace_dir / "bad.json", ckpt / "bad.json"):
+            with pytest.raises(ValueError):
+                rollouts.main([*base, "--out", str(bad)])
+        with pytest.raises(SystemExit):
+            rollouts.main(["aim", "--trace-dir", str(trace_dir), "--out", str(tmp_path / "x.json")])

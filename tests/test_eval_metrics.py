@@ -4314,3 +4314,125 @@ class TestPassOptions:
         line = next(ln for ln in text.splitlines() if ln.startswith("pass options"))
         assert "option 71.4%" in line and "aim_open 75.0%" in line
         assert "completion 66.7%" in line and "no_option_opponent 50.0%" in line
+
+
+# ----------------------------------------------------------------------------
+# Chance baselines for aim at the kick (reachable open teammates, kickable arc)
+# ----------------------------------------------------------------------------
+def aim_scene(trace: dict, t0: int, mates_deg: dict, *, facing_deg: float = 0.0, dir_deg: float = 0.0,
+              speed: float = 300.0, dist: float = 200.0) -> None:
+    """`pass_scene` at row `t0` (kicker A3, ball (300, 420)) with the kicker facing `facing_deg` at row `t0` and facing
+    `facing_deg + 90` on every later row, teammates `{player: bearing in deg}` `dist` u from the ball, and the kick leaving
+    at `dir_deg` with `speed` u/s on row `t0 + 1`."""
+    T = trace["holder"].shape[0]
+    trace.setdefault("ang", np.zeros((T, 12), dtype=np.float32))
+    d = math.radians(dir_deg)
+    pass_scene(trace, t0, bvel=(speed * math.cos(d), speed * math.sin(d)))
+    for who, bearing in mates_deg.items():
+        b = math.radians(bearing)
+        trace["pos"][t0, who] = (300.0 + dist * math.cos(b), 420.0 + dist * math.sin(b))
+    trace["ang"][t0, 3] = math.radians(facing_deg)
+    trace["ang"][t0 + 1:, 3] = math.radians(facing_deg + 90.0)
+
+
+class TestAimReach:
+    """Grid of the kickable arc: facing + {-35, -34, ..., +35} deg (71 angles); an angle is covered when an open teammate
+    lies within 15 deg of it. A kick is reachable when an open teammate lies within 50 deg of the facing."""
+
+    def test_reachable_aimed_and_arc_baseline_on_two_kicks(self):
+        """[RED] Kick at 5: facing 0, the only open teammate A4 at +20.5 deg, kick direction +20.5 deg -> reachable and
+        aimed; covered grid angles are those within [5.5, 35.5] deg -> 6..35 = 30 of 71. Kick at 40: the only open teammate
+        at +80 deg -> not reachable (arc cover: [65, 95] holds no grid angle -> 0). Hand values:
+        open_reachable_share 1/2, aim_open_reachable_share 1/1, aim_open_arc_baseline 30/71."""
+        tr = make_trace(80)
+        aim_scene(tr, 5, {4: 20.5}, dir_deg=20.5)
+        aim_scene(tr, 40, {4: 80.0}, dir_deg=0.0)
+        recs = census.pass_options(tr)
+        assert [(r["step"], r["open"], r["aimed_open"], r["reachable"]) for r in recs] == [
+            (5, [4], True, True), (40, [4], False, False)]
+        assert recs[0]["arc_cover"] == pytest.approx(30 / 71)
+        assert recs[1]["arc_cover"] == pytest.approx(0.0)
+        met = census.summarize([census.match_metrics(tr)])["metrics"]
+        assert met["open_reachable_share"]["mean"] == pytest.approx(1 / 2)
+        assert met["aim_open_reachable_share"]["mean"] == pytest.approx(1.0)
+        assert met["aim_open_arc_baseline"]["mean"] == pytest.approx(30 / 71)
+        assert met["open_reachable_share"]["n"] == 1
+
+    def test_facing_wraps_around_pi(self):
+        """[RED] Facing +170 deg, open teammate at -175 deg: the difference -345 deg wraps to +15 deg -> reachable.
+        Facing +170, teammate at -172.5 deg: relative +17.5 deg -> covered grid angles [2.5, 32.5] -> 3..32 = 30 of 71."""
+        tr = make_trace(80)
+        aim_scene(tr, 5, {4: -175.0}, facing_deg=170.0, dir_deg=170.0)
+        aim_scene(tr, 40, {4: -172.5}, facing_deg=170.0, dir_deg=170.0)
+        recs = census.pass_options(tr)
+        assert [r["reachable"] for r in recs] == [True, True]
+        assert recs[1]["arc_cover"] == pytest.approx(30 / 71)
+
+    def test_reach_limit_is_50_degrees(self):
+        """[RED] Open teammate at +49.5 deg -> reachable (arc cover [34.5, 64.5] -> grid angle 35 only -> 1/71); at +50.5 deg
+        -> not reachable; at -49.5 deg -> reachable."""
+        tr = make_trace(120)
+        aim_scene(tr, 5, {4: 49.5})
+        aim_scene(tr, 40, {4: 50.5})
+        aim_scene(tr, 80, {4: -49.5})
+        recs = census.pass_options(tr)
+        assert [r["reachable"] for r in recs] == [True, False, True]
+        assert recs[0]["arc_cover"] == pytest.approx(1 / 71)
+        assert recs[2]["arc_cover"] == pytest.approx(1 / 71)
+
+    def test_arc_cover_is_the_union_over_open_teammates_and_excluded_kicks(self):
+        """[RED] Two open teammates at +10.5 and -0.5 deg cover [-4.5, 25.5] and [-15.5, 14.5]: the union -15..25 is 41 of 71
+        (not 30 + 30). A blocked teammate covers nothing: A4 at +10.5 blocked by B1 on its lane, A5 at +60 open -> not
+        reachable. A kick with an open teammate and no direction (|bvel| 40) and a kick without an open teammate enter no
+        reach key."""
+        tr = make_trace(200)
+        aim_scene(tr, 5, {4: 10.5, 5: -0.5})
+        aim_scene(tr, 40, {4: 10.5, 5: 60.0})
+        tr["pos"][40, 7] = (300.0 + 100.0 * math.cos(math.radians(10.5)), 420.0 + 100.0 * math.sin(math.radians(10.5)))
+        aim_scene(tr, 80, {4: 10.5}, speed=40.0)
+        aim_scene(tr, 120, {})
+        recs = census.pass_options(tr)
+        assert [(r["step"], r["open"]) for r in recs] == [(5, [4, 5]), (40, [5]), (80, [4]), (120, [])]
+        assert recs[0]["arc_cover"] == pytest.approx(41 / 71)
+        assert [r["reachable"] for r in recs] == [True, False, None, None]
+        counts = census.aim_reach_counts(recs)
+        assert counts == {"open_reach_den": 2, "open_reach_n": 1, "aim_reach_n": 1, "arc_reach_sum": pytest.approx(41 / 71)}
+
+    def test_trace_without_facing_enters_no_reach_key(self):
+        """[RED] A trace without `ang` keeps every E7 pass-option key and has no reach key (n = 0)."""
+        tr = make_trace(80)
+        pass_scene(tr, 5)
+        tr["pos"][5, 4] = (500.0, 420.0)
+        recs = census.pass_options(tr)
+        assert recs[0]["reachable"] is None and recs[0]["arc_cover"] is None
+        met = census.summarize([census.match_metrics(tr)])["metrics"]
+        assert met["aim_open_share"]["mean"] == pytest.approx(1.0)
+        for key in ("open_reachable_share", "aim_open_reachable_share", "aim_open_arc_baseline"):
+            assert met[key] == {"mean": None, "se": None, "n": 0}
+
+    @staticmethod
+    def _two_matches():
+        """Match 1: the two kicks of `test_reachable_aimed_and_arc_baseline_on_two_kicks` (reach 1 of 2, aimed 1, cover
+        30/71). Match 2: one kick with the open teammate at +49.5 deg, direction 0 (reach 1 of 1, aimed 0, cover 1/71)."""
+        m1 = make_trace(80)
+        aim_scene(m1, 5, {4: 20.5}, dir_deg=20.5)
+        aim_scene(m1, 40, {4: 80.0})
+        m2 = make_trace(80)
+        aim_scene(m2, 5, {4: 49.5})
+        return [m1, m2]
+
+    def test_pooled_ratios_and_report_line_on_two_matches(self):
+        """[RED] open_reachable_share: (reach, den) = (1, 2), (1, 1) -> r = 2/3; residuals -1/3, 1/3; se = sqrt(2 * 2/9) / 3
+        = 2/9. aim_open_reachable_share: (1, 1), (0, 1) -> r = 1/2; residuals 1/2, -1/2; se = sqrt(2 * 1/2) / 2 = 1/2.
+        aim_open_arc_baseline: (30/71, 1), (1/71, 1) -> r = 31/142; residuals +-29/142; se = sqrt(2 * 2 * (29/142)^2) / 2
+        = 29/142. The report's pass options line ends with reachable 66.7%, aim|reach 50.0%, arc baseline 21.8%."""
+        per_match = [census.match_metrics(t) for t in self._two_matches()]
+        met = census.summarize(per_match)["metrics"]
+        for key, mean, se in (("open_reachable_share", 2 / 3, 2 / 9), ("aim_open_reachable_share", 1 / 2, 1 / 2),
+                              ("aim_open_arc_baseline", 31 / 142, 29 / 142)):
+            assert met[key]["mean"] == pytest.approx(mean), key
+            assert met[key]["se"] == pytest.approx(se), key
+            assert met[key]["n"] == 2, key
+        line = next(ln for ln in census.report(per_match, title="hand").splitlines() if ln.startswith("pass options"))
+        assert " | reachable 66.7% +- 22.2% (n=2) | aim|reach 50.0% +- 50.0% (n=2) | arc baseline 21.8% +- 20.4% (n=2)" in line
+        assert line.index("no_option_opponent") < line.index(" | reachable ")
