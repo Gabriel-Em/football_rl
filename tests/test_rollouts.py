@@ -1294,6 +1294,36 @@ class TestAimRollouts:
         assert res["aim"] == res["policy"]
         assert res["aimp"] == res["policy"]
 
+    def test_full_return_adds_the_critic_bootstrap_at_every_horizon(self, tmp_path):
+        """[GUARD] On the fixture point (120-step match, kick at step 2, so no terminal step within 75 decisions), the full
+        return at h = 15, 45, 75 is sum_{k<h} gamma^k * mean(r_k over the kicking team) + gamma^h * mean(V(s_h) over the
+        kicking team). The oracle reads the step rewards and the state s_h through `after_step` and evaluates V(s_h) with
+        the harness team policy; gamma = 0.995 is the config value."""
+        from tools.audit import rollouts
+
+        _, _, tr, p, snap, (team_a, team_b) = self._fixture_point(tmp_path)
+        gamma = 0.995
+        rewards, states = [], {}
+
+        def hook(branch, k, env, act):
+            if branch == "policy":
+                rewards.append(float(np.asarray(env.last_step_rewards, dtype=np.float64)[:6].mean()))
+                if k + 1 in (15, 45, 75):
+                    states[k + 1] = (env._get_observations_array(), env.get_centralized_state())
+
+        res = rollouts.roll_aim_branches(
+            snap, recorded_actions=tr["act"][2], kicker=5, target=4, branch_seed=321,
+            team_a=team_a, team_b=team_b, steer=0.0, power=0.5, after_step=hook,
+        )["policy"]
+        assert len(rewards) == 75
+        for h in (15, 45, 75):
+            obs, cen = states[h]
+            _, val, _ = team_a.act(obs[:6], cen[:6], "sampled", 1.0, torch.Generator().manual_seed(0))
+            boot = gamma ** h * float(np.mean(val))
+            assert abs(boot) > 1e-3, h                                          # the bootstrap is visible at this tolerance
+            plain = sum(gamma ** k * r for k, r in enumerate(rewards[:h]))
+            assert res["returns"][h]["full_return_bootstrap"] == pytest.approx(plain + boot, abs=1e-6), h
+
     @staticmethod
     def _hand_record(already, third, intent, firsts, ns75):
         branches = {}
