@@ -587,9 +587,14 @@ _SNAPSHOT_DIR_PATTERN = re.compile(r"^gen(\d{4,})$")
 
 
 def validate_pool_settings(
-    pool_envs: int, pool_size: int, num_envs: int, separate_teams: bool = True, seed: int = 0
+    pool_envs: int, pool_size: int, num_envs: int, separate_teams: bool = True, seed: int = 0, shared_keepers: bool = False
 ) -> None:
-    """Raise ValueError unless the opponent-pool settings are usable; `pool_envs = 0` (pool off) accepts any `pool_size`."""
+    """Raise ValueError unless the opponent-pool and shared-keeper settings are usable; `pool_envs = 0` (pool off) accepts any `pool_size`.
+
+    Shared keepers need separate teams (a shared-team run already plays one keeper network) and no pool.
+    """
+    if shared_keepers and not separate_teams:
+        raise ValueError("shared_keepers needs separate teams; a shared-team run already plays one keeper network")
     if pool_envs < 0 or pool_envs > num_envs:
         raise ValueError(f"pool_envs must be between 0 and num_envs ({num_envs}), got {pool_envs}")
     if pool_envs == 0:
@@ -598,6 +603,8 @@ def validate_pool_settings(
         raise ValueError(f"pool_size must be at least 1 when pool_envs > 0, got {pool_size}")
     if not separate_teams:
         raise ValueError("pool_envs > 0 needs separate teams; a shared-team run has no opponent snapshot to freeze")
+    if shared_keepers:
+        raise ValueError("pool_envs > 0 is not supported with shared_keepers; a frozen pool snapshot holds one keeper per team")
     if seed < 0:
         raise ValueError(f"seed must be non-negative when pool_envs > 0, got {seed}")
 
@@ -760,6 +767,32 @@ class FrozenSeatBatch:
             values[ix] = value_np[g, :rows].reshape(shape)
             if action_means is not None:
                 action_means[ix] = mean_np[g, :rows].reshape(*shape, -1)
+
+
+def gae_advantages(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    dones: np.ndarray,
+    next_values: np.ndarray,
+    gamma: float,
+    lam: Any,
+) -> np.ndarray:
+    """Generalised advantage estimates of a rollout, computed backwards; the result has the dtype of `rewards`.
+
+    `rewards`, `values` and `dones` have shape `(T, ...)`; `dones[t]` is non-zero when the episode ends after step `t`,
+    so neither the bootstrap nor later advantages reach across it. `next_values` (shape `(...)`) is the value after the
+    last step. `lam` is a float, or an array that broadcasts over the trailing agent axis to give each agent its own lambda.
+    """
+    steps = rewards.shape[0]
+    advantages = np.zeros_like(rewards)
+    lastgaelam = np.zeros(rewards.shape[1:], dtype=rewards.dtype)
+    for t in reversed(range(steps)):
+        next_nonterminal = 1.0 - dones[t]
+        next_val = next_values if t == steps - 1 else values[t + 1]
+        delta = rewards[t] + gamma * next_val * next_nonterminal - values[t]
+        lastgaelam = delta + gamma * lam * next_nonterminal * lastgaelam
+        advantages[t] = lastgaelam
+    return advantages
 
 
 def compute_mc_returns(
@@ -1045,6 +1078,8 @@ class ParameterSharingPPOTrainer:
     - Red Team (`TEAM_A`, indices 0..5): `blue_keeper_policy` ([0]) + `blue_field_policy` ([1..5])
     - Blue Team (`TEAM_B`, indices 6..11): `red_keeper_policy` ([6]) + `red_field_policy` ([7..11])
     If `separate_teams=False`, both teams share `blue_field_policy` and `blue_keeper_policy`.
+    With `shared_keepers=True` (separate teams only) both keeper seats play `blue_keeper_policy`, which is updated once per
+    generation on the rows of both keeper seats, while the two field policies stay separate.
     """
 
     def __init__(
@@ -1065,8 +1100,11 @@ class ParameterSharingPPOTrainer:
         pool_size: int = DEFAULT_POOL_SIZE,
         replay_every: int = 1,
         replay_kind: str = "both",
+        shared_keepers: bool = False,
     ) -> None:
-        validate_pool_settings(int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed))
+        validate_pool_settings(
+            int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed), bool(shared_keepers)
+        )
         self.replay_every, self.replay_kind = validate_replay_settings(replay_every, replay_kind)
         self._export_replays_active: bool = True
         self._uniform_capture_active: bool = False
@@ -1079,6 +1117,7 @@ class ParameterSharingPPOTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.seed = seed
         self.separate_teams = separate_teams
+        self.shared_keepers = bool(shared_keepers)
         self.write_root_summary = write_root_summary
         self.critic_only_until_gen = int(critic_only_until_gen)
         self.config_overrides: Dict[str, Any] = dict(sorted((config_overrides or {}).items()))
@@ -1139,12 +1178,14 @@ class ParameterSharingPPOTrainer:
         # Blue Team (TEAM_B) Policies (independent weights & optimizers when separate_teams=True)
         if self.separate_teams:
             self.red_field_policy = self._new_policy(self.device)
-            self.red_keeper_policy = self._new_policy(self.device)
+            self.red_keeper_policy = self.blue_keeper_policy if self.shared_keepers else self._new_policy(self.device)
             self.red_field_optimizer = optim.Adam(
                 self.red_field_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5
             )
-            self.red_keeper_optimizer = optim.Adam(
-                self.red_keeper_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5
+            self.red_keeper_optimizer = (
+                self.blue_keeper_optimizer
+                if self.shared_keepers
+                else optim.Adam(self.red_keeper_policy.parameters(), lr=self.cfg.ppo.learning_rate, eps=1e-5)
             )
         else:
             self.red_field_policy = self.blue_field_policy
@@ -1158,7 +1199,9 @@ class ParameterSharingPPOTrainer:
             self.cpu_blue_keeper_policy = self._new_policy(self.inference_device)
             if self.separate_teams:
                 self.cpu_red_field_policy = self._new_policy(self.inference_device)
-                self.cpu_red_keeper_policy = self._new_policy(self.inference_device)
+                self.cpu_red_keeper_policy = (
+                    self.cpu_blue_keeper_policy if self.shared_keepers else self._new_policy(self.inference_device)
+                )
             else:
                 self.cpu_red_field_policy = self.cpu_blue_field_policy
                 self.cpu_red_keeper_policy = self.cpu_blue_keeper_policy
@@ -1198,7 +1241,8 @@ class ParameterSharingPPOTrainer:
         self.cpu_blue_keeper_policy.load_state_dict(self.blue_keeper_policy.state_dict())
         if self.separate_teams:
             self.cpu_red_field_policy.load_state_dict(self.red_field_policy.state_dict())
-            self.cpu_red_keeper_policy.load_state_dict(self.red_keeper_policy.state_dict())
+            if not self.shared_keepers:
+                self.cpu_red_keeper_policy.load_state_dict(self.red_keeper_policy.state_dict())
 
     def _get_max_saved_match_id(self) -> int:
         """Scan match_history and replay directory to determine the highest existing match ID."""
@@ -1694,20 +1738,21 @@ class ParameterSharingPPOTrainer:
 
         # Compute Generalized Advantage Estimation (GAE) per agent trajectory
         next_values = self._compute_values(self.current_obs, self.current_central_state)
-        advantages = np.zeros_like(buf_rew)
-        lastgaelam = np.zeros((N, self.num_agents), dtype=np.float32)
 
         gamma = self.cfg.ppo.gamma
         gae_lambda = self.cfg.ppo.gae_lambda
 
-        for t in reversed(range(T)):
-            next_nonterminal = 1.0 - buf_done[t]
-            next_val = next_values if t == T - 1 else buf_val[t + 1]
-            delta = buf_rew[t] + gamma * next_val * next_nonterminal - buf_val[t]
-            lastgaelam = delta + gamma * gae_lambda * next_nonterminal * lastgaelam
-            advantages[t] = lastgaelam
-
+        advantages = gae_advantages(buf_rew, buf_val, buf_done, next_values, gamma, gae_lambda)
         returns = advantages + buf_val
+
+        # Field seats take their policy-gradient advantages from their own lambda; the critic targets above and the
+        # keeper seats' advantages keep `gae_lambda`.
+        field_lambda = self.cfg.ppo.field_actor_gae_lambda
+        if field_lambda != gae_lambda:
+            field = self.field_indices
+            advantages[:, :, field] = gae_advantages(
+                buf_rew[:, :, field], buf_val[:, :, field], buf_done[:, :, field], next_values[:, field], gamma, field_lambda
+            )
 
         return {
             "obs": buf_obs,
@@ -2022,7 +2067,9 @@ class ParameterSharingPPOTrainer:
             critic_only=critic_only,
         )
         _attach_v_corr(blue_field_m, self.blue_field_indices)
-        bk_tensors = _extract_role_tensors(self.blue_keeper_indices)
+        # Shared keepers take one update per generation on the rows of both keeper seats.
+        keeper_seats = self.keeper_indices if self.shared_keepers else self.blue_keeper_indices
+        bk_tensors = _extract_role_tensors(keeper_seats)
         blue_keeper_m = self._ppo_update_role(
             self.blue_keeper_policy,
             self.blue_keeper_optimizer,
@@ -2030,7 +2077,7 @@ class ParameterSharingPPOTrainer:
             b_central=bk_tensors[6],
             critic_only=critic_only,
         )
-        _attach_v_corr(blue_keeper_m, self.blue_keeper_indices)
+        _attach_v_corr(blue_keeper_m, keeper_seats)
         rf_tensors = _extract_role_tensors(self.red_field_indices)
         red_field_m = self._ppo_update_role(
             self.red_field_policy,
@@ -2040,15 +2087,18 @@ class ParameterSharingPPOTrainer:
             critic_only=critic_only,
         )
         _attach_v_corr(red_field_m, self.red_field_indices)
-        rk_tensors = _extract_role_tensors(self.red_keeper_indices)
-        red_keeper_m = self._ppo_update_role(
-            self.red_keeper_policy,
-            self.red_keeper_optimizer,
-            rk_tensors[0], rk_tensors[1], rk_tensors[2], rk_tensors[3], rk_tensors[4], rk_tensors[5],
-            b_central=rk_tensors[6],
-            critic_only=critic_only,
-        )
-        _attach_v_corr(red_keeper_m, self.red_keeper_indices)
+        if self.shared_keepers:
+            red_keeper_m = blue_keeper_m
+        else:
+            rk_tensors = _extract_role_tensors(self.red_keeper_indices)
+            red_keeper_m = self._ppo_update_role(
+                self.red_keeper_policy,
+                self.red_keeper_optimizer,
+                rk_tensors[0], rk_tensors[1], rk_tensors[2], rk_tensors[3], rk_tensors[4], rk_tensors[5],
+                b_central=rk_tensors[6],
+                critic_only=critic_only,
+            )
+            _attach_v_corr(red_keeper_m, self.red_keeper_indices)
         metrics = {
             "field": blue_field_m,
             "keeper": blue_keeper_m,
@@ -2088,6 +2138,7 @@ class ParameterSharingPPOTrainer:
                 "git_commit": self.git_commit,
                 "next_match_id": self._get_max_saved_match_id() + 1,
                 "separate_teams": self.separate_teams,
+                "shared_keepers": self.shared_keepers,
                 "policy_head": self.policy_head,
                 "pool_envs": self.pool_envs,
                 "pool_size": self.pool_size,
@@ -2118,6 +2169,7 @@ class ParameterSharingPPOTrainer:
             "total_matches": len(self.match_history),
             "total_env_steps": self.total_env_steps,
             "separate_teams": self.separate_teams,
+            "shared_keepers": self.shared_keepers,
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "team_color_schema": TEAM_COLOR_SCHEMA,
             "matches": self.match_history,
@@ -2370,6 +2422,15 @@ class ParameterSharingPPOTrainer:
                         "Pass --accept-config-change to resume anyway."
                     )
                 print(f"[Resume] Pool settings changed: {described}; continuing with the requested settings.")
+            stored_shared_keepers = bool(state.get("shared_keepers", False))
+            if stored_shared_keepers != self.shared_keepers:
+                described = f"stored shared_keepers={stored_shared_keepers}, requested shared_keepers={self.shared_keepers}"
+                if not self.accept_config_change:
+                    raise ValueError(
+                        f"Keeper sharing differs from the checkpoint: {described}. "
+                        "Pass --accept-config-change to resume anyway."
+                    )
+                print(f"[Resume] Keeper sharing changed: {described}; continuing with the requested setting.")
             stored_replay_every = int(state.get("replay_every", 1))
             stored_replay_kind = str(state.get("replay_kind", "both"))
             if (stored_replay_every, stored_replay_kind) != (self.replay_every, self.replay_kind):
@@ -2409,7 +2470,7 @@ class ParameterSharingPPOTrainer:
             if self.separate_teams:
                 if red_f_weights is not None:
                     self._load_adapted_weights(self.red_field_policy, red_f_weights)
-                if red_k_weights is not None:
+                if red_k_weights is not None and not self.shared_keepers:
                     self._load_adapted_weights(self.red_keeper_policy, red_k_weights)
 
             if "blue_field_optimizer" in state:
@@ -2450,7 +2511,7 @@ class ParameterSharingPPOTrainer:
                         )
                     except Exception:
                         pass
-                if "red_keeper_optimizer" in state:
+                if "red_keeper_optimizer" in state and not self.shared_keepers:
                     try:
                         self.red_keeper_optimizer.load_state_dict(
                             adapt_optimizer_state(state["red_keeper_optimizer"], self.red_keeper_policy, red_k_weights)
@@ -2518,7 +2579,8 @@ class ParameterSharingPPOTrainer:
         are skipped. The condition is evaluated only once
         the window holds `COEVO_WINDOW_MATCHES` matches: at least 8 total goals with one side
         scoring >= 3x the other (opponent floored at 1 goal). The trailing team's policies are then
-        blended 35% towards the dominant team's and the window is cleared. Returns True on a sync.
+        blended 35% towards the dominant team's and the window is cleared; with shared keepers only the field
+        policy is blended and the keeper network is left as it is. Returns True on a sync.
         """
         if not self.separate_teams:
             return False
@@ -2536,7 +2598,8 @@ class ParameterSharingPPOTrainer:
         if sum_a >= 3 * max(1, sum_b):
             # Team A is dominating >= 75% -> soft-sync Team B towards Team A
             self._soft_blend(self.red_field_policy, self.blue_field_policy, 0.35)
-            self._soft_blend(self.red_keeper_policy, self.blue_keeper_policy, 0.35)
+            if not self.shared_keepers:
+                self._soft_blend(self.red_keeper_policy, self.blue_keeper_policy, 0.35)
             print(
                 f"  [Co-Evolution Sync] Red dominated ({sum_a}-{sum_b} over {COEVO_WINDOW_MATCHES} matches). "
                 f"Soft-synced Blue policy (tau=0.35) to restore parity."
@@ -2544,7 +2607,8 @@ class ParameterSharingPPOTrainer:
         elif sum_b >= 3 * max(1, sum_a):
             # Team B is dominating >= 75% -> soft-sync Team A towards Team B
             self._soft_blend(self.blue_field_policy, self.red_field_policy, 0.35)
-            self._soft_blend(self.blue_keeper_policy, self.red_keeper_policy, 0.35)
+            if not self.shared_keepers:
+                self._soft_blend(self.blue_keeper_policy, self.red_keeper_policy, 0.35)
             print(
                 f"  [Co-Evolution Sync] Blue dominated ({sum_b}-{sum_a} over {COEVO_WINDOW_MATCHES} matches). "
                 f"Soft-synced Red policy (tau=0.35) to restore parity."
@@ -3104,6 +3168,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Share a single field_policy and keeper_policy across both Red and Blue (default: False, Red and Blue train separate brains).",
     )
     parser.add_argument(
+        "--shared-keepers",
+        action="store_true",
+        help="Play both teams' keepers with one network, updated once per generation on both keeper seats' data; the two "
+        "field networks stay separate (needs separate teams and no opponent pool). Stored with the checkpoint and must "
+        "match on resume.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -3237,7 +3308,9 @@ def main() -> None:
         ),
     )
 
-    validate_pool_settings(args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed)
+    validate_pool_settings(
+        args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed, args.shared_keepers
+    )
     validate_replay_settings(args.replay_every, args.replay_kind)
 
     # 3. Handle `--from-scratch` vs automatic/explicit `--resume`
@@ -3262,6 +3335,7 @@ def main() -> None:
         pool_size=args.pool_size,
         replay_every=args.replay_every,
         replay_kind=args.replay_kind,
+        shared_keepers=args.shared_keepers,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")
@@ -3280,6 +3354,8 @@ def main() -> None:
             )
     else:
         mode_label = "Independent Red vs. Blue Policies" if not args.shared_teams else "Shared Mirror Policies"
+        if args.shared_keepers:
+            mode_label += ", one shared keeper network"
         print(
             f"Training new batch ({mode_label}) from Generation 1..{args.total_updates} "
             f"(num_envs={args.num_envs}, rollout_steps={args.rollout_steps}, "

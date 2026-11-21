@@ -348,6 +348,9 @@ class PPOHyperparams:
     learning_rate: float = 3e-4
     gamma: float = 0.995
     gae_lambda: float = 0.95
+    # GAE lambda of the field seats' policy-gradient advantages. Critic targets and the keeper seats' advantages use
+    # `gae_lambda`. It is independent of `gae_lambda`: overriding one never moves the other. Finite, in [0, 1].
+    field_actor_gae_lambda: float = 0.95
     clip_coef: float = 0.2
     ent_coef: float = 0.005
     vf_coef: float = 0.5
@@ -398,6 +401,8 @@ class PPOHyperparams:
             raise ValueError(f"fire_entropy 'separate' requires policy_head 'hybrid5', got {self.policy_head!r}")
         if self.fire_entropy == "joint" and self.fire_ent_coef != 0.0:
             raise ValueError(f"fire_ent_coef must be 0 with fire_entropy 'joint', got {self.fire_ent_coef}")
+        if not (math.isfinite(self.field_actor_gae_lambda) and 0.0 <= self.field_actor_gae_lambda <= 1.0):
+            raise ValueError(f"field_actor_gae_lambda must be finite and in [0, 1], got {self.field_actor_gae_lambda}")
         if not (math.isfinite(self.value_norm_momentum) and 0.0 < self.value_norm_momentum < 1.0):
             raise ValueError(f"value_norm_momentum must be finite and in (0, 1), got {self.value_norm_momentum}")
         if self.policy_head == "hybrid5":

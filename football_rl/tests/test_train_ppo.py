@@ -5035,3 +5035,689 @@ def test_replay_cap_trainer_rejects_invalid_values(tmp_path: Path, kwargs, flag_
     with pytest.raises(ValueError, match=flag_name):
         _replay_cap_trainer(tmp_path, name="invalid", num_envs=1, **kwargs)
 
+
+
+# ==============================================================================
+# Shared keepers (`shared_keepers`) and the field actors' own GAE lambda (`ppo.field_actor_gae_lambda`)
+# ==============================================================================
+import contextlib  # noqa: E402
+import inspect  # noqa: E402
+
+
+def _switch_trainer(
+    tmp_path: Path,
+    name: str = "ckpt",
+    ppo: dict | None = None,
+    full_batch: bool = False,
+    max_rl_steps: int | None = None,
+    rollout_steps: int = 8,
+    num_envs: int = 1,
+    seed: int = 3,
+    device: str = "cpu",
+    **kwargs,
+) -> ParameterSharingPPOTrainer:
+    """Trainer with the given PPO changes; `full_batch` uses one minibatch and one epoch (no random permutation)."""
+    cfg = _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}"))
+    changes = {"num_minibatches": 1, "update_epochs": 1} if full_batch else {}
+    changes.update(ppo or {})
+    cfg = replace(cfg, ppo=replace(cfg.ppo, **changes))
+    if max_rl_steps is not None:
+        cfg = replace(cfg, physics=replace(cfg.physics, max_rl_steps=max_rl_steps))
+    return ParameterSharingPPOTrainer(
+        config=cfg, num_envs=num_envs, rollout_steps=rollout_steps, device=device,
+        checkpoint_dir=str(tmp_path / name), seed=seed, **kwargs,
+    )
+
+
+@contextlib.contextmanager
+def _closing_all(*trainers: ParameterSharingPPOTrainer):
+    try:
+        yield trainers
+    finally:
+        for trainer in trainers:
+            trainer.close()
+
+
+def _synthetic_rollout(seed: int, steps: int = 6) -> dict:
+    """A one-env rollout of seeded finite numbers: only that several trainers read the same data matters."""
+    rng = np.random.default_rng(seed)
+    shape = (steps, 1, len(ALL_AGENTS))
+    return {
+        "obs": rng.standard_normal(shape + (OBS_DIM,)).astype(np.float32),
+        "central_state": rng.standard_normal(shape + (CENTRAL_STATE_DIM,)).astype(np.float32),
+        "actions": rng.uniform(-1.0, 1.0, shape + (ACTION_DIM,)).astype(np.float32),
+        "logprobs": rng.normal(-4.0, 0.5, shape).astype(np.float32),
+        "advantages": rng.standard_normal(shape).astype(np.float32),
+        "returns": rng.standard_normal(shape).astype(np.float32),
+        "values": rng.standard_normal(shape).astype(np.float32),
+        "rewards": rng.standard_normal(shape).astype(np.float32),
+        "dones": np.zeros(shape, dtype=np.float32),
+    }
+
+
+def _assert_equal_state_dicts(a: torch.nn.Module, b: torch.nn.Module, label: str = "") -> None:
+    sa, sb = a.state_dict(), b.state_dict()
+    assert list(sa) == list(sb), label
+    for key in sa:
+        assert torch.equal(sa[key], sb[key]), (label, key)
+
+
+def _saved_weights(path: Path) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+class TestSharedKeepers:
+    """One keeper network plays both teams; the two field networks stay separate."""
+
+    @pytest.fixture(autouse=True)
+    def _fixed_commit(self, monkeypatch) -> None:
+        """A trainer reads the commit when it is built; these tests hand it a fixed answer instead of running git."""
+        monkeypatch.setattr(tp, "current_git_commit", lambda: "unit-test")
+
+    def test_the_keeper_network_and_its_optimizer_are_shared_and_the_field_networks_are_not(self, tmp_path: Path) -> None:
+        """[RED] Shared keepers: one keeper network, optimizer and CPU shadow; two distinct field networks that differ."""
+        trainer = _switch_trainer(tmp_path, shared_keepers=True)
+        with _closing_all(trainer):
+            assert trainer.shared_keepers is True
+            assert trainer.red_keeper_policy is trainer.blue_keeper_policy
+            assert trainer.red_keeper_optimizer is trainer.blue_keeper_optimizer
+            assert trainer.cpu_red_keeper_policy is trainer.cpu_blue_keeper_policy
+            assert trainer.red_field_policy is not trainer.blue_field_policy
+            assert trainer.red_field_optimizer is not trainer.blue_field_optimizer
+            blue_field, red_field = trainer.blue_field_policy.state_dict(), trainer.red_field_policy.state_dict()
+            assert list(blue_field) == list(red_field)
+            differing = [key for key in blue_field if not torch.equal(blue_field[key], red_field[key])]
+            assert "critic.0.weight" in differing and "actor_mean.0.weight" in differing
+            driven = lambda opt: {id(p) for group in opt.param_groups for p in group["params"]}  # noqa: E731
+            assert driven(trainer.blue_keeper_optimizer) == {id(p) for p in trainer.blue_keeper_policy.parameters()}
+            assert driven(trainer.blue_field_optimizer) == {id(p) for p in trainer.blue_field_policy.parameters()}
+            assert driven(trainer.red_field_optimizer) == {id(p) for p in trainer.red_field_policy.parameters()}
+
+    def test_a_default_trainer_has_four_distinct_networks_and_optimizers(self, tmp_path: Path) -> None:
+        """[GUARD] Without the switch the four roles keep their own networks, optimizers and CPU shadows."""
+        trainer = _switch_trainer(tmp_path)
+        with _closing_all(trainer):
+            policies = [trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy]
+            optimizers = [trainer.blue_field_optimizer, trainer.blue_keeper_optimizer, trainer.red_field_optimizer, trainer.red_keeper_optimizer]
+            assert len({id(p) for p in policies}) == 4
+            assert len({id(o) for o in optimizers}) == 4
+            assert trainer.cpu_red_keeper_policy is not trainer.cpu_blue_keeper_policy
+
+    def test_keepers_are_not_shared_unless_asked_for(self, tmp_path: Path) -> None:
+        """[RED] The switch reads False on a trainer built without it and True on one built with it."""
+        default = _switch_trainer(tmp_path, "default")
+        shared = _switch_trainer(tmp_path, "shared", shared_keepers=True)
+        with _closing_all(default, shared):
+            assert default.shared_keepers is False and shared.shared_keepers is True
+
+    def test_the_networks_it_builds_start_from_the_default_trainers_weights(self, tmp_path: Path) -> None:
+        """[RED] The blue field, blue keeper and red field draw the initial weights a default trainer gives them."""
+        default = _switch_trainer(tmp_path, "default")
+        shared = _switch_trainer(tmp_path, "shared", shared_keepers=True)
+        with _closing_all(default, shared):
+            _assert_equal_state_dicts(shared.blue_field_policy, default.blue_field_policy, "blue_field")
+            _assert_equal_state_dicts(shared.blue_keeper_policy, default.blue_keeper_policy, "blue_keeper")
+            _assert_equal_state_dicts(shared.red_field_policy, default.red_field_policy, "red_field")
+
+    def test_both_keeper_seats_play_and_are_valued_by_the_shared_network(self, tmp_path: Path) -> None:
+        """[RED] Rollout groups keep the order keeper, field, keeper, field with the shared network twice; identical
+        observations give the two keepers identical actions and values, and the two fields different ones."""
+        shared = _switch_trainer(tmp_path, "shared", shared_keepers=True)
+        default = _switch_trainer(tmp_path, "default")
+        with _closing_all(shared, default):
+            groups = shared._rollout_groups()
+            assert [indices for indices, _ in groups] == [[0], [1, 2, 3, 4, 5], [6], [7, 8, 9, 10, 11]]
+            assert groups[0][1] is groups[2][1] is shared.cpu_blue_keeper_policy
+            assert groups[1][1] is shared.cpu_blue_field_policy and groups[3][1] is shared.cpu_red_field_policy
+
+            rng = np.random.default_rng(11)
+            obs = np.tile(rng.standard_normal((1, 1, OBS_DIM)).astype(np.float32), (1, len(ALL_AGENTS), 1))
+            cen = np.tile(rng.standard_normal((1, 1, CENTRAL_STATE_DIM)).astype(np.float32), (1, len(ALL_AGENTS), 1))
+            actions, logprobs, values = shared._select_actions(obs, cen, deterministic=True)
+            assert np.array_equal(actions[0, 0], actions[0, 6]) and values[0, 0] == values[0, 6]
+            assert not np.array_equal(actions[0, 1], actions[0, 7]) and values[0, 1] != values[0, 7]
+            computed = shared._compute_values(obs, cen)
+            assert computed[0, 0] == computed[0, 6] and computed[0, 1] != computed[0, 7]
+
+            d_actions, _, d_values = default._select_actions(obs, cen, deterministic=True)
+            assert not np.array_equal(d_actions[0, 0], d_actions[0, 6]) and d_values[0, 0] != d_values[0, 6]
+
+    @pytest.mark.parametrize("value_norm", [False, True])
+    def test_one_update_on_both_keeper_seats_matches_the_existing_modes(self, tmp_path: Path, value_norm: bool) -> None:
+        """[RED] From equal initial weights and one rollout, the shared keeper equals the shared-teams keeper (one update
+        on both keeper seats' rows) and each field network equals the default trainer's for its team; the two keeper
+        metric entries are one dict."""
+        ppo = {"value_norm": value_norm}
+        default = _switch_trainer(tmp_path, "default", ppo=ppo, full_batch=True)
+        shared = _switch_trainer(tmp_path, "shared", ppo=ppo, full_batch=True, shared_keepers=True)
+        mirror = _switch_trainer(tmp_path, "mirror", ppo=ppo, full_batch=True, separate_teams=False)
+        with _closing_all(default, shared, mirror):
+            for dst, src in (
+                (shared.blue_field_policy, default.blue_field_policy),
+                (shared.blue_keeper_policy, default.blue_keeper_policy),
+                (shared.red_field_policy, default.red_field_policy),
+                (mirror.blue_field_policy, default.blue_field_policy),
+                (mirror.blue_keeper_policy, default.blue_keeper_policy),
+            ):
+                dst.load_state_dict(src.state_dict())
+            rollout = _synthetic_rollout(5)
+            initial_keeper = {k: v.clone() for k, v in shared.blue_keeper_policy.state_dict().items()}
+            default_metrics = default.update_policies(copy.deepcopy(rollout))
+            shared_metrics = shared.update_policies(copy.deepcopy(rollout))
+            mirror_metrics = mirror.update_policies(copy.deepcopy(rollout))
+
+            trained_keeper = shared.blue_keeper_policy.state_dict()
+            assert any(not torch.equal(initial_keeper[k], trained_keeper[k]) for k in initial_keeper)  # the update did move it
+            _assert_equal_state_dicts(shared.blue_keeper_policy, mirror.blue_keeper_policy, "keeper vs shared teams")
+            _assert_equal_state_dicts(shared.blue_field_policy, default.blue_field_policy, "blue field")
+            _assert_equal_state_dicts(shared.red_field_policy, default.red_field_policy, "red field")
+            assert shared_metrics["blue_keeper"] is shared_metrics["red_keeper"]
+            assert shared_metrics["blue_keeper"] == mirror_metrics["keeper"]
+            assert shared_metrics["blue_field"] == default_metrics["blue_field"]
+            assert shared_metrics["red_field"] == default_metrics["red_field"]
+            assert shared_metrics["keeper"] is shared_metrics["blue_keeper"]
+
+    @pytest.mark.parametrize("dominant, field_attr, expected", [("A", "red", 0.35), ("B", "blue", 0.65)])
+    def test_a_sync_blends_the_trailing_field_network_and_leaves_the_keeper_untouched(
+        self, tmp_path: Path, dominant: str, field_attr: str, expected: float
+    ) -> None:
+        """[RED] Blue field weights 1.0, red field weights 0.0: the 24-match window won 24-0 by one side moves the other
+        team's field weights to 0.35 (trailing red) or 0.65 (trailing blue); every keeper tensor is bit-identical."""
+        trainer = _switch_trainer(tmp_path, shared_keepers=True)
+        with _closing_all(trainer):
+            with torch.no_grad():
+                for p in trainer.blue_field_policy.parameters():
+                    p.fill_(1.0)
+                for p in trainer.red_field_policy.parameters():
+                    p.fill_(0.0)
+            before = {k: v.clone() for k, v in trainer.blue_keeper_policy.state_dict().items()}
+            records = _matches_with_totals(24, 0, n=24) if dominant == "A" else _matches_with_totals(0, 24, n=24)
+            assert trainer._coevolution_step(records) is True
+            after = trainer.blue_keeper_policy.state_dict()
+            assert list(after) == list(before)
+            for key in before:
+                assert torch.equal(after[key], before[key]), key
+            trailing = getattr(trainer, f"{field_attr}_field_policy")
+            for p in trailing.parameters():
+                assert torch.allclose(p, torch.full_like(p, expected), rtol=0.0, atol=1e-6)
+            leading = trainer.blue_field_policy if field_attr == "red" else trainer.red_field_policy
+            leading_value = 1.0 if field_attr == "red" else 0.0
+            assert all(torch.equal(p, torch.full_like(p, leading_value)) for p in leading.parameters())
+            assert len(trainer.recent_match_scores) == 0
+
+    def test_the_checkpoint_records_the_switch_and_a_new_trainer_resumes_the_shared_keeper(self, tmp_path: Path) -> None:
+        """[RED] After a generation the state and history say shared_keepers, both keeper files hold equal tensors, and a
+        shared-keeper trainer loads them into one network with the optimizer state of the saved keeper."""
+        first = _switch_trainer(tmp_path, "ckpt", shared_keepers=True)
+        with _closing_all(first):
+            first.train(total_updates=1)
+            saved_optimizer = _optimizer_state_bytes(first.blue_keeper_policy, first.blue_keeper_optimizer)
+            saved_keeper = {k: v.clone() for k, v in first.blue_keeper_policy.state_dict().items()}
+        ckpt = tmp_path / "ckpt"
+        state = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["shared_keepers"] is True
+        history = json.loads((ckpt / "training_history.json").read_text(encoding="utf-8"))
+        assert history["shared_keepers"] is True
+        blue_file, red_file = _saved_weights(ckpt / "blue_keeper_policy.pt"), _saved_weights(ckpt / "red_keeper_policy.pt")
+        assert list(blue_file) == list(red_file) and all(torch.equal(blue_file[k], red_file[k]) for k in blue_file)
+        blue_field, red_field = _saved_weights(ckpt / "blue_field_policy.pt"), _saved_weights(ckpt / "red_field_policy.pt")
+        assert any(not torch.equal(blue_field[k], red_field[k]) for k in blue_field)
+
+        second = _switch_trainer(tmp_path, "ckpt", shared_keepers=True)
+        with _closing_all(second):
+            assert second.load_checkpoints() is True
+            assert second.red_keeper_policy is second.blue_keeper_policy
+            assert second.red_keeper_optimizer is second.blue_keeper_optimizer
+            assert second.current_generation == 1
+            for key, value in saved_keeper.items():
+                assert torch.equal(second.blue_keeper_policy.state_dict()[key], value), key
+            loaded_optimizer = _optimizer_state_bytes(second.blue_keeper_policy, second.blue_keeper_optimizer)
+            assert loaded_optimizer and loaded_optimizer == saved_optimizer
+
+    @pytest.mark.parametrize("saved_shared", [True, False])
+    def test_resume_refuses_a_shared_keepers_mismatch_and_names_both_values(self, tmp_path: Path, saved_shared: bool) -> None:
+        """[RED] A stored shared_keepers that differs from the requested one raises naming both and the escape flag; an
+        equal one loads."""
+        first = _switch_trainer(tmp_path, "ckpt", shared_keepers=saved_shared)
+        with _closing_all(first):
+            first.train(total_updates=1)
+        other = _switch_trainer(tmp_path, "ckpt", shared_keepers=not saved_shared)
+        with _closing_all(other):
+            with pytest.raises(ValueError) as exc:
+                other.load_checkpoints()
+            message = str(exc.value)
+            assert f"stored shared_keepers={saved_shared}" in message
+            assert f"requested shared_keepers={not saved_shared}" in message
+            assert "--accept-config-change" in message
+            assert other.current_generation == 0
+        same = _switch_trainer(tmp_path, "ckpt", shared_keepers=saved_shared)
+        with _closing_all(same):
+            assert same.load_checkpoints() is True and same.current_generation == 1
+
+    @pytest.mark.parametrize("saved_shared", [True, False])
+    def test_accepting_a_config_change_prints_one_line_and_stores_the_requested_value(
+        self, tmp_path: Path, capsys, saved_shared: bool
+    ) -> None:
+        """[RED] With `accept_config_change` a mismatch prints one line, resumes, and the next save stores the requested value."""
+        first = _switch_trainer(tmp_path, "ckpt", shared_keepers=saved_shared)
+        with _closing_all(first):
+            first.train(total_updates=1)
+        resumed = _switch_trainer(tmp_path, "ckpt", shared_keepers=not saved_shared, accept_config_change=True)
+        with _closing_all(resumed):
+            capsys.readouterr()
+            assert resumed.load_checkpoints() is True
+            lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+            assert len(lines) == 1 and "shared_keepers" in lines[0]
+            assert resumed.current_generation == 1
+            resumed.train(total_updates=1)
+        state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["shared_keepers"] is (not saved_shared) and state["current_generation"] == 2
+
+    def test_a_separate_keeper_checkpoint_loaded_into_a_shared_keeper_trainer_takes_the_blue_keeper(self, tmp_path: Path) -> None:
+        """[RED] Resuming a run with two keepers as shared keepers keeps the blue keeper's weights and Adam state."""
+        first = _switch_trainer(tmp_path, "ckpt")
+        with _closing_all(first):
+            first.train(total_updates=1)
+            blue_optimizer = _optimizer_state_bytes(first.blue_keeper_policy, first.blue_keeper_optimizer)
+            blue_keeper = {k: v.clone() for k, v in first.blue_keeper_policy.state_dict().items()}
+            red_keeper = first.red_keeper_policy.state_dict()
+            assert any(not torch.equal(blue_keeper[k], red_keeper[k]) for k in blue_keeper)  # the two saved keepers differ
+        resumed = _switch_trainer(tmp_path, "ckpt", shared_keepers=True, accept_config_change=True)
+        with _closing_all(resumed):
+            assert resumed.load_checkpoints() is True
+            for key, value in blue_keeper.items():
+                assert torch.equal(resumed.blue_keeper_policy.state_dict()[key], value), key
+            assert resumed.red_keeper_policy is resumed.blue_keeper_policy
+            assert _optimizer_state_bytes(resumed.blue_keeper_policy, resumed.blue_keeper_optimizer) == blue_optimizer
+
+    def test_a_state_without_the_key_reads_as_separate_keepers(self, tmp_path: Path) -> None:
+        """[RED] A state that holds no `shared_keepers` resumes silently in a default trainer and is refused, as stored
+        False, by a shared-keeper trainer."""
+        first = _switch_trainer(tmp_path, "ckpt")
+        with _closing_all(first):
+            first.train(total_updates=1)
+        state_path = tmp_path / "ckpt" / "training_state.pt"
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        assert state["shared_keepers"] is False
+        del state["shared_keepers"]
+        torch.save(state, state_path)
+        default = _switch_trainer(tmp_path, "ckpt")
+        with _closing_all(default):
+            assert default.load_checkpoints() is True and default.current_generation == 1
+        shared = _switch_trainer(tmp_path, "ckpt", shared_keepers=True)
+        with _closing_all(shared):
+            with pytest.raises(ValueError, match="stored shared_keepers=False"):
+                shared.load_checkpoints()
+
+    def test_save_load_then_one_more_update_equals_the_uninterrupted_run(self, tmp_path: Path) -> None:
+        """[RED] update(r1), save, load, update(r2) equals update(r1), update(r2) for every role, Adam state and return
+        statistics included, with the keeper shared."""
+        ppo = {"value_norm": True}
+        straight = _switch_trainer(tmp_path, "straight", ppo=ppo, shared_keepers=True)
+        first = _switch_trainer(tmp_path, "resumed", ppo=ppo, shared_keepers=True)
+        with _closing_all(straight, first):
+            r1, r2 = _synthetic_rollout(1), _synthetic_rollout(2)
+            torch.manual_seed(100)
+            straight.update_policies(copy.deepcopy(r1))
+            torch.manual_seed(101)
+            straight.update_policies(copy.deepcopy(r2))
+
+            torch.manual_seed(100)
+            first.update_policies(copy.deepcopy(r1))
+            first.current_generation = 1
+            first.save_checkpoints()
+            second = _switch_trainer(tmp_path, "resumed", ppo=ppo, shared_keepers=True)
+            with _closing_all(second):
+                assert second.load_checkpoints()
+                torch.manual_seed(101)
+                second.update_policies(copy.deepcopy(r2))
+                _assert_same_training_state(straight, second)
+
+    def test_two_generations_leave_equal_keeper_files_and_different_field_files(self, tmp_path: Path) -> None:
+        """[RED] Real generations: no error, the saved keeper files are equal, the field files differ, and the two keeper
+        correlation entries of every generation record are the same numbers."""
+        trainer = _switch_trainer(tmp_path, "ckpt", shared_keepers=True, rollout_steps=16)
+        with _closing_all(trainer):
+            trainer.train(total_updates=2)
+            records = trainer.generation_history
+        ckpt = tmp_path / "ckpt"
+        blue_keeper, red_keeper = _saved_weights(ckpt / "blue_keeper_policy.pt"), _saved_weights(ckpt / "red_keeper_policy.pt")
+        assert all(torch.equal(blue_keeper[k], red_keeper[k]) for k in blue_keeper)
+        blue_field, red_field = _saved_weights(ckpt / "blue_field_policy.pt"), _saved_weights(ckpt / "red_field_policy.pt")
+        assert any(not torch.equal(blue_field[k], red_field[k]) for k in blue_field)
+        assert len(records) == 2
+        for record in records:
+            for kind in ("v_corr_lambda", "v_corr_mc"):
+                assert record[kind]["blue_keeper"] == record[kind]["red_keeper"]
+
+    @pytest.mark.parametrize(
+        "kwargs, named",
+        [({"separate_teams": False}, "separate teams"), ({"pool_envs": 1, "num_envs": 2}, "pool_envs")],
+    )
+    def test_the_trainer_refuses_shared_keepers_with_shared_teams_or_a_pool(self, tmp_path: Path, kwargs, named) -> None:
+        """[RED] Shared keepers need separate teams and no opponent pool; the error names the switch and the conflict."""
+        with pytest.raises(ValueError, match="shared_keepers") as exc:
+            _switch_trainer(tmp_path, shared_keepers=True, **kwargs)
+        assert named in str(exc.value)
+
+    def test_the_settings_check_refuses_the_same_two_combinations_and_accepts_the_rest(self) -> None:
+        """[RED] `validate_pool_settings`: shared keepers with shared teams or with a pool raise; with the pool off, or
+        without the switch, nothing does."""
+        validate = tp.validate_pool_settings
+        with pytest.raises(ValueError, match="shared_keepers"):
+            validate(0, 10, 2, False, 0, shared_keepers=True)
+        with pytest.raises(ValueError, match="shared_keepers"):
+            validate(1, 10, 2, True, 0, shared_keepers=True)
+        validate(0, 10, 2, True, 0, shared_keepers=True)
+        validate(0, 0, 2, True, 0, shared_keepers=True)
+        validate(1, 10, 2, True, 0, shared_keepers=False)
+        validate(1, 10, 2, True, 0)
+
+    def test_cli_flag_defaults_off(self) -> None:
+        """[RED] `--shared-keepers` is a store-true flag that defaults to False."""
+        parser = tp.build_arg_parser()
+        assert parser.parse_args([]).shared_keepers is False
+        assert parser.parse_args(["--shared-keepers"]).shared_keepers is True
+
+    @pytest.mark.parametrize("extra", [["--shared-teams"], ["--pool-envs", "1"]])
+    def test_main_refuses_shared_keepers_with_shared_teams_or_a_pool_before_wiping_the_batch(
+        self, tmp_path: Path, monkeypatch, extra
+    ) -> None:
+        """[RED] The refusal aborts `main(--from-scratch)` before anything on disk changes."""
+        monkeypatch.chdir(tmp_path)
+        marker = tmp_path / "checkpoints" / "marker.txt"
+        marker.parent.mkdir()
+        marker.write_text("keep", encoding="utf-8")
+        monkeypatch.setattr("sys.argv", ["train_ppo", "--from-scratch", "--shared-keepers", "--total-updates", "1"] + extra)
+        with pytest.raises(ValueError, match="shared_keepers"):
+            tp.main()
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+        assert not (tmp_path / "replays").exists()
+
+    def test_main_trains_with_shared_keepers_says_so_and_enforces_the_flag_on_resume(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        """[RED] End to end through `main()`: the start line names the shared keeper network, the state stores the
+        switch, and resuming without the flag is refused."""
+        monkeypatch.chdir(tmp_path)
+        base = ["train_ppo", "--num-envs", "1", "--rollout-steps", "8", "--total-updates", "1", "--device", "cpu"]
+        monkeypatch.setattr("sys.argv", base + ["--shared-keepers"])
+        tp.main()
+        start = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Training new batch"))
+        assert "shared keeper" in start.lower()
+        state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["shared_keepers"] is True and state["current_generation"] == 1
+
+        monkeypatch.setattr("sys.argv", base)
+        with pytest.raises(ValueError, match="shared_keepers"):
+            tp.main()
+        state = torch.load(tmp_path / "checkpoints" / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["current_generation"] == 1
+
+    def test_a_default_run_start_line_does_not_mention_shared_keepers(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        """[GUARD] Without the flag the start line keeps its wording and names no keeper network."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["train_ppo", "--num-envs", "1", "--rollout-steps", "8", "--total-updates", "1", "--device", "cpu"],
+        )
+        tp.main()
+        start = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Training new batch"))
+        assert start.startswith("Training new batch (Independent Red vs. Blue Policies) from Generation 1..1")
+        assert "keeper" not in start.lower()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+    def test_the_cpu_shadow_of_the_shared_keeper_is_one_network_that_follows_the_updates(self, tmp_path: Path) -> None:
+        """[RED] On a CUDA trainer the rollout copy of the keeper is one network for both seats and equals the trained one
+        after an update."""
+        trainer = _switch_trainer(tmp_path, shared_keepers=True, device="cuda")
+        with _closing_all(trainer):
+            assert trainer.cpu_red_keeper_policy is trainer.cpu_blue_keeper_policy
+            assert trainer.cpu_blue_keeper_policy is not trainer.blue_keeper_policy
+            before = {k: v.clone() for k, v in trainer.cpu_blue_keeper_policy.state_dict().items()}
+            trainer.update_policies(_synthetic_rollout(3))
+            trained = trainer.blue_keeper_policy.state_dict()
+            shadow = trainer.cpu_blue_keeper_policy.state_dict()
+            assert any(not torch.equal(before[k], shadow[k]) for k in before)  # the shadow moved with the update
+            for key, value in trained.items():
+                assert torch.equal(value.cpu(), shadow[key]), key
+
+
+def _gae_digest_inputs():
+    """Integer-built float32 inputs: 40 steps, 2 environments, 12 agents, terminal steps in some environments."""
+    steps, envs, agents = 40, 2, 12
+    idx = np.arange(steps * envs * agents, dtype=np.int64).reshape(steps, envs, agents)
+    rewards = ((idx * 37) % 101 - 50).astype(np.float32) / np.float32(25.0)
+    values = ((idx * 53) % 97 - 48).astype(np.float32) / np.float32(8.0)
+    t_idx = np.arange(steps).reshape(steps, 1, 1)
+    n_idx = np.arange(envs).reshape(1, envs, 1)
+    dones = np.broadcast_to((t_idx * 3 + n_idx * 5) % 13 == 12, (steps, envs, agents)).astype(np.float32).copy()
+    next_values = (((np.arange(envs * agents) * 29) % 89 - 44).astype(np.float32) / np.float32(8.0)).reshape(envs, agents)
+    return rewards, values, dones, next_values
+
+
+def _forward_sum_gae(rewards, values, dones, next_values, gamma, lam):
+    """GAE as the explicit sum A_t = sum_k (gamma lam)^k (non-terminal flags in between) delta_{t+k}, one trajectory at a time."""
+    steps = rewards.shape[0]
+    lam_per_trajectory = np.broadcast_to(np.asarray(lam, dtype=np.float64), rewards.shape[1:])
+    out = np.zeros_like(rewards)
+    for traj in np.ndindex(*rewards.shape[1:]):
+        for t in range(steps):
+            total, weight = 0.0, 1.0
+            for s in range(t, steps):
+                alive = 1.0 - dones[(s,) + traj]
+                following = next_values[traj] if s == steps - 1 else values[(s + 1,) + traj]
+                delta = rewards[(s,) + traj] + gamma * following * alive - values[(s,) + traj]
+                total += weight * delta
+                weight *= gamma * lam_per_trajectory[traj] * alive
+            out[(t,) + traj] = total
+    return out
+
+
+HAND_REWARDS = [1.0, 0.0, 2.0]
+HAND_VALUES = [0.5, 0.25, 1.0]
+
+
+def _hand_arrays(agents: int = 1, dtype=np.float32):
+    """Rewards [1, 0, 2], values [0.5, 0.25, 1.0] and next value 0.5 for one environment and `agents` agents."""
+    def column(numbers):
+        return np.repeat(np.array(numbers, dtype=dtype).reshape(3, 1, 1), agents, axis=2)
+
+    return column(HAND_REWARDS), column(HAND_VALUES), np.zeros((3, 1, agents), dtype=dtype), np.full((1, agents), 0.5, dtype=dtype)
+
+
+class TestFieldActorLambda:
+    """Field seats' policy-gradient advantages use their own GAE lambda; critic targets and keeper advantages do not."""
+
+    @pytest.fixture(autouse=True)
+    def _fixed_commit(self, monkeypatch) -> None:
+        """A trainer reads the commit when it is built; these tests hand it a fixed answer instead of running git."""
+        monkeypatch.setattr(tp, "current_git_commit", lambda: "unit-test")
+
+    @pytest.mark.parametrize(
+        "lam, expected",
+        [
+            (0.0, [0.625, 0.25, 1.25]),
+            (0.5, [0.765625, 0.5625, 1.25]),
+            (1.0, [1.0625, 0.875, 1.25]),
+        ],
+    )
+    def test_gae_hand_values(self, lam: float, expected) -> None:
+        """[RED] Rewards [1, 0, 2], values [0.5, 0.25, 1.0], next value 0.5, gamma 0.5, no terminal step: lambda 0 is the
+        TD errors [0.625, 0.25, 1.25], and the lambdas 0.5 and 1 add the discounted tail."""
+        rewards, values, dones, next_values = _hand_arrays()
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.5, lam)
+        assert out.shape == (3, 1, 1) and out.dtype == np.float32
+        assert out[:, 0, 0].tolist() == expected
+
+    def test_gae_does_not_look_past_a_terminal_step(self) -> None:
+        """[RED] A terminal step at t = 1 with lambda 1: A1 = -0.25 has no bootstrap term, A0 = 0.625 + 0.5 * (-0.25) = 0.5,
+        and A2 = 1.25 is unaffected."""
+        rewards, values, dones, next_values = _hand_arrays()
+        dones[1] = 1.0
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.5, 1.0)
+        assert out[:, 0, 0].tolist() == [0.5, -0.25, 1.25]
+
+    def test_gae_with_a_lambda_per_agent_gives_each_agent_its_own_row(self) -> None:
+        """[RED] Two agents with the same data and lambdas [0.0, 1.0]: the first reads the lambda-0 advantages and the second
+        the lambda-1 advantages."""
+        rewards, values, dones, next_values = _hand_arrays(agents=2)
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.5, np.array([0.0, 1.0]))
+        assert out.dtype == np.float32
+        assert out[:, 0, 0].tolist() == [0.625, 0.25, 1.25]
+        assert out[:, 0, 1].tolist() == [1.0625, 0.875, 1.25]
+        dones[1] = 1.0
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.5, np.array([0.0, 1.0]))
+        assert out[:, 0, 0].tolist() == [0.625, -0.25, 1.25]
+        assert out[:, 0, 1].tolist() == [0.5, -0.25, 1.25]
+
+    def test_gae_rejects_a_lambda_array_that_does_not_fit_the_agent_axis(self) -> None:
+        """[RED] Three lambdas for two agents raise instead of broadcasting silently."""
+        rewards, values, dones, next_values = _hand_arrays(agents=2)
+        with pytest.raises(ValueError):
+            tp.gae_advantages(rewards, values, dones, next_values, 0.5, np.array([0.0, 0.5, 1.0]))
+
+    def test_gae_degenerate_shapes(self) -> None:
+        """[RED] A single step is its TD error (1 + 0.5 * 0.5 - 0.5 = 0.75); no steps give an empty result of the same dtype."""
+        one = tp.gae_advantages(
+            np.array([[[1.0]]], dtype=np.float32), np.array([[[0.5]]], dtype=np.float32),
+            np.zeros((1, 1, 1), dtype=np.float32), np.array([[0.5]], dtype=np.float32), 0.5, 0.9,
+        )
+        assert one.tolist() == [[[0.75]]]
+        none = tp.gae_advantages(
+            np.zeros((0, 2, 3), dtype=np.float32), np.zeros((0, 2, 3), dtype=np.float32),
+            np.zeros((0, 2, 3), dtype=np.float32), np.zeros((2, 3), dtype=np.float32), 0.5, 0.9,
+        )
+        assert none.shape == (0, 2, 3) and none.dtype == np.float32
+
+    def test_gae_does_not_hide_a_non_finite_reward(self) -> None:
+        """[RED] A NaN reward at t = 1 makes the advantages at t <= 1 NaN and leaves the step after it exact (1.25)."""
+        rewards, values, dones, next_values = _hand_arrays()
+        rewards[1] = np.nan
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.5, 0.5)
+        assert np.isnan(out[0, 0, 0]) and np.isnan(out[1, 0, 0]) and out[2, 0, 0] == 1.25
+
+    @pytest.mark.parametrize("lam", [0.0, 0.3, 0.95, 1.0, np.array([0.0, 0.5, 1.0])])
+    def test_gae_matches_the_explicit_forward_sum_on_random_arrays(self, lam) -> None:
+        """[GUARD] On seeded random float64 arrays with terminal steps, the backward recursion equals the explicit sum
+        of discounted TD errors, for a scalar lambda and for one lambda per agent."""
+        rng = np.random.default_rng(7)
+        shape = (12, 2, 3)
+        rewards, values = rng.standard_normal(shape), rng.standard_normal(shape)
+        dones = (rng.random(shape) < 0.2).astype(np.float64)
+        next_values = rng.standard_normal(shape[1:])
+        actual = tp.gae_advantages(rewards, values, dones, next_values, 0.9, lam)
+        expected = _forward_sum_gae(rewards, values, dones, next_values, 0.9, lam)
+        np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
+        assert actual.dtype == np.float64
+
+    @pytest.mark.parametrize(
+        "lam, digest",
+        [
+            (0.95, "191c838998b2ab749c23488f5e341854ec716baf535b28662f6bc778ecbdbdbe"),
+            (0.8, "0cb72f14af16b3bc43e46d65083786f3706ce651c6415111d68af419ca6d57d8"),
+            (0.0, "8c58f3ad971e01ee68b081dba08ecf6da7d20d11d6158f69019b7f7d1e4ac26f"),
+        ],
+    )
+    def test_gae_float_path_reproduces_the_original_inline_loop_bit_for_bit(self, lam: float, digest: str) -> None:
+        """[GUARD] SHA-256 of the float32 advantages on integer-built inputs equals the digest the trainer's original inline
+        loop produced for the same inputs (gamma 0.995): the operations and their order are unchanged."""
+        rewards, values, dones, next_values = _gae_digest_inputs()
+        out = tp.gae_advantages(rewards, values, dones, next_values, 0.995, lam)
+        assert out.dtype == np.float32 and out.shape == rewards.shape
+        assert hashlib.sha256(out.tobytes()).hexdigest() == digest
+
+    def test_field_seats_use_the_field_lambda_and_nothing_else_changes(self, tmp_path: Path) -> None:
+        """[RED] With ppo.field_actor_gae_lambda = 0 on a rollout with terminal steps, the field seats' advantages equal
+        `gae_advantages(..., lam=0)` with the trainer's end-of-rollout values, while the keeper seats' advantages and
+        every seat's returns equal the default lambda's."""
+        base = _switch_trainer(tmp_path, "base", max_rl_steps=5, rollout_steps=12)
+        zero = _switch_trainer(tmp_path, "zero", ppo={"field_actor_gae_lambda": 0.0}, max_rl_steps=5, rollout_steps=12)
+        with _closing_all(base, zero):
+            ref = _seeded_collect(base, 1)
+            out = _seeded_collect(zero, 1)
+            assert ref["dones"].sum() > 0  # terminal steps occur inside the rollout
+            for key in ("obs", "actions", "logprobs", "values", "rewards", "dones"):
+                assert np.array_equal(ref[key], out[key]), key
+            next_values = zero._compute_values(zero.current_obs, zero.current_central_state)
+            expected = tp.gae_advantages(out["rewards"], out["values"], out["dones"], next_values, zero.cfg.ppo.gamma, 0.0)
+            field, keeper = zero.field_indices, zero.keeper_indices
+            assert np.array_equal(out["advantages"][:, :, field], expected[:, :, field])
+            assert np.array_equal(out["advantages"][:, :, keeper], ref["advantages"][:, :, keeper])
+            assert np.array_equal(out["returns"], ref["returns"])
+            assert not np.array_equal(out["advantages"][:, :, field], ref["advantages"][:, :, field])
+
+    def test_the_field_lambda_follows_neither_the_default_nor_an_override_of_gae_lambda(self, tmp_path: Path) -> None:
+        """[RED] With gae_lambda 0.5 and the default field lambda (0.95), the keeper seats read the 0.5 advantages and the
+        field seats the 0.95 ones of an otherwise default trainer."""
+        reference = _switch_trainer(tmp_path, "ref", max_rl_steps=5, rollout_steps=12)
+        half = _switch_trainer(tmp_path, "half", ppo={"gae_lambda": 0.5}, max_rl_steps=5, rollout_steps=12)
+        with _closing_all(reference, half):
+            assert half.cfg.ppo.field_actor_gae_lambda == 0.95
+            ref = _seeded_collect(reference, 1)
+            out = _seeded_collect(half, 1)
+            next_values = half._compute_values(half.current_obs, half.current_central_state)
+            keeper_expected = tp.gae_advantages(out["rewards"], out["values"], out["dones"], next_values, half.cfg.ppo.gamma, 0.5)
+            field, keeper = half.field_indices, half.keeper_indices
+            assert np.array_equal(out["advantages"][:, :, keeper], keeper_expected[:, :, keeper])
+            assert np.array_equal(out["advantages"][:, :, field], ref["advantages"][:, :, field])
+            assert np.array_equal(out["returns"], keeper_expected + out["values"])
+            assert not np.array_equal(out["returns"], ref["returns"])
+
+    def test_no_second_pass_runs_when_the_two_lambdas_agree(self, tmp_path: Path, monkeypatch) -> None:
+        """[RED] A rollout makes one `gae_advantages` call at gae_lambda when the field lambda equals it, and a second one
+        at the field lambda when it differs."""
+        seen: list = []
+        real = tp.gae_advantages
+
+        def counting(*args, **kwargs):
+            seen.append(inspect.signature(real).bind(*args, **kwargs).arguments["lam"])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(tp, "gae_advantages", counting)
+        default = _switch_trainer(tmp_path, "default", rollout_steps=4)
+        shorter = _switch_trainer(tmp_path, "shorter", ppo={"field_actor_gae_lambda": 0.8}, rollout_steps=4)
+        with _closing_all(default, shorter):
+            default.collect_rollouts(1)
+            assert seen == [0.95]
+            seen.clear()
+            shorter.collect_rollouts(1)
+            assert seen == [0.95, 0.8]
+
+    def test_default_returns_are_the_advantages_plus_the_values_exactly(self, tmp_path: Path) -> None:
+        """[GUARD] With the default config, returns equal advantages + values bit for bit, and the rollout carries finite
+        advantages of the rollout's shape."""
+        trainer = _switch_trainer(tmp_path, max_rl_steps=5, rollout_steps=12)
+        with _closing_all(trainer):
+            rollout = trainer.collect_rollouts(1)
+            assert np.array_equal(rollout["returns"], rollout["advantages"] + rollout["values"])
+            assert rollout["advantages"].shape == rollout["rewards"].shape and np.isfinite(rollout["advantages"]).all()
+
+    def test_the_default_field_lambda_equals_the_default_gae_lambda(self) -> None:
+        """[RED] Defaults: field_actor_gae_lambda 0.95, the value of gae_lambda."""
+        ppo = DEFAULT_CONFIG.ppo
+        assert (ppo.field_actor_gae_lambda, ppo.gae_lambda) == (0.95, 0.95)
+
+    @pytest.mark.parametrize("bad", [1.5, -0.1, 1.0000001, -1e-9, float("nan"), float("inf"), float("-inf")])
+    def test_the_field_lambda_must_be_finite_and_in_the_unit_interval(self, bad: float) -> None:
+        """[RED] Values outside [0, 1] and non-finite values raise ValueError naming the field."""
+        with pytest.raises(ValueError, match="field_actor_gae_lambda"):
+            PPOHyperparams(field_actor_gae_lambda=bad)
+
+    @pytest.mark.parametrize("good", [0.0, 0.5, 0.8, 1.0])
+    def test_the_field_lambda_accepts_the_interval_including_both_ends(self, good: float) -> None:
+        """[RED] 0, interior values and 1 are accepted as given."""
+        assert PPOHyperparams(field_actor_gae_lambda=good).field_actor_gae_lambda == good
+
+    def test_the_field_lambda_is_reachable_through_config_overrides(self, tmp_path: Path) -> None:
+        """[RED] `ppo.field_actor_gae_lambda=0.8` parses to the float 0.8, reaches the trainer's config and is stored in the
+        applied overrides; an out-of-range override is refused naming it."""
+        cfg, applied = tp.parse_config_overrides(["ppo.field_actor_gae_lambda=0.8"])
+        assert cfg.ppo.field_actor_gae_lambda == 0.8 and applied == {"ppo.field_actor_gae_lambda": 0.8}
+        assert cfg.ppo.gae_lambda == 0.95
+        trainer = _override_trainer(tmp_path, ["ppo.field_actor_gae_lambda=0.8"])
+        with _closing_all(trainer):
+            assert trainer.cfg.ppo.field_actor_gae_lambda == 0.8
+        with pytest.raises(ValueError, match="field_actor_gae_lambda"):
+            tp.parse_config_overrides(["ppo.field_actor_gae_lambda=1.5"])
+        with pytest.raises(ValueError, match="field_actor_gae_lambda"):
+            tp.parse_config_overrides(["ppo.field_actor_gae_lambda=nan"])
