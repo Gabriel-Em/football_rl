@@ -44,6 +44,22 @@ Metrics
                     `aim_open_arc_baseline`: over the reachable kicks, the mean share of the 71 angles facing + {-35, -34,
                     ..., +35} deg lying within 15 deg (inclusive) of some open theta_j: the aim share of a kick sent in a
                     uniformly random direction of the kickable arc. A trace without `ang` enters none of the three keys.
+  basin keys        outfield seats only (slots 1..5), per team A / B and pooled, as per-match counts pooled across matches
+                    like the shares above; a trace without `ang` or without `vel` enters none of the three keys, and a
+                    player-decision with a non-finite value among the quantities a key reads enters neither its numerator
+                    nor its denominator. A seat's team is its own team.
+                    `reverse_motion_share`: outfield player-decisions with speed > 40 u/s and cos(velocity, facing) < -0.5
+                    (the body moves within 60 deg of straight backwards; facing = `ang`, velocity = `vel`), over all
+                    outfield player-decisions.
+                    `facing_ball_share`: outfield player-decisions whose bearing to the ball is within 60 deg (inclusive) of
+                    the facing, over all outfield player-decisions; a player exactly on the ball has no bearing and counts
+                    as facing it.
+                    `tackle_ready_share`: over decisions in which an outfield player holds the ball, the opposing outfield
+                    players within 85 u (inclusive) of the carrier that face it, i.e. cos(facing, carrier - tackler) >= 0.25
+                    (the facing gate of a tackle; a tackler standing on the carrier reads 1), over all opposing outfield
+                    players within 85 u of the carrier. The team is the tacklers' team. Decisions with a loose ball or a
+                    keeper holding it enter nothing.
+                    The report line is `basin: reverse X | facing ball Y | tackle-ready Z` (pooled shares).
   n_within(R)       mean number of a team's outfield players strictly closer than R u to the ball per
                     decision (per team). Uniform random placement gives 0.123 (R=100), 0.266 (R=150).
   cluster_ge4       fraction of decisions in which at least 4 of a team's 5 outfield players form one
@@ -85,7 +101,7 @@ from football_rl.config import DEFAULT_CONFIG  # noqa: E402
 
 __all__ = [
     "hold_share", "loose_share", "holder_spell_intervals", "holder_spells", "kick_events", "kick_outcomes",
-    "outfield_outcome_counts", "pass_options", "pass_option_counts", "aim_reach_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
+    "outfield_outcome_counts", "pass_options", "pass_option_counts", "aim_reach_counts", "basin_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
     "cluster_ge4", "role_inversion", "gk_geometry", "gk_opportunities", "goal_events", "goal_type_counts",
     "time_binned_counts", "time_binned_metrics", "match_metrics", "mean_se", "ratio_se", "summarize", "report",
     "load_traces", "main",
@@ -124,9 +140,25 @@ PASS_OPTION_COUNT_KEYS = (
     "pass_opt_n", "pass_opt_with", "aim_open_den", "aim_open_n",
     "aim_comp_den", "aim_comp_mate", "noopt_den", "noopt_opp",
 )
+REVERSE_MIN_SPEED = 40.0
+REVERSE_COS_MAX = -0.5
+FACING_BALL_DEG = 60.0
+FACING_BALL_COS = math.cos(math.radians(FACING_BALL_DEG))
+TACKLE_RADIUS = 85.0
+TACKLE_FACING_DOT = 0.25
+TACKLE_ON_CARRIER = 1e-4
+BASIN_KEYS = ("reverse_motion", "facing_ball", "tackle_ready")
+BASIN_PARTS = ("n", "den")
+BASIN_GROUPS = ("A", "B", "pooled")
+BASIN_COUNT_KEYS = tuple(f"{k}_{p}_{g}" for k in BASIN_KEYS for p in BASIN_PARTS for g in BASIN_GROUPS)
+BASIN_BLOCK_ROWS = 768
 LATE_WINDOW_STEPS = 225
 TEAM_SIZE = 6
 TEAMS = ("A", "B")
+# row = the carrier's team; True at the outfield seats of the other team (the players that can tackle the carrier)
+_OPPOSING_OUTFIELD = np.zeros((2, 2 * TEAM_SIZE), dtype=bool)
+for _carrier_team in (0, 1):
+    _OPPOSING_OUTFIELD[_carrier_team, TEAM_SIZE * (1 - _carrier_team) + 1:TEAM_SIZE * (2 - _carrier_team)] = True
 ROLE_GROUPS = {"GK": (0,), "D": (1, 2), "M": (3, 4), "ST": (5,)}
 
 
@@ -338,6 +370,76 @@ def aim_reach_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             c["open_reach_n"] += 1
             c["aim_reach_n"] += int(rec["aimed_open"])
             c["arc_reach_sum"] += float(rec["arc_cover"])
+    return c
+
+
+def _floats(a: Any) -> np.ndarray:
+    """`a` as an array of its own floating dtype (a trace stores float32), integers promoted to float64."""
+    arr = np.asarray(a)
+    return arr if arr.dtype.kind == "f" else arr.astype(np.float64)
+
+
+def basin_counts(trace: Dict[str, np.ndarray]) -> Dict[str, int]:
+    """Per-match numerators and denominators of the three basin shares, per team and pooled (see `basin keys`).
+
+    The tests use the facing vector (cos `ang`, sin `ang`) and the dot product of a vector with it: cos(velocity, facing) < -0.5 is
+    `dot < -0.5 |v|`, a bearing within 60 deg is `dot >= 0.5 |d|` and the tackle gate is `dot >= 0.25 |d|`. Decisions are processed
+    `BASIN_BLOCK_ROWS` at a time, which keeps the temporaries of a block in cache.
+    """
+    c = {key: 0 for key in BASIN_COUNT_KEYS}
+    if "ang" not in trace or "vel" not in trace:
+        return c
+
+    def add(key: str, group: str, num: int, den: int) -> None:
+        c[f"{key}_n_{group}"] += num
+        c[f"{key}_den_{group}"] += den
+        c[f"{key}_n_pooled"] += num
+        c[f"{key}_den_pooled"] += den
+
+    pos, vel, ang, ball = (_floats(trace[k]) for k in ("pos", "vel", "ang", "ball"))
+    clean = bool(np.isfinite(sum(float(x.sum()) for x in (pos, vel, ang, ball))))      # a NaN or an infinity anywhere makes the sum non-finite
+    for lo in range(0, int(ang.shape[0]), BASIN_BLOCK_ROWS):
+        rows = slice(lo, lo + BASIN_BLOCK_ROWS)
+        p, v, a, b = pos[rows], vel[rows], ang[rows], ball[rows]
+        fx, fy = np.cos(a), np.sin(a)
+        speed = np.sqrt(v[..., 0] * v[..., 0] + v[..., 1] * v[..., 1])
+        reverse = (speed > REVERSE_MIN_SPEED) & (v[..., 0] * fx + v[..., 1] * fy < REVERSE_COS_MAX * speed)
+        to_ball_x, to_ball_y = b[:, 0:1] - p[..., 0], b[:, 1:2] - p[..., 1]
+        facing = to_ball_x * fx + to_ball_y * fy >= FACING_BALL_COS * np.sqrt(to_ball_x * to_ball_x + to_ball_y * to_ball_y)
+        if clean:
+            moving = seen = None
+        else:
+            moving = np.isfinite(v).all(axis=-1) & np.isfinite(a)
+            seen = np.isfinite(p).all(axis=-1) & np.isfinite(a) & np.isfinite(b).all(axis=-1)[:, None]
+        for team, label in enumerate(TEAMS):
+            seats = slice(TEAM_SIZE * team + 1, TEAM_SIZE * team + TEAM_SIZE)
+            if clean:
+                add("reverse_motion", label, int(np.count_nonzero(reverse[:, seats])), int(a.shape[0]) * (TEAM_SIZE - 1))
+                add("facing_ball", label, int(np.count_nonzero(facing[:, seats])), int(a.shape[0]) * (TEAM_SIZE - 1))
+            else:
+                add("reverse_motion", label, int(np.count_nonzero(reverse[:, seats] & moving[:, seats])),
+                    int(np.count_nonzero(moving[:, seats])))
+                add("facing_ball", label, int(np.count_nonzero(facing[:, seats] & seen[:, seats])),
+                    int(np.count_nonzero(seen[:, seats])))
+
+    holder = _holder(trace)
+    held = np.flatnonzero((holder >= 0) & (holder % TEAM_SIZE != 0))
+    if held.size:
+        carrier = holder[held]
+        where = pos[held]
+        at = np.arange(held.size)
+        to_x = where[at, carrier, 0][:, None] - where[..., 0]
+        to_y = where[at, carrier, 1][:, None] - where[..., 1]
+        dist = np.sqrt(to_x * to_x + to_y * to_y)
+        row, seat = np.nonzero((dist <= TACKLE_RADIUS) & _OPPOSING_OUTFIELD[carrier // TEAM_SIZE])       # opposing outfield players near the carrier
+        facing = ang[held[row], seat]
+        d = dist[row, seat]
+        toward = np.cos(facing) * to_x[row, seat] + np.sin(facing) * to_y[row, seat]
+        valid = np.isfinite(toward) if not clean else np.ones(row.size, dtype=bool)
+        ready = valid & ((d < TACKLE_ON_CARRIER) | (toward >= TACKLE_FACING_DOT * d))
+        for team, label in enumerate(TEAMS):
+            mine = seat // TEAM_SIZE == team
+            add("tackle_ready", label, int(np.count_nonzero(ready & mine)), int(np.count_nonzero(valid & mine)))
     return c
 
 
@@ -586,6 +688,10 @@ PASS_OPTION_SHARES = {
     "aim_open_arc_baseline": ("arc_reach_sum", "open_reach_n"),
 }
 
+BASIN_SHARES = {
+    f"{key}_share_{group}": (f"{key}_n_{group}", f"{key}_den_{group}") for key in BASIN_KEYS for group in BASIN_GROUPS
+}
+
 KICK_PROP_KEYS = (
     "A", "B", "pooled", "GK", "D", "M", "ST",
     "A_GK", "A_D", "A_M", "A_ST", "B_GK", "B_D", "B_M", "B_ST",
@@ -779,6 +885,7 @@ def match_metrics(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     options = pass_options(trace, kicks=kicks, outcomes=outcomes)
     m.update(pass_option_counts(options))
     m.update(aim_reach_counts(options))
+    m.update(basin_counts(trace))
 
     kp_counts = kick_propensity_counts(trace, holder=holder, kicks=kicks)
     for k, (kn, hn) in kp_counts.items():
@@ -882,6 +989,9 @@ def summarize(per_match: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     for key, (num, den) in PASS_OPTION_SHARES.items():
         metrics[key] = _stat_dict(ratio_se(col(num), col(den)))
 
+    for key, (num, den) in BASIN_SHARES.items():
+        metrics[key] = _stat_dict(ratio_se(col(num), col(den)))
+
     for k in KICK_PROP_KEYS:
         metrics[f"kick_propensity_{k}"] = _stat_dict(ratio_se(col(f"kick_prop_kicks_{k}"), col(f"kick_prop_holds_{k}")))
 
@@ -970,6 +1080,11 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
         f"reachable {_fmt_d(met['open_reachable_share'], 1, 100.0, '%')} | "
         f"aim|reach {_fmt_d(met['aim_open_reachable_share'], 1, 100.0, '%')} | "
         f"arc baseline {_fmt_d(met['aim_open_arc_baseline'], 1, 100.0, '%')}"
+    )
+    lines.append(
+        "basin: reverse " + _fmt_d(met["reverse_motion_share_pooled"], 3)
+        + " | facing ball " + _fmt_d(met["facing_ball_share_pooled"], 3)
+        + " | tackle-ready " + _fmt_d(met["tackle_ready_share_pooled"], 3)
     )
     lines.append(
         "kick_propensity A/B/pooled : "

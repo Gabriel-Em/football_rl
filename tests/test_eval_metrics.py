@@ -4436,3 +4436,215 @@ class TestAimReach:
         line = next(ln for ln in census.report(per_match, title="hand").splitlines() if ln.startswith("pass options"))
         assert " | reachable 66.7% +- 22.2% (n=2) | aim|reach 50.0% +- 50.0% (n=2) | arc baseline 21.8% +- 20.4% (n=2)" in line
         assert line.index("no_option_opponent") < line.index(" | reachable ")
+
+
+# ----------------------------------------------------------------------------
+# Basin keys: reverse motion, facing the ball, tackle-ready opponents
+# ----------------------------------------------------------------------------
+BASIN_BALL = (700.0, 420.0)
+
+
+def basin_trace(T: int) -> dict:
+    """`make_trace` with a zero body angle `ang` (T, 12) and a zero velocity `vel` (T, 12, 2) for every player."""
+    tr = make_trace(T)
+    tr["ang"] = np.zeros((T, 12), dtype=np.float32)
+    tr["vel"] = np.zeros((T, 12, 2), dtype=np.float32)
+    tr["ball"][:] = BASIN_BALL
+    return tr
+
+
+def place_seat(tr: dict, t: int, seat: int, *, bearing_deg: float, facing_deg: float, speed: float = 0.0,
+               vel_off_deg: float = 180.0, dist: float = 200.0) -> None:
+    """Row `t`: `seat` stands `dist` u from the ball so that the bearing seat -> ball is `bearing_deg`, faces `facing_deg` and
+    moves at `speed` u/s along `facing_deg + vel_off_deg` (180 = straight backwards)."""
+    b = math.radians(bearing_deg)
+    tr["pos"][t, seat] = (BASIN_BALL[0] - dist * math.cos(b), BASIN_BALL[1] - dist * math.sin(b))
+    tr["ang"][t, seat] = math.radians(facing_deg)
+    v = math.radians(facing_deg + vel_off_deg)
+    tr["vel"][t, seat] = (speed * math.cos(v), speed * math.sin(v))
+
+
+def basin_scene(reverse_rows=(0, 1, 2), away_rows=(2, 3), T: int = 4) -> dict:
+    """Ball loose at BASIN_BALL. Team A seat 3 faces within 15 deg of the ball in the rows not in `away_rows` and with the ball
+    at +90 deg of its facing in `away_rows`; it moves backwards at 100 u/s in `reverse_rows`. Every other outfield seat stands
+    still and faces within 30 deg of the ball. Both keepers move backwards at 100 u/s and face away from the ball."""
+    tr = basin_trace(T)
+    offsets = {1: 0.0, 2: 10.0, 4: -20.0, 5: 25.0, 7: -5.0, 8: 15.0, 9: -30.0, 10: 30.0, 11: 0.0}
+    for t in range(T):
+        for i, seat in enumerate(range(12)):
+            bearing = 36.0 * i + 7.0 * t
+            if seat in (0, 6):
+                place_seat(tr, t, seat, bearing_deg=bearing, facing_deg=bearing + 180.0, speed=100.0)
+            elif seat == 3:
+                away = t in away_rows
+                place_seat(tr, t, seat, bearing_deg=bearing, facing_deg=bearing - 90.0 if away else bearing - 15.0,
+                           speed=100.0 if t in reverse_rows else 0.0)
+            else:
+                place_seat(tr, t, seat, bearing_deg=bearing, facing_deg=bearing - offsets[seat])
+    return tr
+
+
+class TestBasinKeys:
+    def test_reverse_and_facing_on_a_four_row_trace(self):
+        """[RED] Four rows, ball loose. Team A seat 3 moves backwards at 100 u/s in rows 0-2 and has the ball at +90 deg of its
+        facing in rows 2-3; every other outfield seat stands still and faces within 30 deg of the ball. Both keepers (excluded)
+        move backwards facing away from the ball. Outfield player-decisions: 5 seats x 4 rows = 20 per team.
+        reverse_motion: team A 3/20, team B 0/20, pooled 3/40. facing_ball: team A 20 - 2 = 18/20, team B 20/20, pooled 38/40.
+        No holder: tackle_ready has no decision, so every denominator is 0 and the share is None."""
+        c = census.basin_counts(basin_scene())
+        assert (c["reverse_motion_n_A"], c["reverse_motion_den_A"]) == (3, 20)
+        assert (c["reverse_motion_n_B"], c["reverse_motion_den_B"]) == (0, 20)
+        assert (c["reverse_motion_n_pooled"], c["reverse_motion_den_pooled"]) == (3, 40)
+        assert (c["facing_ball_n_A"], c["facing_ball_den_A"]) == (18, 20)
+        assert (c["facing_ball_n_B"], c["facing_ball_den_B"]) == (20, 20)
+        assert (c["facing_ball_n_pooled"], c["facing_ball_den_pooled"]) == (38, 40)
+        assert all(c[f"tackle_ready_{p}_{t}"] == 0 for p in ("n", "den") for t in ("A", "B", "pooled"))
+        met = census.summarize([census.match_metrics(basin_scene())])["metrics"]
+        assert met["reverse_motion_share_A"]["mean"] == pytest.approx(3 / 20)
+        assert met["reverse_motion_share_B"]["mean"] == pytest.approx(0.0)
+        assert met["reverse_motion_share_pooled"]["mean"] == pytest.approx(3 / 40)
+        assert met["facing_ball_share_A"]["mean"] == pytest.approx(18 / 20)
+        assert met["facing_ball_share_pooled"]["mean"] == pytest.approx(38 / 40)
+        assert met["tackle_ready_share_pooled"] == {"mean": None, "se": None, "n": 0}
+
+    def test_one_tackle_ready_of_two_near_opponents(self):
+        """[RED] One row. Team B outfield seat 8 holds the ball at (700, 420) (the ball is parked at (700, 120), 300 u away, so
+        that facing the ball differs from facing the carrier). Team A seats near it: A1 at (650, 420) facing east (dot with the
+        direction to the carrier = 1, ready), A2 at (700, 480) facing north (dot = -1, not ready); A3 at (820, 420) facing the
+        carrier but 120 u away (not near). Decoys that must not count: team A's keeper at (730, 420) facing the carrier, and team
+        B's seat 9 at (700, 460) facing it. Team A: 1 of 2; team B holds the ball, so it has no tackler: None; pooled 1/2."""
+        tr = basin_trace(1)
+        tr["holder"][0] = 8
+        tr["pos"][0, 8] = (700.0, 420.0)
+        tr["ball"][0] = (700.0, 120.0)
+        tr["pos"][0, 1], tr["ang"][0, 1] = (650.0, 420.0), 0.0
+        tr["pos"][0, 2], tr["ang"][0, 2] = (700.0, 480.0), math.pi / 2
+        tr["pos"][0, 3], tr["ang"][0, 3] = (820.0, 420.0), math.pi
+        tr["pos"][0, 0], tr["ang"][0, 0] = (730.0, 420.0), math.pi
+        tr["pos"][0, 9], tr["ang"][0, 9] = (700.0, 460.0), -math.pi / 2
+        c = census.basin_counts(tr)
+        assert (c["tackle_ready_n_A"], c["tackle_ready_den_A"]) == (1, 2)
+        assert (c["tackle_ready_n_B"], c["tackle_ready_den_B"]) == (0, 0)
+        assert (c["tackle_ready_n_pooled"], c["tackle_ready_den_pooled"]) == (1, 2)
+        met = census.summarize([census.match_metrics(tr)])["metrics"]
+        assert met["tackle_ready_share_pooled"]["mean"] == pytest.approx(0.5)
+        assert met["tackle_ready_share_A"]["mean"] == pytest.approx(0.5)
+        assert met["tackle_ready_share_B"] == {"mean": None, "se": None, "n": 0}
+
+    def test_tackle_ready_boundaries_and_excluded_decisions(self):
+        """[RED] Seven rows, carrier at (700, 420) with the ball on it (ready = the tackler's facing within cos >= 0.25 of the
+        direction to the carrier, within 85 u inclusive):
+          r0 team A keeper holds -> no decision          r1 ball loose -> no decision
+          r2 B7 holds, A1 exactly 85 u away facing it    -> A 1/1
+          r3 B7 holds, A1 85.5 u away                    -> not near: A 0/0
+          r4 B7 holds, A1 faces 75 deg off the carrier (cos 0.2588, ready), A2 76 deg off (cos 0.2419, not) -> A 1/2
+          r5 A3 holds, B8 at (700, 480) facing the carrier -> B 1/1
+          r6 B7 holds, A1 near with a NaN facing (skipped), A2 near and facing it -> A 1/1
+          r7 B7 holds at (0, 0), A1 at (5e-5, 0) facing away from it (the env's gate reads facing_dot = 1 below 1e-4 u) -> A 1/1
+        Team A 4/5, team B 1/1, pooled 5/6."""
+        tr = basin_trace(8)
+        far = tr["pos"].copy()
+        tr["holder"][0] = 0
+        tr["holder"][2:5] = 7
+        tr["holder"][5] = 3
+        tr["holder"][6:8] = 7
+        tr["pos"][:, 7] = (700.0, 420.0)
+        tr["pos"][5, 3], tr["pos"][5, 7] = (700.0, 420.0), far[5, 7]
+        tr["pos"][2, 1], tr["ang"][2, 1] = (785.0, 420.0), math.pi
+        tr["pos"][3, 1], tr["ang"][3, 1] = (785.5, 420.0), math.pi
+        tr["pos"][4, 1], tr["ang"][4, 1] = (650.0, 420.0), math.radians(75.0)
+        tr["pos"][4, 2], tr["ang"][4, 2] = (750.0, 420.0), math.pi + math.radians(76.0)
+        tr["pos"][5, 8], tr["ang"][5, 8] = (700.0, 480.0), -math.pi / 2
+        tr["pos"][6, 1], tr["ang"][6, 1] = (650.0, 420.0), np.nan
+        tr["pos"][6, 2], tr["ang"][6, 2] = (750.0, 420.0), math.pi
+        tr["pos"][7, 7], tr["pos"][7, 1], tr["ang"][7, 1] = (0.0, 0.0), (5e-5, 0.0), 0.0
+        c = census.basin_counts(tr)
+        assert (c["tackle_ready_n_A"], c["tackle_ready_den_A"]) == (4, 5)
+        assert (c["tackle_ready_n_B"], c["tackle_ready_den_B"]) == (1, 1)
+        assert (c["tackle_ready_n_pooled"], c["tackle_ready_den_pooled"]) == (5, 6)
+
+    def test_reverse_and_facing_thresholds_and_non_finite_rows(self):
+        """[RED] Team A seat 1 over eight rows (ball at (700, 420); every other outfield seat faces the ball and stands still):
+          speed 40.0 straight back -> not reverse (needs > 40)   speed 40.5 straight back -> reverse
+          speed 100 at 119 deg from the facing -> not (cos -0.485)   speed 100 at 121 deg -> reverse (cos -0.515)
+          speed 100 forwards -> not   speed 0 -> not   NaN velocity -> skipped (no reverse decision)   row 7 as row 5
+        Facing the ball, same seat and rows: |bearing - facing| of 0, 59, -59, 61, -61, 179 deg count 1, 1, 1, 0, 0, 0; row 6 has
+        facing 170 deg and bearing -175 deg, whose difference wraps to 15 deg -> 1; the NaN-velocity row 7 still counts for
+        facing (0 deg) -> 1. Reverse: A 2 of 39 (the NaN decision leaves the denominator), B 0/40, pooled 2/79.
+        Facing: A 32 + 5 = 37 of 40, pooled 77/80."""
+        tr = basin_trace(8)
+        for t in range(8):
+            for seat in (2, 3, 4, 5, 7, 8, 9, 10, 11):
+                place_seat(tr, t, seat, bearing_deg=40.0 * seat, facing_deg=40.0 * seat)
+        specs = [
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=40.0),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=40.5),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=100.0, vel_off_deg=119.0),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=100.0, vel_off_deg=121.0),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=100.0, vel_off_deg=0.0),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=0.0),
+            dict(bearing_deg=-175.0, facing_deg=170.0, speed=0.0),
+            dict(bearing_deg=0.0, facing_deg=0.0, speed=0.0),
+        ]
+        for t, kw in enumerate(specs):
+            place_seat(tr, t, 1, **kw)
+        for t, (b, f) in enumerate([(0, 0), (59, 0), (-59, 0), (61, 0), (-61, 0), (179, 0)]):
+            place_seat(tr, t, 1, bearing_deg=float(b), facing_deg=float(f), speed=specs[t].get("speed", 0.0),
+                       vel_off_deg=specs[t].get("vel_off_deg", 180.0))
+        tr["vel"][7, 1] = (np.nan, np.nan)
+        c = census.basin_counts(tr)
+        assert (c["reverse_motion_n_A"], c["reverse_motion_den_A"]) == (2, 39)
+        assert (c["reverse_motion_n_B"], c["reverse_motion_den_B"]) == (0, 40)
+        assert (c["reverse_motion_n_pooled"], c["reverse_motion_den_pooled"]) == (2, 79)
+        assert (c["facing_ball_n_A"], c["facing_ball_den_A"]) == (37, 40)
+        assert (c["facing_ball_n_pooled"], c["facing_ball_den_pooled"]) == (77, 80)
+
+    def test_empty_trace_has_no_basin_decisions(self):
+        """[RED] A trace with no rows enters no basin key: every count is 0 and no key is a share."""
+        c = census.basin_counts(basin_trace(0))
+        assert set(c.values()) == {0}
+        assert len(c) == 18
+
+    def test_trace_without_facing_or_velocity_enters_no_basin_key(self):
+        """[RED] A trace without `ang`, and one without `vel`, enters none of the three keys (n = 0), and the pass-option and
+        aim keys of a kick scene do not change when `vel` is added to the trace."""
+        base = basin_scene()
+        for dropped in ("ang", "vel"):
+            tr = {k: v for k, v in base.items() if k != dropped}
+            assert set(census.basin_counts(tr).values()) == {0}, dropped
+            met = census.summarize([census.match_metrics(tr)])["metrics"]
+            for key in ("reverse_motion_share", "facing_ball_share", "tackle_ready_share"):
+                for t in ("A", "B", "pooled"):
+                    assert met[f"{key}_{t}"] == {"mean": None, "se": None, "n": 0}, (dropped, key, t)
+        kick_keys = ("pass_option_share", "aim_open_share", "aim_open_completion", "no_option_opponent_share",
+                     "open_reachable_share", "aim_open_reachable_share", "aim_open_arc_baseline")
+        with_ang = make_trace(80)
+        aim_scene(with_ang, 5, {4: 20.5}, dir_deg=20.5)
+        aim_scene(with_ang, 40, {4: 80.0})
+        without_vel = census.summarize([census.match_metrics(with_ang)])["metrics"]
+        with_ang["vel"] = np.zeros((80, 12, 2), dtype=np.float32)
+        with_vel = census.summarize([census.match_metrics(with_ang)])["metrics"]
+        assert without_vel["facing_ball_share_pooled"]["n"] == 0 and with_vel["facing_ball_share_pooled"]["n"] == 1
+        for key in kick_keys:
+            assert with_vel[key] == without_vel[key], key
+        assert without_vel["open_reachable_share"]["mean"] == pytest.approx(1 / 2)
+        assert without_vel["aim_open_arc_baseline"]["mean"] == pytest.approx(30 / 71)
+
+    def test_pooled_ratios_and_report_line_on_two_matches(self):
+        """[RED] Match 1 is `basin_scene()`, match 2 the same scene with no reversing and everybody facing the ball. reverse_motion
+        pooled: (3, 40), (0, 40) -> r = 3/80, residuals +1.5 and -1.5, se = sqrt(2 * 4.5) / 80 = 0.0375. Team A: (3, 20), (0, 20)
+        -> r = 3/40, se = sqrt(9) / 40 = 0.075. facing_ball pooled: (38, 40), (40, 40) -> r = 0.975, residuals -1 and +1,
+        se = sqrt(2 * 2) / 80 = 0.025. The report line of match 1 alone reads
+        `basin: reverse 0.075 +- n/a (n=1) | facing ball 0.950 +- n/a (n=1) | tackle-ready -  (n=0)`."""
+        calm = basin_scene(reverse_rows=(), away_rows=())
+        for t in range(4):
+            place_seat(calm, t, 3, bearing_deg=36.0 * 3 + 7.0 * t, facing_deg=36.0 * 3 + 7.0 * t)
+        per_match = [census.match_metrics(basin_scene()), census.match_metrics(calm)]
+        met = census.summarize(per_match)["metrics"]
+        for key, mean, se in (("reverse_motion_share_pooled", 3 / 80, 0.0375), ("reverse_motion_share_A", 3 / 40, 0.075),
+                              ("facing_ball_share_pooled", 0.975, 0.025)):
+            assert met[key]["mean"] == pytest.approx(mean), key
+            assert met[key]["se"] == pytest.approx(se), key
+            assert met[key]["n"] == 2, key
+        line = next(ln for ln in census.report(per_match[:1], title="hand").splitlines() if ln.startswith("basin:"))
+        assert line == "basin: reverse 0.075 +- n/a (n=1) | facing ball 0.950 +- n/a (n=1) | tackle-ready -  (n=0)"

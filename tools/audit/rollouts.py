@@ -1,4 +1,5 @@
-"""Counterfactual rollouts over harness traces: keeper reach (`gk`), hold-vs-kick (`hold`) and kick aim (`aim`).
+"""Counterfactual rollouts over harness traces: keeper reach (`gk`), hold-vs-kick (`hold`), kick aim (`aim`) and the
+credit a decision's benefit receives in the trainer's advantage (`credit`).
 
 From a harness trace directory (`m*.npz`) and (for `hold` and `aim`) the checkpoint that produced it,
 re-simulates each match from its harness seed (`trace_seed * 1000 + match_idx`), verifies position
@@ -55,6 +56,35 @@ branches:
         AIMP - POLICY differences (mean +- SE). The loaded policies must reproduce `val` and `mean` of the trace at
         decision 0 of every match within 1e-5, as in `hold`.
 
+  credit How much of a decision's true counterfactual benefit reaches the trainer's GAE advantage, and with how much noise.
+        `--decision aim` (default): the points of `aim` that are not already aimed (`find_aim_points`), with the branches POLICY
+        (the recorded actions at decision 0) and AIM (as POLICY, the kicker's steer turned at the target). `--decision attack`:
+        outfield kicks where the kicker holds the ball at kick row k (k + 2 < the trace length), the ball is in the kicker's
+        attacking third (canonical x > 2/3 of the pitch) and k is >= 45 decisions after the previous point, with the branches
+        KICK (the recorded actions at decision 0) and HOLD (as KICK, the kicker's env kick column forced to -1 for decisions 0-14).
+        Seed index j = 0..K-1 (`--seeds`, default 4) gives every pair one generator seed
+        `((seed + 7919 j) * 1_000_003 + match_idx * 10_000 + k) & 0x7FFFFFFF` (j = 0 is the seed of `aim`). From decision 1 on both
+        teams sample from the checkpoint, for 75 decisions (5 s), then the kicker's critic value V_75 is read (none after a
+        terminal step).
+        Per branch the kicker's own reward per decision is split into `goal` = 10 x (goals for - goals against in the decision),
+        `sparse` = the non-shaping reward - goal, `ball` = `team_advance_pbrs_weight` x the decision's change of the kicker team's
+        ball potential (the full change, also in a decision that teleports the ball, where the env pays no shaping) and `role` =
+        the shaping - ball; the critic value V_t of the kicker is recorded for t = 0..75.
+        The estimator is the trainer's GAE at decision 0, A(lambda) = sum_l (gamma lambda)^l delta_l with delta_l = r_l +
+        gamma V_{l+1} - V_l (gamma from the config), cut at 75 decisions with V_75 and without any bootstrap after a terminal
+        step, for every lambda in `--lambdas` (default 0 0.5 0.8 0.9 0.95 0.99 1). A(lambda) splits into the four reward parts and
+        a critic part, which add up to it. Per lambda:
+          S     signal: the mean over points of the seed-averaged benefit of the decision, A_AIM - A_POLICY for aim, A_KICK - A_HOLD
+                for attack (the recorded kick against holding), with its standard error over points;
+          N     noise: sqrt of the mean over points of the variance across seeds of the recorded branch's A (same state, same
+                action, different futures); SNR = S / N;
+          paired SD  the standard deviation over all (point, seed) pairs of the same difference as S;
+          variance share  of each part (goal, sparse, ball, role, critic) in the variance across seeds of the recorded branch;
+          signal parts    the same parts of S (they add up to S).
+        `attack` also reports the goals for and against per branch within the 75 decisions (mean per point and seed).
+        A point set that is empty gives an empty result with every statistic None. The loaded policies must reproduce `val` and
+        `mean` of the trace at decision 0 of every match within 1e-5, as in `hold`.
+
 Nothing is written to `checkpoints/`, `replays/`, checkpoint directories, or the trace directory.
 
 Usage:
@@ -63,6 +93,8 @@ Usage:
          [--workers 4] [--seed 1] [--hold-steps 15] --out OUT
   python tools/audit/rollouts.py aim --trace-dir DIR --checkpoint-dir DIR [--max-matches 32]
          [--workers 4] [--seed 1] [--shaping-mode legacy] --out OUT
+  python tools/audit/rollouts.py credit --trace-dir DIR --checkpoint-dir DIR [--decision aim|attack] [--seeds 4]
+         [--lambdas 0 0.5 0.8 0.9 0.95 0.99 1] [--max-matches 32] [--workers 4] [--seed 1] [--shaping-mode legacy] --out OUT
 """
 
 from __future__ import annotations
@@ -93,7 +125,14 @@ __all__ = [
     "AIM_BRANCHES",
     "AIM_HORIZONS",
     "AIM_MAX_DEFLECTION_DEG",
+    "ATTACK_THIRD",
     "COMPONENT_KEYS",
+    "CREDIT_GOAL_REWARD",
+    "CREDIT_LAMBDAS",
+    "CREDIT_PARTS",
+    "CREDIT_SEEDS",
+    "CREDIT_SEED_STRIDE",
+    "CREDIT_STEPS",
     "GK_HORIZON_STEPS",
     "GK_INERT_ACTION",
     "GK_MAX_BALL_SPEED",
@@ -107,20 +146,30 @@ __all__ = [
     "SPACING_STEPS",
     "aim_steer",
     "aimp_power",
+    "credit_branch_seed",
+    "credit_gae",
+    "credit_statistics",
+    "credit_step_components",
     "decision_intent",
     "eval_gk_opportunity",
     "find_aim_points",
+    "find_attack_points",
+    "find_credit_points",
     "find_gk_opportunities",
     "find_hold_decisions",
     "gk_scripted_action",
     "main",
     "resimulate_match",
     "roll_aim_branches",
+    "roll_credit_branch",
+    "roll_credit_point",
     "roll_hold_branches",
     "run_aim",
+    "run_credit",
     "run_gk",
     "run_hold",
     "summarize_aim",
+    "summarize_credit",
     "summarize_gk",
     "summarize_hold",
 ]
@@ -1673,6 +1722,488 @@ def format_aim_report(summary: Dict[str, Any], title: str = "") -> str:
 
 
 # ----------------------------------------------------------------------------
+# Credit: how much of a decision's counterfactual benefit reaches the trainer's advantage
+# ----------------------------------------------------------------------------
+CREDIT_STEPS = 75
+CREDIT_SEEDS = 4
+CREDIT_SEED_STRIDE = 7919
+CREDIT_GOAL_REWARD = 10.0
+CREDIT_LAMBDAS = (0.0, 0.5, 0.8, 0.9, 0.95, 0.99, 1.0)
+CREDIT_PARTS = ("goal", "sparse", "ball", "role")
+CREDIT_SHARE_PARTS = (*CREDIT_PARTS, "critic")
+ATTACK_THIRD = 2.0 * FIELD_WIDTH / 3.0
+# decision -> (recorded branch, alternative branch, sign of the benefit: +1 = alternative - recorded, -1 = recorded - alternative)
+CREDIT_DECISIONS = {"aim": ("policy", "aim", 1.0), "attack": ("kick", "hold", -1.0)}
+
+
+def credit_branch_seed(seed: int, j: int, match_idx: int, step: int) -> int:
+    """Generator seed shared by the two branches of seed index `j` at decision `step` of match `match_idx`."""
+    return ((int(seed) + CREDIT_SEED_STRIDE * int(j)) * 1_000_003 + int(match_idx) * 10_000 + int(step)) & 0x7FFF_FFFF
+
+
+def credit_step_components(
+    reward: float,
+    shaping: float,
+    goals_for: int,
+    goals_against: int,
+    phi_before: float,
+    phi_after: float,
+    advance_weight: float,
+) -> np.ndarray:
+    """One decision of the kicker's reward as `(goal, sparse, ball, role)`; the four add up to `reward`."""
+    goal = CREDIT_GOAL_REWARD * (int(goals_for) - int(goals_against))
+    ball = float(advance_weight) * (float(phi_after) - float(phi_before))
+    return np.array([goal, (float(reward) - float(shaping)) - goal, ball, float(shaping) - ball], dtype=np.float64)
+
+
+def credit_gae(
+    components: np.ndarray, values: np.ndarray, gamma: float, lam: float, *, terminal: bool
+) -> Tuple[np.ndarray, float]:
+    """The trainer's GAE at decision 0 of a branch as `(reward parts, critic part)`; their sum is the advantage.
+
+    `components` is `(n, parts)` (the reward of every decision, split in any way), `values` holds V_0..V_n (V_n is the bootstrap
+    after the last decision and is not read when `terminal`, where the last decision ends the episode). The advantage is
+    sum_l (gamma lam)^l delta_l with delta_l = r_l + gamma V_{l+1} - V_l; the reward part is sum_l (gamma lam)^l r_l per part and the
+    critic part sum_l (gamma lam)^l (gamma V_{l+1} - V_l).
+    """
+    comps = np.asarray(components, dtype=np.float64)
+    n = int(comps.shape[0])
+    if n < 1:
+        raise ValueError("a branch needs at least one decision")
+    if not (0.0 <= float(lam) <= 1.0):
+        raise ValueError(f"lambda must be in [0, 1], got {lam}")
+    v = np.asarray(values, dtype=np.float64)
+    if v.shape[0] < (n if terminal else n + 1):
+        raise ValueError(f"{n} decisions need {n if terminal else n + 1} critic values, got {v.shape[0]}")
+    weights = (float(gamma) * float(lam)) ** np.arange(n)
+    next_value = np.zeros(n)
+    next_value[: n - 1] = v[1:n]
+    if not terminal:
+        next_value[n - 1] = v[n]
+    return (weights[:, None] * comps).sum(axis=0), float((weights * (float(gamma) * next_value - v[:n])).sum())
+
+
+def find_attack_points(trace: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    """Outfield kicks in the kicker's attacking third, >= 45 decisions apart (see `credit` in the module docstring)."""
+    holder = np.asarray(trace["holder"], dtype=np.int64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    side = np.asarray(trace["side"], dtype=np.int64)
+    n = int(holder.size)
+    steps, players = census.kick_events(trace)
+    points: List[Dict[str, Any]] = []
+    last_step = -SPACING_STEPS - 1
+    for step, kicker in sorted(zip(steps.tolist(), players.tolist())):
+        if kicker % TEAM_SIZE == 0 or int(holder[step]) != kicker or step + 2 >= n or step - last_step < SPACING_STEPS:
+            continue
+        team = kicker // TEAM_SIZE
+        canon_x = float(ball[step, 0]) if int(side[step, team]) == 0 else FIELD_WIDTH - float(ball[step, 0])
+        if canon_x <= ATTACK_THIRD:
+            continue
+        last_step = step
+        points.append({"step": int(step), "kicker": int(kicker), "team": team})
+    return points
+
+
+def find_credit_points(trace: Dict[str, np.ndarray], decision: str) -> List[Dict[str, Any]]:
+    """Points of a credit decision: `aim` points not already aimed, or attacking-third kicks."""
+    if decision == "aim":
+        return [p for p in find_aim_points(trace) if not p["already"]]
+    if decision == "attack":
+        return find_attack_points(trace)
+    raise ValueError(f"decision must be one of {tuple(CREDIT_DECISIONS)}, got {decision!r}")
+
+
+def roll_credit_branch(
+    snap: Any,
+    *,
+    recorded_actions: np.ndarray,
+    kicker: int,
+    branch_seed: int,
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    steer: Optional[float] = None,
+    hold_steps: int = 0,
+    mode: str = "sampled",
+    sigma_scale: float = 1.0,
+    steps: int = CREDIT_STEPS,
+    after_step: Optional[Callable[[int, Any, np.ndarray], None]] = None,
+) -> Dict[str, Any]:
+    """Roll `steps` decisions from `snap`: decision 0 plays `recorded_actions` (the kicker's steer replaced by `steer` when given),
+    later decisions sample both teams; the kicker's kick column is -1 for the first `hold_steps` decisions.
+
+    Returns the kicker's reward split per decision `components` `(steps, 4)` (goal, sparse, ball, role; zero after the last played
+    decision), its critic values `values` `(steps + 1,)` (V_t before decision t, V_steps after the last one unless the branch ended),
+    `n_steps`, `terminal`, and the goals for and against of the kicker's team within the branch.
+    """
+    env = copy.deepcopy(snap)
+    team = kicker // TEAM_SIZE
+    opp = 1 - team
+    gen = torch.Generator().manual_seed(int(branch_seed))
+    obs = env._get_observations_array()
+    cen = env.get_centralized_state()
+    advance_weight = float(env.cfg.rewards.team_advance_pbrs_weight)
+    components = np.zeros((steps, len(CREDIT_PARTS)))
+    values = np.zeros(steps + 1)
+    n_steps, terminal, goals_for, goals_against = steps, False, 0, 0
+    for k in range(steps):
+        act_a, val_a = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        act_b, val_b = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        val = np.concatenate([val_a, val_b])
+        values[k] = float(val[kicker])
+        act = np.concatenate([act_a, act_b])
+        if k == 0:
+            act = np.array(recorded_actions, dtype=np.float32, copy=True)
+            if steer is not None:
+                act[kicker, 1] = steer
+        if k < hold_steps:
+            act[kicker, 2] = -1.0
+        score_for, score_against = int(env.stats["score"][team]), int(env.stats["score"][opp])
+        phi_before = float(env._compute_ball_potential(team))
+        obs, cen, rew, done, _ = env.step_array(act, val)
+        if after_step is not None:
+            after_step(k, env, act)
+        d_for, d_against = int(env.stats["score"][team]) - score_for, int(env.stats["score"][opp]) - score_against
+        goals_for += d_for
+        goals_against += d_against
+        components[k] = credit_step_components(
+            float(rew[kicker]), float(env.last_shaping_rewards[kicker]), d_for, d_against,
+            phi_before, float(env._compute_ball_potential(team)), advance_weight,
+        )
+        if done:
+            n_steps, terminal = k + 1, True
+            break
+    if not terminal:
+        _, val_a = _team_action_and_value(team_a, env, 0, obs, cen, mode, sigma_scale, gen)
+        _, val_b = _team_action_and_value(team_b, env, 1, obs, cen, mode, sigma_scale, gen)
+        values[steps] = float(np.concatenate([val_a, val_b])[kicker])
+    return {
+        "components": components,
+        "values": values,
+        "n_steps": n_steps,
+        "terminal": terminal,
+        "goals_for": goals_for,
+        "goals_against": goals_against,
+    }
+
+
+def roll_credit_point(
+    snap: Any,
+    *,
+    decision: str,
+    recorded_actions: np.ndarray,
+    kicker: int,
+    branch_seeds: Sequence[int],
+    team_a: Optional[harness.TeamPolicy],
+    team_b: Optional[harness.TeamPolicy],
+    steer: Optional[float] = None,
+    hold_steps: int = HOLD_OVERRIDE_STEPS,
+    mode: str = "sampled",
+    sigma_scale: float = 1.0,
+    after_step: Optional[Callable[[str, int, int, Any, np.ndarray], None]] = None,
+) -> Dict[str, np.ndarray]:
+    """Both branches of a decision for every seed in `branch_seeds` (one generator seed per index j for the pair).
+
+    `aim`: POLICY and AIM (`steer` required, the kicker's steer at decision 0). `attack`: KICK and HOLD (`hold_steps` decisions with the
+    kicker's kick column at -1). Arrays are indexed `[j, branch, ...]` with the recorded branch first.
+    `after_step(branch, j, k, env, act)` sees every applied action.
+    """
+    if decision not in CREDIT_DECISIONS:
+        raise ValueError(f"decision must be one of {tuple(CREDIT_DECISIONS)}, got {decision!r}")
+    if decision == "aim" and steer is None:
+        raise ValueError("the aim decision needs a steer")
+    labels = CREDIT_DECISIONS[decision][:2]
+    n_seeds = len(branch_seeds)
+    components = np.zeros((n_seeds, 2, CREDIT_STEPS, len(CREDIT_PARTS)))
+    values = np.zeros((n_seeds, 2, CREDIT_STEPS + 1))
+    n_steps = np.zeros((n_seeds, 2), dtype=np.int64)
+    terminal = np.zeros((n_seeds, 2), dtype=bool)
+    goals = np.zeros((n_seeds, 2, 2), dtype=np.int64)
+    for j, seed in enumerate(branch_seeds):
+        for b, label in enumerate(labels):
+            hook = None if after_step is None else (lambda k, env, act, label=label, j=j: after_step(label, j, k, env, act))
+            res = roll_credit_branch(
+                snap, recorded_actions=recorded_actions, kicker=kicker, branch_seed=int(seed), team_a=team_a, team_b=team_b,
+                steer=steer if (decision == "aim" and b == 1) else None,
+                hold_steps=hold_steps if (decision == "attack" and b == 1) else 0,
+                mode=mode, sigma_scale=sigma_scale, after_step=hook,
+            )
+            components[j, b], values[j, b] = res["components"], res["values"]
+            n_steps[j, b], terminal[j, b] = res["n_steps"], res["terminal"]
+            goals[j, b] = (res["goals_for"], res["goals_against"])
+    return {"components": components, "values": values, "n_steps": n_steps, "terminal": terminal, "goals": goals}
+
+
+def _lambda_key(lam: float) -> str:
+    return f"{float(lam):g}"
+
+
+def credit_statistics(
+    components: np.ndarray,
+    values: np.ndarray,
+    n_steps: np.ndarray,
+    terminal: np.ndarray,
+    *,
+    lambdas: Sequence[float],
+    gamma: float,
+    sign: float,
+) -> Dict[str, Dict[str, Any]]:
+    """Signal, noise and variance shares of the GAE at decision 0 per lambda (see `credit` in the module docstring).
+
+    Arrays are indexed `[point, seed, branch, ...]`, the recorded branch first: `components` `(P, K, 2, T, 4)`, `values`
+    `(P, K, 2, T + 1)`, `n_steps` and `terminal` `(P, K, 2)`. `sign` is +1 when the benefit is alternative - recorded and -1 when it
+    is recorded - alternative. Every statistic is None where it is undefined (no points, one point for an SE, zero noise for an SNR
+    or variance share).
+    """
+    n_points, n_seeds = int(components.shape[0]), int(components.shape[1])
+    if n_seeds < 2:
+        raise ValueError(f"the noise needs at least two seeds, got {n_seeds}")
+    out: Dict[str, Dict[str, Any]] = {}
+    for lam in lambdas:
+        adv = np.zeros((n_points, n_seeds, 2))
+        parts = np.zeros((n_points, n_seeds, 2, len(CREDIT_SHARE_PARTS)))
+        for p in range(n_points):
+            for j in range(n_seeds):
+                for b in range(2):
+                    n = int(n_steps[p, j, b])
+                    reward, critic = credit_gae(
+                        components[p, j, b, :n], values[p, j, b, : n + 1], gamma, lam, terminal=bool(terminal[p, j, b])
+                    )
+                    parts[p, j, b, : len(CREDIT_PARTS)] = reward
+                    parts[p, j, b, -1] = critic
+                    adv[p, j, b] = reward.sum() + critic
+        entry: Dict[str, Any] = {
+            "S": None, "S_se": None, "N": None, "SNR": None, "paired_sd": None,
+            "var_share": {k: None for k in CREDIT_SHARE_PARTS}, "signal_parts": {k: None for k in CREDIT_SHARE_PARTS},
+        }
+        if n_points > 0:
+            benefit = sign * (adv[:, :, 1] - adv[:, :, 0])                                  # (P, K)
+            per_point = benefit.mean(axis=1)
+            entry["S"] = float(per_point.mean())
+            if n_points > 1:
+                entry["S_se"] = float(per_point.std(ddof=1) / math.sqrt(n_points))
+            entry["paired_sd"] = float(benefit.std(ddof=1))
+            variance = adv[:, :, 0].var(axis=1, ddof=1).mean()
+            entry["N"] = float(math.sqrt(variance))
+            if entry["N"] > 0.0:
+                entry["SNR"] = entry["S"] / entry["N"]
+                entry["var_share"] = {
+                    name: float(parts[:, :, 0, c].var(axis=1, ddof=1).mean() / variance) for c, name in enumerate(CREDIT_SHARE_PARTS)
+                }
+            entry["signal_parts"] = {
+                name: float(sign * (parts[:, :, 1, c] - parts[:, :, 0, c]).mean(axis=1).mean())
+                for c, name in enumerate(CREDIT_SHARE_PARTS)
+            }
+        out[_lambda_key(lam)] = entry
+    return out
+
+
+def _credit_worker(task: Tuple[int, str, int, int, int, str]) -> Dict[str, Any]:
+    match_idx, path_str, trace_seed, rollout_seed, n_seeds, decision = task
+    assert _HOLD_POLICIES is not None and _HOLD_SPEC_CFG is not None
+    team_a, team_b = _HOLD_POLICIES
+    mode, sigma_scale, shaping_mode = _HOLD_SPEC_CFG
+
+    trace = _load_trace(Path(path_str))
+    pts = find_credit_points(trace, decision)
+    ok, max_err, snapshots = resimulate_match(
+        trace,
+        match_seed=trace_seed * 1000 + match_idx,
+        target_steps=sorted({0, *(p["step"] for p in pts)}),
+        shaping_mode=shaping_mode,
+    )
+    if not ok:
+        return {"ok": False, "max_err": max_err, "records": []}
+    _verify_checkpoint_matches_trace(match_idx, 0, snapshots[0], trace, team_a, team_b)
+
+    act = np.asarray(trace["act"], dtype=np.float32)
+    records = []
+    for p in pts:
+        step, kicker = p["step"], p["kicker"]
+        snap = snapshots[step]
+        steer = (
+            aim_steer(p["deflection"], float(snap.cfg.mechanics.kick_steer_max_deflection_deg)) if decision == "aim" else None
+        )
+        res = roll_credit_point(
+            snap,
+            decision=decision,
+            recorded_actions=act[step],
+            kicker=kicker,
+            branch_seeds=[credit_branch_seed(rollout_seed, j, match_idx, step) for j in range(n_seeds)],
+            team_a=team_a,
+            team_b=team_b,
+            steer=steer,
+            mode=mode,
+            sigma_scale=sigma_scale,
+        )
+        point = {"match_idx": match_idx, "step": step, "kicker": kicker}
+        if decision == "aim":
+            point["target"] = p["target"]
+        records.append({"point": point, **res})
+    return {"ok": True, "max_err": max_err, "records": records}
+
+
+def summarize_credit(
+    records: Sequence[Dict[str, Any]],
+    n_matches_total: int,
+    n_matches_ok: int,
+    n_matches_skipped: int,
+    max_pos_err: Optional[float],
+    *,
+    decision: str,
+    seed: int,
+    seeds: int,
+    lambdas: Sequence[float],
+    shaping_mode: str = str(DEFAULT_CONFIG.rewards.shaping_mode),
+    gamma: float = float(DEFAULT_CONFIG.ppo.gamma),
+) -> Dict[str, Any]:
+    """Summary of `credit` over per-point records (`point` plus the arrays of `roll_credit_point`)."""
+    n_points = len(records)
+
+    def stack(key: str, shape: Tuple[int, ...], dtype: Any) -> np.ndarray:
+        return np.stack([r[key] for r in records]) if records else np.zeros((0, *shape), dtype=dtype)
+
+    comps = stack("components", (seeds, 2, CREDIT_STEPS, len(CREDIT_PARTS)), np.float64)
+    vals = stack("values", (seeds, 2, CREDIT_STEPS + 1), np.float64)
+    n_steps = stack("n_steps", (seeds, 2), np.int64)
+    terminal = stack("terminal", (seeds, 2), bool)
+    sign = CREDIT_DECISIONS[decision][2]
+    summary: Dict[str, Any] = {
+        "mode": "credit",
+        "decision": decision,
+        "seed": seed,
+        "seeds": seeds,
+        "steps": CREDIT_STEPS,
+        "lambdas": [float(x) for x in lambdas],
+        "shaping_mode": shaping_mode,
+        "gamma": float(gamma),
+        "n_matches_total": n_matches_total,
+        "n_matches_ok": n_matches_ok,
+        "n_matches_skipped": n_matches_skipped,
+        "max_pos_err": max_pos_err,
+        "n_points": n_points,
+        "points": [r["point"] for r in records],
+        "estimators": credit_statistics(comps, vals, n_steps, terminal, lambdas=lambdas, gamma=gamma, sign=sign),
+    }
+    if decision == "attack":
+        goals = stack("goals", (seeds, 2, 2), np.int64)
+        recorded, alternative = CREDIT_DECISIONS[decision][:2]
+        summary["goals_5s"] = {
+            label: {
+                kind: (float(goals[:, :, b, c].mean()) if n_points else None) for c, kind in enumerate(("for", "against"))
+            }
+            for b, label in enumerate((recorded, alternative))
+        }
+    return summary
+
+
+def run_credit(
+    *,
+    trace_dir: Path | str,
+    checkpoint_dir: Path | str,
+    decision: str = "aim",
+    trace_seed: Optional[int] = None,
+    seed: int = 1,
+    seeds: int = CREDIT_SEEDS,
+    lambdas: Sequence[float] = CREDIT_LAMBDAS,
+    max_matches: Optional[int] = None,
+    workers: int = 1,
+    shaping_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """`credit` over the traces (see the module docstring); the summary carries the points under `points`."""
+    if workers <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    if decision not in CREDIT_DECISIONS:
+        raise ValueError(f"decision must be one of {tuple(CREDIT_DECISIONS)}, got {decision!r}")
+    if int(seeds) < 2:
+        raise ValueError(f"seeds must be at least 2, got {seeds}")
+    if not lambdas or not all(0.0 <= float(x) <= 1.0 for x in lambdas):
+        raise ValueError(f"lambdas must be a non-empty list in [0, 1], got {list(lambdas)}")
+    spec = harness.EvalSpec(
+        checkpoint_dir=str(checkpoint_dir), opponent="self", mode="sampled", n=1, seed=int(seed), workers=int(workers)
+    )
+    spec.validate()
+    t_seed = _resolve_trace_seed(trace_dir, trace_seed)
+    items = _trace_paths_with_indices(trace_dir, max_matches=max_matches)
+    tasks = [(idx, str(path), t_seed, int(seed), int(seeds), decision) for idx, path in items]
+
+    if workers == 1 or len(tasks) == 1:
+        prev_threads = torch.get_num_threads()
+        try:
+            _init_hold_worker(spec, shaping_mode)
+            outputs = [_credit_worker(t) for t in tasks]
+        finally:
+            torch.set_num_threads(prev_threads)
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(min(workers, len(tasks)), initializer=_init_hold_worker, initargs=(spec, shaping_mode)) as pool:
+            outputs = list(pool.map(_credit_worker, tasks, chunksize=1))
+
+    records: List[Dict[str, Any]] = []
+    n_ok = 0
+    max_err: Optional[float] = None
+    for res in outputs:
+        if res["ok"]:
+            n_ok += 1
+            records.extend(res["records"])
+            err = float(res["max_err"])
+            max_err = err if max_err is None else max(max_err, err)
+    return summarize_credit(
+        records,
+        len(tasks),
+        n_ok,
+        len(tasks) - n_ok,
+        max_err,
+        decision=decision,
+        seed=int(seed),
+        seeds=int(seeds),
+        lambdas=[float(x) for x in lambdas],
+        shaping_mode=_resolved_shaping_mode(shaping_mode),
+        gamma=float(DEFAULT_CONFIG.ppo.gamma),
+    )
+
+
+def format_credit_report(summary: Dict[str, Any], title: str = "") -> str:
+    header = f"===== rollouts credit {title}".strip()
+    decision = summary["decision"]
+    recorded, alternative, _ = CREDIT_DECISIONS[decision]
+    lines = [
+        f"{header}  decision={decision} matches ok={summary['n_matches_ok']}/{summary['n_matches_total']} "
+        f"skipped={summary['n_matches_skipped']} points={summary['n_points']} seeds={summary['seeds']} seed={summary['seed']} "
+        f"shaping={summary['shaping_mode']} gamma={summary['gamma']:g} "
+        f"max_pos_err={summary['max_pos_err'] if summary['max_pos_err'] is not None else '-'}"
+    ]
+    if summary["n_points"] == 0:
+        lines.append("  no points: nothing to measure")
+    benefit = f"A_{alternative.upper()} - A_{recorded.upper()}" if decision == "aim" else f"A_{recorded.upper()} - A_{alternative.upper()}"
+    lines.append(f"signal S = mean over points of ({benefit}); noise N = SD across seeds of A_{recorded.upper()} (same state and action)")
+    if "goals_5s" in summary:
+        g = summary["goals_5s"]
+
+        def rate(v: Optional[float]) -> str:
+            return "-" if v is None else f"{v:.3f}"
+
+        lines.append(
+            "goals within 5 s: "
+            + " | ".join(f"{label.upper()} for {rate(g[label]['for'])} against {rate(g[label]['against'])}" for label in g)
+        )
+    lines.append(
+        "lambda | S +- se | N | SNR | paired SD | variance share goal/sparse/ball/role/critic | signal goal/sparse/ball/role/critic"
+    )
+
+    def num(v: Optional[float], fmt: str) -> str:
+        return "-" if v is None else format(v, fmt)
+
+    for key, r in summary["estimators"].items():
+        shares = "/".join(num(r["var_share"][c], ".2f") for c in CREDIT_SHARE_PARTS)
+        parts = "/".join(num(r["signal_parts"][c], "+.3f") for c in CREDIT_SHARE_PARTS)
+        lines.append(
+            f"{key} | {num(r['S'], '+.4f')} +- {num(r['S_se'], '.4f')} | {num(r['N'], '.4f')} | {num(r['SNR'], '+.3f')} | "
+            f"{num(r['paired_sd'], '.3f')} | {shares} | {parts}"
+        )
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
 # Command line
 # ----------------------------------------------------------------------------
 def _positive_int(text: str) -> int:
@@ -1682,6 +2213,23 @@ def _positive_int(text: str) -> int:
         raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {text!r}") from None
     if value < 1:
         raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {value}")
+    return value
+
+
+def _seed_count(text: str) -> int:
+    value = _positive_int(text)
+    if value < 2:
+        raise argparse.ArgumentTypeError(f"expected at least 2 seeds (the noise needs two), got {value}")
+    return value
+
+
+def _unit_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {text!r}") from None
+    if not (0.0 <= value <= 1.0):
+        raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {text!r}")
     return value
 
 
@@ -1720,6 +2268,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_common(p_aim)
     p_aim.add_argument("--checkpoint-dir", required=True, help="checkpoint directory with blue_*/red_* policies (read only)")
     p_aim.add_argument("--seed", type=int, default=1, help="rollout RNG seed")
+
+    p_credit = sub.add_parser("credit", help="how much of a decision's counterfactual benefit reaches the trainer's GAE advantage")
+    add_common(p_credit)
+    p_credit.add_argument("--checkpoint-dir", required=True, help="checkpoint directory with blue_*/red_* policies (read only)")
+    p_credit.add_argument("--decision", choices=tuple(CREDIT_DECISIONS), default="aim", help="aim: AIM vs POLICY; attack: KICK vs HOLD")
+    p_credit.add_argument("--seeds", type=_seed_count, default=CREDIT_SEEDS, help=f"generator seeds per point (>= 2, default {CREDIT_SEEDS})")
+    p_credit.add_argument(
+        "--lambdas", type=_unit_float, nargs="+", default=list(CREDIT_LAMBDAS), help="GAE lambdas in [0, 1] (default 0 0.5 0.8 0.9 0.95 0.99 1)"
+    )
+    p_credit.add_argument("--seed", type=int, default=1, help="rollout RNG seed")
     return ap
 
 
@@ -1754,6 +2312,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shaping_mode=args.shaping_mode,
         )
         rep = format_aim_report(summary, title=str(args.trace_dir))
+    elif args.command == "credit":
+        summary = run_credit(
+            trace_dir=args.trace_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            decision=args.decision,
+            trace_seed=args.trace_seed,
+            seed=args.seed,
+            seeds=args.seeds,
+            lambdas=args.lambdas,
+            max_matches=args.max_matches,
+            workers=args.workers,
+            shaping_mode=args.shaping_mode,
+        )
+        rep = format_credit_report(summary, title=str(args.trace_dir))
     else:
         summary = run_hold(
             trace_dir=args.trace_dir,
