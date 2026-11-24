@@ -1405,3 +1405,587 @@ class TestAimRollouts:
                 rollouts.main([*base, "--out", str(bad)])
         with pytest.raises(SystemExit):
             rollouts.main(["aim", "--trace-dir", str(trace_dir), "--out", str(tmp_path / "x.json")])
+
+
+# ----------------------------------------------------------------------------
+# Credit: how much of a decision's counterfactual benefit reaches the trainer's advantage
+# ----------------------------------------------------------------------------
+from tests.test_eval_metrics import pass_scene  # noqa: E402
+
+CREDIT_COMPONENTS = np.array([[0, 1, 0, 0], [10, 0, 0, 0], [0, 0, 1, 0]], dtype=np.float64)
+CREDIT_VALUES = np.array([0.5, 0.25, 1.0, 0.5], dtype=np.float64)
+
+
+def _credit_scene(holder: int, pos, angle: float, ball):
+    """Every player parked on a back line except `holder`, who holds the ball at `pos` facing `angle`; ball at `ball`."""
+    env = FootballParallelEnv(config=replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False)))
+    env.reset(seed=0)
+    env.player_vel[:] = 0.0
+    for idx in range(12):
+        env.player_pos[idx] = (100.0 + 40.0 * (idx % 6), 40.0 if idx < 6 else 800.0)
+    env.player_pos[holder] = pos
+    env.player_angle[holder] = angle
+    env.ball_holder = holder
+    env.ball_hold_timer = 0.10
+    env.kick_grace_timer = 0.0
+    env.ball_pos[:] = ball
+    return env
+
+
+def _credit_recorded(kicker: int, steer: float = 0.0, kick: float = 1.0) -> np.ndarray:
+    rec = np.zeros((12, 4), dtype=np.float32)
+    rec[:, 2:] = -1.0
+    rec[kicker] = (0.0, steer, kick, -1.0)
+    return rec
+
+
+def _credit_policies(ckpt: Path):
+    return harness.TeamPolicy(str(ckpt), "blue"), harness.TeamPolicy(str(ckpt), "red")
+
+
+def _attack_fixture(tmp_path: Path):
+    """Two 700-row matches of a random hybrid5 checkpoint (seed 5, spread 1.0, trace seed 11): match 1 has two outfield kicks of
+    team B's seat 3 (player 9) in team B's attacking third, at rows 548 and 630."""
+    ckpt = write_head_checkpoint(tmp_path / "ckpt_attack", {"blue": "hybrid5", "red": "hybrid5"}, seed=5, spread=1.0)
+    trace_dir = tmp_path / "traces_attack"
+    traces = harness.run_matches(quick_spec(ckpt, opponent="self", mode="sampled", n=2, seed=11, max_steps=700))
+    harness.save_traces(traces, trace_dir, protected=[ckpt])
+    return ckpt, trace_dir, traces
+
+
+class TestCreditEstimator:
+    def test_gae_at_decision_zero_hand_values(self):
+        """[RED] Three steps, reward components (goal, sparse, ball, role) = (0, 1, 0, 0), (10, 0, 0, 0), (0, 0, 1, 0), critic
+        V = [0.5, 0.25, 1.0, 0.5], gamma 0.5. The advantage at decision 0 is the reward part sum_l (gamma lam)^l r_l plus the
+        critic part sum_l (gamma lam)^l (gamma V_{l+1} - V_l).
+          lam 0: reward (0, 1, 0, 0), critic 0.125 - 0.5 = -0.375, total 0.625.
+          lam 1: weights 1, 0.5, 0.25: reward (5, 1, 0.25, 0), critic (0.125 - 0.5) + 0.5 (0.5 - 0.25) + 0.25 (0.25 - 1) = -0.4375,
+                 total 5.8125. A terminal at the last step drops gamma V_3 = 0.25 (weight 0.25): critic -0.5, total 5.75.
+          lam 0.5: weights 1, 0.25, 0.0625: reward (2.5, 1, 0.0625, 0), critic -0.375 + 0.25 * 0.25 + 0.0625 * (0.25 - 1) = -0.359375,
+                 total 3.203125."""
+        from tools.audit import rollouts
+
+        def total(parts, critic):
+            return float(parts.sum() + critic)
+
+        parts, critic = rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES, 0.5, 0.0, terminal=False)
+        assert parts.tolist() == [0.0, 1.0, 0.0, 0.0]
+        assert critic == pytest.approx(-0.375)
+        assert total(parts, critic) == pytest.approx(0.625)
+        parts, critic = rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES, 0.5, 1.0, terminal=False)
+        np.testing.assert_allclose(parts, [5.0, 1.0, 0.25, 0.0])
+        assert critic == pytest.approx(-0.4375)
+        assert total(parts, critic) == pytest.approx(5.8125)
+        parts, critic = rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES, 0.5, 1.0, terminal=True)
+        np.testing.assert_allclose(parts, [5.0, 1.0, 0.25, 0.0])
+        assert critic == pytest.approx(-0.5)
+        assert total(parts, critic) == pytest.approx(5.75)
+        parts, critic = rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES, 0.5, 0.5, terminal=False)
+        np.testing.assert_allclose(parts, [2.5, 1.0, 0.0625, 0.0])
+        assert critic == pytest.approx(-0.359375)
+        assert total(parts, critic) == pytest.approx(3.203125)
+
+    def test_gae_reproduces_the_trainer_on_random_branches(self):
+        """[RED] Against the trainer's backward recursion (`train_ppo.gae_advantages`, an independent implementation): the
+        advantage at decision 0 of seeded random 75-step branches, bootstrapped from V_75, and of a branch that ends in a
+        terminal step after 40 decisions, for lambda in {0, 0.5, 0.8, 0.95, 1}, gamma 0.995."""
+        from football_rl.train_ppo import gae_advantages
+        from tools.audit import rollouts
+
+        rng = np.random.default_rng(20261122)
+        for n, terminal in ((75, False), (40, True), (1, True), (1, False)):
+            comps = rng.normal(size=(n, 4))
+            values = rng.normal(size=n + 1)
+            dones = np.zeros((n, 1))
+            dones[-1, 0] = 1.0 if terminal else 0.0
+            for lam in (0.0, 0.5, 0.8, 0.95, 1.0):
+                want = gae_advantages(comps.sum(axis=1)[:, None], values[:n, None], dones, values[n:n + 1], 0.995, lam)[0, 0]
+                parts, critic = rollouts.credit_gae(comps, values, 0.995, lam, terminal=terminal)
+                assert float(parts.sum() + critic) == pytest.approx(float(want), rel=1e-10, abs=1e-12), (n, terminal, lam)
+
+    def test_gae_rejects_degenerate_input(self):
+        """[RED] No decisions, a lambda outside [0, 1] and a value vector shorter than n + 1 are errors; a terminal branch needs no
+        V_n, so n values suffice there."""
+        from tools.audit import rollouts
+
+        with pytest.raises(ValueError):
+            rollouts.credit_gae(np.zeros((0, 4)), np.zeros(1), 0.5, 0.5, terminal=False)
+        for lam in (-0.01, 1.01, float("nan")):
+            with pytest.raises(ValueError):
+                rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES, 0.5, lam, terminal=False)
+        with pytest.raises(ValueError):
+            rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES[:3], 0.5, 0.5, terminal=False)
+        parts, critic = rollouts.credit_gae(CREDIT_COMPONENTS, CREDIT_VALUES[:3], 0.5, 1.0, terminal=True)
+        assert float(parts.sum() + critic) == pytest.approx(5.75)
+
+    def test_step_components_hand_values(self):
+        """[RED] One step of the kicker's reward split into goal, sparse, ball and role, advance weight 6:
+          reward 13.0, shaping 0.25, one goal for, potential 0.10 -> 0.12: goal 10, sparse (13 - 0.25) - 10 = 2.75,
+             ball 6 * 0.02 = 0.12, role 0.25 - 0.12 = 0.13.
+          reward -10.5, shaping -0.5, one goal against, potential 0.30 -> 0.27: goal -10, sparse (-10.5 + 0.5) + 10 = 0,
+             ball -0.18, role -0.5 + 0.18 = -0.32.
+          a goal each way in one step: goal 0. No goal: goal 0 and sparse = reward - shaping."""
+        from tools.audit import rollouts
+
+        got = rollouts.credit_step_components(13.0, 0.25, 1, 0, 0.10, 0.12, 6.0)
+        np.testing.assert_allclose(got, [10.0, 2.75, 0.12, 0.13], atol=1e-12)
+        got = rollouts.credit_step_components(-10.5, -0.5, 0, 1, 0.30, 0.27, 6.0)
+        np.testing.assert_allclose(got, [-10.0, 0.0, -0.18, -0.32], atol=1e-12)
+        got = rollouts.credit_step_components(0.4, 0.1, 1, 1, 0.0, 0.0, 6.0)
+        np.testing.assert_allclose(got, [0.0, 0.3, 0.0, 0.1], atol=1e-12)
+        got = rollouts.credit_step_components(0.4, 0.1, 0, 0, 0.0, 0.0, 6.0)
+        np.testing.assert_allclose(got, [0.0, 0.3, 0.0, 0.1], atol=1e-12)
+
+    def test_branch_seed_hand_values(self):
+        """[RED] Branch seed ((seed + 7919 j) * 1_000_003 + match * 10_000 + step) & 0x7FFFFFFF.
+        seed 1, j 0, match 2, step 30: 1_000_003 + 20_000 + 30 = 1_020_033.
+        seed 1, j 1: 7920 * 1_000_003 = 7_920_023_760, + 20_030 = 7_920_043_790, minus 3 * 2^31 = 1_477_592_846.
+        With j 0 it is the seed of `rollouts aim`. Seeds of different j differ."""
+        from tools.audit import rollouts
+
+        assert rollouts.credit_branch_seed(1, 0, 2, 30) == 1_020_033
+        assert rollouts.credit_branch_seed(1, 1, 2, 30) == 1_477_592_846
+        assert rollouts.credit_branch_seed(5, 0, 3, 9) == (5 * 1_000_003 + 30_000 + 9) & 0x7FFF_FFFF
+        assert len({rollouts.credit_branch_seed(1, j, 2, 30) for j in range(4)}) == 4
+
+
+def _hand_branches():
+    """2 points x 2 seeds x (recorded, alternative) x 1 decision x (goal, sparse, ball, role); V = 0; every branch is one terminal
+    decision, so the advantage is the step reward whatever lambda. Totals (recorded / alternative):
+      point 1: seeds (1, 3) / (2, 6)   all goal;     point 2: (0, 2) / (1, 2)   recorded: goal 0 / sparse 2, alternative: goal 1 / sparse 2."""
+    comps = np.zeros((2, 2, 2, 1, 4))
+    comps[0, :, 0, 0, 0] = (1.0, 3.0)
+    comps[0, :, 1, 0, 0] = (2.0, 6.0)
+    comps[1, 1, 0, 0, 1] = 2.0
+    comps[1, 0, 1, 0, 0] = 1.0
+    comps[1, 1, 1, 0, 1] = 2.0
+    return comps, np.zeros((2, 2, 2, 2)), np.ones((2, 2, 2), dtype=np.int64), np.ones((2, 2, 2), dtype=bool)
+
+
+class TestCreditStatistics:
+    def test_signal_noise_and_shares_on_hand_arrays(self):
+        """[RED] `_hand_branches`. Seed-averaged difference alternative - recorded: point 1 (1 + 3) / 2 = 2, point 2 (1 + 0) / 2 = 0.5.
+        S = 1.25, SE = sd(2, 0.5) / sqrt(2) = (1.5 / sqrt(2)) / sqrt(2) = 0.75. Recorded branch across seeds: variances 2 and 2, so
+        N = sqrt(2) = 1.4142136 and SNR = 1.25 / sqrt(2) = 0.8838835. Paired SD of the four differences (1, 3, 1, 0): mean 1.25,
+        variance (0.0625 + 3.0625 + 0.0625 + 1.5625) / 3 = 1.5833333, sd 1.2583057. Variance shares: goal (2 + 0) / 2 = 1 of 2,
+        sparse (0 + 2) / 2 = 1 of 2, the rest 0. Signal parts: goal 1.25, sparse 0. Same at every lambda (one terminal decision).
+        With sign -1 (the benefit of the recorded kick over the alternative) the signal and its parts flip, noise stays."""
+        from tools.audit import rollouts
+
+        comps, vals, n_steps, terminal = _hand_branches()
+        out = rollouts.credit_statistics(comps, vals, n_steps, terminal, lambdas=(0.8, 0.95), gamma=0.995, sign=1.0)
+        assert list(out) == ["0.8", "0.95"]
+        for key in out:
+            r = out[key]
+            assert r["S"] == pytest.approx(1.25)
+            assert r["S_se"] == pytest.approx(0.75)
+            assert r["N"] == pytest.approx(math.sqrt(2.0))
+            assert r["SNR"] == pytest.approx(1.25 / math.sqrt(2.0))
+            assert r["paired_sd"] == pytest.approx(math.sqrt(4.75 / 3.0))
+            assert r["var_share"] == pytest.approx({"goal": 0.5, "sparse": 0.5, "ball": 0.0, "role": 0.0, "critic": 0.0})
+            assert r["signal_parts"] == pytest.approx({"goal": 1.25, "sparse": 0.0, "ball": 0.0, "role": 0.0, "critic": 0.0})
+        flipped = rollouts.credit_statistics(comps, vals, n_steps, terminal, lambdas=(0.8,), gamma=0.995, sign=-1.0)["0.8"]
+        assert flipped["S"] == pytest.approx(-1.25) and flipped["S_se"] == pytest.approx(0.75)
+        assert flipped["N"] == pytest.approx(math.sqrt(2.0)) and flipped["SNR"] == pytest.approx(-1.25 / math.sqrt(2.0))
+        assert flipped["paired_sd"] == pytest.approx(math.sqrt(4.75 / 3.0))
+        assert flipped["signal_parts"]["goal"] == pytest.approx(-1.25)
+
+    def test_critic_part_enters_the_signal_and_the_noise(self):
+        """[RED] One decision, non-terminal, gamma 0.5, V_0 = 0 and V_1 = 2 in the alternative branch of seed 0 only, no reward:
+        the advantage there is 0.5 * 2 - 0 = 1 (critic part), all other branches 0. One point, two seeds: S = 0.5 (seed average of
+        1 and 0), N = 0 (the recorded branch is constant), so SNR and the variance shares are None; the critic part carries the whole signal (0.5)."""
+        from tools.audit import rollouts
+
+        comps = np.zeros((1, 2, 2, 1, 4))
+        vals = np.zeros((1, 2, 2, 2))
+        vals[0, 0, 1, 1] = 2.0
+        out = rollouts.credit_statistics(comps, vals, np.ones((1, 2, 2), dtype=np.int64), np.zeros((1, 2, 2), dtype=bool),
+                                         lambdas=(0.5,), gamma=0.5, sign=1.0)["0.5"]
+        assert out["S"] == pytest.approx(0.5) and out["N"] == 0.0 and out["SNR"] is None
+        assert out["S_se"] is None
+        assert out["signal_parts"]["critic"] == pytest.approx(0.5)
+        assert all(v is None for v in out["var_share"].values())
+
+    def test_degenerate_point_and_seed_counts(self):
+        """[RED] No points: every statistic is None. One point: S defined, its SE None. One seed: an error (the noise needs two)."""
+        from tools.audit import rollouts
+
+        comps, vals, n_steps, terminal = _hand_branches()
+        none = rollouts.credit_statistics(comps[:0], vals[:0], n_steps[:0], terminal[:0], lambdas=(0.8,), gamma=0.995, sign=1.0)["0.8"]
+        assert all(none[k] is None for k in ("S", "S_se", "N", "SNR", "paired_sd"))
+        assert all(v is None for v in none["var_share"].values()) and all(v is None for v in none["signal_parts"].values())
+        one = rollouts.credit_statistics(comps[:1], vals[:1], n_steps[:1], terminal[:1], lambdas=(0.8,), gamma=0.995, sign=1.0)["0.8"]
+        assert one["S"] == pytest.approx(2.0) and one["S_se"] is None and one["N"] == pytest.approx(math.sqrt(2.0))
+        with pytest.raises(ValueError):
+            rollouts.credit_statistics(comps[:, :1], vals[:, :1], n_steps[:, :1], terminal[:, :1], lambdas=(0.8,), gamma=0.995, sign=1.0)
+
+
+class TestCreditSummary:
+    @staticmethod
+    def _records(goals):
+        comps, vals, n_steps, terminal = _hand_branches()
+        return [
+            {"point": {"match_idx": 0, "step": 10 * p, "kicker": 3}, "components": comps[p], "values": vals[p],
+             "n_steps": n_steps[p], "terminal": terminal[p], "goals": goals[p]}
+            for p in range(2)
+        ]
+
+    def test_sign_convention_and_goal_rates_on_hand_records(self):
+        """[RED] The hand arrays of `_hand_branches` as records. aim: S = A_AIM - A_POLICY = +1.25. attack: S = A_KICK - A_HOLD, the
+        recorded branch minus the alternative = -1.25, with the noise of the recorded branch unchanged (sqrt 2). Goal counts per
+        point, seed and branch (for, against), recorded branch first: point 1 seed 0 recorded (1, 0) and alternative (0, 1), seed 1
+        recorded (0, 0) and alternative (0, 1); point 2 seed 0 alternative (0, 2), everything else 0. Means over the 4 (point, seed)
+        pairs: recorded for 1/4, against 0; alternative for 0, against (1 + 1 + 2) / 4 = 1. Aim reports no goal rates."""
+        from tools.audit import rollouts
+
+        goals = np.zeros((2, 2, 2, 2), dtype=np.int64)
+        goals[0, 0, 0, 0] = 1
+        goals[0, 0, 1, 1] = 1
+        goals[0, 1, 1, 1] = 1
+        goals[1, 0, 1, 1] = 2
+        aim = rollouts.summarize_credit(self._records(goals), 2, 2, 0, 0.0, decision="aim", seed=1, seeds=2, lambdas=[0.8])
+        attack = rollouts.summarize_credit(self._records(goals), 2, 2, 0, 0.0, decision="attack", seed=1, seeds=2, lambdas=[0.8])
+        assert aim["estimators"]["0.8"]["S"] == pytest.approx(1.25) and attack["estimators"]["0.8"]["S"] == pytest.approx(-1.25)
+        assert aim["estimators"]["0.8"]["N"] == pytest.approx(math.sqrt(2.0)) == pytest.approx(attack["estimators"]["0.8"]["N"])
+        assert "goals_5s" not in aim
+        assert attack["goals_5s"] == {"kick": {"for": 0.25, "against": 0.0}, "hold": {"for": 0.0, "against": 1.0}}
+        assert [p["step"] for p in attack["points"]] == [0, 10] and attack["n_points"] == 2
+        assert attack["steps"] == 75 and attack["lambdas"] == [0.8]
+        empty = rollouts.summarize_credit([], 2, 2, 0, None, decision="attack", seed=1, seeds=3, lambdas=[0.8, 0.95])
+        assert empty["goals_5s"] == {"kick": {"for": None, "against": None}, "hold": {"for": None, "against": None}}
+        assert empty["estimators"]["0.95"]["S"] is None and empty["points"] == []
+
+
+class TestCreditPoints:
+    def test_attack_point_selection(self):
+        """[RED] Outfield kicks of a 300-row trace (ball at row = canonical x; side 0 for team A, 1 for team B):
+          5   A3, ball x 1000                      -> point
+          30  A3, 1000, 25 after 5                 -> skipped
+          40  A3, ball x 600 (middle third)        -> no point; the spacing counts from the last point
+          50  A3, 1000, 45 after 5                 -> point (exactly 45 is enough)
+          100 A3, ball x 933.0 (< 2/3 of 1400)     -> no point
+          110 B9, ball x 400 = canonical 1000      -> point (60 after 50)
+          154 A3, 1000, 44 after 110               -> skipped
+          160 A3, ball x 934 (> 933.33)            -> point (50 after 110; the skipped kick at 154 did not move the spacing)
+          190 A0 (keeper) kicks at 1000            -> no point
+          200 A3, 1000, but nobody holds the ball  -> no point
+          297 A3, 1000                             -> point in a 300-row trace (297 + 2 < 300), not in a 299-row one."""
+        from tools.audit import rollouts
+
+        def scene(T):
+            tr = make_trace(T)
+            for t0, kicker, x in ((5, 3, 1000.0), (30, 3, 1000.0), (40, 3, 600.0), (50, 3, 1000.0), (100, 3, 933.0), (110, 9, 400.0),
+                                  (154, 3, 1000.0), (160, 3, 934.0), (190, 0, 1000.0), (200, 3, 1000.0), (297, 3, 1000.0)):
+                if t0 + 1 < T:
+                    pass_scene(tr, t0, kicker=kicker, ball=(x, 420.0))
+            tr["holder"][200] = -1
+            return tr
+
+        pts = rollouts.find_attack_points(scene(300))
+        assert [(p["step"], p["kicker"], p["team"]) for p in pts] == [(5, 3, 0), (50, 3, 0), (110, 9, 1), (160, 3, 0), (297, 3, 0)]
+        assert [p["step"] for p in rollouts.find_attack_points(scene(299))] == [5, 50, 110, 160]
+        assert rollouts.find_attack_points(make_trace(0)) == []
+
+    def test_attack_points_on_a_real_trace_are_kicks_of_the_holder(self, tmp_path):
+        """[RED] The attack fixture's match 1 has the two hand-checked points (rows 548 and 630, player 9)."""
+        from tools.audit import rollouts
+
+        _, _, traces = _attack_fixture(tmp_path)
+        assert rollouts.find_attack_points(traces[0]) == []
+        assert [(p["step"], p["kicker"]) for p in rollouts.find_attack_points(traces[1])] == [(548, 9), (630, 9)]
+
+    def test_override_scope_of_the_alternative_branches(self, tmp_path):
+        """[RED] Constant hybrid5 checkpoint (z_kick +10, so the policy fires almost always; its outputs do not depend on the
+        observation), sigma 0, kicker A5 holding at (700, 420). Per seed j, the actions applied in the 75 decisions:
+          attack: KICK plays the recorded actions at decision 0 and the policy afterwards; HOLD differs from KICK only in the
+            kicker's kick column, which is -1 for decisions 0-14 and equal to KICK's from decision 15 on (whole rows equal).
+          aim: POLICY plays the recorded actions at decision 0; AIM differs only in the kicker's steer at decision 0 (0.5),
+            everything else equal in all 75 decisions."""
+        from tools.audit import rollouts
+
+        ckpt = write_constant_hybrid_checkpoint(tmp_path / "c", z_kick=10.0, z_spec=-10.0)
+        team_a, team_b = _credit_policies(ckpt)
+        rec = _credit_recorded(5, steer=0.2, kick=1.0)
+        logs: dict = {}
+
+        def hook(label, j, k, env, act):
+            logs.setdefault((label, j), []).append(np.array(act, dtype=np.float32, copy=True))
+
+        def acts(label, j):
+            arr = np.stack(logs[(label, j)])
+            assert arr.shape == (75, 12, 4)
+            return arr
+
+        snap = _credit_scene(5, (700.0, 420.0), 0.0, (724.0, 420.0))
+        out = rollouts.roll_credit_point(snap, decision="attack", recorded_actions=rec, kicker=5, branch_seeds=[41, 42],
+                                         team_a=team_a, team_b=team_b, sigma_scale=0.0, after_step=hook)
+        assert out["components"].shape == (2, 2, 75, 4) and out["values"].shape == (2, 2, 76)
+        for j in (0, 1):
+            kick, hold = acts("kick", j), acts("hold", j)
+            np.testing.assert_array_equal(kick[0], rec)
+            assert (hold[:15, 5, 2] == -1.0).all()
+            assert (kick[15:20, 5, 2] > -1.0).all()                      # the policy fires, so a 16th held decision would show
+            np.testing.assert_array_equal(hold[15:], kick[15:])
+            differs = kick != hold
+            expected = np.zeros_like(differs)
+            expected[:15, 5, 2] = kick[:15, 5, 2] != -1.0
+            np.testing.assert_array_equal(differs, expected)
+            assert expected[0, 5, 2] and expected[1:15, 5, 2].any()
+
+        logs.clear()
+        snap = _credit_scene(5, (700.0, 420.0), 0.0, (724.0, 420.0))
+        rollouts.roll_credit_point(snap, decision="aim", recorded_actions=rec, kicker=5, branch_seeds=[41, 42],
+                                   team_a=team_a, team_b=team_b, steer=0.5, sigma_scale=0.0, after_step=hook)
+        for j in (0, 1):
+            pol, aim = acts("policy", j), acts("aim", j)
+            np.testing.assert_array_equal(pol[0], rec)
+            expected = np.zeros(aim.shape, dtype=bool)
+            expected[0, 5, 1] = True
+            np.testing.assert_array_equal(pol != aim, expected)
+            assert aim[0, 5, 1] == np.float32(0.5)
+
+    def test_policy_branch_replays_the_trace_and_the_aim_policy_branch(self, tmp_path):
+        """[RED] On the hybrid5 fixture point (match 0, kick at row 2 by A5): the credit POLICY branch of seed index 0 plays the
+        trace's kick (ball velocity after decision 0 equals the trace's bvel[3] within 1e-4), and every ball and player position of
+        its 75 decisions equals the `rollouts aim` POLICY branch run from the same generator seed."""
+        from tools.audit import rollouts
+
+        _, _, tr, p, snap, (team_a, team_b) = TestAimRollouts._fixture_point(tmp_path)
+        seed = rollouts.credit_branch_seed(5, 0, 0, p["step"])
+        assert seed == (5 * 1_000_003 + 0 * 10_000 + p["step"]) & 0x7FFF_FFFF
+        credit_traj, aim_traj = [], []
+
+        def credit_hook(label, j, k, env, act):
+            if label == "policy":
+                credit_traj.append((env.ball_pos.copy(), env.player_pos.copy(), env.ball_vel.copy()))
+
+        def aim_hook(branch, k, env, act):
+            if branch == "policy":
+                aim_traj.append((env.ball_pos.copy(), env.player_pos.copy(), env.ball_vel.copy()))
+
+        rollouts.roll_credit_point(snap, decision="aim", recorded_actions=tr["act"][p["step"]], kicker=p["kicker"], branch_seeds=[seed],
+                                   team_a=team_a, team_b=team_b, steer=rollouts.aim_steer(p["deflection"]), after_step=credit_hook)
+        rollouts.roll_aim_branches(snap, recorded_actions=tr["act"][p["step"]], kicker=p["kicker"], target=p["target"], branch_seed=seed,
+                                   team_a=team_a, team_b=team_b, steer=rollouts.aim_steer(p["deflection"]), power=0.5, after_step=aim_hook)
+        assert len(credit_traj) == len(aim_traj) == 75
+        np.testing.assert_allclose(credit_traj[0][2], tr["bvel"][p["step"] + 1], atol=1e-4)
+        for (cb, cp, cv), (ab, ap, av) in zip(credit_traj, aim_traj):
+            np.testing.assert_array_equal(cb, ab)
+            np.testing.assert_array_equal(cp, ap)
+            np.testing.assert_array_equal(cv, av)
+
+
+class TestCreditArguments:
+    def test_aim_points_exclude_kicks_that_are_already_aimed(self):
+        """[RED] The `aim` points of `TestAimRollouts.test_point_selection_spacing_target_and_reach` are rows 5 (already aimed: A4 at
+        +10 deg, direction 0) and 60 (not aimed); the credit points of the aim decision are row 60 only. An unknown decision is an
+        error."""
+        from tools.audit import rollouts
+
+        tr = _aim_hand_trace(200)
+        aim_scene(tr, 5, {4: 10.0, 5: -30.0})
+        aim_scene(tr, 60, {4: -34.5})
+        assert [p["step"] for p in rollouts.find_aim_points(tr)] == [5, 60]
+        assert [(p["step"], p["kicker"], p["target"]) for p in rollouts.find_credit_points(tr, "aim")] == [(60, 3, 4)]
+        with pytest.raises(ValueError):
+            rollouts.find_credit_points(tr, "shoot")
+
+    def test_run_rejects_bad_arguments(self, tmp_path):
+        """[RED] `run_credit` refuses fewer than 2 seeds, an empty or out-of-range lambda list, an unknown decision and no workers
+        before it looks at any trace: with a trace directory that does not exist the error is a ValueError, and with good arguments
+        the same call gets as far as the missing traces (FileNotFoundError)."""
+        from tools.audit import rollouts
+
+        ckpt, _, _ = _hold_fixture(tmp_path, "hybrid5")
+        base = dict(trace_dir=tmp_path / "no_such_traces", checkpoint_dir=ckpt, trace_seed=11)
+        for bad in (dict(seeds=1), dict(lambdas=[]), dict(lambdas=[0.5, 1.5]), dict(lambdas=[-0.1]), dict(decision="shoot"), dict(workers=0)):
+            with pytest.raises(ValueError):
+                rollouts.run_credit(**base, **bad)
+        with pytest.raises(FileNotFoundError):
+            rollouts.run_credit(**base)
+
+
+class TestCreditBranch:
+    def test_values_are_the_kickers_critic_with_a_bootstrap_at_the_end(self, tmp_path):
+        """[RED] On the fixture point (a 120-row trace, kick at row 2: no terminal step within 75 decisions) the recorded values
+        V_0..V_75 are the kicker's critic at the state before each decision and, after the last one, at the final state (the
+        bootstrap). The oracle evaluates the harness team policy on the states `after_step` sees. V_75 is non-zero, the branch is
+        not terminal, and the step count is 75."""
+        from tools.audit import rollouts
+
+        _, _, tr, p, snap, (team_a, team_b) = TestAimRollouts._fixture_point(tmp_path)
+        kicker = p["kicker"]
+        gen = torch.Generator().manual_seed(0)
+
+        def critic(env):
+            obs, cen = env._get_observations_array(), env.get_centralized_state()
+            _, val, _ = team_a.act(obs[:6], cen[:6], "sampled", 1.0, gen)
+            return float(val[kicker])
+
+        oracle = [critic(snap)]
+
+        def hook(k, env, act):
+            oracle.append(critic(env))
+
+        res = rollouts.roll_credit_branch(snap, recorded_actions=tr["act"][p["step"]], kicker=kicker, branch_seed=321,
+                                          team_a=team_a, team_b=team_b, after_step=hook)
+        assert res["n_steps"] == 75 and res["terminal"] is False
+        assert res["values"].shape == (76,) and len(oracle) == 76
+        np.testing.assert_allclose(res["values"], oracle, atol=1e-6)
+        assert abs(res["values"][75]) > 1e-3
+
+    def test_goal_split_on_scored_and_conceded_goals(self, tmp_path):
+        """[RED] Empty-net scenes, constant checkpoint that never kicks (z_kick -10), kicker A5 (team A), sigma 0.
+        Team A's seat 5 holds at (1300, 420) facing the goal and kicks into the empty net at decision 0: one goal for, 13 = 10 (team)
+        + 3 (scorer) in the goal decision, so goal = +10 and sparse = +3 there. Team B's seat 5 (player 11) holds at (100, 420)
+        facing the other goal and scores against A: goal = -10 and sparse = 0 for the kicker. The goal sums are +10 and -10. In the
+        goal decision the env pays no shaping (the ball teleports to the centre): ball + role = 0 there, whatever the ball
+        potential did. The four parts add up to the kicker's step reward in every decision."""
+        from tools.audit import rollouts
+
+        ckpt = write_constant_hybrid_checkpoint(tmp_path / "c", z_kick=-10.0, z_spec=-10.0)
+        team_a, team_b = _credit_policies(ckpt)
+        for holder, pos, angle, ball, want_goals, want_goal, want_sparse in (
+            (5, (1300.0, 420.0), 0.0, (1324.0, 420.0), (1, 0), 10.0, 3.0),
+            (11, (100.0, 420.0), math.pi, (76.0, 420.0), (0, 1), -10.0, 0.0),
+        ):
+            rewards = []
+
+            def hook(k, env, act):
+                rewards.append(float(env.last_step_rewards[5]))
+
+            res = rollouts.roll_credit_branch(
+                _credit_scene(holder, pos, angle, ball), recorded_actions=_credit_recorded(holder), kicker=5,
+                branch_seed=7, team_a=team_a, team_b=team_b, sigma_scale=0.0, after_step=hook)
+            assert (res["goals_for"], res["goals_against"]) == want_goals
+            comps = res["components"]
+            assert comps[:, 0].sum() == pytest.approx(want_goal)
+            assert comps[1, 0] == pytest.approx(want_goal)
+            assert comps[1, 1] == pytest.approx(want_sparse)
+            assert comps[1, 2] + comps[1, 3] == pytest.approx(0.0, abs=1e-9)
+            np.testing.assert_allclose(comps.sum(axis=1), rewards, atol=1e-9)
+
+    def test_ball_part_is_the_kicker_teams_territorial_gain(self, tmp_path):
+        """[RED] A weak kick (action 0.4, about 200 u/s: it stops within 125 u) that stays in play: team A's seat 5 kicks east from
+        (800, 420), then team B's seat 5 (player 11) kicks west from (600, 420). The ball moves toward the attacked goal of team A in the first and of team B in the second, so the kicker's
+        ball part in decision 0 is positive in the first scene and negative in the second."""
+        from tools.audit import rollouts
+
+        ckpt = write_constant_hybrid_checkpoint(tmp_path / "c", z_kick=-10.0, z_spec=-10.0)
+        team_a, team_b = _credit_policies(ckpt)
+        signs = []
+        for holder, pos, angle, ball in ((5, (800.0, 420.0), 0.0, (824.0, 420.0)), (11, (600.0, 420.0), math.pi, (576.0, 420.0))):
+            res = rollouts.roll_credit_branch(
+                _credit_scene(holder, pos, angle, ball), recorded_actions=_credit_recorded(holder, kick=0.4), kicker=5,
+                branch_seed=7, team_a=team_a, team_b=team_b, sigma_scale=0.0)
+            assert res["goals_for"] == res["goals_against"] == 0
+            signs.append(res["components"][0, 2])
+        assert signs[0] > 1e-3 and signs[1] < -1e-3
+
+
+class TestCreditTerminal:
+    def test_branch_that_ends_stops_and_reads_no_bootstrap(self, tmp_path):
+        """[GUARD] A match with 10 decisions left ends in the 10th decision of the branch: 10 decisions are played, the branch is
+        terminal, nothing is recorded after them (components and values zero) and no V_10 is read. A match with exactly 75 decisions
+        left ends in the last decision of the branch: 75 decisions, terminal, and V_75 is not read (0). With 76 left, the branch is
+        not terminal and V_75 is the bootstrap."""
+        from tools.audit import rollouts
+
+        ckpt = write_constant_hybrid_checkpoint(tmp_path / "c", z_kick=-10.0, z_spec=-10.0)
+        team_a, team_b = _credit_policies(ckpt)
+        for left, n_steps, terminal in ((10, 10, True), (75, 75, True), (76, 75, False)):
+            snap = _credit_scene(5, (800.0, 420.0), 0.0, (824.0, 420.0))
+            snap.rl_step_count = snap.cfg.physics.max_rl_steps - left
+            res = rollouts.roll_credit_branch(snap, recorded_actions=_credit_recorded(5, kick=0.4), kicker=5, branch_seed=7,
+                                              team_a=team_a, team_b=team_b, sigma_scale=0.0)
+            assert (res["n_steps"], res["terminal"]) == (n_steps, terminal), left
+            assert (res["components"][n_steps:] == 0.0).all() and (res["values"][n_steps + (0 if terminal else 1):] == 0.0).all()
+            assert (res["values"][:n_steps] != 0.0).all()
+            assert (res["values"][75] != 0.0) == (not terminal)
+
+
+class TestCreditCli:
+    def test_aim_decision_end_to_end(self, tmp_path):
+        """[RED] `rollouts credit` (default decision aim) on the hybrid5 fixture, 2 seeds: one point; JSON and report written; the
+        same JSON with 1 and 2 workers; the noise is positive (the seeds differ per index); inputs untouched; protected outputs
+        refused; a missing --checkpoint-dir, one seed and a lambda outside [0, 1] are argparse errors."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _hold_fixture(tmp_path, "hybrid5")
+        digests = (_dir_digest(ckpt), _dir_digest(trace_dir))
+        out1, out2 = tmp_path / "credit1", tmp_path / "credit2.json"
+        base = ["credit", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt), "--trace-seed", "11", "--seed", "5",
+                "--seeds", "2", "--shaping-mode", "legacy", "--lambdas", "0", "0.8", "0.95"]
+        assert rollouts.main([*base, "--workers", "1", "--out", str(out1)]) == 0
+        assert rollouts.main([*base, "--workers", "2", "--max-matches", "2", "--out", str(out2)]) == 0
+        d1 = json.loads((out1 / "rollouts.json").read_text(encoding="utf-8"))
+        d2 = json.loads(out2.read_text(encoding="utf-8"))
+        assert d1 == d2
+        assert (d1["mode"], d1["decision"], d1["seed"], d1["seeds"], d1["steps"], d1["shaping_mode"]) == ("credit", "aim", 5, 2, 75, "legacy")
+        assert (d1["n_matches_ok"], d1["n_points"]) == (2, 1)
+        assert d1["gamma"] == pytest.approx(float(DEFAULT_CONFIG.ppo.gamma))
+        assert d1["points"] == [{"match_idx": 0, "step": 2, "kicker": 5, "target": 4}]
+        assert list(d1["estimators"]) == ["0", "0.8", "0.95"]
+        assert d1["estimators"]["0.95"]["N"] > 0.0
+        assert d1["estimators"]["0"]["N"] == pytest.approx(0.0, abs=1e-6)       # the decision step is deterministic given the actions
+        assert "goals_5s" not in d1
+        text = (out1 / "report.txt").read_text(encoding="utf-8")
+        assert text.startswith("===== rollouts credit") and "decision=aim" in text and "0.95 |" in text
+        assert (_dir_digest(ckpt), _dir_digest(trace_dir)) == digests
+        for bad in (trace_dir / "bad.json", ckpt / "bad.json"):
+            with pytest.raises(ValueError):
+                rollouts.main([*base, "--out", str(bad)])
+        for extra in (["--seeds", "1"], ["--lambdas", "1.5"], ["--lambdas", "-0.1"], ["--decision", "shoot"]):
+            with pytest.raises(SystemExit):
+                rollouts.main([*base, *extra, "--out", str(tmp_path / "x.json")])
+        with pytest.raises(SystemExit):
+            rollouts.main(["credit", "--trace-dir", str(trace_dir), "--out", str(tmp_path / "x.json")])
+
+    def test_attack_decision_end_to_end(self, tmp_path):
+        """[RED] `rollouts credit --decision attack` on the attack fixture (2 points in match 1), 2 seeds: the points, the goal counts
+        within 5 s per branch (KICK and HOLD, for and against, in [0, 1] as per-point means), the sign convention (S is the benefit
+        of the recorded kick over holding), identical JSON with 1 and 2 workers; and, on the hybrid5 fixture that has no
+        attacking-third kick, an empty result that is reported, not an error."""
+        from tools.audit import rollouts
+
+        ckpt, trace_dir, _ = _attack_fixture(tmp_path)
+        base = ["credit", "--decision", "attack", "--trace-dir", str(trace_dir), "--checkpoint-dir", str(ckpt), "--trace-seed", "11",
+                "--seed", "3", "--seeds", "2", "--shaping-mode", "legacy", "--lambdas", "0.8", "0.95"]
+        assert rollouts.main([*base, "--workers", "1", "--out", str(tmp_path / "a1.json")]) == 0
+        assert rollouts.main([*base, "--workers", "2", "--out", str(tmp_path / "a2.json")]) == 0
+        d1 = json.loads((tmp_path / "a1.json").read_text(encoding="utf-8"))
+        d2 = json.loads((tmp_path / "a2.json").read_text(encoding="utf-8"))
+        assert d1 == d2
+        assert (d1["decision"], d1["n_points"], d1["n_matches_ok"]) == ("attack", 2, 2)
+        assert d1["points"] == [{"match_idx": 1, "step": 548, "kicker": 9}, {"match_idx": 1, "step": 630, "kicker": 9}]
+        assert set(d1["goals_5s"]) == {"kick", "hold"}
+        for branch in ("kick", "hold"):
+            assert set(d1["goals_5s"][branch]) == {"for", "against"}
+            assert all(0.0 <= v <= 1.0 for v in d1["goals_5s"][branch].values())
+        assert d1["estimators"]["0.95"]["N"] > 0.0
+
+        hold_ckpt, hold_traces, _ = _hold_fixture(tmp_path / "hold", "hybrid5")
+        empty = tmp_path / "empty"
+        assert rollouts.main(["credit", "--decision", "attack", "--trace-dir", str(hold_traces), "--checkpoint-dir", str(hold_ckpt),
+                              "--trace-seed", "11", "--seeds", "2", "--out", str(empty)]) == 0
+        d0 = json.loads((empty / "rollouts.json").read_text(encoding="utf-8"))
+        assert d0["n_points"] == 0 and d0["points"] == []
+        assert all(d0["estimators"]["0.95"][k] is None for k in ("S", "N", "SNR"))
+        assert "no points" in (empty / "report.txt").read_text(encoding="utf-8")
+
+    def test_report_layout_on_a_hand_summary(self):
+        """[RED] The text report lists one row per lambda in the order given, with S +- SE, N, SNR, the paired SD and the variance
+        shares and signal parts of goal / sparse / ball / role / critic; the goal line appears for attack only."""
+        from tools.audit import rollouts
+
+        comps, vals, n_steps, terminal = _hand_branches()
+        stats = rollouts.credit_statistics(comps, vals, n_steps, terminal, lambdas=(0.8, 0.95), gamma=0.995, sign=1.0)
+        summary = {"mode": "credit", "decision": "aim", "seed": 1, "seeds": 2, "steps": 75, "shaping_mode": "legacy",
+                   "gamma": 0.995, "lambdas": [0.8, 0.95], "n_matches_total": 2, "n_matches_ok": 2, "n_matches_skipped": 0,
+                   "max_pos_err": 0.0, "n_points": 2, "points": [], "estimators": stats}
+        lines = rollouts.format_credit_report(summary, title="hand").splitlines()
+        assert lines[0].startswith("===== rollouts credit hand  decision=aim matches ok=2/2 skipped=0 points=2 seeds=2 seed=1")
+        rows = [ln for ln in lines if ln.startswith(("0.8 |", "0.95 |"))]
+        assert len(rows) == 2 and rows[0].startswith("0.8 | +1.2500 +- 0.7500 | 1.4142 | +0.884 | 1.258 |")
+        assert "0.50/0.50/0.00/0.00/0.00" in rows[0] and "+1.250/+0.000/+0.000/+0.000/+0.000" in rows[0]
+        assert not any(ln.startswith("goals within 5 s") for ln in lines)
