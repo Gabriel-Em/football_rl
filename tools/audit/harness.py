@@ -20,21 +20,26 @@ for throttle and steer and samples kick and special, `greedy` uses the mean. `--
 the standard deviation of the sampled components.
 
 Policy heads: a checkpoint's head is read from the output width of its actor (4 = `gaussian4`, 5 =
-`hybrid5`), so the two heads can play each other. A `hybrid5` network draws throttle, steer and power from
+`hybrid5`, 6 = `hybrid6`), so the heads can play each other. A `hybrid5` network draws throttle, steer and power from
 Gaussians and fires kick and special as Bernoulli draws; the env actions are decoded from those with
 `football_rl.policy.to_env_actions`. For `hybrid5`, `sampled` draws everything, `mixed` uses the means of
 throttle, steer and power and samples the two fires, `greedy` uses the means and fires when the probability
 exceeds 0.5; `--sigma-scale` scales the three Gaussian heads only. The trace's `mean` row of a `hybrid5` team
 holds `[tanh(z_throttle), tanh(z_steer), 2 * p_kick - 1, 2 * p_special - 1]`; `act` and `mean` are always
-env-space `(12, 4)` arrays.
+env-space `(12, 4)` arrays. A `hybrid6` network adds an aim Gaussian: a seat whose observation says it holds the ball
+(`football_rl.policy.HOLDING_OBS_INDEX`) and fires the kick takes the aim as its env steer. It plays the same modes
+(`mixed` uses the aim mean like the steer mean) and `--sigma-scale` scales its four Gaussian heads. Its `mean` row is
+the hybrid5 one (the steer column is the steer mean); the aim mean `tanh(z_aim)` goes to the trace's `aim_mean`.
 
 Trace layout (row t = decision t, T = steps played): `pos vel ang ball bvel holder inflight lastteam box
 half side hold_t act mean val` hold the state before the step-t action (act = clipped actions applied,
 mean = deterministic action means, val = critic values; scripted teams record mean = act and val = 0);
 `rew`, `lastkick` and every `s_*` counter hold the value after step t. `holder` is -1 while the ball is
 loose, `side` is 0 for the team defending the left goal, `box` is the active keeper box radius per side.
+`aim_mean` (T, 12), present only when a team plays `hybrid6`, holds `tanh(z_aim)` on `hybrid6` seats and NaN on every
+other seat.
 `final_score`, `n_steps` are scalars; `head` is `(2,)` int8 with the policy head of team A and team B per match
-(0 = `gaussian4` or scripted, 1 = `hybrid5`). `--store-obs` adds `obs_s` and `cen_s` (observations of every 5th
+(0 = `gaussian4` or scripted, 1 = `hybrid5`, 2 = `hybrid6`). `--store-obs` adds `obs_s` and `cen_s` (observations of every 5th
 decision); `--breakdown` enables replay recording in the environment and adds `bd` (ball advance,
 individual potential, role potential, crowd potential, sparse), `role` (label index) and `phi`.
 
@@ -173,7 +178,7 @@ def _mlp(x, layers, squash_output: bool):
 class TeamPolicy:
     """A team's shared field and keeper networks with batched forward passes.
 
-    `head` is 0 for `gaussian4` networks and 1 for `hybrid5` ones; a team's two networks share one head.
+    `head` is 0 for `gaussian4` networks, 1 for `hybrid5` and 2 for `hybrid6` ones; a team's two networks share one head.
     """
 
     def __init__(self, directory: str, prefix: str) -> None:
@@ -199,7 +204,7 @@ class TeamPolicy:
             self.value_affines.append(net.value_affine())  # (ret_mean, ret_std) of a value-normalised critic, else None
         if len(kinds) != 1:
             raise ValueError(f"the field and keeper networks of {base} / {prefix} use different policy heads: {sorted(kinds)}")
-        self.head = 1 if kinds == {"hybrid5"} else 0
+        self.head = {"hybrid5": 1, "hybrid6": 2}.get(kinds.pop(), 0)
 
     @staticmethod
     def _raw_value(head, affine):
@@ -212,18 +217,22 @@ class TeamPolicy:
         c = torch.as_tensor(cen[slot])
         return _mlp(o, actor, True), self._raw_value(_mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1), affine)
 
-    def _act_hybrid(self, obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine=None):
+    def _act_hybrid(
+        self, obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine=None,
+        aim_out=None,
+    ):
         from football_rl.config import DEFAULT_CONFIG
-        from football_rl.policy import fire_probability, to_env_actions
+        from football_rl.policy import HOLDING_OBS_INDEX, fire_probability, to_env_actions
 
         o = torch.as_tensor(obs[slot])
         c = torch.as_tensor(cen[slot])
         z = _mlp(o, actor, False)
         values[slot] = self._raw_value(_mlp(torch.cat([o, c], dim=-1), critic, False).squeeze(-1), affine).numpy()
-        mean3 = torch.tanh(z[:, :3])
+        n_gauss = z.shape[1] - 2  # 3 for hybrid5; 4 for hybrid6, whose fourth Gaussian is the aim
+        mean3 = torch.tanh(z[:, :n_gauss])
         floor, bound = bounds
-        p_kick = fire_probability(z[:, 3], floor, bound)
-        p_spec = fire_probability(z[:, 4], floor, bound)
+        p_kick = fire_probability(z[:, n_gauss], floor, bound)
+        p_spec = fire_probability(z[:, n_gauss + 1], floor, bound)
         noise = torch.randn(mean3.shape, generator=gen)
         uniform = torch.rand((mean3.shape[0], 2), generator=gen)
         sampled3 = mean3 + sigma_scale * std * noise
@@ -236,13 +245,21 @@ class TeamPolicy:
         policy_action = torch.cat(
             [gaussian, kick.to(gaussian.dtype).unsqueeze(-1), spec.to(gaussian.dtype).unsqueeze(-1)], dim=1
         )
-        actions[slot] = to_env_actions(policy_action.numpy(), DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
+        holding = obs[slot][:, HOLDING_OBS_INDEX] > 0.5 if n_gauss == 4 else None
+        actions[slot] = to_env_actions(
+            policy_action.numpy(), DEFAULT_CONFIG.mechanics.kick_trigger_threshold, holding=holding
+        )
         means[slot] = torch.cat(
             [mean3[:, :2], (2.0 * p_kick - 1.0).unsqueeze(-1), (2.0 * p_spec - 1.0).unsqueeze(-1)], dim=1
         ).numpy()
+        if aim_out is not None and n_gauss == 4:
+            aim_out[slot] = mean3[:, 3].numpy()
 
-    def act(self, obs, cen, mode: str, sigma_scale: float, gen):
-        """Return `(actions (6,4), values (6,), means (6,4))` for the team's six slots."""
+    def act(self, obs, cen, mode: str, sigma_scale: float, gen, aim_out=None):
+        """Return `(actions (6,4), values (6,), means (6,4))` for the team's six slots.
+
+        `aim_out` (6,), when given, receives the aim means of `hybrid6` slots; other slots are left unchanged.
+        """
         actions = np.empty((6, 4), dtype=np.float32)
         values = np.empty(6, dtype=np.float32)
         means = np.empty((6, 4), dtype=np.float32)
@@ -250,7 +267,8 @@ class TeamPolicy:
             for (slot, actor, critic, std), bounds, affine in zip(self.heads, self.fire_bounds, self.value_affines):
                 if bounds is not None:
                     self._act_hybrid(
-                        obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine
+                        obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine,
+                        aim_out,
                     )
                     continue
                 mean, value = self.forward(obs, cen, slot, actor, critic, affine)
@@ -305,6 +323,7 @@ def _alloc(steps: int, with_obs: bool, with_breakdown: bool) -> Dict[str, np.nda
         "holder": ((), i8), "inflight": ((), i8), "lastteam": ((), i8), "half": ((), i8), "side": ((2,), i8),
         "box": ((2,), f32), "hold_t": ((), f32),
         "act": ((12, 4), f32), "mean": ((12, 4), f32), "val": ((12,), f32), "rew": ((12,), f32), "lastkick": ((12,), f32),
+        "aim_mean": ((12,), f32),
     }
     for name in VECTOR_STATS:
         shapes["s_" + name] = ((2,), i32)
@@ -313,6 +332,7 @@ def _alloc(steps: int, with_obs: bool, with_breakdown: bool) -> Dict[str, np.nda
     if with_breakdown:
         shapes.update({"bd": ((12, 5), f32), "role": ((12,), i8), "phi": ((12,), f32)})
     out = {k: np.zeros((steps,) + shp, dt) for k, (shp, dt) in shapes.items()}
+    out["aim_mean"][:] = np.nan
     if with_obs:
         from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
 
@@ -376,16 +396,17 @@ def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
     tr = _alloc(horizon, spec.store_obs, spec.breakdown)
     steps = 0
     for t in range(horizon):
+        aim = tr["aim_mean"][t]
         if team_a is None:
             act_a, val_a = scripted_actions(env, 0), np.zeros(6, np.float32)
             mean_a = act_a
         else:
-            act_a, val_a, mean_a = team_a.act(obs[:6], cen[:6], spec.mode, spec.sigma_scale, gen)
+            act_a, val_a, mean_a = team_a.act(obs[:6], cen[:6], spec.mode, spec.sigma_scale, gen, aim_out=aim[:6])
         if team_b is None:
             act_b, val_b = scripted_actions(env, 1), np.zeros(6, np.float32)
             mean_b = act_b
         else:
-            act_b, val_b, mean_b = team_b.act(obs[6:], cen[6:], spec.mode, spec.sigma_scale, gen)
+            act_b, val_b, mean_b = team_b.act(obs[6:], cen[6:], spec.mode, spec.sigma_scale, gen, aim_out=aim[6:])
         act = np.concatenate([act_a, act_b])
         val = np.concatenate([val_a, val_b])
         if spec.store_obs and t % OBS_STRIDE == 0:
@@ -429,6 +450,8 @@ def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
     trace["final_score"] = np.array(env.stats["score"], dtype=np.int32)
     trace["n_steps"] = np.array(steps)
     trace["head"] = np.array([0 if t is None else t.head for t in (team_a, team_b)], dtype=np.int8)
+    if 2 not in trace["head"]:
+        del trace["aim_mean"]
     return trace
 
 

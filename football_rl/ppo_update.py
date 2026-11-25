@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
-from football_rl.policy import ActorCritic, FIRE_STATS_STRIDE, hybrid_entropy_bonus
+from football_rl.policy import ActorCritic, FIRE_HEADS, FIRE_STATS_STRIDE, HOLDING_OBS_INDEX, hybrid_entropy_bonus
 from football_rl.returns import compute_mc_returns, pearson_correlation
 
 
@@ -62,17 +62,17 @@ class PPOUpdateMixin:
         if batch_size == 0:
             nan = float("nan")
             empty = {"pg_loss": nan, "v_loss": nan, "entropy": nan}
-            if self.policy_head == "hybrid5":
+            if self.policy_head in FIRE_HEADS:
                 empty.update({"fire_sat_kick": nan, "fire_sat_spec": nan, "p_kick": nan, "p_spec": nan})
             return empty
         num_minibatches = min(self.cfg.ppo.num_minibatches, batch_size)
         minibatch_size = max(1, batch_size // num_minibatches)
         clip_coef = self.cfg.ppo.clip_coef
-        separate_fire_entropy = self.policy_head == "hybrid5" and self.cfg.ppo.fire_entropy == "separate"
+        separate_fire_entropy = self.policy_head in FIRE_HEADS and self.cfg.ppo.fire_entropy == "separate"
 
         # Fire statistics of the policy that produced this batch, taken before any update.
         fire_metrics: Dict[str, float] = {}
-        if self.policy_head == "hybrid5":
+        if self.policy_head in FIRE_HEADS:
             sat_kick, sat_spec, p_kick_mean, p_spec_mean = policy.fire_stats(b_obs[::FIRE_STATS_STRIDE])
             fire_metrics = {
                 "fire_sat_kick": sat_kick,
@@ -167,8 +167,10 @@ class PPOUpdateMixin:
 
                 entropy_loss = entropy.mean()
                 if separate_fire_entropy:
+                    # hybrid6 weights its aim entropy by each row's holding flag, read from the raw minibatch observations.
+                    holding = mb_obs[..., HOLDING_OBS_INDEX] > 0.5 if policy.aim else None
                     bonus = hybrid_entropy_bonus(
-                        head_logstd, head_p, self.cfg.ppo.ent_coef, "separate", self.cfg.ppo.fire_ent_coef
+                        head_logstd, head_p, self.cfg.ppo.ent_coef, "separate", self.cfg.ppo.fire_ent_coef, holding
                     ).mean()
                     loss = pg_loss - bonus + v_loss * self.cfg.ppo.vf_coef
                 else:
