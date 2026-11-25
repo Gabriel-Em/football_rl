@@ -5743,6 +5743,11 @@ def _h6_trainer(tmp_path: Path, name: str = "ckpt", **kwargs) -> ParameterSharin
 
 
 class TestHybrid6:
+    @pytest.fixture(autouse=True)
+    def _fixed_commit(self, monkeypatch) -> None:
+        """A trainer reads the commit when it is built; these tests hand it a fixed answer instead of running git."""
+        monkeypatch.setattr(tp, "current_git_commit", lambda: "unit-test")
+
     # ln N(x | 0, 1) = -x^2 / 2 - 0.9189385332; ln 0.25 = -1.3862943611, ln 0.75 = -0.2876820725, ln 0.5 = -0.6931471806.
     def test_log_prob_hand_values(self) -> None:
         """[RED] K 1, h 1: lnN(0.5) + lnN_aim(2) + lnN(0) + ln 0.25 + ln 0.5 = -6.961257141. K 1, h 0: the steer term lnN(1)
@@ -5814,6 +5819,21 @@ class TestHybrid6:
             tp.to_env_actions(pol, 0.35)
         with pytest.raises(ValueError, match="holding"):
             tp.to_env_actions(pol, 0.35, holding=np.array([True, False]))
+
+    def test_decode_reads_a_numeric_holding_flag_like_observation_column_7(self) -> None:
+        """[RED] `holding` given as the raw 0.0 / 1.0 observation column decodes like the boolean flag: env steer 0.8 (aim)
+        only on the firing holder, -0.3 (steer) on the other three rows."""
+        pol = np.array(
+            [
+                [0.2, -0.3, 0.0, 0.8, 1.0, 0.0],
+                [0.2, -0.3, 0.0, 0.8, 1.0, 1.0],
+                [0.2, -0.3, 0.0, 0.8, 0.0, 0.0],
+                [0.2, -0.3, 0.0, 0.8, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        out = tp.to_env_actions(pol, 0.35, holding=np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32))
+        np.testing.assert_allclose(out[:, 1], [0.8, -0.3, -0.3, -0.3], atol=1e-7)
 
     def test_five_wide_decode_is_unchanged_and_ignores_holding(self) -> None:
         """[GUARD] hybrid5 `[thr, steer, u, K, S]`: kick 0.35 + 0.65 * 0.5 = 0.675 for u 0, -1 when K 0; special +1 / -1;
@@ -5979,6 +5999,23 @@ class TestHybrid6:
         """[RED] Frozen pool seats are sampled without the aim head, so a hybrid6 trainer with `pool_envs > 0` is refused."""
         with pytest.raises(ValueError, match="hybrid6"):
             _pool_trainer(tmp_path, head="hybrid6", pool_envs=1)
+
+    def test_main_refuses_a_pool_with_hybrid6_before_wiping_the_batch(self, tmp_path: Path, monkeypatch) -> None:
+        """[RED] The pool refusal aborts `main(--from-scratch)` before anything on disk changes."""
+        monkeypatch.chdir(tmp_path)
+        marker = tmp_path / "checkpoints" / "marker.txt"
+        marker.parent.mkdir()
+        marker.write_text("keep", encoding="utf-8")
+        monkeypatch.setattr(
+            "sys.argv",
+            ["train_ppo", "--from-scratch", "--total-updates", "1", "--pool-envs", "1",
+             "--config-override", "ppo.policy_head=hybrid6"],
+        )
+        with pytest.raises(ValueError, match="hybrid6"):
+            tp.main()
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+        assert not (tmp_path / "replays").exists()
 
     def test_update_reads_the_holding_flag_from_the_minibatch_observations(self, tmp_path: Path) -> None:
         """[RED] Separate fire entropy, 64 rows with K = 1 on every row. With observation column 7 at 0 on every row the aim

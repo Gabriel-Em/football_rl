@@ -81,6 +81,8 @@ def to_env_actions(policy_actions: np.ndarray, kick_threshold: float, holding: O
         holding = np.asarray(holding)
         if holding.shape != pol.shape[:-1]:
             raise ValueError(f"holding has shape {holding.shape}, expected {pol.shape[:-1]}")
+        if holding.dtype != np.bool_:
+            holding = holding > 0.5
         out[..., 1] = np.where((pol[..., fire] > 0.5) & holding, pol[..., 3], pol[..., 1])
     power = np.maximum(np.clip((pol[..., 2] + 1.0) / 2.0, 0.0, 1.0), 0.001)
     out[..., 2] = np.where(pol[..., fire] > 0.5, kick_threshold + (1.0 - kick_threshold) * power, -1.0)

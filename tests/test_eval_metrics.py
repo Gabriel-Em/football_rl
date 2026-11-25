@@ -4775,7 +4775,7 @@ class TestAimControl:
 
     def test_stats_on_orthogonal_hand_arrays(self):
         """[RED] 24 points, m_prev and need zero-mean and orthogonal: x_k = need -> r2_prev 0, gain 1; x_k = 0.5 m_prev ->
-        r2_prev 1, gain 0. With an intercept, x_k = m_prev - 1 on m_prev' = m_prev + 1 (mean 1) still gives r2_prev 1 and gain 0
+        r2_prev 1, gain 0. With an intercept, x_k = m_prev on m_prev' = m_prev + 1 (mean 1) still gives r2_prev 1 and gain 0
         (a fit through the origin would give r2_prev 0.36)."""
         from tools.audit import internals
 

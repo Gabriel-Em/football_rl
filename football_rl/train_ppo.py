@@ -74,6 +74,12 @@ def validate_replay_settings(replay_every: Any, replay_kind: Any) -> Tuple[int, 
     return int(replay_every), replay_kind
 
 
+def validate_pool_head(pool_envs: int, policy_head: str) -> None:
+    """Raise ValueError for an opponent pool with the hybrid6 head: frozen pool seats are sampled without an aim head."""
+    if pool_envs > 0 and policy_head == "hybrid6":
+        raise ValueError("pool_envs > 0 is not available with policy_head 'hybrid6': frozen pool seats have no aim head")
+
+
 def _run_git(args: Sequence[str]) -> Optional[str]:
     """Run ``git <args>`` in the package directory; return stdout, or None when git is unavailable or fails."""
     try:
@@ -134,8 +140,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         validate_pool_settings(
             int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed), bool(shared_keepers)
         )
-        if int(pool_envs) > 0 and config.ppo.policy_head == "hybrid6":
-            raise ValueError("pool_envs > 0 is not available with policy_head 'hybrid6': frozen pool seats have no aim head")
+        validate_pool_head(int(pool_envs), config.ppo.policy_head)
         self.replay_every, self.replay_kind = validate_replay_settings(replay_every, replay_kind)
         self._export_replays_active: bool = True
         self._uniform_capture_active: bool = False
@@ -1201,6 +1206,7 @@ def main() -> None:
     validate_pool_settings(
         args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed, args.shared_keepers
     )
+    validate_pool_head(args.pool_envs, cfg.ppo.policy_head)
     validate_replay_settings(args.replay_every, args.replay_kind)
 
     # 3. Handle `--from-scratch` vs automatic/explicit `--resume`
