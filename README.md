@@ -57,11 +57,27 @@ Simulates 6v6 competitive football matches featuring 12 autonomous agents across
 football_rl/
 ├── football_rl/
 │   ├── config.py             # Dataclass configurations: physics, mechanics, vision, rewards, PPO
-│   ├── env.py                # PettingZoo ParallelEnv: 60Hz physics, Dec-POMDP obs, rules & rewards
+│   ├── env.py                # PettingZoo ParallelEnv: state, reset/step loop; assembles the mixins below
+│   ├── physics.py            #   fixed-order 60 Hz substep, collisions, boundary clamping, wall bounces
+│   ├── ball_play.py          #   kicks, tackles, keeper strips, free-ball pickups
+│   ├── match_rules.py        #   5-second violations, goals, halftime, kickoff, per-side box timer
+│   ├── observations.py       #   team-canonical observations and the centralized critic state
+│   ├── reward_shaping.py     #   team rewards, ball/role potentials, shaping telemetry
+│   ├── recording.py          #   replay recorder (preallocated 60 Hz buffer) and replay-file export
+│   ├── scalar_math.py        # Angle wrapping and a NumPy-free scalar clamp
 │   ├── potentials.py         # Pure per-player potential field (roles, crowding, cover assignment) behind PBRS
-│   ├── recording.py          # Preallocated 60 Hz replay recorder; builds JSON frames on demand
-│   ├── replay.py             # 60 FPS Pygame replay visualizer & match analyzer
-│   ├── train_ppo.py          # Vectorized PPO training loop, parameter sharing, co-evolution
+│   ├── train_ppo.py          # PPO trainer (rollouts, generation loop) and the training CLI
+│   ├── policy.py             #   actor-critic network, Gaussian/hybrid heads, return statistics
+│   ├── returns.py            #   GAE, Monte Carlo returns, critic correlation
+│   ├── ppo_update.py         #   PPO losses and per-role updates
+│   ├── coevolution.py        #   co-evolution soft sync
+│   ├── opponent_pool.py      #   opponent snapshot pool
+│   ├── trainer_checkpoints.py #  checkpoints, snapshots, summaries, resume
+│   ├── migrations.py         #   history and checkpoint-weight migrations
+│   ├── config_overrides.py   #   --config-override parsing
+│   ├── archive.py            #   batch archive, load, list, status
+│   ├── replay.py             # 60 FPS Pygame replay viewer (assembles viewer/) and the replay CLI
+│   ├── viewer/               #   theme, timeline, controls, pitch, hud, overlays, telemetry
 │   └── tests/
 │       └── test_env.py       # Automated test suite (70+ unit tests covering physics, symmetry, mechanics)
 ├── context/                  # Architectural specs, behavioral audits, and tactical masterplans

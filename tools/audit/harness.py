@@ -22,7 +22,7 @@ the standard deviation of the sampled components.
 Policy heads: a checkpoint's head is read from the output width of its actor (4 = `gaussian4`, 5 =
 `hybrid5`), so the two heads can play each other. A `hybrid5` network draws throttle, steer and power from
 Gaussians and fires kick and special as Bernoulli draws; the env actions are decoded from those with
-`football_rl.train_ppo.to_env_actions`. For `hybrid5`, `sampled` draws everything, `mixed` uses the means of
+`football_rl.policy.to_env_actions`. For `hybrid5`, `sampled` draws everything, `mixed` uses the means of
 throttle, steer and power and samples the two fires, `greedy` uses the means and fires when the probability
 exceeds 0.5; `--sigma-scale` scales the three Gaussian heads only. The trace's `mean` row of a `hybrid5` team
 holds `[tanh(z_throttle), tanh(z_steer), 2 * p_kick - 1, 2 * p_special - 1]`; `act` and `mean` are always
@@ -177,7 +177,8 @@ class TeamPolicy:
     """
 
     def __init__(self, directory: str, prefix: str) -> None:
-        from football_rl.train_ppo import ActorCritic, adapt_policy_weights, policy_head_of_weights
+        from football_rl.migrations import adapt_policy_weights
+        from football_rl.policy import ActorCritic, policy_head_of_weights
 
         base = Path(directory)
         self.heads = []
@@ -213,7 +214,7 @@ class TeamPolicy:
 
     def _act_hybrid(self, obs, cen, mode, sigma_scale, gen, slot, actor, critic, std, bounds, actions, means, values, affine=None):
         from football_rl.config import DEFAULT_CONFIG
-        from football_rl.train_ppo import fire_probability, to_env_actions
+        from football_rl.policy import fire_probability, to_env_actions
 
         o = torch.as_tensor(obs[slot])
         c = torch.as_tensor(cen[slot])

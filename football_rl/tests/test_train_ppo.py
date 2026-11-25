@@ -25,14 +25,16 @@ from football_rl.config import (
     DEFAULT_CONFIG,
     OBS_DIM,
 )
+from football_rl.archive import select_archive_replays
+from football_rl.config_overrides import coerce_override_value
 from football_rl.env import FootballParallelEnv
+from football_rl.migrations import adapt_policy_weights, migrate_team_color_keys
+from football_rl.policy import RunningStat, fire_probability, hybrid_entropy_bonus, hybrid_log_prob_entropy
 from football_rl.train_ppo import (
     ActorCritic,
     ParameterSharingPPOTrainer,
     archive_batch,
-    migrate_team_color_keys,
     print_active_status,
-    select_archive_replays,
     uniform_env_index,
 )
 
@@ -955,7 +957,7 @@ def test_coevo_sync_log_names_both_teams_by_their_rendered_colour(tmp_path: Path
     """[GUARD] The sync line follows the team colour schema: team A (seats 0-5, `blue_*` policy files, `score[0]`) is drawn
     red and is "Red" in every console line; team B (seats 6-11, `red_*` files, `score[1]`) is drawn blue and is "Blue".
     """
-    from football_rl.replay import COLOR_TEAM_A, COLOR_TEAM_B
+    from football_rl.viewer.theme import COLOR_TEAM_A, COLOR_TEAM_B
 
     assert COLOR_TEAM_A[0] > COLOR_TEAM_A[2] and COLOR_TEAM_B[2] > COLOR_TEAM_B[0]  # A drawn red, B drawn blue
 
@@ -1495,7 +1497,7 @@ def test_critic_only_generations_skip_coevolution_sync_and_window(tmp_path: Path
 
 def test_v_corr_mc_hand_values_and_segments(tmp_path: Path) -> None:
     """[RED] Monte-Carlo returns and correlations match hand-solved values across segments and degenerate inputs."""
-    from football_rl.train_ppo import compute_mc_returns, pearson_correlation
+    from football_rl.returns import compute_mc_returns, pearson_correlation
 
     # Single segment: rewards [1, 0, 0, 2], gamma = 0.5 -> G = [1.25, 0.5, 1.0, 2.0]
     rewards_1 = np.array([1.0, 0.0, 0.0, 2.0], dtype=np.float32)
@@ -1721,7 +1723,7 @@ def test_override_values_are_coerced_to_the_field_type() -> None:
 def test_coerce_override_value_hand_values(raw, annotation, expected) -> None:
     import football_rl.train_ppo as tp
 
-    got = tp.coerce_override_value(raw, annotation)
+    got = coerce_override_value(raw, annotation)
     assert got == expected and type(got) is type(expected)
 
 
@@ -1733,7 +1735,7 @@ def test_coerce_override_value_rejects_unparseable_values(raw, annotation) -> No
     import football_rl.train_ppo as tp
 
     with pytest.raises(ValueError):
-        tp.coerce_override_value(raw, annotation)
+        coerce_override_value(raw, annotation)
 
 
 def test_gamma_override_shifts_shaping_by_the_hand_value() -> None:
@@ -2155,13 +2157,13 @@ def test_to_env_actions_contract_edges() -> None:
 # ------------------------------------------------------------------ fire probability
 def test_fire_probability_bounds_and_midpoint_hand_values() -> None:
     """[RED] Floor 0.005, L = 6: z -> -inf gives 0.005 + 0.99 * sigmoid(-6) = 0.007448; +inf gives 0.992552; 0 gives 0.5."""
-    p = tp.fire_probability(torch.tensor([-1e6, 1e6, 0.0], dtype=torch.float64), 0.005, 6.0)
+    p = fire_probability(torch.tensor([-1e6, 1e6, 0.0], dtype=torch.float64), 0.005, 6.0)
     np.testing.assert_allclose(p.numpy(), [0.007448, 0.992552, 0.5], atol=1e-5)
     # Floor 0: sigmoid(+-6) = 0.0024726 / 0.9975274.
-    p0 = tp.fire_probability(torch.tensor([-1e6, 1e6], dtype=torch.float64), 0.0, 6.0)
+    p0 = fire_probability(torch.tensor([-1e6, 1e6], dtype=torch.float64), 0.0, 6.0)
     np.testing.assert_allclose(p0.numpy(), [0.0024726, 0.9975274], atol=1e-6)
     # Floor 0 and z solved for 0.25.
-    assert float(tp.fire_probability(torch.tensor([Z_FOR_QUARTER], dtype=torch.float64), 0.0, 6.0)) == pytest.approx(
+    assert float(fire_probability(torch.tensor([Z_FOR_QUARTER], dtype=torch.float64), 0.0, 6.0)) == pytest.approx(
         0.25, abs=1e-9
     )
 
@@ -2169,10 +2171,10 @@ def test_fire_probability_bounds_and_midpoint_hand_values() -> None:
 def test_fire_probability_is_monotone_symmetric_and_finite_at_extremes() -> None:
     """[RED] Strictly increasing on a grid, p(z) + p(-z) = 1, finite and inside the bounds for float32 extremes."""
     z = torch.linspace(-30.0, 30.0, 121, dtype=torch.float64)
-    p = tp.fire_probability(z, 0.005, 6.0)
+    p = fire_probability(z, 0.005, 6.0)
     assert (p[1:] > p[:-1]).all()
-    np.testing.assert_allclose((p + tp.fire_probability(-z, 0.005, 6.0)).numpy(), 1.0, atol=1e-12)
-    extreme = tp.fire_probability(torch.tensor([-3e38, -1e30, 1e30, 3e38], dtype=torch.float32), 0.005, 6.0)
+    np.testing.assert_allclose((p + fire_probability(-z, 0.005, 6.0)).numpy(), 1.0, atol=1e-12)
+    extreme = fire_probability(torch.tensor([-3e38, -1e30, 1e30, 3e38], dtype=torch.float32), 0.005, 6.0)
     assert torch.isfinite(extreme).all()
     assert (extreme >= 0.00744).all() and (extreme <= 0.99256).all()
 
@@ -2190,8 +2192,8 @@ def _hand_inputs(k: float, s: float, u: float = 0.0):
 def test_hybrid_log_prob_and_entropy_hand_values() -> None:
     """[RED] K=1,S=0: 3*ln N(0) + ln 0.25 + ln 0.5 = -4.836257. K=0,S=0: 2*ln N(0) + ln 0.75 + ln 0.5 = -2.818706.
     Entropy: 2*1.418939 + H_B(0.25) + H_B(0.5) + 0.25 * 1.418939 = 4.448094."""
-    lp1, ent = tp.hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0))
-    lp0, ent0 = tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0))
+    lp1, ent = hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0))
+    lp0, ent0 = hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0))
     assert float(lp1) == pytest.approx(-4.836257, abs=1e-5)
     assert float(lp0) == pytest.approx(-2.818706, abs=1e-5)
     assert float(ent) == pytest.approx(4.448094, abs=1e-5)
@@ -2200,11 +2202,11 @@ def test_hybrid_log_prob_and_entropy_hand_values() -> None:
 
 def test_hybrid_power_term_counts_only_when_a_kick_fired() -> None:
     """[RED] u = +1 adds -0.5 to ln N when K = 1 (-5.336257) and changes nothing when K = 0."""
-    assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0, u=1.0))[0]) == pytest.approx(-5.336257, abs=1e-5)
+    assert float(hybrid_log_prob_entropy(*_hand_inputs(1.0, 0.0, u=1.0))[0]) == pytest.approx(-5.336257, abs=1e-5)
     for u in (-3.0, 0.0, 2.5):
-        assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0, u=u))[0]) == pytest.approx(-2.818706, abs=1e-5)
+        assert float(hybrid_log_prob_entropy(*_hand_inputs(0.0, 0.0, u=u))[0]) == pytest.approx(-2.818706, abs=1e-5)
     # Special fired: ln 0.5 either way; S=1,K=0 equals S=0,K=0.
-    assert float(tp.hybrid_log_prob_entropy(*_hand_inputs(0.0, 1.0))[0]) == pytest.approx(-2.818706, abs=1e-5)
+    assert float(hybrid_log_prob_entropy(*_hand_inputs(0.0, 1.0))[0]) == pytest.approx(-2.818706, abs=1e-5)
 
 
 def test_network_log_prob_and_entropy_match_the_hand_values() -> None:
@@ -3594,7 +3596,7 @@ def _bonus_and_grads(logstd_values, p_values, ent_coef, fire_entropy, fire_ent_c
     """Per-sample bonus (float64) and the gradients of its sum with respect to logstd and p (zeros when unused)."""
     logstd = torch.tensor([list(logstd_values)], dtype=torch.float64, requires_grad=True)
     p = torch.tensor(p_values, dtype=torch.float64, requires_grad=True)
-    bonus = tp.hybrid_entropy_bonus(logstd, p, ent_coef, fire_entropy, fire_ent_coef)
+    bonus = hybrid_entropy_bonus(logstd, p, ent_coef, fire_entropy, fire_ent_coef)
     g_logstd, g_p = torch.autograd.grad(bonus.sum(), (logstd, p), allow_unused=True)
     g_logstd = torch.zeros_like(logstd) if g_logstd is None else g_logstd
     g_p = torch.zeros_like(p) if g_p is None else g_p
@@ -3683,7 +3685,7 @@ def test_separate_bonus_with_zero_ent_coef_keeps_only_the_fire_term() -> None:
 def test_hybrid_entropy_bonus_rejects_an_unknown_mode() -> None:
     """[RED] An unrecognised mode raises instead of silently picking one."""
     with pytest.raises(ValueError, match="fire_entropy"):
-        tp.hybrid_entropy_bonus(torch.zeros(1, 3), torch.full((1, 2), 0.25), 0.005, "both", 0.0)
+        hybrid_entropy_bonus(torch.zeros(1, 3), torch.full((1, 2), 0.25), 0.005, "both", 0.0)
 
 
 def test_joint_entropy_pays_the_kick_head_for_firing_up_to_the_maximiser() -> None:
@@ -3822,7 +3824,7 @@ def test_reported_entropy_equals_the_batch_mean_of_the_policy_entropy(tmp_path: 
         with torch.no_grad():
             action, logp, value = policy.sample_action_and_value(obs)
             mean3, p_kick, p_spec = policy.hybrid_heads(obs)
-            expected = float(tp.hybrid_log_prob_entropy(mean3, policy.actor_logstd, p_kick, p_spec, action)[1].mean())
+            expected = float(hybrid_log_prob_entropy(mean3, policy.actor_logstd, p_kick, p_spec, action)[1].mean())
         stats = trainer._ppo_update_role(policy, opt, obs, action, logp, torch.zeros(24), value.clone(), value)
         assert stats["entropy"] == pytest.approx(expected, abs=1e-6)
         assert stats["entropy"] > 2.0  # the throttle and steer Gaussians alone give 2 * 0.918939 = 1.837877
@@ -4001,7 +4003,7 @@ def test_critic_switches_are_reachable_through_config_overrides() -> None:
 
 def test_running_stat_first_batch_sets_mean_and_population_variance() -> None:
     """[RED] Batch [1, 2, 3]: mean 2, population variance (1 + 0 + 1) / 3 = 2/3, std sqrt(2/3) = 0.8164966."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     assert (stat.mean, stat.std, stat.count) == (0.0, 1.0, 0)
     stat.update([1.0, 2.0, 3.0])
     assert stat.mean == pytest.approx(2.0, abs=1e-7)
@@ -4012,7 +4014,7 @@ def test_running_stat_first_batch_sets_mean_and_population_variance() -> None:
 
 def test_running_stat_blends_first_and_second_moments_with_weight_one_minus_momentum() -> None:
     """[RED] After [1, 2, 3], batch [4] at m = 0.5: mean 0.5*2 + 0.5*4 = 3; second moment 0.5*(2/3 + 4) + 0.5*16 = 10.3333; var 10.3333 - 9 = 1.3333."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     stat.update([1.0, 2.0, 3.0])
     stat.update([4.0])
     assert stat.mean == pytest.approx(3.0, abs=1e-7)
@@ -4025,7 +4027,7 @@ def test_running_stat_weights_are_not_symmetric() -> None:
 
     At m = 0.5 swapping m and 1 - m changes nothing, so this case is the one that tells them apart.
     """
-    stat = tp.RunningStat(0.75)
+    stat = RunningStat(0.75)
     stat.update([1.0, 2.0, 3.0])
     stat.update([4.0])
     assert stat.mean == pytest.approx(2.5, abs=1e-7)
@@ -4034,7 +4036,7 @@ def test_running_stat_weights_are_not_symmetric() -> None:
 
 def test_running_stat_ignores_empty_batches() -> None:
     """[RED] An empty batch changes nothing, fresh or not."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     stat.update([])
     assert (stat.mean, stat.var, stat.count) == (0.0, 1.0, 0)
     stat.update([1.0, 2.0, 3.0])
@@ -4046,7 +4048,7 @@ def test_running_stat_ignores_empty_batches() -> None:
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_running_stat_rejects_non_finite_batches_and_keeps_its_state(bad: float) -> None:
     """[RED] A batch holding NaN or an infinity raises ValueError and leaves the statistic untouched."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     stat.update([1.0, 2.0, 3.0])
     with pytest.raises(ValueError):
         stat.update([1.0, bad])
@@ -4055,7 +4057,7 @@ def test_running_stat_rejects_non_finite_batches_and_keeps_its_state(bad: float)
 
 def test_running_stat_std_never_drops_below_one_thousandth() -> None:
     """[RED] A constant batch [5, 5, 5] has variance 25 - 25 = 0, so std is the 1e-3 floor and 5 normalises to 0."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     stat.update([5.0, 5.0, 5.0])
     assert stat.var == 0.0 and stat.std == 1e-3
     assert float(stat.normalize(torch.tensor(5.0))) == 0.0
@@ -4064,7 +4066,7 @@ def test_running_stat_std_never_drops_below_one_thousandth() -> None:
 
 def test_running_stat_normalise_and_denormalise_invert_each_other() -> None:
     """[RED] After [1, 2, 3] (mean 2, std 0.8164966): 3 -> 1.2247449, and 1.2247449 -> 3."""
-    stat = tp.RunningStat(0.5)
+    stat = RunningStat(0.5)
     stat.update([1.0, 2.0, 3.0])
     assert float(stat.normalize(torch.tensor(3.0, dtype=torch.float64))) == pytest.approx(1.2247449, abs=1e-7)
     assert float(stat.denormalize(torch.tensor(1.2247449, dtype=torch.float64))) == pytest.approx(3.0, abs=1e-6)
@@ -4184,7 +4186,7 @@ def test_a_network_loading_statistics_it_was_not_built_with_picks_them_up() -> N
     _constant_head_critic(saved, 0.5)
     _set_return_stats(saved, 7.0, 2.5)
     loaded = ActorCritic()
-    loaded.load_state_dict(tp.adapt_policy_weights(saved.state_dict(), loaded.obs_dim, loaded.central_state_dim))
+    loaded.load_state_dict(adapt_policy_weights(saved.state_dict(), loaded.obs_dim, loaded.central_state_dim))
     assert loaded.value_norm is True and loaded.return_stats() == (7.0, 2.5)
     assert loaded.get_value(torch.zeros(3, OBS_DIM)).tolist() == [8.25] * 3
 
@@ -4194,7 +4196,7 @@ def test_adapt_policy_weights_passes_the_statistics_through() -> None:
     saved = ActorCritic(value_norm=True)
     _set_return_stats(saved, 7.0, 2.5)
     weights = saved.state_dict()
-    adapted = tp.adapt_policy_weights(weights, OBS_DIM, CENTRAL_STATE_DIM)
+    adapted = adapt_policy_weights(weights, OBS_DIM, CENTRAL_STATE_DIM)
     assert adapted["ret_mean"] is weights["ret_mean"] and adapted["ret_std"] is weights["ret_std"]
 
 
@@ -4261,7 +4263,7 @@ def test_value_norm_trainer_reaches_the_constant_return_in_raw_units(tmp_path: P
                 assert float(weights["ret_mean"]) == pytest.approx(policy.return_stats()[0], abs=1e-6)
                 assert float(weights["ret_std"]) == pytest.approx(policy.return_stats()[1], abs=1e-6)
                 loaded = ActorCritic(policy_head=head)
-                loaded.load_state_dict(tp.adapt_policy_weights(weights, loaded.obs_dim, loaded.central_state_dim))
+                loaded.load_state_dict(adapt_policy_weights(weights, loaded.obs_dim, loaded.central_state_dim))
                 with torch.no_grad():
                     np.testing.assert_allclose(loaded.get_value(obs, cen).numpy(), raw.numpy(), atol=1e-6)
     finally:

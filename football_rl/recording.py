@@ -4,13 +4,22 @@
 builds the JSON-ready frame dictionaries only when `materialize()` is called. Telemetry that is
 produced once per RL step (rewards, critic values, role labels, actions, ...) is stored once as a
 step payload and shared by the frames of that step.
+
+`ReplayRecordingMixin` is the environment side: it logs match events, captures each physics frame into the
+buffer, scores a match's interest and writes replay files.
 """
 
 from __future__ import annotations
 
+import copy
+from datetime import datetime
+import json
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from football_rl.potentials import ROLE_LABELS
 
 BREAKDOWN_KEYS = ("r_ball_adv", "r_pot_i", "phi_role", "phi_crowd", "r_sparse")
 
@@ -323,3 +332,308 @@ class ReplayBuffer:
             if payload.get("action_mean") is not None:
                 frames[-1]["action_mean"] = payload["action_mean"]
         return frames
+
+
+# Replay role labels: potential-field roles plus the two status overrides shown while a player is stunned or lunging.
+_STUN_ROLE_CODE = len(ROLE_LABELS)
+_LUNGE_ROLE_CODE = len(ROLE_LABELS) + 1
+_REPLAY_ROLE_LABELS = ROLE_LABELS + ("STUN", "LNGE")
+
+
+class ReplayRecordingMixin:
+    """Replay recording of `FootballParallelEnv`: events, per-frame capture, interest score and file export."""
+
+    def _ensure_replay_buffer(self) -> ReplayBuffer:
+        """Return the replay buffer, allocating it for a full match on first use."""
+        if self._replay_buffer is None:
+            self._replay_buffer = ReplayBuffer(
+                max_frames=self.cfg.physics.max_physics_frames + 1, num_players=self.num_players
+            )
+        return self._replay_buffer
+
+    def _emit_event(
+        self,
+        label: str,
+        pos: np.ndarray,
+        team: Optional[int] = None,
+        agent: Optional[str] = None,
+        reward: Optional[float] = None,
+    ) -> None:
+        """Record a discrete game event on the current physics frame for UI popups."""
+        self._frame_events.append(
+            {
+                "type": label,
+                "x": round(float(pos[0]), 2),
+                "y": round(float(pos[1]), 2),
+                "team": int(team) if team is not None else -1,
+                "agent": agent or "",
+                "reward": round(float(reward), 2) if reward is not None else None,
+            }
+        )
+
+    def _replay_step_payload(self) -> LazyStepPayload:
+        """Per-RL-step telemetry shared by every replay frame recorded during that step (rounded on export)."""
+        return LazyStepPayload(
+            actions=self._tele_actions,
+            action_means=self._tele_action_means,
+            v_preds=None if self.last_v_preds is None else np.array(self.last_v_preds, dtype=np.float32),
+            player_rewards=self.last_step_rewards.copy(),
+            cum_rewards=self.cum_player_rewards.copy(),
+            breakdown=self._tele_breakdown,
+            role_codes=self._tele_role_codes,
+            role_labels=_REPLAY_ROLE_LABELS,
+            role_targets=self._tele_targets,
+        )
+
+    def _record_replay_frame(self) -> None:
+        """Copy the current 60 Hz state snapshot into the replay buffer."""
+        if not self.cfg.replay.enable_recording:
+            return
+        flags = self.is_ghost * 2.0 + (self.stun_timer > 0.0) * 4.0 + (self.lunge_timer > 0.0) * 8.0
+        if self.ball_holder is not None:
+            flags[self.ball_holder] += 1.0
+
+        ball_team_color = (
+            int(self.player_team[self.ball_holder])
+            if self.ball_holder is not None
+            else (int(self.last_ball_team) if self.last_ball_team is not None else -1)
+        )
+
+        stats = self.stats
+        self._ensure_replay_buffer().record_frame(
+            frame=self.physics_frame_count,
+            time=self.physics_frame_count * self.cfg.physics.dt,
+            half=self.current_half,
+            team_side=self.team_side,
+            box_radii=self.active_box_radius,
+            player_pos=self.player_pos,
+            player_angle=self.player_angle,
+            player_flags=flags,
+            player_vel=self.player_vel,
+            ball_pos=self.ball_pos,
+            ball_team=ball_team_color,
+            ball_vel=self.ball_vel,
+            step_index=self._replay_step_index,
+            score=stats["score"],
+            possession_frames=stats["possession_frames"],
+            stationary=stats.get("stationary_ball_frames", 0),
+            passes=stats["team_passes"],
+            tackles=stats["team_tackles"],
+            saves=stats["team_saves"],
+            shots=stats["shots"],
+            events=self._frame_events,
+            inflight=self.ball_kicked_in_flight,
+            post_kick=self.post_kick_pbrs_timer,
+        )
+
+    def compute_interest_score(self) -> float:
+        """Compute a competitive episode interest_score that rewards two-sided play and penalizes blowouts/own-goals."""
+        rep = self.cfg.replay
+        score_a, score_b = int(self.stats["score"][0]), int(self.stats["score"][1])
+        total_goals = score_a + score_b
+        own_goals = int(self.stats.get("own_goals", 0))
+        valid_goals = max(0, total_goals - own_goals)
+        goal_diff = abs(score_a - score_b)
+
+        # Diminishing returns on excess goals in blowouts (first 5 valid goals count full, excess counts 35%)
+        effective_goals = min(valid_goals, 5) + max(0, valid_goals - 5) * 0.35
+
+        passes_a, passes_b = int(self.stats["team_passes"][0]), int(self.stats["team_passes"][1])
+        tackles_a, tackles_b = int(self.stats["team_tackles"][0]), int(self.stats["team_tackles"][1])
+        shots_a, shots_b = int(self.stats["shots"][0]), int(self.stats["shots"][1])
+
+        # Cap raw tackle spam contribution at 18 total tackles
+        effective_tackles = min(int(self.stats["successful_tackles"]), 18)
+
+        base_score = (
+            (effective_goals * rep.goal_weight)
+            + (self.stats["completed_passes"] * rep.completed_pass_weight)
+            + (effective_tackles * rep.successful_tackle_weight)
+            + (self.stats["keeper_saves"] * rep.keeper_save_weight)
+        )
+
+        # Two-sided play bonus (rewards matches where BOTH teams pass, shoot, and tackle)
+        two_sided_bonus = (
+            min(passes_a, passes_b) * 2.5
+            + min(shots_a, shots_b) * 2.0
+            + min(tackles_a, tackles_b) * 1.0
+        )
+
+        # Closeness multiplier: boost tight contested games, discount lopsided blowouts
+        if valid_goals > 0 and goal_diff <= 1:
+            closeness_mult = 1.25
+        elif goal_diff <= 2:
+            closeness_mult = 1.0
+        else:
+            closeness_mult = 1.0 / (1.0 + 0.22 * (goal_diff - 2))
+
+        penalties = (own_goals * 4.0) + (int(self.stats.get("keeper_5s_violations", 0)) * 1.5)
+        final_score = max(0.0, (base_score + two_sided_bonus) * closeness_mult - penalties)
+        return round(float(final_score), 2)
+
+    def _write_replay_to_disk(
+        self,
+        match_id: int,
+        generation: int,
+        interest_score: float,
+        stats: Dict[str, Any],
+        frames: List[Dict[str, Any]],
+        tag: str = "",
+    ) -> str:
+        """Serialize and write a 60 Hz JSON replay trajectory to disk; `tag` is appended to the file name."""
+        os.makedirs(self.cfg.replay.save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        score_str = f"{interest_score:.1f}".replace(".", "_")
+        tag_str = f"_{tag}" if tag else ""
+        if match_id > 0:
+            filename = (
+                f"match_{match_id:04d}_gen{generation:04d}"
+                f"_score{score_str}{tag_str}_{timestamp}.json"
+            )
+        else:
+            filename = f"unindexed_{timestamp}_score{score_str}{tag_str}.json"
+        filepath = os.path.join(self.cfg.replay.save_dir, filename)
+
+        highlights = []
+        for fr in frames:
+            for ev in fr.get("events", []):
+                if ev.get("type") != "TACKLE FAILED!":
+                    highlights.append(
+                        {
+                            "frame": fr["frame"],
+                            "time": fr["time"],
+                            "half": fr["half"],
+                            "type": ev["type"],
+                            "agent": ev.get("agent", ""),
+                            "team": ev.get("team", -1),
+                            "x": ev["x"],
+                            "y": ev["y"],
+                            "reward": ev.get("reward"),
+                        }
+                    )
+
+        metadata_block = {
+            "env_name": self.metadata["name"],
+            "match_id": match_id,
+            "generation": generation,
+            "timestamp": timestamp,
+            "interest_score": round(interest_score, 2),
+            "physics_hz": self.cfg.physics.physics_hz,
+            "rl_hz": self.cfg.physics.rl_hz,
+            "field_width": self.cfg.physics.field_width,
+            "field_height": self.cfg.physics.field_height,
+            "goal_y_min": self.cfg.physics.goal_y_min,
+            "goal_y_max": self.cfg.physics.goal_y_max,
+            "keeper_box_radius": self.cfg.physics.keeper_box_radius,
+            "player_radius": self.cfg.physics.player_radius,
+            "ball_radius": self.cfg.physics.ball_radius,
+            "vision_fov_deg": self.cfg.vision.fov_deg,
+            "vision_max_range": self.cfg.vision.max_range,
+            "agents": self.possible_agents,
+            "final_stats": stats,
+            "highlights": highlights,
+        }
+
+        meta_json = json.dumps(metadata_block, indent=2)
+        meta_indented = "\n".join("  " + line for line in meta_json.splitlines())
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("{\n  \"metadata\": ")
+            f.write(meta_indented.lstrip())
+            f.write(",\n  \"frames\": [\n")
+            last_idx = len(frames) - 1
+            for i, fr in enumerate(frames):
+                suffix = ",\n" if i < last_idx else "\n"
+                f.write("    " + json.dumps(fr) + suffix)
+            f.write("  ]\n}\n")
+
+        self.last_saved_replay_path = filepath
+        return filepath
+
+    def _maybe_export_replay(self) -> Optional[str]:
+        """Export or defer the full 60 Hz JSON trajectory if `interest_score >= threshold`."""
+        if not self.uniform_capture and not self.export_replays:
+            self.last_saved_replay_path = None
+            return None
+        interest_score = self.compute_interest_score()
+        if self.uniform_capture:
+            self._uniform_replay = {
+                "match_id": self.current_match_id,
+                "generation": self.current_generation,
+                "interest_score": interest_score,
+                "stats": copy.deepcopy(self.stats),
+                "frames": self._ensure_replay_buffer().snapshot(),
+            }
+        if not self.export_replays:
+            self.last_saved_replay_path = None
+            return None
+        if interest_score < self.cfg.replay.interest_threshold:
+            return None
+
+        if self.cfg.replay.save_best_only:
+            cur_goals = int(self.stats.get("goals", 0))
+            if self._deferred_replay is None or (
+                interest_score,
+                cur_goals,
+            ) >= (
+                float(self._deferred_replay["interest_score"]),
+                int(self._deferred_replay["stats"].get("goals", 0)),
+            ):
+                self._deferred_replay = {
+                    "match_id": self.current_match_id,
+                    "generation": self.current_generation,
+                    "interest_score": interest_score,
+                    "stats": copy.deepcopy(self.stats),
+                    "frames": self._ensure_replay_buffer().snapshot(),
+                }
+            self.last_saved_replay_path = None
+            return None
+
+        return self._write_replay_to_disk(
+            match_id=self.current_match_id,
+            generation=self.current_generation,
+            interest_score=interest_score,
+            stats=self.stats,
+            frames=self.replay_frames,
+        )
+
+    def export_uniform_replay(self) -> Optional[str]:
+        """Write the most recent match captured while `uniform_capture` was set, once; `None` if there is none."""
+        payload = self._uniform_replay
+        if payload is None:
+            return None
+        self._uniform_replay = None
+        previous = self.last_saved_replay_path
+        path = self._write_replay_to_disk(
+            match_id=int(payload["match_id"]),
+            generation=int(payload["generation"]),
+            interest_score=float(payload["interest_score"]),
+            stats=payload["stats"],
+            frames=payload["frames"].materialize(),
+            tag="uniform",
+        )
+        self.last_saved_replay_path = previous
+        return path
+
+    def export_deferred_replay(self) -> Optional[str]:
+        """Write the deferred replay snapshot to disk when selected as the winning worker."""
+        if self._deferred_replay is not None:
+            payload = self._deferred_replay
+            self._deferred_replay = None
+            return self._write_replay_to_disk(
+                match_id=int(payload["match_id"]),
+                generation=int(payload["generation"]),
+                interest_score=float(payload["interest_score"]),
+                stats=payload["stats"],
+                frames=payload["frames"].materialize(),
+            )
+        if self._replay_buffer is not None and len(self._replay_buffer) > 0:
+            interest_score = self.compute_interest_score()
+            if interest_score >= self.cfg.replay.interest_threshold:
+                return self._write_replay_to_disk(
+                    match_id=self.current_match_id,
+                    generation=self.current_generation,
+                    interest_score=interest_score,
+                    stats=self.stats,
+                    frames=self.replay_frames,
+                )
+        return None

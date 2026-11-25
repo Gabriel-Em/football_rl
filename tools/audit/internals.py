@@ -12,7 +12,7 @@ column has no tanh gradient scale) and are None when no such decision exists. Th
 (`keeper_special_rate`, `field_special_rate_far`, `keeper_kick_fire_holding`) read the env-space `act` columns,
 so they mean the same thing for both policy heads.
 
-Tackle counters: in `football_rl/env.py`, `self.stats["failed_tackles"]` and `self.stats["successful_tackles"]`
+Tackle counters: in `football_rl/ball_play.py`, `self.stats["failed_tackles"]` and `self.stats["successful_tackles"]`
 are incremented across the match and never reset per step, and `tools/audit/harness.py` records them after each
 step; both `s_failed_tackles` and `s_successful_tackles` are therefore cumulative series, and the per-match total
 is the final step's value.
