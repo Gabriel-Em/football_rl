@@ -4648,3 +4648,211 @@ class TestBasinKeys:
             assert met[key]["n"] == 2, key
         line = next(ln for ln in census.report(per_match[:1], title="hand").splitlines() if ln.startswith("basin:"))
         assert line == "basin: reverse 0.075 +- n/a (n=1) | facing ball 0.950 +- n/a (n=1) | tackle-ready -  (n=0)"
+
+
+# ----------------------------------------------------------------------------
+# Kick-conditional aim head (`hybrid6`) in the harness and the aim-control internals
+# ----------------------------------------------------------------------------
+def write_hybrid6_checkpoint(directory: Path, seed: int = 0, spread: float = 0.3) -> Path:
+    """hybrid6 checkpoint (both teams) whose outputs depend on the observation."""
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head="hybrid6")
+            with torch.no_grad():
+                net.actor_mean[4].weight.normal_(0.0, spread)
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+def write_constant_hybrid6_checkpoint(directory: Path, z_kick: float) -> Path:
+    """hybrid6 checkpoint with observation-independent outputs: throttle 0.7, steer -0.2, power 0.4, aim 0.6 (pre-tanh),
+    special -3."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head="hybrid6")
+            with torch.no_grad():
+                net.actor_mean[4].weight.zero_()
+                net.actor_mean[4].bias.copy_(torch.tensor([0.7, -0.2, 0.4, 0.6, z_kick, -3.0]))
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+TANH_AIM = 0.5370496  # tanh(0.6)
+
+
+class TestHybrid6Harness:
+    def test_a_hybrid6_team_plays_a_scripted_team_and_records_its_aim_means(self, tmp_path):
+        """[RED] CLI, one match of 30 decisions: `head` is [2, 0]; `aim_mean` (30, 12) float32 is finite on team A's seats
+        and NaN on the scripted team's; a match without a hybrid6 team has no `aim_mean`."""
+        d = write_hybrid6_checkpoint(tmp_path / "c", seed=2)
+        out = tmp_path / "out"
+        argv = ["--checkpoint-dir", str(d), "--opp", "scripted", "--n", "1", "--seed", "3", "--workers", "1",
+                "--max-steps", "30", "--out-dir", str(out)]
+        assert harness.main(argv) == 0
+        with np.load(out / "m000.npz") as trace:
+            assert trace["head"].tolist() == [2, 0]
+            aim = trace["aim_mean"]
+            assert aim.shape == (30, 12) and aim.dtype == np.float32
+            assert np.isfinite(aim[:, :6]).all() and np.isnan(aim[:, 6:]).all()
+            assert trace["act"].shape == (30, 12, 4) and np.isfinite(trace["act"]).all()
+        h5 = write_head_checkpoint(tmp_path / "h5", {"blue": "hybrid5", "red": "hybrid5"})
+        assert "aim_mean" not in harness.play_match(quick_spec(h5, max_steps=5), 0)
+
+    def test_a_firing_holder_kicks_along_the_aim_mean_and_every_other_seat_steers(self, tmp_path):
+        """[RED] Constant head, kick logit +3 (p 0.937): greedy fires on every seat; the seat whose observation index 7 is 1
+        (slot 2) gets env steer tanh(0.6) = 0.5370496, every other seat tanh(-0.2) = -0.1973753. The recorded steer mean is
+        tanh(-0.2) on every seat and the aim mean tanh(0.6). Mixed uses the same two means. With kick logit -3 nobody fires
+        and slot 2 steers too."""
+        obs, cen = _obs_cen()
+        obs[:, 7] = 0.0
+        obs[2, 7] = 1.0
+        fires = harness.TeamPolicy(str(write_constant_hybrid6_checkpoint(tmp_path / "on", 3.0)), "blue")
+        assert fires.head == 2
+        expected_steer = [CONST_STEER, CONST_STEER, TANH_AIM, CONST_STEER, CONST_STEER, CONST_STEER]
+        aim = np.full(6, np.nan, dtype=np.float32)
+        a, _, m = fires.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0), aim_out=aim)
+        np.testing.assert_allclose(a[:, 1], expected_steer, atol=1e-6)
+        np.testing.assert_allclose(a[:, 2], CONST_KICK_ACTION, atol=1e-6)
+        np.testing.assert_allclose(m[:, 1], CONST_STEER, atol=1e-6)
+        np.testing.assert_allclose(aim, TANH_AIM, atol=1e-6)
+        mixed, _, _ = fires.act(obs, cen, "mixed", 1.0, torch.Generator().manual_seed(1))
+        fired = mixed[:, 2] != -1.0
+        np.testing.assert_allclose(mixed[fired, 1], np.array(expected_steer)[fired], atol=1e-6)
+        silent = harness.TeamPolicy(str(write_constant_hybrid6_checkpoint(tmp_path / "off", -3.0)), "blue")
+        a, _, _ = silent.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+        np.testing.assert_allclose(a[:, 1], CONST_STEER, atol=1e-6)
+        assert (a[:, 2] == -1.0).all()
+
+    def test_sigma_scale_moves_the_four_gaussian_heads(self, tmp_path):
+        """[RED] Sampled, kick logit +3: the fired holder's env steer is the aim sample, which sits at the aim mean at scale 0
+        and moves away from it by twice as much at scale 2 as at scale 1 (same generator state)."""
+        obs, cen = _obs_cen()
+        obs[:, 7] = 1.0
+        team = harness.TeamPolicy(str(write_constant_hybrid6_checkpoint(tmp_path / "c", 3.0)), "blue")
+        zero, one, two = (team.act(obs, cen, "sampled", s, torch.Generator().manual_seed(4))[0] for s in (0.0, 1.0, 2.0))
+        fired = (zero[:, 2] != -1.0) & (one[:, 2] != -1.0)
+        assert fired.sum() >= 3
+        np.testing.assert_allclose(zero[fired, 1], TANH_AIM, atol=1e-6)
+        np.testing.assert_allclose((two - zero)[fired][:, [0, 1]], 2.0 * (one - zero)[fired][:, [0, 1]], rtol=1e-4, atol=1e-6)
+
+
+def aim_control_trace(head, x_from_aim: bool, n_points: int = 12) -> dict:
+    """`n_points` aim points of kicker A3 at rows 5, 55, 105, ... (50 apart). Point i: teammate A4 at +17.5 deg when i is even
+    and -17.5 deg when odd (need +0.5 / -0.5); the steer mean one row earlier is +0.5 for i // 2 even, -0.5 otherwise; the
+    kick's intended steer x_k equals need, stored in `aim_mean` (hybrid6 seat) or in `mean[..., 1]`; the sampled steer is
+    x_k + 0.1 for even i and x_k - 0.1 for odd i."""
+    T = 50 * n_points + 10
+    tr = make_internals_trace(T)
+    tr["mean"][:] = 0.0
+    tr["act"][:] = 0.0
+    tr["head"] = np.array(head, dtype=np.int8)
+    if x_from_aim:
+        tr["aim_mean"] = np.full((T, 12), np.nan, dtype=np.float32)
+        tr["aim_mean"][:, :6] = 0.9                       # a value no point reads
+    for i in range(n_points):
+        k = 5 + 50 * i
+        need = 0.5 if i % 2 == 0 else -0.5
+        aim_scene(tr, k, {4: 35.0 * need})
+        tr["mean"][k - 1, 3, 1] = 0.5 if (i // 2) % 2 == 0 else -0.5
+        if x_from_aim:
+            tr["aim_mean"][k, 3] = need
+            tr["mean"][k, 3, 1] = -0.7                    # the steer mean, never read for a hybrid6 seat
+        else:
+            tr["mean"][k, 3, 1] = need
+        tr["act"][k, 3, 1] = need + (0.1 if i % 2 == 0 else -0.1)
+    return tr
+
+
+class TestAimControl:
+    @staticmethod
+    def _hand(n_rep: int = 6):
+        m_prev = np.tile([0.5, 0.5, -0.5, -0.5], n_rep)
+        need = np.tile([0.5, -0.5, 0.5, -0.5], n_rep)
+        return m_prev, need
+
+    def test_stats_on_orthogonal_hand_arrays(self):
+        """[RED] 24 points, m_prev and need zero-mean and orthogonal: x_k = need -> r2_prev 0, gain 1; x_k = 0.5 m_prev ->
+        r2_prev 1, gain 0. With an intercept, x_k = m_prev on m_prev' = m_prev + 1 (mean 1) still gives r2_prev 1 and gain 0
+        (a fit through the origin would give r2_prev 0.36)."""
+        from tools.audit import internals
+
+        m_prev, need = self._hand()
+        s = internals.aim_control_stats(need, m_prev, need)
+        assert s["aim_control_r2_prev"] == pytest.approx(0.0, abs=1e-12)
+        assert s["aim_control_r2_gain"] == pytest.approx(1.0, abs=1e-12)
+        s = internals.aim_control_stats(0.5 * m_prev, m_prev, need)
+        assert s["aim_control_r2_prev"] == pytest.approx(1.0, abs=1e-12)
+        assert s["aim_control_r2_gain"] == pytest.approx(0.0, abs=1e-12)
+        s = internals.aim_control_stats(m_prev, m_prev + 1.0, need)
+        assert s["aim_control_r2_prev"] == pytest.approx(1.0, abs=1e-12)
+        assert s["aim_control_r2_gain"] == pytest.approx(0.0, abs=1e-12)
+
+    def test_stats_are_none_below_twenty_points(self):
+        """[RED] 19 points give None for both keys; 20 points give numbers."""
+        from tools.audit import internals
+
+        m_prev, need = self._hand(n_rep=5)
+        s = internals.aim_control_stats(need[:19], m_prev[:19], need[:19])
+        assert s == {"aim_control_r2_prev": None, "aim_control_r2_gain": None}
+        s = internals.aim_control_stats(need, m_prev, need)
+        assert s["aim_control_r2_gain"] == pytest.approx(1.0, abs=1e-12)
+
+    def test_point_extraction_reads_the_aim_mean_of_a_hybrid6_seat(self):
+        """[RED] One point at row 5 (kicker A3, A4 at +17.5 deg -> need 0.5); steer mean -0.6 at row 5 and 0.1 at row 4;
+        aim mean 0.4 at row 5; sampled steer 0.7. Head [2, 0]: (x_k, m_prev, need, noise) = (0.4, 0.1, 0.5, 0.3).
+        Head [1, 0]: x_k is the steer mean -0.6 and the noise 1.3."""
+        from tools.audit import internals
+
+        tr = make_internals_trace(20)
+        tr["mean"][:] = 0.0
+        tr["act"][:] = 0.0
+        aim_scene(tr, 5, {4: 17.5})
+        tr["mean"][5, 3, 1], tr["mean"][4, 3, 1], tr["act"][5, 3, 1] = -0.6, 0.1, 0.7
+        tr["aim_mean"] = np.full((20, 12), np.nan, dtype=np.float32)
+        tr["aim_mean"][5, 3] = 0.4
+        tr["head"] = np.array([2, 0], dtype=np.int8)
+        np.testing.assert_allclose(internals.aim_control_points(tr), [[0.4, 0.1, 0.5, 0.3]], atol=1e-6)
+        tr["head"] = np.array([1, 0], dtype=np.int8)
+        np.testing.assert_allclose(internals.aim_control_points(tr), [[-0.6, 0.1, 0.5, 1.3]], atol=1e-6)
+        del tr["aim_mean"]
+        np.testing.assert_allclose(internals.aim_control_points(tr), [[-0.6, 0.1, 0.5, 1.3]], atol=1e-6)
+
+    def test_points_pool_over_matches_in_the_summary_and_the_cli(self, tmp_path, capsys):
+        """[RED] Two matches of 12 points each (one hybrid6 team reading `aim_mean`, one hybrid5 team reading the steer mean),
+        x_k = need: pooled r2_prev 0, gain 1, noise SD 0.1 over 24 points. Each match alone (12 points) gives None. The CLI
+        writes them under `aim_control` beside the summary; the per-match records keep their keys."""
+        from tools.audit import internals
+
+        traces = [aim_control_trace([2, 0], True), aim_control_trace([1, 0], False)]
+        met = internals.aim_control([internals.aim_control_points(t) for t in traces])
+        assert met["aim_control_r2_prev"] == {"mean": pytest.approx(0.0, abs=1e-12), "se": None, "n": 24}
+        assert met["aim_control_r2_gain"] == {"mean": pytest.approx(1.0, abs=1e-12), "se": None, "n": 24}
+        assert met["kick_steer_noise_sd"] == {"mean": pytest.approx(0.1, abs=1e-6), "se": None, "n": 24}
+        alone = internals.aim_control([internals.aim_control_points(traces[0])])
+        assert alone["aim_control_r2_gain"]["mean"] is None and alone["aim_control_r2_gain"]["n"] == 12
+        assert alone["kick_steer_noise_sd"]["mean"] is None
+        d = tmp_path / "t"
+        d.mkdir()
+        for i, tr in enumerate(traces):
+            np.savez_compressed(d / f"m{i:03d}.npz", **tr)
+        out_json = tmp_path / "internals.json"
+        assert internals.main([str(d), "--json", str(out_json)]) == 0
+        assert "aim control" in capsys.readouterr().out
+        payload = json.loads(out_json.read_text(encoding="utf-8"))[str(d)]
+        assert payload["aim_control"]["aim_control_r2_gain"]["mean"] == pytest.approx(1.0, abs=1e-12)
+        assert payload["aim_control"]["aim_control_r2_gain"]["n"] == 24
+        assert all("aim_control_r2_gain" not in m for m in payload["per_match"])
+
+    def test_head_code_2_reads_the_fire_columns_like_hybrid5(self):
+        """[RED] Kick and special intent, saturation and gradient scale of a head-2 team equal those of a head-1 team."""
+        from tools.audit import internals
+
+        tr = TestInternalsHybridHead._trace([1, 0])
+        ref = internals.match_internals(tr)
+        tr["head"] = np.array([2, 0], dtype=np.int8)
+        got = internals.match_internals(tr)
+        for key in internals.METRIC_KEYS:
+            assert got[key] == ref[key], key

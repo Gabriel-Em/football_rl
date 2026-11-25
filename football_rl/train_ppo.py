@@ -38,6 +38,9 @@ from football_rl.opponent_pool import (
 )
 from football_rl.policy import (
     ActorCritic,
+    FIRE_HEADS,
+    HOLDING_OBS_INDEX,
+    HYBRID6_ACTION_DIM,
     HYBRID_ACTION_DIM,
     _hybrid_log_prob,
     holds_return_statistics,
@@ -69,6 +72,12 @@ def validate_replay_settings(replay_every: Any, replay_kind: Any) -> Tuple[int, 
     if not isinstance(replay_kind, str) or replay_kind not in REPLAY_KINDS:
         raise ValueError(f"--replay-kind / replay_kind must be one of {REPLAY_KINDS}, got {replay_kind!r}")
     return int(replay_every), replay_kind
+
+
+def validate_pool_head(pool_envs: int, policy_head: str) -> None:
+    """Raise ValueError for an opponent pool with the hybrid6 head: frozen pool seats are sampled without an aim head."""
+    if pool_envs > 0 and policy_head == "hybrid6":
+        raise ValueError("pool_envs > 0 is not available with policy_head 'hybrid6': frozen pool seats have no aim head")
 
 
 def _run_git(args: Sequence[str]) -> Optional[str]:
@@ -131,6 +140,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         validate_pool_settings(
             int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed), bool(shared_keepers)
         )
+        validate_pool_head(int(pool_envs), config.ppo.policy_head)
         self.replay_every, self.replay_kind = validate_replay_settings(replay_every, replay_kind)
         self._export_replays_active: bool = True
         self._uniform_capture_active: bool = False
@@ -155,7 +165,9 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         self._pool_skipped: set = set()
         self.git_commit: str = current_git_commit()
         self.policy_head: str = self.cfg.ppo.policy_head
-        self.policy_action_dim: int = HYBRID_ACTION_DIM if self.policy_head == "hybrid5" else ACTION_DIM
+        self.policy_action_dim: int = {"hybrid5": HYBRID_ACTION_DIM, "hybrid6": HYBRID6_ACTION_DIM}.get(
+            self.policy_head, ACTION_DIM
+        )
         self.save_best_only = save_best_only or self.cfg.replay.save_best_only
         if self.save_best_only != self.cfg.replay.save_best_only:
             self.cfg = replace(
@@ -338,7 +350,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         """Query Red and Blue role policies for `(num_envs, len(ALL_AGENTS), OBS_DIM)` observations.
 
         Returns `(actions, logprobs, values)`; with `with_means` the policy mean actions are appended.
-        Each role group is one forward pass and one random draw, taken in agent order; under `hybrid5` the groups'
+        Each role group is one forward pass and one random draw, taken in agent order; under a hybrid head the groups'
         forward passes are followed by one draw for all groups together.
         """
         n = self.num_envs
@@ -349,8 +361,8 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             else None
         )
         outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
-        hybrid = self.policy_head == "hybrid5"
-        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor]] = []
+        hybrid = self.policy_head in FIRE_HEADS
+        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = []
         for indices, policy in self._rollout_groups():
             rows = slice(indices[0], indices[-1] + 1) if indices[-1] - indices[0] + 1 == len(indices) else indices
             # Contiguous rows: the CPU matmul's summation order depends on the input row stride.
@@ -358,7 +370,8 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             g_cen = cen_t[:, rows, :].reshape(-1, CENTRAL_STATE_DIM) if cen_t is not None else None
             if hybrid:
                 z, value = policy.hybrid_logits_and_value(g_obs, central_state=g_cen)
-                pending.append((indices, policy, z, value))
+                holding = g_obs[:, HOLDING_OBS_INDEX] > 0.5 if policy.aim else None
+                pending.append((indices, policy, z, value, holding))
                 continue
             outputs.append(
                 (
@@ -395,30 +408,34 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
     @torch.no_grad()
     def _sample_hybrid_groups(
         self,
-        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor]],
+        pending: List[Tuple[List[int], ActorCritic, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
         deterministic: bool,
         with_means: bool,
     ) -> List[Tuple[List[int], Tuple[torch.Tensor, ...]]]:
-        """Sample hybrid5 actions for all role groups at once from their output logits.
+        """Sample hybrid5 or hybrid6 actions for all role groups at once from their output logits.
 
         The fire probabilities, one Gaussian draw, one Bernoulli draw and the log-probabilities are computed on the
-        rows of every group stacked in group order, each row with its own policy's `actor_logstd`; the results are
-        split back per group as `(action, log_prob, value[, env-space mean])`.
+        rows of every group stacked in group order, each row with its own policy's `actor_logstd` and, under hybrid6,
+        the holding flag of its observation row; the results are split back per group as
+        `(action, log_prob, value[, env-space mean])`.
         """
         first = pending[0][1]
-        counts = [z.shape[0] for _, _, z, _ in pending]
-        z = torch.cat([z for _, _, z, _ in pending])
-        logstd = torch.cat([pol.actor_logstd.expand(c, 3) for (_, pol, _, _), c in zip(pending, counts)])
+        counts = [z.shape[0] for _, _, z, _, _ in pending]
+        z = torch.cat([z for _, _, z, _, _ in pending])
+        logstd = torch.cat(
+            [pol.actor_logstd.expand(c, first.n_gauss) for (_, pol, _, _, _), c in zip(pending, counts)]
+        )
+        holding = torch.cat([h for _, _, _, _, h in pending]) if first.aim else None
         mean3, p = first._hybrid_split(z)
         if deterministic:
             action = first._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
         else:
             action = torch.cat([torch.normal(mean3, torch.exp(logstd)), torch.bernoulli(p)], dim=-1)
-        log_prob = _hybrid_log_prob(mean3, logstd, p, action)
+        log_prob = _hybrid_log_prob(mean3, logstd, p, action, holding)
         env_mean = first._hybrid_env_mean(mean3, p[..., 0], p[..., 1]) if with_means else None
         outputs: List[Tuple[List[int], Tuple[torch.Tensor, ...]]] = []
         start = 0
-        for (indices, _, _, value), count in zip(pending, counts):
+        for (indices, _, _, value, _), count in zip(pending, counts):
             part = slice(start, start + count)
             fields: Tuple[torch.Tensor, ...] = (action[part], log_prob[part], value)
             if env_mean is not None:
@@ -654,10 +671,12 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             buf_logp[t] = logprobs
             buf_val[t] = values
 
+            # hybrid6 decodes the steer with the holding flag of the observation rows the actions were drawn for.
+            holding = self.current_obs[..., HOLDING_OBS_INDEX] > 0.5 if self.policy_head == "hybrid6" else None
             env_actions = (
                 actions
                 if self.policy_head == "gaussian4"
-                else to_env_actions(actions, self.cfg.mechanics.kick_trigger_threshold)
+                else to_env_actions(actions, self.cfg.mechanics.kick_trigger_threshold, holding=holding)
             )
             act_clipped = np.clip(env_actions, -1.0, 1.0)
             obs_batch, central_batch, rew_batch, done_batch, ep_summaries = (
@@ -911,7 +930,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                     }
                     gen_record["ret_mean"] = {role: pol.return_stats()[0] for role, pol in role_policies.items()}
                     gen_record["ret_std"] = {role: pol.return_stats()[1] for role, pol in role_policies.items()}
-                if self.policy_head == "hybrid5":
+                if self.policy_head in FIRE_HEADS:
                     roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
                     gen_record["fire_sat"] = {
                         role: {"kick": metrics[role]["fire_sat_kick"], "spec": metrics[role]["fire_sat_spec"]}
@@ -919,6 +938,15 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                     }
                     gen_record["p_kick"] = {role: metrics[role]["p_kick"] for role in roles}
                     gen_record["p_spec"] = {role: metrics[role]["p_spec"] for role in roles}
+                if self.policy_head == "hybrid6":
+                    logstds = {
+                        "blue_field": self.blue_field_policy.actor_logstd,
+                        "blue_keeper": self.blue_keeper_policy.actor_logstd,
+                        "red_field": self.red_field_policy.actor_logstd,
+                        "red_keeper": self.red_keeper_policy.actor_logstd,
+                    }
+                    gen_record["aim_logstd"] = {role: float(ls[0, 3]) for role, ls in logstds.items()}
+                    gen_record["steer_logstd"] = {role: float(ls[0, 1]) for role, ls in logstds.items()}
                 self.generation_history.append(gen_record)
                 self.current_generation = gen
 
@@ -1178,6 +1206,7 @@ def main() -> None:
     validate_pool_settings(
         args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed, args.shared_keepers
     )
+    validate_pool_head(args.pool_envs, cfg.ppo.policy_head)
     validate_replay_settings(args.replay_every, args.replay_kind)
 
     # 3. Handle `--from-scratch` vs automatic/explicit `--resume`

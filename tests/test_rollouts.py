@@ -1039,6 +1039,16 @@ class TestHoldIntentSplit:
             tr["mean"][step, 9, 2] = 0.9            # the other team's seat is never read for holder 3
             assert rollouts.decision_intent(tr, step, 3) == expected, (mean_kick, expected)
 
+    def test_intent_hybrid6_reads_p_from_the_kick_mean_like_hybrid5(self):
+        """[RED] hybrid6 (`head[team] == 2`) records the kick column as 2 p - 1 too: the same five cases as hybrid5."""
+        from tools.audit import rollouts
+
+        tr = self._intent_trace([2, 0])
+        cases = {0.2: "kick", 0.0: "mid", -0.88: "mid", -0.92: "hold", -1.0: "hold"}
+        for step, (mean_kick, expected) in enumerate(cases.items()):
+            tr["mean"][step, 3, 2] = mean_kick
+            assert rollouts.decision_intent(tr, step, 3) == expected, (mean_kick, expected)
+
     def test_intent_gaussian4_threshold_is_strict_at_0_35(self):
         """[RED] gaussian4 (`head[team] == 0`, or no `head` field): kick if mean_kick > 0.35, else hold (never mid)."""
         from tools.audit import rollouts

@@ -2049,7 +2049,7 @@ def test_policy_head_config_defaults_are_todays_policy_and_literals() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"policy_head": "hybrid6"},
+        {"policy_head": "hybrid7"},
         {"policy_head": ""},
         {"logstd_min": -0.35},                       # equal bounds
         {"logstd_min": -0.3},                        # inverted bounds
@@ -5723,3 +5723,327 @@ class TestFieldActorLambda:
             tp.parse_config_overrides(["ppo.field_actor_gae_lambda=1.5"])
         with pytest.raises(ValueError, match="field_actor_gae_lambda"):
             tp.parse_config_overrides(["ppo.field_actor_gae_lambda=nan"])
+
+
+# ==============================================================================
+# Kick-conditional aim head (`ppo.policy_head = "hybrid6"`)
+# ==============================================================================
+def _h6_inputs(k: float, h: float, aim_logstd: float = 0.0):
+    """Means 0, logstd 0 (aim `aim_logstd`), p_kick 0.25, p_spec 0.5; action thr 0.5, steer 1.0, u 0.0, a 2.0, K k, S 0."""
+    mean = torch.zeros(1, 4, dtype=torch.float64)
+    logstd = torch.tensor([[0.0, 0.0, 0.0, aim_logstd]], dtype=torch.float64)
+    p_kick = torch.tensor([0.25], dtype=torch.float64)
+    p_spec = torch.tensor([0.5], dtype=torch.float64)
+    action = torch.tensor([[0.5, 1.0, 0.0, 2.0, k, 0.0]], dtype=torch.float64)
+    return mean, logstd, p_kick, p_spec, action, torch.tensor([h], dtype=torch.float64)
+
+
+def _h6_trainer(tmp_path: Path, name: str = "ckpt", **kwargs) -> ParameterSharingPPOTrainer:
+    return _head_trainer(tmp_path, head="hybrid6", name=name, **kwargs)
+
+
+class TestHybrid6:
+    @pytest.fixture(autouse=True)
+    def _fixed_commit(self, monkeypatch) -> None:
+        """A trainer reads the commit when it is built; these tests hand it a fixed answer instead of running git."""
+        monkeypatch.setattr(tp, "current_git_commit", lambda: "unit-test")
+
+    # ln N(x | 0, 1) = -x^2 / 2 - 0.9189385332; ln 0.25 = -1.3862943611, ln 0.75 = -0.2876820725, ln 0.5 = -0.6931471806.
+    def test_log_prob_hand_values(self) -> None:
+        """[RED] K 1, h 1: lnN(0.5) + lnN_aim(2) + lnN(0) + ln 0.25 + ln 0.5 = -6.961257141. K 1, h 0: the steer term lnN(1)
+        replaces the aim term: -5.461257141. K 0, h 1: lnN(0.5) + lnN(1) + ln 0.75 + ln 0.5 = -3.443706319. With the aim's
+        own logstd ln 2 (sigma 2): lnN(2 | 0, 2) = -0.5 - 0.6931471806 - 0.9189385332, total -6.154404322."""
+        for k, h, expected in ((1.0, 1.0, -6.961257141), (1.0, 0.0, -5.461257141), (0.0, 1.0, -3.443706319)):
+            mean, logstd, p_kick, p_spec, action, hold = _h6_inputs(k, h)
+            lp, _ = hybrid_log_prob_entropy(mean, logstd, p_kick, p_spec, action, holding=hold)
+            assert float(lp) == pytest.approx(expected, abs=1e-6), (k, h)
+        mean, logstd, p_kick, p_spec, action, hold = _h6_inputs(1.0, 1.0, aim_logstd=math.log(2.0))
+        lp, _ = hybrid_log_prob_entropy(mean, logstd, p_kick, p_spec, action, holding=hold)
+        assert float(lp) == pytest.approx(-6.154404322, abs=1e-6)
+
+    def test_six_wide_log_prob_requires_the_holding_flag(self) -> None:
+        """[RED] The 4-Gaussian block without `holding` is refused."""
+        mean, logstd, p_kick, p_spec, action, _ = _h6_inputs(1.0, 1.0)
+        with pytest.raises(ValueError, match="holding"):
+            hybrid_log_prob_entropy(mean, logstd, p_kick, p_spec, action)
+
+    def test_entropy_bonus_and_joint_entropy_hand_values(self) -> None:
+        """[RED] logstd 0 (each H = 1.4189385), p_kick 0.25, p_spec 0.5. Separate, ent_coef 0.01, fire_ent_coef 0:
+        h 1: 0.01 * (2 + 0.25 + 0.25) * H = 0.0354735; h 0: 0.01 * 2.25 * H = 0.0319261.
+        Joint: 2.5 H + H_B(0.25) + H_B(0.5) = 3.5473463 + 0.5623351 + 0.6931472 = 4.8028286 at h 1; 4.4480939 at h 0."""
+        logstd = torch.zeros(1, 4, dtype=torch.float64)
+        p = torch.tensor([[0.25, 0.5], [0.25, 0.5]], dtype=torch.float64)
+        hold = torch.tensor([1.0, 0.0], dtype=torch.float64)
+        bonus = hybrid_entropy_bonus(logstd, p, 0.01, "separate", 0.0, holding=hold)
+        assert bonus.tolist() == pytest.approx([0.0354735, 0.0319261], abs=1e-7)
+        joint = hybrid_entropy_bonus(logstd, p, 1.0, "joint", 0.0, holding=hold)
+        assert joint.tolist() == pytest.approx([4.8028286, 4.4480939], abs=1e-6)
+        mean, _, p_kick, p_spec, action, _ = _h6_inputs(0.0, 1.0)
+        _, ent = hybrid_log_prob_entropy(mean, logstd, p_kick, p_spec, action, holding=torch.tensor([1.0], dtype=torch.float64))
+        assert float(ent) == pytest.approx(4.8028286, abs=1e-6)
+
+    def test_holding_flag_is_exactly_one_on_the_holder_of_every_role(self) -> None:
+        """[GUARD] Observation index 7 is 1.0 on the holder (keeper seats 0 and 6, field seat 3) and 0.0 on the other
+        eleven seats; with no holder it is 0.0 everywhere."""
+        env = FootballParallelEnv(config=_quiet_cfg())
+        env.reset(seed=5)
+        for seat in (0, 6, 3):
+            env.ball_holder = seat
+            obs = env._get_observations_array()
+            expected = np.zeros(12, dtype=np.float32)
+            expected[seat] = 1.0
+            np.testing.assert_array_equal(obs[:, 7], expected)
+        env.ball_holder = None
+        np.testing.assert_array_equal(env._get_observations_array()[:, 7], np.zeros(12, dtype=np.float32))
+
+    def test_decode_uses_the_aim_only_when_the_holder_fires(self) -> None:
+        """[RED] Columns thr, steer, u, a, K, S. Env steer: a when K 1 and holding, steer otherwise. Kick 0.35 + 0.65 * 0.5
+        = 0.675 for u 0 when K 1, else -1; special +1 / -1. A 6-wide action without `holding` raises ValueError."""
+        pol = np.array(
+            [
+                [0.2, -0.3, 0.0, 0.8, 1.0, 0.0],   # holder fires -> aim
+                [0.2, -0.3, 0.0, 0.8, 1.0, 1.0],   # not holding, fires -> steer
+                [0.2, -0.3, 0.0, 0.8, 0.0, 0.0],   # holder, no fire -> steer
+                [0.2, -0.3, 0.0, 0.8, 0.0, 1.0],   # neither -> steer
+            ],
+            dtype=np.float32,
+        )
+        holding = np.array([True, False, True, False])
+        out = tp.to_env_actions(pol, 0.35, holding=holding)
+        np.testing.assert_allclose(
+            out,
+            [[0.2, 0.8, 0.675, -1.0], [0.2, -0.3, 0.675, 1.0], [0.2, -0.3, -1.0, -1.0], [0.2, -0.3, -1.0, 1.0]],
+            atol=1e-7,
+        )
+        with pytest.raises(ValueError, match="holding"):
+            tp.to_env_actions(pol, 0.35)
+        with pytest.raises(ValueError, match="holding"):
+            tp.to_env_actions(pol, 0.35, holding=np.array([True, False]))
+
+    def test_decode_reads_a_numeric_holding_flag_like_observation_column_7(self) -> None:
+        """[RED] `holding` given as the raw 0.0 / 1.0 observation column decodes like the boolean flag: env steer 0.8 (aim)
+        only on the firing holder, -0.3 (steer) on the other three rows."""
+        pol = np.array(
+            [
+                [0.2, -0.3, 0.0, 0.8, 1.0, 0.0],
+                [0.2, -0.3, 0.0, 0.8, 1.0, 1.0],
+                [0.2, -0.3, 0.0, 0.8, 0.0, 0.0],
+                [0.2, -0.3, 0.0, 0.8, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        out = tp.to_env_actions(pol, 0.35, holding=np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32))
+        np.testing.assert_allclose(out[:, 1], [0.8, -0.3, -0.3, -0.3], atol=1e-7)
+
+    def test_five_wide_decode_is_unchanged_and_ignores_holding(self) -> None:
+        """[GUARD] hybrid5 `[thr, steer, u, K, S]`: kick 0.35 + 0.65 * 0.5 = 0.675 for u 0, -1 when K 0; special +1 / -1;
+        throttle and steer pass through. Passing `holding` changes nothing."""
+        pol = np.array([[0.2, -0.3, 0.0, 1.0, 0.0], [0.5, 0.9, -1.0, 0.0, 1.0]], dtype=np.float32)
+        expected = [[0.2, -0.3, 0.675, -1.0], [0.5, 0.9, -1.0, 1.0]]
+        np.testing.assert_allclose(tp.to_env_actions(pol, 0.35), expected, atol=1e-7)
+        np.testing.assert_array_equal(tp.to_env_actions(pol, 0.35, holding=np.array([True, True])), tp.to_env_actions(pol, 0.35))
+
+    def test_gaussian4_and_hybrid5_log_probs_and_entropies_on_fixed_arrays(self) -> None:
+        """[GUARD] gaussian4: means 0, logstd 0, action (0.5, 1, 0, 2): lnN sum -1.0439385 - 1.4189385 - 0.9189385 - 2.9189385
+        = -6.300754, entropy 4 * 1.4189385 = 5.675754. hybrid5 with a `holding` argument keeps -4.836257 (K 1, S 0, zero
+        action) and entropy 4.448094."""
+        g = ActorCritic()
+        with torch.no_grad():
+            g.actor_mean[4].weight.zero_()
+            g.actor_mean[4].bias.zero_()
+            g.actor_logstd.zero_()
+        _, lp, ent, _ = g.get_action_and_value(torch.zeros(1, OBS_DIM), torch.tensor([[0.5, 1.0, 0.0, 2.0]]))
+        assert float(lp) == pytest.approx(-6.300754, abs=1e-5) and float(ent) == pytest.approx(5.675754, abs=1e-5)
+        mean = torch.zeros(1, 3, dtype=torch.float64)
+        logstd = torch.zeros(1, 3, dtype=torch.float64)
+        args = (mean, logstd, torch.tensor([0.25], dtype=torch.float64), torch.tensor([0.5], dtype=torch.float64),
+                torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]], dtype=torch.float64))
+        for kwargs in ({}, {"holding": torch.tensor([1.0], dtype=torch.float64)}):
+            lp5, ent5 = hybrid_log_prob_entropy(*args, **kwargs)
+            assert float(lp5) == pytest.approx(-4.836257, abs=1e-5) and float(ent5) == pytest.approx(4.448094, abs=1e-5)
+
+    def test_gradient_isolation_between_steer_and_aim(self) -> None:
+        """[RED] d log pi / d mean_aim is 0 on rows with K*h = 0, and d log pi / d mean_steer is 0 on rows with K*h = 1;
+        both are nonzero where their Gaussian counts (actions away from the means)."""
+        kh = [(1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]
+        mean = torch.full((4, 4), 0.1, dtype=torch.float64, requires_grad=True)
+        logstd = torch.zeros(1, 4, dtype=torch.float64)
+        action = torch.tensor([[0.5, 1.0, 0.0, 2.0, k, 0.0] for k, _ in kh], dtype=torch.float64)
+        hold = torch.tensor([h for _, h in kh], dtype=torch.float64)
+        p = torch.full((4,), 0.25, dtype=torch.float64)
+        lp, _ = hybrid_log_prob_entropy(mean, logstd, p, p, action, holding=hold)
+        (grad,) = torch.autograd.grad(lp.sum(), mean)
+        assert grad[:, 3].tolist()[1:] == [0.0, 0.0, 0.0] and grad[0, 3] != 0.0
+        assert grad[0, 1] == 0.0 and all(g != 0.0 for g in grad[1:, 1].tolist())
+
+    def test_shapes_and_head_detection(self) -> None:
+        """[RED] Six output logits, a (1, 4) logstd at -0.5, the policy action width 6 and `policy_head_of_weights` -> hybrid6."""
+        from football_rl.policy import HYBRID6_ACTION_DIM
+
+        net = ActorCritic(policy_head="hybrid6")
+        assert HYBRID6_ACTION_DIM == 6 and net.action_dim == 6
+        assert net.actor_mean[4].weight.shape == (6, 256)
+        assert net.actor_logstd.shape == (1, 4) and net.actor_logstd.eq(-0.5).all()
+        assert tp.policy_head_of_weights(net.state_dict()) == "hybrid6"
+        action, logp, _ = net.sample_action_and_value(torch.zeros(3, OBS_DIM))
+        assert action.shape == (3, 6) and set(action[:, 4:].flatten().tolist()) <= {0.0, 1.0} and logp.shape == (3,)
+
+    def test_config_accepts_hybrid6_and_names_the_three_heads(self) -> None:
+        """[RED] hybrid6 is a valid head, also with fire_entropy 'separate'; an unknown head's error lists all three."""
+        assert PPOHyperparams(policy_head="hybrid6").policy_head == "hybrid6"
+        ok = PPOHyperparams(policy_head="hybrid6", fire_entropy="separate", fire_ent_coef=0.0)
+        assert (ok.policy_head, ok.fire_entropy) == ("hybrid6", "separate")
+        with pytest.raises(ValueError, match=r"(?s)(?=.*gaussian4)(?=.*hybrid5)(?=.*hybrid6)"):
+            PPOHyperparams(policy_head="hybrid7")
+
+    def test_trainer_decodes_with_the_observed_holding_flag_and_the_update_reproduces_the_log_probs(self, tmp_path: Path) -> None:
+        """[RED] One env, real matches: the buffer holds 6-wide actions; the env receives
+        clip(to_env_actions(actions, 0.35, holding = obs[..., 7] > 0.5)); the first update minibatch (one minibatch, so the
+        rows keep their rollout order) recomputes the stored log-probabilities of the blue field policy within 1e-6."""
+        trainer = _h6_trainer(tmp_path, rollout_steps=120, num_minibatches=1, fire_entropy="separate", fire_ent_coef=0.0)
+        seen = []
+        real_step = trainer.vec_env.step_array
+
+        def spy(actions, values, action_means=None):
+            seen.append(np.array(actions, copy=True))
+            return real_step(actions, values, action_means=action_means)
+
+        trainer.vec_env.step_array = spy
+        captured = []
+        policy = trainer.blue_field_policy
+        real_forward = policy.get_action_and_value
+
+        def capture(*args, **kwargs):
+            out = real_forward(*args, **kwargs)
+            captured.append(out[1].detach().clone())
+            return out
+
+        try:
+            rollout = trainer.collect_rollouts(active_generation=1)
+            stored, obs = rollout["actions"], rollout["obs"]
+            assert stored.shape == (120, 1, 12, 6)
+            holding = obs[..., 7] > 0.5
+            fired_holder = (stored[..., 4] == 1.0) & holding
+            assert fired_holder.any() and ((stored[..., 4] == 1.0) & ~holding).any()
+            decoded = np.clip(tp.to_env_actions(stored, 0.35, holding=holding), -1.0, 1.0)
+            np.testing.assert_array_equal(np.stack(seen), decoded)
+            np.testing.assert_array_equal(np.stack(seen)[fired_holder][:, 1], np.clip(stored[fired_holder][:, 3], -1.0, 1.0))
+            policy.get_action_and_value = capture
+            trainer.update_policies(rollout)
+            first = captured[0]
+            expected = torch.as_tensor(rollout["logprobs"][:, :, trainer.blue_field_indices].reshape(-1))
+            assert float((first - expected).abs().max()) < 1e-6
+        finally:
+            trainer.close()
+
+    def test_checkpoint_round_trip_and_head_refusal(self, tmp_path: Path) -> None:
+        """[RED] A hybrid6 trainer reloads its weights exactly (logstd (1, 4)); hybrid5 and hybrid6 checkpoints refuse to load
+        into each other, through the state file and through bare policy files, naming both heads."""
+        a = _h6_trainer(tmp_path, name="a")
+        try:
+            a.train(total_updates=1)
+            assert torch.load(tmp_path / "a" / "training_state.pt", map_location="cpu", weights_only=False)["policy_head"] == "hybrid6"
+        finally:
+            a.close()
+        b = _h6_trainer(tmp_path, name="a")
+        try:
+            assert b.load_checkpoints() is True and b.current_generation == 1
+            for name, tensor in a.blue_field_policy.state_dict().items():
+                assert torch.equal(tensor, b.blue_field_policy.state_dict()[name]), name
+            assert b.red_keeper_policy.actor_logstd.shape == (1, 4)
+        finally:
+            b.close()
+        for saved, configured in (("hybrid5", "hybrid6"), ("hybrid6", "hybrid5")):
+            name = f"src_{saved}"
+            src = _head_trainer(tmp_path, head=saved, name=name)
+            try:
+                src.train(total_updates=1)
+            finally:
+                src.close()
+            for bare in (False, True):
+                if bare:
+                    (tmp_path / name / "training_state.pt").unlink()
+                dst = _head_trainer(tmp_path, head=configured, name=name)
+                try:
+                    with pytest.raises(ValueError, match=rf"(?s)(?=.*{saved})(?=.*{configured})"):
+                        dst.load_checkpoints()
+                finally:
+                    dst.close()
+
+    def test_generation_record_carries_fire_telemetry_and_both_logstds(self, tmp_path: Path) -> None:
+        """[RED] hybrid6 records `fire_sat`, `p_kick`, `p_spec` and, per role network, `aim_logstd` and `steer_logstd` equal to
+        that network's logstd columns 3 and 1 after the generation; hybrid5 records neither logstd key."""
+        trainer = _h6_trainer(tmp_path)
+        try:
+            pols = (trainer.blue_field_policy, trainer.blue_keeper_policy, trainer.red_field_policy, trainer.red_keeper_policy)
+            for i, pol in enumerate(pols):
+                with torch.no_grad():
+                    pol.actor_logstd.copy_(torch.tensor([[-0.5, -0.4 - 0.1 * i, -0.5, -1.0 + 0.1 * i]]))
+            trainer.train(total_updates=1)
+            rec = trainer.generation_history[0]
+            for role, pol in zip(ROLE_KEYS, pols):
+                assert rec["aim_logstd"][role] == float(pol.actor_logstd[0, 3])
+                assert rec["steer_logstd"][role] == float(pol.actor_logstd[0, 1])
+                assert math.isfinite(rec["p_kick"][role]) and set(rec["fire_sat"][role]) == {"kick", "spec"}
+            assert rec["aim_logstd"]["blue_field"] != rec["aim_logstd"]["red_keeper"]
+        finally:
+            trainer.close()
+        h5 = _head_trainer(tmp_path, name="h5")
+        try:
+            h5.train(total_updates=1)
+            assert not {"aim_logstd", "steer_logstd"} & set(h5.generation_history[0])
+        finally:
+            h5.close()
+
+    def test_the_opponent_pool_refuses_hybrid6(self, tmp_path: Path) -> None:
+        """[RED] Frozen pool seats are sampled without the aim head, so a hybrid6 trainer with `pool_envs > 0` is refused."""
+        with pytest.raises(ValueError, match="hybrid6"):
+            _pool_trainer(tmp_path, head="hybrid6", pool_envs=1)
+
+    def test_main_refuses_a_pool_with_hybrid6_before_wiping_the_batch(self, tmp_path: Path, monkeypatch) -> None:
+        """[RED] The pool refusal aborts `main(--from-scratch)` before anything on disk changes."""
+        monkeypatch.chdir(tmp_path)
+        marker = tmp_path / "checkpoints" / "marker.txt"
+        marker.parent.mkdir()
+        marker.write_text("keep", encoding="utf-8")
+        monkeypatch.setattr(
+            "sys.argv",
+            ["train_ppo", "--from-scratch", "--total-updates", "1", "--pool-envs", "1",
+             "--config-override", "ppo.policy_head=hybrid6"],
+        )
+        with pytest.raises(ValueError, match="hybrid6"):
+            tp.main()
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+        assert not (tmp_path / "replays").exists()
+
+    def test_update_reads_the_holding_flag_from_the_minibatch_observations(self, tmp_path: Path) -> None:
+        """[RED] Separate fire entropy, 64 rows with K = 1 on every row. With observation column 7 at 0 on every row the aim
+        Gaussian enters neither the log-probability nor the entropy bonus, so its logstd and mean output bias get no
+        gradient and Adam leaves them exactly where they were, while the steer logstd moves. With column 7 at 1 on half the
+        rows the aim logstd moves."""
+        torch.manual_seed(0)
+        for holders, aim_moves in ((0, False), (32, True)):
+            trainer = _h6_trainer(tmp_path, name=f"u{holders}", fire_entropy="separate", fire_ent_coef=0.0)
+            try:
+                policy = trainer.blue_field_policy
+                obs = torch.randn(64, OBS_DIM)
+                obs[:, 7] = 0.0
+                obs[:holders, 7] = 1.0
+                cen = torch.randn(64, CENTRAL_STATE_DIM)
+                with torch.no_grad():
+                    action, logp, _ = policy.sample_action_and_value(obs, central_state=cen)
+                action[:, 4] = 1.0
+                with torch.no_grad():
+                    _, logp, _, values = policy.get_action_and_value(obs, action, central_state=cen)
+                before = policy.actor_logstd.detach().clone()
+                aim_bias = float(policy.actor_mean[4].bias[3])
+                trainer._ppo_update_role(
+                    policy, trainer.blue_field_optimizer, obs, action, logp, torch.randn(64), torch.randn(64), values, cen
+                )
+                after = policy.actor_logstd.detach()
+                assert after[0, 1] != before[0, 1]
+                assert (after[0, 3] != before[0, 3]) == aim_moves
+                assert (float(policy.actor_mean[4].bias[3]) != aim_bias) == aim_moves
+            finally:
+                trainer.close()

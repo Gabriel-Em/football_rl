@@ -5,7 +5,7 @@ Every metric is computed per match from one trace and aggregated across matches 
 and 7..11.
 
 Policy heads: the trace's optional `head` field gives each team's head (0 = gaussian4, the default when the field
-is absent; 1 = hybrid5). A hybrid5 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
+is absent; 1 = hybrid5; 2 = hybrid6). A hybrid5 or hybrid6 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
 p = (mean + 1) / 2 > 0.5; a gaussian4 seat's intent is mean > 0.35 (kick) or mean > 0.5 (special). `sat99_*` and
 `grad_scale_*` of the kick and special columns are computed over gaussian4 field players only (a probability
 column has no tanh gradient scale) and are None when no such decision exists. The fire-behaviour metrics
@@ -39,6 +39,15 @@ Metrics
   failed_tackles_pm       per-match failed tackle total (final value of cumulative `s_failed_tackles`).
   successful_tackles_pm   per-match successful tackle total (final value of cumulative `s_successful_tackles`).
 
+Aim control (`aim_control`, reported per trace directory beside the per-match metrics: pooled over the points of all
+matches, not averaged per match; `n` is the point count, `se` is None, and every key is None with fewer than 20 points). Points are `rollouts.find_aim_points` kicks (outfield kickers with an open
+teammate in the kickable arc, already aimed or not) at a row k >= 1. x_k is the kick's intended steer: the aim mean
+`aim_mean[k, i]` of a hybrid6 seat, else the clipped steer mean `mean[k, i, 1]`; m_prev is the clipped steer mean at
+k - 1; need is `rollouts.aim_steer(deflection)`, the steer pointing the kick at the target.
+  aim_control_r2_prev     R^2 of x_k on m_prev (least squares with an intercept).
+  aim_control_r2_gain     R^2 of x_k on (m_prev, need) minus aim_control_r2_prev.
+  kick_steer_noise_sd     SD of the sampled kick steer `act[k, i, 1]` minus x_k.
+
 Usage:
   python tools/audit/internals.py TRACE_DIR [TRACE_DIR ...] [--json OUT]
 """
@@ -58,13 +67,17 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from football_rl.config import DEFAULT_CONFIG  # noqa: E402
-from tools.audit import census  # noqa: E402
+from tools.audit import census, rollouts  # noqa: E402
 
 __all__ = [
     "KEEPERS",
     "FIELD_PLAYERS",
     "HEAD_COLS",
     "METRIC_KEYS",
+    "AIM_CONTROL_KEYS",
+    "aim_control_points",
+    "aim_control_stats",
+    "aim_control",
     "match_internals",
     "summarize",
     "internals_payload",
@@ -77,7 +90,9 @@ FIELD_PLAYERS = (1, 2, 3, 4, 5, 7, 8, 9, 10, 11)
 TEAM_OUTFIELD_OFFSETS = np.arange(1, 6, dtype=np.int64)
 HEAD_COLS = (("throttle", 0), ("steer", 1), ("kick", 2), ("special", 3))
 TRACE_KEYS = ("mean", "act", "holder", "hold_t", "pos", "ang", "ball")
-OPTIONAL_TRACE_KEYS = ("head", "s_failed_tackles", "s_successful_tackles")
+# Further keys `aim_control_points` reads (through `rollouts.find_aim_points`).
+AIM_TRACE_KEYS = ("bvel", "side", "lastkick", "s_score")
+OPTIONAL_TRACE_KEYS = ("head", "s_failed_tackles", "s_successful_tackles", "aim_mean")
 
 KICK_THR = float(DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
 SPECIAL_THR = float(DEFAULT_CONFIG.mechanics.special_trigger_threshold)
@@ -118,6 +133,9 @@ METRIC_KEYS = (
     "failed_tackles_pm",
     "successful_tackles_pm",
 )
+AIM_CONTROL_KEYS = ("aim_control_r2_prev", "aim_control_r2_gain", "kick_steer_noise_sd")
+AIM_CONTROL_MIN_POINTS = 20
+HYBRID6_HEAD = 2
 
 
 def _aim_share(
@@ -140,6 +158,52 @@ def _aim_share(
     return float(hit.any(axis=1).mean())
 
 
+def aim_control_points(trace: Dict[str, np.ndarray]) -> np.ndarray:
+    """`(n, 4)` rows `(x_k, m_prev, need, noise)` of the trace's aim points with k >= 1 (see the module docstring)."""
+    mean = np.asarray(trace["mean"], dtype=np.float64)
+    act = np.asarray(trace["act"], dtype=np.float64)
+    team_head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
+    rows = []
+    for point in rollouts.find_aim_points(trace):
+        k, i = point["step"], point["kicker"]
+        if k < 1:
+            continue
+        if team_head[i // census.TEAM_SIZE] == HYBRID6_HEAD:
+            x_k = float(trace["aim_mean"][k, i])
+        else:
+            x_k = float(np.clip(mean[k, i, 1], -1.0, 1.0))
+        m_prev = float(np.clip(mean[k - 1, i, 1], -1.0, 1.0))
+        rows.append((x_k, m_prev, rollouts.aim_steer(point["deflection"]), float(act[k, i, 1]) - x_k))
+    return np.array(rows, dtype=np.float64).reshape(-1, 4)
+
+
+def _r2(y: np.ndarray, x: np.ndarray) -> float:
+    """Share of the variance of `y` explained by a least-squares fit on the columns of `x` and an intercept."""
+    design = np.column_stack([np.ones(len(y)), x])
+    beta, *_ = np.linalg.lstsq(design, y, rcond=None)
+    return float(1.0 - (y - design @ beta).var() / y.var())
+
+
+def aim_control_stats(x_k: np.ndarray, m_prev: np.ndarray, need: np.ndarray) -> Dict[str, Optional[float]]:
+    """`aim_control_r2_prev` and `aim_control_r2_gain` of pooled points; both None with fewer than 20 points."""
+    if len(x_k) < AIM_CONTROL_MIN_POINTS:
+        return {"aim_control_r2_prev": None, "aim_control_r2_gain": None}
+    r2_prev = _r2(x_k, m_prev)
+    return {
+        "aim_control_r2_prev": r2_prev,
+        "aim_control_r2_gain": _r2(x_k, np.column_stack([m_prev, need])) - r2_prev,
+    }
+
+
+def aim_control(points: Sequence[np.ndarray]) -> Dict[str, Dict[str, Any]]:
+    """The aim-control keys of the per-match `aim_control_points` arrays pooled: `{key: {mean, se: None, n: points}}`."""
+    pooled = np.concatenate([np.zeros((0, 4))] + list(points))
+    n_points = len(pooled)
+    values = dict(aim_control_stats(pooled[:, 0], pooled[:, 1], pooled[:, 2]))
+    values["kick_steer_noise_sd"] = float(pooled[:, 3].std()) if n_points >= AIM_CONTROL_MIN_POINTS else None
+    return {key: {"mean": values[key], "se": None, "n": n_points} for key in AIM_CONTROL_KEYS}
+
+
 def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     """Compute per-match policy-internal metrics from one harness trace."""
     holder = np.asarray(trace["holder"], dtype=np.int64)
@@ -157,7 +221,7 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     ang = np.asarray(trace["ang"], dtype=np.float64)
 
     team_head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
-    seat_hybrid = np.repeat(team_head == 1, census.TEAM_SIZE)
+    seat_hybrid = np.repeat(np.isin(team_head, (1, HYBRID6_HEAD)), census.TEAM_SIZE)
     field_hybrid = seat_hybrid[list(FIELD_PLAYERS)]
 
     rec = {"n_steps": n_steps}
@@ -332,10 +396,19 @@ def report(per_match: Sequence[Dict[str, Any]], title: str = "") -> str:
     return "\n".join(lines)
 
 
+def aim_control_line(aim: Dict[str, Dict[str, Any]]) -> str:
+    """Printable line of the pooled aim-control keys and their point count."""
+    return (
+        "aim control (r2 prev / gain / noise) : "
+        + " / ".join("-" if aim[k]["mean"] is None else f"{aim[k]['mean']:.3f}" for k in AIM_CONTROL_KEYS)
+        + f"  (points={aim['aim_control_r2_prev']['n']})"
+    )
+
+
 def _iter_internal_traces(directory: Path | str) -> Iterator[Dict[str, np.ndarray]]:
     for path in census._trace_paths(directory):
         with np.load(path) as z:
-            yield {k: z[k] for k in TRACE_KEYS + tuple(k for k in OPTIONAL_TRACE_KEYS if k in z.files)}
+            yield {k: z[k] for k in TRACE_KEYS + AIM_TRACE_KEYS + tuple(k for k in OPTIONAL_TRACE_KEYS if k in z.files)}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -345,9 +418,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     dump: Dict[str, Any] = {}
     for directory in args.trace_dirs:
-        per_match = [match_internals(t) for t in _iter_internal_traces(directory)]
+        per_match, points = [], []
+        for trace in _iter_internal_traces(directory):
+            per_match.append(match_internals(trace))
+            points.append(aim_control_points(trace))
+        aim = aim_control(points)
         print(report(per_match, title=str(directory)))
-        dump[str(directory)] = internals_payload(per_match)
+        print(aim_control_line(aim))
+        dump[str(directory)] = {**internals_payload(per_match), "aim_control": aim}
     if args.json:
         out_path = Path(args.json)
         out_path.parent.mkdir(parents=True, exist_ok=True)
