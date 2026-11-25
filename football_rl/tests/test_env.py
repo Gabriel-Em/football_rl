@@ -37,7 +37,7 @@ from football_rl.config import (
     TEAM_A,
     TEAM_B,
 )
-from football_rl.env import FootballParallelEnv, parallel_env, wrap_to_pi
+from football_rl.env import FootballParallelEnv, parallel_env
 from football_rl.potentials import PotentialState, compute_potentials
 from football_rl.replay import (
     ReplayViewer,
@@ -45,6 +45,7 @@ from football_rl.replay import (
     generate_demo_replay,
     load_replay_json,
 )
+from football_rl.scalar_math import wrap_to_pi
 from football_rl.train_ppo import (
     ParameterSharingPPOTrainer,
     archive_batch,

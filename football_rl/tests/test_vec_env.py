@@ -15,7 +15,8 @@ import pytest
 import torch
 
 from football_rl.config import ALL_AGENTS, CENTRAL_STATE_DIM, DEFAULT_CONFIG, ACTION_DIM, OBS_DIM
-from football_rl.env import FootballParallelEnv, _fast_clip
+from football_rl.env import FootballParallelEnv
+from football_rl.scalar_math import _fast_clip
 from football_rl.train_ppo import ActorCritic, ParameterSharingPPOTrainer
 from football_rl.vec_env import (
     DummyVecFootballEnv,
