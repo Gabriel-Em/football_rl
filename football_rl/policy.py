@@ -72,6 +72,9 @@ def validate_hybrid7_env_config(cfg: Any) -> None:
     """Verify the environment constants relied on by `kick_targets` for `hybrid7`, raising ValueError on mismatch."""
     phys = cfg.physics
     mech = cfg.mechanics
+    # KICK_READY_OBS_MIN is half of one 1/60 s substep in obs[8] units; another substep length moves the k = 1 hold.
+    if phys.dt != 1.0 / 60.0:
+        raise ValueError(f"hybrid7 requires dt == 1/60 s, got {phys.dt}")
     min_substeps = math.ceil(mech.pickup_kick_grace / phys.dt - phys.frame_skip - 1e-12)
     if min_substeps != 1:
         raise ValueError(
@@ -579,6 +582,9 @@ class ActorCritic(nn.Module):
     logits `[z_thr, z_steer, z_pow, z_aim, z_kick, z_spec]` and the policy action is `[thr, steer, u, a, K, S]`. The aim
     replaces the steer, in the env action and in the log-probability, on rows where the seat holds the ball
     (observation column `HOLDING_OBS_INDEX`) and the kick fires.
+    `policy_head="hybrid7"`: hybrid6 with six kick-target logits `[z_tm1..z_tm5, z_free]` after the fire logits (twelve
+    outputs) and the policy action `[thr, steer, u, a, T, K, S]`. On rows where the holder is ready (`kick_targets`) and
+    the kick fires, T picks an in-arc teammate slot, whose bearing becomes the env steer, or FREE, which uses the aim.
 
     With `value_norm` the critic head is trained in standardised return units and the network holds the running
     return statistics as the buffers `ret_mean`, `ret_std` and `ret_count`. Every value it returns is in raw return units

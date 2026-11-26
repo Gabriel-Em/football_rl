@@ -6410,6 +6410,20 @@ class TestHybrid7:
                     checkpoint_dir=str(tmp_path / field_name), seed=1,
                 )
 
+    def test_trainer_refuses_a_changed_substep_length(self, tmp_path: Path) -> None:
+        """[RED] dt = 1/120 with frame_skip 9 keeps ceil(0.08 / dt - frame_skip) = ceil(0.6) = 1, but one held substep
+        is then obs[8] = (1/120) / 5 = 1/600, which the gate `obs[8] > 1/600` reads as not ready although the kick fires
+        on substep 9. The trainer must refuse any substep length other than 1/60 s."""
+        cfg = replace(
+            _quiet_cfg(save_dir=str(tmp_path / "rep_dt")),
+            physics=replace(DEFAULT_CONFIG.physics, dt=1.0 / 120.0, frame_skip=9),
+            ppo=replace(DEFAULT_CONFIG.ppo, policy_head="hybrid7", fire_entropy="separate"),
+        )
+        with pytest.raises(ValueError, match="dt"):
+            ParameterSharingPPOTrainer(
+                config=cfg, num_envs=1, rollout_steps=8, device="cpu", checkpoint_dir=str(tmp_path / "dt"), seed=1
+            )
+
     def test_trainer_integration(self, tmp_path: Path) -> None:
         """[RED] 1 env, short rollout, real env, hybrid7: 7-wide buffer, env actions == clip(to_env_actions(..., obs=obs)),
         every stored T is valid, first minibatch |log ratio| < 1e-6, deterministic selection takes masked argmax,

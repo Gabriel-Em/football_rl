@@ -426,11 +426,12 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         deterministic: bool,
         with_means: bool,
     ) -> List[Tuple[List[int], Tuple[torch.Tensor, ...]]]:
-        """Sample hybrid5 or hybrid6 actions for all role groups at once from their output logits.
+        """Sample hybrid5, hybrid6 or hybrid7 actions for all role groups at once from their output logits.
 
         The fire probabilities, one Gaussian draw, one Bernoulli draw and the log-probabilities are computed on the
         rows of every group stacked in group order, each row with its own policy's `actor_logstd` and, under hybrid6,
-        the holding flag of its observation row; the results are split back per group as
+        the holding flag of its observation row. Under hybrid7 one kick-target draw follows the Bernoulli draw, masked
+        by `kick_targets` of each row's observation. The results are split back per group as
         `(action, log_prob, value[, env-space mean])`.
         """
         first = pending[0][1]
