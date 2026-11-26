@@ -5109,6 +5109,22 @@ class TestTackleSpells:
         assert (c["tackle_in_range_rate_n_A"], c["tackle_in_range_rate_den_A"], c["tackle_win_rate_den_A"]) == (0, 3, 0)
         assert c["tackle_out_of_range_per_match_A"] == 3
 
+    def test_a_non_finite_body_angle_on_the_carrier_removes_that_decision_too(self):
+        """Seat 1 stands exactly on the carrier (seat 9, distance 0, which counts as facing whatever the angle) on rows 0-2 and fires on
+        row 1, where its body angle is NaN. Row 1 is no chance row, so the run is cut in two (rows 0 and 2): 2 spells, none fired; the fire
+        on row 1 is not an out-of-reach fire either. With a finite angle on row 1 it is one fired spell."""
+        tr = defence_trace(3)
+        tr["holder"][:] = 9
+        for seat in range(1, 6):
+            tr["pos"][:, seat] = (50.0, 420.0 + 10.0 * seat)
+        tr["pos"][:, 9] = tr["pos"][:, 1] = (600.0, 420.0)
+        tr["act"][1, 1, 3] = 1.0
+        c = census.defence_counts(tr)
+        assert (c["tackle_in_range_rate_n_A"], c["tackle_in_range_rate_den_A"]) == (1, 1)
+        tr["ang"][1, 1] = np.nan
+        c = census.defence_counts(tr)
+        assert (c["tackle_in_range_rate_n_A"], c["tackle_in_range_rate_den_A"], c["tackle_out_of_range_per_match_A"]) == (0, 2, 0)
+
     def test_a_trace_without_actions_or_facing_enters_no_spell(self):
         """[RED] Without `act` or without `ang` there is nothing to count: zero spells and zero fires."""
         for dropped in ("act", "ang"):
@@ -5127,6 +5143,19 @@ class TestDefenceAggregation:
         below = census.defence_metrics([m] * 9)
         assert below["shot_nearest_def_facing_B"] == {"mean": None, "se": None, "n": 9}
         assert below["shot_nearest_def_closing_B"]["mean"] is None
+
+    def test_facing_and_closing_each_floor_on_their_own_shot_count(self):
+        """Ten matches without `ang`: closing has 10 shots (1.0), facing none (None). Eight full matches plus two whose nearest defender has a
+        NaN velocity in the window: facing has 10 shots (1.0), closing 8 (None)."""
+        no_ang = census.match_metrics({k: v for k, v in shot_scene().items() if k != "ang"})
+        met = census.defence_metrics([no_ang] * 10)
+        assert met["shot_nearest_def_closing_B"]["mean"] == pytest.approx(1.0)
+        assert met["shot_nearest_def_facing_B"]["mean"] is None
+        nan_vel = shot_scene()
+        nan_vel["vel"][7, 8] = (np.nan, np.nan)
+        met = census.defence_metrics([census.match_metrics(shot_scene())] * 8 + [census.match_metrics(nan_vel)] * 2)
+        assert met["shot_nearest_def_facing_B"]["mean"] == pytest.approx(1.0)
+        assert met["shot_nearest_def_closing_B"]["mean"] is None
 
     def test_a_floor_of_one_returns_the_single_match_value(self):
         """[RED] With `min_events` 1 the regain scene gives its hand values from one match: at the shot (2 + 0) / 2 = 1, retention 2/3."""

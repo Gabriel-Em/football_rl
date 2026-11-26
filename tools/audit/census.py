@@ -212,7 +212,7 @@ TRAP_GOALS_BELOW = 0.5
 DEFENCE_SHARES = {
     "goal_side_at_goal": ("goal_side_at_goal_sum", "goal_side_at_goal_den", "goal_side_at_goal_den", "events"),
     "shot_nearest_def_facing": ("shot_nearest_def_facing_n", "shot_nearest_def_facing_den", "shot_nearest_def_facing_den", "events"),
-    "shot_nearest_def_closing": ("shot_nearest_def_closing_n", "shot_nearest_def_closing_den", "shot_nearest_def_facing_den", "events"),
+    "shot_nearest_def_closing": ("shot_nearest_def_closing_n", "shot_nearest_def_closing_den", "shot_nearest_def_closing_den", "events"),
     "regain_goalside_at_shot": ("regain_goalside_at_shot_sum", "regain_goalside_at_shot_den", "regain_goalside_at_shot_den", "events"),
     "regain_goalside_retention": ("regain_goalside_retention_sum", "regain_goalside_retention_den", "regain_goalside_at_shot_den", "events"),
     "tackle_in_range_rate": ("tackle_in_range_rate_n", "tackle_in_range_rate_den", "tackle_in_range_rate_den", "events"),
@@ -628,7 +628,7 @@ def _tackle_counts(c: Dict[str, Any], trace: Dict[str, np.ndarray], pos: np.ndar
         toward = np.cos(ang[rows][:, seats]) * gap[..., 0] + np.sin(ang[rows][:, seats]) * gap[..., 1]
         seen = np.isfinite(dist) & np.isfinite(toward)
         facing = (dist < TACKLE_ON_CARRIER) | (toward >= TACKLE_FACING_DOT * dist)
-        chance = facing & (np.maximum(0.0, dist - TACKLE_CONTACT_OFFSET) <= TACKLE_REACH[None, :])
+        chance = seen & facing & (np.maximum(0.0, dist - TACKLE_CONTACT_OFFSET) <= TACKLE_REACH[None, :])
         fired = fires[rows][:, seats]
         out_of_reach = int((fired & seen & ~chance & (dist <= TACKLE_WHIFF_RANGE)).sum())
         for group in (TEAMS[defending], "pooled"):
