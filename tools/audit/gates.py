@@ -19,6 +19,14 @@ C0L: T2(last) - T2(100) < 0.50 fails, where T2 is the mean `goal_diff` of `vs_fr
 G6: fails if more than half of the arm seeds have no takeoff (`training_progress.takeoff_generation`
 with its default threshold and window, self-play matches only) in their `--history`; not evaluated
 unless every arm seed has a history.
+P1 (parking, with `--comparator`): fails if any arm seed at a generation >= 200 has `deep_block_ge4_pooled` (of
+`--tag`) above the comparator's maximum seed at that generation plus 0.05. It does not set the exit status.
+T1h (held-out bot, with `--comparator`): `goals_B` of `vs_heldout_sampled` and `vs_heldout_sampled_red` (the two
+colours averaged per seed), lower is better, delta 1.0 goal, the EBE verdict of the other targets; the goal
+difference of the same tags is reported beside it. The comparator is the baseline census, not the calibration.
+Both checks are left out of the report, and named on stderr, when their inputs are absent (no comparator, no
+`deep_block_ge4_pooled` in the arm's censuses at generations >= 200, no held-out tags in the arm or the comparator);
+inputs present for some seeds only are an error.
 
 Reports between-seed SDs and ranges when >= 2 seeds are supplied.
 
@@ -116,6 +124,16 @@ FRESH_TARGET_TAGS: Dict[str, Tuple[str, ...]] = {
 }
 
 FRESH_TARGET_DIRECTION: Dict[str, str] = {"T1": "higher", "T2": "higher", "T3": "higher"}
+
+PARKING_METRIC = "deep_block_ge4_pooled"
+PARKING_FIRST_GEN = 200
+PARKING_MARGIN = 0.05
+HELDOUT_TARGET_ID = "T1h"
+HELDOUT_TARGET_TAGS: Tuple[str, ...] = ("vs_heldout_sampled", "vs_heldout_sampled_red")
+HELDOUT_TARGET_KEY = "goals_B"
+HELDOUT_TARGET_DIRECTION = "lower"
+HELDOUT_TARGET_DELTA = 1.0
+HELDOUT_INFO_KEY = "goal_diff"
 
 STYLE_TARGET_TAG = "self_sampled"
 STYLE_TARGET_SPECS: Tuple[Tuple[str, str, str, str, float], ...] = (
@@ -627,6 +645,81 @@ def _evaluate_takeoff_gate(
     return out
 
 
+def _note(notes: Optional[List[str]], text: str) -> None:
+    if notes is not None:
+        notes.append(text)
+
+
+def _evaluate_parking_guard(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    tag: str,
+    eval_gens: List[str],
+    notes: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    """P1: every arm seed's parking share at each generation >= `PARKING_FIRST_GEN` stays within `PARKING_MARGIN` of the comparator's maximum."""
+    if comp_norm is None:
+        _note(notes, "P1: not evaluated (no comparator)")
+        return None
+    gens = [g for g in eval_gens if g.isdigit() and int(g) >= PARKING_FIRST_GEN]
+    if not any(
+        PARKING_METRIC in _extract_metrics_dict(arm_norm[s][g][tag]) for s in arm_norm for g in gens if tag in arm_norm[s].get(g, {})
+    ):
+        _note(notes, f"P1: not evaluated (no {PARKING_METRIC} in the arm's {tag} censuses at generations >= {PARKING_FIRST_GEN} of --gens)")
+        return None
+    per_gen: Dict[str, Any] = {}
+    violations: List[Dict[str, Any]] = []
+    for gen in gens:
+        arm_vals = {s: _require_seed_metric(arm_norm, s, gen, tag, PARKING_METRIC, role="arm") for s in sorted(arm_norm)}
+        comp_vals = {s: _require_seed_metric(comp_norm, s, gen, tag, PARKING_METRIC, role="comparator") for s in sorted(comp_norm)}
+        comp_max = max(comp_vals.values())
+        limit = comp_max + PARKING_MARGIN
+        per_gen[gen] = {"arm_per_seed": arm_vals, "comp_per_seed": comp_vals, "comp_max": comp_max, "limit": limit}
+        violations.extend({"seed": s, "gen": gen, "value": v, "limit": limit} for s, v in arm_vals.items() if v > limit)
+    return {
+        "description": "parking (deep block, relative to the comparator)",
+        "rule": f"FAIL if an arm seed's {PARKING_METRIC} at a generation >= {PARKING_FIRST_GEN} is above the comparator's maximum seed + {PARKING_MARGIN}",
+        "passed": not violations,
+        "margin": PARKING_MARGIN,
+        "per_gen": per_gen,
+        "violations": violations,
+    }
+
+
+def _evaluate_heldout_target(
+    arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
+    comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    gen: str,
+    notes: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    """T1h: goals conceded to the held-out bot (both colours averaged per seed) against the comparator, with the goal difference alongside."""
+    if comp_norm is None:
+        _note(notes, f"{HELDOUT_TARGET_ID}: not evaluated (no comparator)")
+        return None
+    has_tags = lambda norm: any(t in norm[s].get(gen, {}) for s in norm for t in HELDOUT_TARGET_TAGS)  # noqa: E731
+    if not (has_tags(arm_norm) and has_tags(comp_norm)):
+        _note(notes, f"{HELDOUT_TARGET_ID}: not evaluated (no {' / '.join(HELDOUT_TARGET_TAGS)} tags at generation {gen} in the arm or the comparator)")
+        return None
+    arm_vals = _multi_tag_per_seed(arm_norm, gen, HELDOUT_TARGET_TAGS, HELDOUT_TARGET_KEY, role="arm")
+    comp_vals = _multi_tag_per_seed(comp_norm, gen, HELDOUT_TARGET_TAGS, HELDOUT_TARGET_KEY, role="comparator")
+    verdict = _ebe_verdict(arm_vals, comp_vals, HELDOUT_TARGET_DIRECTION, HELDOUT_TARGET_DELTA)
+    arm_diff = _multi_tag_per_seed(arm_norm, gen, HELDOUT_TARGET_TAGS, HELDOUT_INFO_KEY, role="arm")
+    comp_diff = _multi_tag_per_seed(comp_norm, gen, HELDOUT_TARGET_TAGS, HELDOUT_INFO_KEY, role="comparator")
+    arm_mean, comp_mean = sum(arm_diff.values()) / len(arm_diff), sum(comp_diff.values()) / len(comp_diff)
+    return {
+        "id": HELDOUT_TARGET_ID,
+        "key": HELDOUT_TARGET_KEY,
+        "tag": "+".join(HELDOUT_TARGET_TAGS),
+        "direction": HELDOUT_TARGET_DIRECTION,
+        "delta": HELDOUT_TARGET_DELTA,
+        "gen": gen,
+        **verdict,
+        "goal_diff": {
+            "arm_per_seed": arm_diff, "comp_per_seed": comp_diff, "arm_mean": arm_mean, "comp_mean": comp_mean, "mean_diff": arm_mean - comp_mean,
+        },
+    }
+
+
 def _evaluate_fresh(
     arm_norm: Dict[str, Dict[str, Dict[str, Any]]],
     comp_norm: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
@@ -638,6 +731,7 @@ def _evaluate_fresh(
     histories: Optional[Dict[str, Dict[str, Any]]] = None,
     arm_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
     comp_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
+    notes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     if calibration is None:
         raise ValueError("--calibration is required when protocol='fresh'")
@@ -738,6 +832,9 @@ def _evaluate_fresh(
             "metrics": metrics_out,
         }
     gates_out["G6"] = _evaluate_takeoff_gate(arm_norm, histories)
+    parking = _evaluate_parking_guard(arm_norm, comp_norm, tag, eval_gens, notes)
+    if parking is not None:
+        gates_out["P1"] = parking
 
     # Targets T1-T3 against --comparator if given, else calibration anchor
     targets_out: List[Dict[str, Any]] = []
@@ -761,6 +858,9 @@ def _evaluate_fresh(
             "gen": last_gen,
             **verdict,
         })
+    heldout = _evaluate_heldout_target(arm_norm, comp_norm, last_gen, notes)
+    if heldout is not None:
+        targets_out.append(heldout)
     for spec in parsed_targets:
         targets_out.append(_evaluate_ebe_target(arm_norm, comp_norm, last_gen, spec))
 
@@ -798,12 +898,14 @@ def evaluate_gates(
     calibration_path: Optional[str] = None,
     histories: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
+    notes: Optional[List[str]] = None,
     _arm_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
     _comp_meta: Optional[Dict[str, Dict[Tuple[str, str], Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate guard and target gates over `arm` (and optional `comparator`).
 
-    `histories` maps arm seeds to loaded `training_history.json` dicts and feeds G6.
+    `histories` maps arm seeds to loaded `training_history.json` dicts and feeds G6. A check whose inputs are absent (P1, T1h) is left out
+    of the result and appended to `notes` when a list is given.
     """
     if protocol not in PROTOCOLS:
         raise ValueError(f"protocol must be one of {PROTOCOLS}, got {protocol!r}")
@@ -828,6 +930,7 @@ def evaluate_gates(
         histories,
         arm_meta=_arm_meta,
         comp_meta=_comp_meta,
+        notes=notes,
     )
 
 
@@ -879,6 +982,14 @@ def _append_targets_table(lines: List[str], result: Dict[str, Any]) -> None:
                 f"{_fmt_seeds(t['arm_per_seed'])} | {_fmt_seeds(t['comp_per_seed'])} | "
                 f"{mdiff} | {t['verdict']} | {t['note']} |"
             )
+        for t in result["targets"]:
+            if t.get("goal_diff"):
+                gd = t["goal_diff"]
+                lines.extend([
+                    "",
+                    f"{t['id']} goal_diff (informational, same tags): arm {_fmt_seeds(gd['arm_per_seed'])} | "
+                    f"comparator {_fmt_seeds(gd['comp_per_seed'])} | mean diff {gd['mean_diff']:+.3f}",
+                ])
 
 
 def _append_style_targets(lines: List[str], result: Dict[str, Any]) -> None:
@@ -954,6 +1065,23 @@ def _format_fresh_markdown(result: Dict[str, Any]) -> str:
             f"Seeds without takeoff: {len(g6['no_takeoff_seeds'])} of {len(g6['per_seed'])} "
             f"(share {g6['no_takeoff_share']:.3f}; FAIL if > {TAKEOFF_FAIL_SHARE}).",
         ])
+
+    p1 = result["gates"].get("P1")
+    if p1 is not None:
+        lines.extend([
+            "",
+            "## Parking (P1)",
+            "",
+            f"FAIL if an arm seed's {PARKING_METRIC} at a generation >= {PARKING_FIRST_GEN} is above the comparator's maximum seed + {p1['margin']:.2f}.",
+            "",
+            "| Gen | Comparator max | Limit | Arm seeds | Status |",
+            "|---|---|---|---|---|",
+        ])
+        for gen, point in p1["per_gen"].items():
+            within = all(v <= point["limit"] for v in point["arm_per_seed"].values())
+            lines.append(
+                f"| {gen} | {point['comp_max']:.4f} | {point['limit']:.4f} | {_fmt_seeds(point['arm_per_seed'], 4)} | {_status_str(within)} |"
+            )
 
     lines.extend([
         "",
@@ -1049,6 +1177,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     comp_data = _parse_seed_dirs(args.comparator, meta_out=comp_meta) if args.comparator else None
     cal_data = json.loads(Path(args.calibration).read_text(encoding="utf-8")) if args.calibration else None
     history_data = _parse_history_args(args.history) if args.history else None
+    notes: List[str] = []
     result = evaluate_gates(
         arm_data,
         comparator=comp_data,
@@ -1059,11 +1188,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         calibration=cal_data,
         calibration_path=args.calibration,
         histories=history_data,
+        notes=notes,
         _arm_meta=arm_meta,
         _comp_meta=comp_meta if comp_data is not None else None,
     )
     md = format_markdown(result)
     print(md)
+    for note in notes:
+        print(note, file=sys.stderr)
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")

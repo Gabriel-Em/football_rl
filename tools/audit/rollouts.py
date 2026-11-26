@@ -51,7 +51,8 @@ branches:
         team in possession after decisions 15 and 30; the first holder other than the kicker after decisions 2..45
         (`target`, `teammate`, `opponent` or `none`); goals for and against by the end; and the angle between the ball's
         direction after step 0 and the ball -> target direction at the snapshot (None while a player holds the ball).
-        Buckets: `not_aimed`, `already_aimed`, and the not-aimed points by third (`not_aimed_third_<third>`) and by
+        Buckets: `not_aimed`, `already_aimed`, `all` (every point, whatever its `already` flag), and the not-aimed points by
+        third (`not_aimed_third_<third>`) and by
         intent (`not_aimed_intent_<intent>`); each gives per-branch shares and the paired AIM - POLICY and
         AIMP - POLICY differences (mean +- SE). The loaded policies must reproduce `val` and `mean` of the trace at
         decision 0 of every match within 1e-5, as in `hold`.
@@ -1602,6 +1603,7 @@ def summarize_aim(
     buckets: Dict[str, Callable[[Dict[str, Any]], bool]] = {
         "not_aimed": lambda r: not r["already"],
         "already_aimed": lambda r: bool(r["already"]),
+        "all": lambda r: True,
     }
     for t in AIM_THIRDS:
         buckets[f"not_aimed_third_{t}"] = lambda r, t=t: (not r["already"]) and r["third"] == t
@@ -1684,7 +1686,7 @@ def format_aim_report(summary: Dict[str, Any], title: str = "") -> str:
         f"skipped={summary['n_matches_skipped']} points={summary['n_points']} seed={summary['seed']} "
         f"shaping={summary['shaping_mode']} max_pos_err={summary['max_pos_err'] if summary['max_pos_err'] is not None else '-'}"
     ]
-    labels = {"not_aimed": "not already aimed", "already_aimed": "already aimed"}
+    labels = {"not_aimed": "not already aimed", "already_aimed": "already aimed", "all": "all points"}
     labels.update({f"not_aimed_third_{t}": f"not already aimed, {t} third" for t in AIM_THIRDS})
     labels.update({f"not_aimed_intent_{i}": f"not already aimed, intent={i}" for i in AIM_INTENTS})
 

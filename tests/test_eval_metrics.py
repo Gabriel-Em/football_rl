@@ -4651,6 +4651,760 @@ class TestBasinKeys:
 
 
 # ----------------------------------------------------------------------------
+# Defence keys: goal-side defenders at goals, the nearest defender at shots, regains, tackle spells, deep block
+# ----------------------------------------------------------------------------
+DEFENCE_RATIO_KEYS = (
+    "goal_side_at_goal", "shot_nearest_def_facing", "shot_nearest_def_closing", "regain_goalside_at_shot",
+    "regain_goalside_retention", "tackle_in_range_rate", "tackle_win_rate", "deep_block_ge4", "outfield_depth_oop",
+)
+
+
+def defence_trace(T: int) -> dict:
+    """`make_trace` with a zero body angle, zero velocity, zero actions and zero shot counters for every player."""
+    tr = make_trace(T)
+    tr["ang"] = np.zeros((T, 12), dtype=np.float32)
+    tr["vel"] = np.zeros((T, 12, 2), dtype=np.float32)
+    tr["act"] = np.zeros((T, 12, 4), dtype=np.float32)
+    tr["s_shots"] = np.zeros((T, 2), dtype=np.int32)
+    return tr
+
+
+def place_outfield(tr: dict, team: int, xs, rows=slice(None), y: float = 420.0) -> None:
+    """World x of `team`'s five outfielders (slots 1-5) on `rows`; slot s stands at y + 10 s."""
+    for slot, x in zip(range(1, 6), xs):
+        tr["pos"][rows, 6 * team + slot] = (x, y + 10.0 * slot)
+
+
+def tile_trace(tr: dict, times: int) -> dict:
+    """`tr` repeated `times` times along the decision axis (only for traces whose cumulative counters stay zero)."""
+    out = {k: np.tile(v, (times,) + (1,) * (v.ndim - 1)) for k, v in tr.items() if k != "n_steps"}
+    out["n_steps"] = np.array(int(tr["n_steps"]) * times)
+    return out
+
+
+class TestDeepBlock:
+    # Appendix table: rows 0-3, the ball and the defending team's five outfielders in the team's own frame (own goal line at 0).
+    BALL = (700.0, 699.0, 1000.0, 1000.0)
+    XS = ((100.0, 200.0, 280.0, 280.0, 900.0), (100.0,) * 5, (100.0, 200.0, 281.0, 280.0, 900.0), (100.0,) * 5)
+
+    @classmethod
+    def scene(cls, team: int, sides=(0, 1)) -> dict:
+        """The table in `team`'s frame; the other team's outfielders stand at world x = 700 (canonical 700, never deep)."""
+        tr = defence_trace(4)
+        tr["side"][:] = sides
+        world = (lambda cx: cx) if sides[team] == 0 else (lambda cx: 1400.0 - cx)
+        for t in range(4):
+            tr["ball"][t] = (world(cls.BALL[t]), 420.0)
+            place_outfield(tr, team, [world(x) for x in cls.XS[t]], rows=t)
+            place_outfield(tr, 1 - team, [700.0] * 5, rows=t)
+        return tr
+
+    @pytest.mark.parametrize("team, sides", [(0, (0, 1)), (1, (0, 1)), (0, (1, 0)), (1, (1, 0))])
+    def test_hand_table_counts_in_each_teams_own_frame(self, team, sides):
+        """[RED] Qualifying decisions are those with the ball at canonical x >= 700 (exactly 700 counts, 699 does not); a decision is
+        deep when at least 4 outfielders stand at canonical x <= 280 (exactly 280 counts, 281 does not; exactly 4 counts).
+          row 0 ball 700, x 100 200 280 280 900  qualifies, 4 deep  -> deep    row 1 ball 699              -> not counted
+          row 2 ball 1000, x 100 200 281 280 900 qualifies, 3 deep  -> not     row 3 ball 1000, five at 100 -> deep
+        The team itself: 2 deep of 3 qualifying, in either colour and with either side assignment (team B's world x is 1400 - x
+        on the default sides). The other team (at world x 700) has the ball at canonical 700, 701, 400, 400: 2 qualifying, 0 deep.
+        Pooled: 2 of 5."""
+        c = census.defence_counts(self.scene(team, sides))
+        own, other = "AB"[team], "AB"[1 - team]
+        assert (c[f"deep_block_ge4_n_{own}"], c[f"deep_block_ge4_den_{own}"]) == (2, 3)
+        assert (c[f"deep_block_ge4_n_{other}"], c[f"deep_block_ge4_den_{other}"]) == (0, 2)
+        assert (c["deep_block_ge4_n_pooled"], c["deep_block_ge4_den_pooled"]) == (2, 5)
+
+    def test_outfield_depth_counts_only_decisions_with_the_opponent_holding_the_ball(self):
+        """[RED] Four rows. Team A's outfielders stand at canonical x 100 200 300 400 500 (mean 300) on row 0 and 50 50 50 50 150
+        (mean 70) on row 1; team B holds the ball on both. On row 2 team A holds (not counted for A) and on row 3 the ball is loose
+        (counted for nobody). Team B's outfielders stand at world x 1300 1200 1100 1000 900 on every row (canonical 100 ... 500,
+        mean 300). Team A: (300 + 70) / 2 = 185. Team B: row 2 only, 300. Pooled: 670 / 3."""
+        tr = defence_trace(4)
+        place_outfield(tr, 0, [100.0, 200.0, 300.0, 400.0, 500.0], rows=0)
+        place_outfield(tr, 0, [50.0, 50.0, 50.0, 50.0, 150.0], rows=1)
+        place_outfield(tr, 0, [700.0] * 5, rows=slice(2, 4))
+        place_outfield(tr, 1, [1300.0, 1200.0, 1100.0, 1000.0, 900.0])
+        tr["holder"][0:2] = 9
+        tr["holder"][2] = 2
+        c = census.defence_counts(tr)
+        assert (c["outfield_depth_oop_sum_A"], c["outfield_depth_oop_den_A"]) == (370.0, 2)
+        assert (c["outfield_depth_oop_sum_B"], c["outfield_depth_oop_den_B"]) == (300.0, 1)
+        assert (c["outfield_depth_oop_sum_pooled"], c["outfield_depth_oop_den_pooled"]) == (670.0, 3)
+
+    def test_the_default_floor_is_100_qualifying_decisions(self):
+        """[RED] 100 rows with the ball at x = 1000 and team A's five outfielders at x = 100: 100 qualifying decisions, all deep -> 1.0;
+        99 rows -> None, still counted in n. Team B's ball is at canonical 400 on every row: no qualifying decision, None, n = 0."""
+        def metrics(rows: int) -> dict:
+            tr = defence_trace(rows)
+            tr["ball"][:] = (1000.0, 420.0)
+            place_outfield(tr, 0, [100.0] * 5)
+            return census.summarize([census.match_metrics(tr)])["metrics"]
+
+        at, below = metrics(100), metrics(99)
+        assert at["deep_block_ge4_A"] == {"mean": pytest.approx(1.0), "se": None, "n": 1}
+        assert below["deep_block_ge4_A"] == {"mean": None, "se": None, "n": 1}
+        assert at["deep_block_ge4_B"] == {"mean": None, "se": None, "n": 0}
+
+    def test_tiled_hand_table_reaches_the_floor_for_the_team_with_three_qualifying_rows(self):
+        """[RED] The table of team A tiled 34 times: 102 qualifying decisions, 68 deep -> 2/3. Team B has 2 x 34 = 68 qualifying
+        decisions, below 100 -> None. Pooled: 68 deep of 170 qualifying = 0.4. With `min_decisions` 3 the untiled table gives 2/3
+        and with 4 it gives None."""
+        met = census.summarize([census.match_metrics(tile_trace(self.scene(0), 34))])["metrics"]
+        assert met["deep_block_ge4_A"]["mean"] == pytest.approx(2 / 3)
+        assert met["deep_block_ge4_B"]["mean"] is None
+        assert met["deep_block_ge4_pooled"]["mean"] == pytest.approx(0.4)
+        one = [census.match_metrics(self.scene(0))]
+        assert census.defence_metrics(one, min_decisions=3)["deep_block_ge4_A"]["mean"] == pytest.approx(2 / 3)
+        assert census.defence_metrics(one, min_decisions=4)["deep_block_ge4_A"]["mean"] is None
+
+
+def goal_scene(goal_row: int = 30, late_shot: bool = True) -> dict:
+    """70 rows, team A defends the left goal. Team A (striker holding) shoots on row 10 and scores on `goal_row`; team B shoots on row
+    20 and scores on row 65 (45 decisions later); with `late_shot`, team A shoots again on row 40 and does not score within 45 decisions
+    (for a `goal_row` of 30 or less).
+    Row 10: ball (1000, 420), team B's outfielders at world x 1200 1000 1001 900 1300 (canonical 200 400 399 500 100): goal-side
+    (canonical x strictly below the ball's 400) are 200, 399, 100 -> 3 (the 400 is level, not goal-side).
+    Row 20: ball (300, 420), team A's outfielders at x 100 299 300 350 400: goal-side are 100 and 299 -> 2."""
+    tr = defence_trace(70)
+    tr["holder"][10], tr["holder"][20] = 5, 11
+    tr["s_shots"][10:, 0], tr["s_shots"][20:, 1] = 1, 1
+    if late_shot:
+        tr["holder"][40] = 5
+        tr["s_shots"][40:, 0] = 2
+    tr["s_score"][goal_row:, 0], tr["s_score"][65:, 1] = 1, 1
+    tr["ball"][10], tr["ball"][20] = (1000.0, 420.0), (300.0, 420.0)
+    place_outfield(tr, 1, [1200.0, 1000.0, 1001.0, 900.0, 1300.0], rows=10)
+    place_outfield(tr, 0, [100.0, 299.0, 300.0, 350.0, 400.0], rows=20)
+    return tr
+
+
+class TestGoalSideAtGoal:
+    def test_goal_side_counts_of_the_conceding_team_at_the_scoring_shot(self):
+        """[RED] See `goal_scene`: team B concedes the row-10 shot (3 goal-side), team A the row-20 shot (2 goal-side); the row-40 shot
+        is followed by no goal and enters nothing. Team A: 2 over 1 goal, team B: 3 over 1, pooled 5 over 2."""
+        c = census.defence_counts(goal_scene())
+        assert (c["goal_side_at_goal_sum_A"], c["goal_side_at_goal_den_A"]) == (2, 1)
+        assert (c["goal_side_at_goal_sum_B"], c["goal_side_at_goal_den_B"]) == (3, 1)
+        assert (c["goal_side_at_goal_sum_pooled"], c["goal_side_at_goal_den_pooled"]) == (5, 2)
+        met = census.defence_metrics([census.match_metrics(goal_scene())] * 10)
+        assert [met[f"goal_side_at_goal_{g}"]["mean"] for g in ("A", "B", "pooled")] == pytest.approx([2.0, 3.0, 2.5])
+
+    @pytest.mark.parametrize("goal_row, counted", [(55, 1), (56, 0)])
+    def test_the_goal_must_come_within_45_decisions_of_the_shot(self, goal_row, counted):
+        """[RED] The row-10 shot of team A is a goal shot when team A's score rises on a row up to 10 + 45 = 55 (inclusive), not on 56
+        (the scene without its row-40 shot, which a goal on row 55 would also follow)."""
+        c = census.defence_counts(goal_scene(goal_row, late_shot=False))
+        assert c["goal_side_at_goal_den_B"] == counted
+
+    def test_a_trace_without_shot_counters_enters_no_goal_shot(self):
+        """[RED] Goals without `s_shots` (a hand trace of the older layout) give zero counts and no error."""
+        tr = goal_scene()
+        del tr["s_shots"]
+        c = census.defence_counts(tr)
+        assert c["goal_side_at_goal_den_pooled"] == 0 and c["regain_goalside_at_shot_den_pooled"] == 0
+
+
+def shot_scene(*, vel_x=-30.0, facing: float = math.pi, k: int = 12, T: int = 20) -> dict:
+    """Team A's striker (seat 5) holds the ball at (300, 420) and shoots on row `k`. Team B's keeper stands at (340, 420), closer than
+    any outfielder, facing away and backing off (a decoy: only outfielders count). Team B's seat 8 stands at (380, 420), 80 u from the
+    shooter, with body angle `facing` and x velocity `vel_x` (a scalar or one value per row). Every other player stands more than 400 u
+    from the shooter."""
+    tr = defence_trace(T)
+    tr["pos"][:, 5] = (300.0, 420.0)
+    tr["holder"][k] = 5
+    tr["s_shots"][k:, 0] = 1
+    set_kick(tr, k, 5)
+    tr["pos"][:, 6] = (340.0, 420.0)
+    tr["vel"][:, 6] = (50.0, 0.0)
+    tr["pos"][:, 8] = (380.0, 420.0)
+    tr["ang"][:, 8] = facing
+    tr["vel"][:, 8, 0] = vel_x
+    return tr
+
+
+class TestShotNearestDefender:
+    @staticmethod
+    def flags(tr: dict, team: str = "B"):
+        c = census.defence_counts(tr)
+        assert (c[f"shot_nearest_def_facing_den_{team}"], c[f"shot_nearest_def_closing_den_{team}"]) == (1, 1)
+        return c[f"shot_nearest_def_facing_n_{team}"], c[f"shot_nearest_def_closing_n_{team}"]
+
+    def test_defender_facing_the_shooter_and_closing_at_30_u_per_s(self):
+        """[RED] The shooter is at (300, 420); the nearest conceding outfielder (80 u away, the keeper at 40 u is ignored) faces angle pi, the
+        bearing to the shooter, so cos = 1 >= 0.25 and facing = 1; its velocity (-30, 0) is 30 u/s toward the shooter on each of the
+        8 decisions before the shot, above 20, so closing = 1. Team A took the shot, so these are team B's keys; team A's have no
+        shot against it. Over the shots: facing 1/1, closing 1/1."""
+        c = census.defence_counts(shot_scene())
+        assert [c[f"shot_nearest_def_{k}_{g}"] for k in ("facing_n", "facing_den", "closing_n", "closing_den") for g in ("A", "B", "pooled")] == [
+            0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1]
+
+    @pytest.mark.parametrize("vel_x, closing", [(-20.0, 0), (-20.5, 1)])
+    def test_closing_must_exceed_20_u_per_s(self, vel_x, closing):
+        """[RED] A velocity of (-20, 0) is 20 u/s toward the shooter: not above 20, closing 0; (-20.5, 0): closing 1."""
+        assert self.flags(shot_scene(vel_x=vel_x)) == (1, closing)
+
+    @pytest.mark.parametrize("off_deg, facing", [(0, 1), (75, 1), (76, 0), (90, 0), (180, 0)])
+    def test_facing_gate_is_cos_0_25_at_the_shot_row(self, off_deg, facing):
+        """[RED] The bearing to the shooter is pi. A body angle `off_deg` away from it faces the shooter when cos(off_deg) >= 0.25:
+        75 deg (cos 0.2588) yes, 76 deg (cos 0.2419), 90 deg and 180 deg no. Closing is unaffected (velocity -30)."""
+        assert self.flags(shot_scene(facing=math.pi - math.radians(off_deg))) == (facing, 1)
+
+    def test_closing_is_the_mean_over_exactly_the_8_decisions_before_the_shot(self):
+        """[RED] Shot on row 12: rows 4-11 are the window. Velocity -30 on rows 4-11 and +100 on rows 3 and 12 -> mean 30 -> closing 1
+        (neither neighbour enters). Velocity -10 on rows 4-7 and -30 on rows 8-11: mean 20, not above 20 -> 0; -10 on rows 4-6 and -30 on
+        rows 7-11: mean (30 + 150) / 8 = 22.5 -> 1."""
+        vel = np.zeros(20)
+        vel[4:12], vel[3], vel[12] = -30.0, 100.0, 100.0
+        assert self.flags(shot_scene(vel_x=vel))[1] == 1
+        vel = np.zeros(20)
+        vel[4:8], vel[8:12] = -10.0, -30.0
+        assert self.flags(shot_scene(vel_x=vel))[1] == 0
+        vel[7] = -30.0
+        vel[4:7] = -10.0
+        assert self.flags(shot_scene(vel_x=vel))[1] == 1
+
+    def test_the_nearest_outfielder_is_chosen_not_a_farther_one_that_faces_and_closes(self):
+        """[RED] Seat 8 at 80 u faces away (angle 0) and backs off (+30); seat 9 at 120 u faces the shooter and closes at 30 u/s. The nearest
+        is seat 8: facing 0, closing 0."""
+        tr = shot_scene(vel_x=30.0, facing=0.0)
+        tr["pos"][:, 9], tr["ang"][:, 9], tr["vel"][:, 9] = (420.0, 420.0), math.pi, (-30.0, 0.0)
+        assert self.flags(tr) == (0, 0)
+
+    def test_both_teams_shoot_and_each_conceding_team_has_its_own_key(self):
+        """[RED] Team A's shot as in `shot_scene` (team B concedes: 1/1, 1/1). Team B's striker (seat 11) holds the ball at (1100, 420) and
+        shoots on row 5; team A's seat 2 at (1020, 420), 80 u away, faces angle pi (away from the shooter) and moves at (-10, 0) (away):
+        team A concedes with facing 0/1, closing 0/1. Pooled 1/2 and 1/2."""
+        tr = shot_scene()
+        tr["pos"][:, 11], tr["holder"][5], tr["s_shots"][5:, 1] = (1100.0, 420.0), 11, 1
+        tr["pos"][:, 2], tr["ang"][:, 2], tr["vel"][:, 2] = (1020.0, 420.0), math.pi, (-10.0, 0.0)
+        c = census.defence_counts(tr)
+        assert (c["shot_nearest_def_facing_n_A"], c["shot_nearest_def_facing_den_A"]) == (0, 1)
+        assert (c["shot_nearest_def_closing_n_A"], c["shot_nearest_def_closing_den_A"]) == (0, 1)
+        assert (c["shot_nearest_def_facing_n_B"], c["shot_nearest_def_facing_den_B"]) == (1, 1)
+        assert (c["shot_nearest_def_closing_n_B"], c["shot_nearest_def_closing_den_B"]) == (1, 1)
+        assert (c["shot_nearest_def_facing_n_pooled"], c["shot_nearest_def_facing_den_pooled"]) == (1, 2)
+        assert (c["shot_nearest_def_closing_n_pooled"], c["shot_nearest_def_closing_den_pooled"]) == (1, 2)
+
+    def test_a_trace_without_facing_or_velocity_enters_only_the_key_that_needs_it(self):
+        """[RED] Without `ang` the facing key has no shot but the closing key keeps its shot; without `vel` the reverse."""
+        no_ang = {k: v for k, v in shot_scene().items() if k != "ang"}
+        no_vel = {k: v for k, v in shot_scene().items() if k != "vel"}
+        c = census.defence_counts(no_ang)
+        assert (c["shot_nearest_def_facing_den_B"], c["shot_nearest_def_closing_den_B"]) == (0, 1)
+        c = census.defence_counts(no_vel)
+        assert (c["shot_nearest_def_facing_den_B"], c["shot_nearest_def_closing_den_B"]) == (1, 0)
+
+    def test_a_non_finite_input_removes_the_shot_from_the_key_that_reads_it(self):
+        """[RED] A NaN body angle of the nearest defender on the shot row leaves the shot out of the facing key (den 0) and in the closing key;
+        a NaN velocity inside the 8-decision window leaves it out of the closing key and in the facing key."""
+        tr = shot_scene()
+        tr["ang"][12, 8] = np.nan
+        c = census.defence_counts(tr)
+        assert (c["shot_nearest_def_facing_den_B"], c["shot_nearest_def_closing_den_B"]) == (0, 1)
+        tr = shot_scene()
+        tr["vel"][7, 8] = (np.nan, np.nan)
+        c = census.defence_counts(tr)
+        assert (c["shot_nearest_def_facing_den_B"], c["shot_nearest_def_closing_den_B"]) == (1, 0)
+
+    @pytest.mark.parametrize("holder", [-1, 9])
+    def test_a_shot_that_the_shooting_team_did_not_hold_raises(self, holder):
+        """[RED] A shot (a rise of `s_shots`) is a kick by the holder, so a row without a holder of the shooting team is a corrupt
+        trace: the loose ball (-1) and a holder of the other team (seat 9) both raise instead of dropping the shot."""
+        tr = shot_scene()
+        tr["holder"][12] = holder
+        with pytest.raises(ValueError, match="shot"):
+            census.defence_counts(tr)
+
+
+def regain_scene(shot_rows=(14, 24)) -> dict:
+    """25 rows. Team A holds on rows 0-4 (seat 3) and 20-21 (seat 2), team B on rows 8-16 (seat 9) and 23-24 (seat 10), the ball is loose
+    otherwise: team B regains on rows 8 and 23, team A on row 20. Team B shoots on each row of `shot_rows` (14 and 24 hold the ball).
+      row 8  ball (600, 420), team A outfielders at x 100 400 599 600 900  -> goal-side (x < 600): seats 1, 2, 3
+      row 14 ball (300, 420), team A outfielders at x 100 400 250 300 500  -> goal-side (x < 300): seats 1, 3
+      rows 23 and 24 ball (100, 420), team A outfielders at x 500 ... 900  -> goal-side: nobody"""
+    tr = defence_trace(25)
+    tr["holder"][0:5], tr["holder"][8:17], tr["holder"][20:22], tr["holder"][23:25] = 3, 9, 2, 10
+    for i, row in enumerate(shot_rows):
+        tr["s_shots"][row:, 1] = i + 1
+    for row, bx, xs in ((8, 600.0, [100, 400, 599, 600, 900]), (14, 300.0, [100, 400, 250, 300, 500]),
+                        (23, 100.0, [500, 600, 700, 800, 900]), (24, 100.0, [500, 600, 700, 800, 900])):
+        tr["ball"][row] = (bx, 420.0)
+        place_outfield(tr, 0, xs, rows=row)
+    return tr
+
+
+class TestRegainKeys:
+    def test_goal_side_at_the_shot_and_retention_since_the_regain(self):
+        """[RED] See `regain_scene`. Team A loses the ball on row 8 and team B shoots on row 14 inside that spell: 2 of A's outfielders are
+        goal-side at the shot (seats 1 and 3; seat 4 stands level with the ball, 300, which is not goal-side), and of the 3 goal-side
+        at the regain (seats 1, 2, 3) two (1 and 3) still are: retention 2/3. Team A loses it again on row 23 and team B shoots on row 24: 0
+        goal-side at the shot; nobody was goal-side at the regain, so that spell has no retention. Over both spells:
+        at the shot (2 + 0) / 2 spells = 1.0; retention (2/3) / 1 spell. Team A's regain on row 20 has no team-A shot: team B's counts are 0."""
+        c = census.defence_counts(regain_scene())
+        assert (c["regain_goalside_at_shot_sum_A"], c["regain_goalside_at_shot_den_A"]) == (2, 2)
+        assert c["regain_goalside_retention_sum_A"] == pytest.approx(2 / 3)
+        assert c["regain_goalside_retention_den_A"] == 1
+        assert [c[f"regain_goalside_{k}_B"] for k in ("at_shot_sum", "at_shot_den", "retention_sum", "retention_den")] == [0, 0, 0, 0]
+        assert (c["regain_goalside_at_shot_sum_pooled"], c["regain_goalside_at_shot_den_pooled"]) == (2, 2)
+        met = census.defence_metrics([census.match_metrics(regain_scene())] * 5)
+        assert met["regain_goalside_at_shot_A"]["mean"] == pytest.approx(1.0)
+        assert met["regain_goalside_retention_A"]["mean"] == pytest.approx(2 / 3)
+        assert met["regain_goalside_at_shot_B"]["mean"] is None
+
+    def test_only_a_shot_inside_the_spell_counts(self):
+        """[RED] The only shot is on row 24, in team B's second possession. The first spell (regain row 8, ending when team A holds on
+        row 20) has no shot even though one comes later in the match: one spell reaches a shot, not two. A match without any shot has none."""
+        c = census.defence_counts(regain_scene(shot_rows=(24,)))
+        assert (c["regain_goalside_at_shot_sum_A"], c["regain_goalside_at_shot_den_A"]) == (0, 1)
+        assert c["regain_goalside_retention_den_A"] == 0
+        assert census.defence_counts(regain_scene(shot_rows=()))["regain_goalside_at_shot_den_A"] == 0
+
+    def test_the_spell_shot_is_a_rise_after_the_regain_row(self):
+        """[RED] A rise of team B's shot counter on row 8, the regain row itself, is not a shot of the spell (the spell is the rows after
+        the regain): no regain reaches a shot."""
+        assert census.defence_counts(regain_scene(shot_rows=(8,)))["regain_goalside_at_shot_den_A"] == 0
+
+    def test_a_match_without_a_regain_has_no_spell(self):
+        """[RED] Ball loose or held by one team for the whole match: no regain, every regain count 0."""
+        tr = defence_trace(30)
+        c = census.defence_counts(tr)
+        assert all(c[f"regain_goalside_{k}_{g}"] == 0 for k in ("at_shot_sum", "at_shot_den", "retention_sum", "retention_den") for g in ("A", "B", "pooled"))
+        tr["holder"][:] = 4
+        assert census.defence_counts(tr)["regain_goalside_at_shot_den_pooled"] == 0
+        met = census.summarize([census.match_metrics(tr)] * 10)["metrics"]
+        assert met["regain_goalside_at_shot_A"] == {"mean": None, "se": None, "n": 0}
+
+    def test_team_b_regain_frame_is_mirrored(self):
+        """[RED] The scene reflected through the pitch centre with the colours swapped (seats 0-5 and 6-11 exchanged, every world x
+        becomes 1400 - x, holders and shot counters follow): team B now defends the right goal exactly as team A defended the left
+        one, so every team-A value of the original is the team-B value of the reflection and the other way round."""
+        tr = regain_scene()
+        mirror = dict(tr)
+        for key in ("pos", "ball"):
+            mirror[key] = tr[key].copy()
+            mirror[key][..., 0] = 1400.0 - mirror[key][..., 0]
+        mirror["pos"] = np.concatenate([mirror["pos"][:, 6:], mirror["pos"][:, :6]], axis=1)
+        mirror["holder"] = np.where(tr["holder"] < 0, tr["holder"], (tr["holder"] + 6) % 12).astype(np.int8)
+        mirror["s_shots"] = tr["s_shots"][:, ::-1].copy()
+        a, b = census.defence_counts(tr), census.defence_counts(mirror)
+        for key in ("regain_goalside_at_shot_sum", "regain_goalside_at_shot_den", "regain_goalside_retention_sum", "regain_goalside_retention_den"):
+            assert b[f"{key}_B"] == pytest.approx(a[f"{key}_A"]), key
+            assert b[f"{key}_A"] == pytest.approx(a[f"{key}_B"]), key
+
+
+def spell_scene(defending_team: int = 0) -> dict:
+    """12 rows. The defending team's attacker of slot 3 on the other team holds the ball at (600, 420) on every row. The defending team's
+    outfielders stand far away at x = 50 except as listed (slot s: seat 6 d + s; each stands on the carrier's row y = 420 facing +x, towards it).
+    Reach per slot is 85, 85, 75, 75, 65 u beyond the 28 u of body contact, so the chance ranges are 113, 113, 103, 103, 93 u.
+      slot 1 at 110 u on rows 2-4, fires on row 3        -> chance spell 1 (fired)
+      slot 3 at 100 u on rows 6-7, never fires           -> chance spell 2 (not fired)
+      slot 2 at 150 u on row 0, fires                    -> out of reach, within the 180 u whiff range: counts
+      slot 4 at 200 u on row 9, fires                    -> beyond the whiff range: counts for nothing
+      slot 5 at 100 u on row 10, fires                   -> out of reach for slot 5 (93 u): counts
+      slot 4 at 100 u on row 11 facing away, fires       -> in reach but not facing: counts"""
+    d = defending_team
+    tr = defence_trace(12)
+    carrier = 6 * (1 - d) + 3
+    tr["holder"][:] = carrier
+    tr["pos"][:, carrier] = (600.0, 420.0)
+    for slot in range(1, 6):
+        tr["pos"][:, 6 * d + slot] = (50.0, 420.0 + 10.0 * slot)
+
+    def put(slot, rows, x, *, ang=0.0, fire_rows=()):
+        seat = 6 * d + slot
+        tr["pos"][rows, seat] = (x, 420.0)
+        tr["ang"][rows, seat] = ang
+        for row in fire_rows:
+            tr["act"][row, seat, 3] = 1.0
+
+    put(1, slice(2, 5), 490.0, fire_rows=(3,))
+    put(3, slice(6, 8), 500.0)
+    put(2, 0, 450.0, fire_rows=(0,))
+    put(4, 9, 400.0, fire_rows=(9,))
+    put(5, 10, 500.0, fire_rows=(10,))
+    put(4, 11, 500.0, ang=math.pi, fire_rows=(11,))
+    return tr
+
+
+class TestTackleSpells:
+    @pytest.mark.parametrize("defending_team", [0, 1])
+    def test_spells_fires_and_out_of_reach_fires_by_slot(self, defending_team):
+        """[RED] See `spell_scene`: 2 chance spells (slot 1 on rows 2-4, slot 3 on rows 6-7), one with a tackle fired and none won, and 3
+        tackle decisions within 180 u of the carrier outside every own spell row (slot 2 on row 0, slot 5 on row 10, slot 4 on row 11; slot 4's
+        fire at 200 u does not count). Team B defending gives the same numbers on its own keys. The out-of-reach count pools as a sum."""
+        c = census.defence_counts(spell_scene(defending_team))
+        own, other = "AB"[defending_team], "AB"[1 - defending_team]
+        assert (c[f"tackle_in_range_rate_n_{own}"], c[f"tackle_in_range_rate_den_{own}"]) == (1, 2)
+        assert (c[f"tackle_win_rate_n_{own}"], c[f"tackle_win_rate_den_{own}"]) == (0, 1)
+        assert c[f"tackle_out_of_range_per_match_{own}"] == 3
+        assert all(c[f"{k}_{other}"] == 0 for k in ("tackle_in_range_rate_n", "tackle_in_range_rate_den", "tackle_win_rate_den", "tackle_out_of_range_per_match"))
+        assert (c["tackle_in_range_rate_n_pooled"], c["tackle_in_range_rate_den_pooled"]) == (1, 2)
+        assert c["tackle_out_of_range_per_match_pooled"] == 3
+
+    def test_floors_and_rates_over_five_matches(self):
+        """[RED] Five copies of the scene: 10 chance spells (the floor is exactly 10), 5 fired, none won -> in-range rate 0.5, win rate
+        0, and 3 out-of-reach decisions per match. Four copies (8 spells) give None for all three."""
+        per_match = [census.match_metrics(spell_scene())] * 5
+        met = census.defence_metrics(per_match)
+        assert met["tackle_in_range_rate_A"]["mean"] == pytest.approx(0.5)
+        assert met["tackle_win_rate_A"]["mean"] == pytest.approx(0.0)
+        assert met["tackle_out_of_range_per_match_A"]["mean"] == pytest.approx(3.0)
+        assert met["tackle_in_range_rate_B"]["mean"] is None
+        below = census.defence_metrics(per_match[:4])
+        assert [below[k]["mean"] for k in ("tackle_in_range_rate_A", "tackle_win_rate_A", "tackle_out_of_range_per_match_A")] == [None, None, None]
+
+    @pytest.mark.parametrize("win_row, won", [(5, 1), (6, 0)])
+    def test_a_tackle_wins_when_the_defender_holds_within_3_decisions_of_the_fire(self, win_row, won):
+        """[RED] Seat 2 is in a chance spell on rows 0-2 (110 u from the carrier, seat 9) and fires on row 2; the ball is loose from row 3 and
+        seat 2 holds it from `win_row`. Row 5 is 3 decisions after the fire: won; row 6 is 4 decisions after: not won."""
+        tr = defence_trace(10)
+        tr["holder"][0:3], tr["holder"][win_row:] = 9, 2
+        tr["holder"][3:win_row] = -1
+        tr["pos"][:, 9] = (600.0, 420.0)
+        for seat in range(1, 6):
+            tr["pos"][:, seat] = (50.0, 420.0 + 10.0 * seat)
+        tr["pos"][0:3, 2] = (490.0, 420.0)
+        tr["act"][2, 2, 3] = 1.0
+        c = census.defence_counts(tr)
+        assert (c["tackle_in_range_rate_n_A"], c["tackle_in_range_rate_den_A"]) == (1, 1)
+        assert (c["tackle_win_rate_n_A"], c["tackle_win_rate_den_A"]) == (won, 1)
+
+    @pytest.mark.parametrize("carriers, rows, spells", [
+        ([9] * 5, (0, 1, 2, 3, 4), 1),
+        ([9] * 5, (0, 1, 3, 4), 2),
+        ([9, 9, 10, 10, 10], (0, 1, 2, 3, 4), 2),
+        ([9, 9, -1, 9, 9], (0, 1, 2, 3, 4), 2),
+    ])
+    def test_a_spell_is_a_consecutive_run_against_one_carrier(self, carriers, rows, spells):
+        """[RED] Seat 1 stands 110 u from the carrier, facing it, on `rows` (far away on the others). One run against one carrier is one
+        spell; a row out of reach splits it in two; a change of carrier (seat 9 to seat 10, both at (600, 420) when they hold) does too,
+        and so does a loose-ball row between two decisions of the same carrier (-1: nobody holds)."""
+        tr = defence_trace(5)
+        for t, c in enumerate(carriers):
+            tr["holder"][t] = c
+            if c >= 0:
+                tr["pos"][t, c] = (600.0, 420.0)
+            tr["pos"][t, 1] = (490.0, 420.0) if t in rows else (50.0, 430.0)
+        assert census.defence_counts(tr)["tackle_in_range_rate_den_A"] == spells
+
+    def test_a_keeper_carrier_and_an_own_team_holder_give_no_spell_and_no_out_of_reach_fire(self):
+        """[RED] The carrier is the other team's keeper (seat 6) or a player of the defending team itself: seat 1 stands 110 u away
+        facing it and fires, and nothing is counted."""
+        for holder in (6, 3):
+            tr = defence_trace(4)
+            tr["holder"][:] = holder
+            tr["pos"][:, holder] = (600.0, 420.0)
+            tr["pos"][:, 1] = (490.0, 420.0)
+            tr["act"][:, 1, 3] = 1.0
+            c = census.defence_counts(tr)
+            assert (c["tackle_in_range_rate_den_A"], c["tackle_out_of_range_per_match_A"]) == (0, 0), holder
+
+    def test_a_non_finite_body_angle_removes_that_defender_decision(self):
+        """[RED] In `spell_scene` slot 1's body angle is NaN on row 3, its fire row inside its chance rows 2-4: row 3 is no chance row, so the
+        run is cut in two (rows 2 and 4) and the spells are 3 (with slot 3's), none fired; the fire on row 3 is neither a spell fire nor an
+        out-of-reach fire, so the out-of-reach count stays 3."""
+        tr = spell_scene()
+        tr["ang"][3, 1] = np.nan
+        c = census.defence_counts(tr)
+        assert (c["tackle_in_range_rate_n_A"], c["tackle_in_range_rate_den_A"], c["tackle_win_rate_den_A"]) == (0, 3, 0)
+        assert c["tackle_out_of_range_per_match_A"] == 3
+
+    def test_a_trace_without_actions_or_facing_enters_no_spell(self):
+        """[RED] Without `act` or without `ang` there is nothing to count: zero spells and zero fires."""
+        for dropped in ("act", "ang"):
+            tr = {k: v for k, v in spell_scene().items() if k != dropped}
+            c = census.defence_counts(tr)
+            assert c["tackle_in_range_rate_den_pooled"] == 0 and c["tackle_out_of_range_per_match_pooled"] == 0, dropped
+
+
+class TestDefenceAggregation:
+    def test_shot_keys_floor_at_10_shots_and_report_shares_over_shots(self):
+        """[RED] One conceded shot per match (facing 1, closing 1): ten matches give 1.0 for both, nine matches give None."""
+        m = census.match_metrics(shot_scene())
+        met = census.defence_metrics([m] * 10)
+        assert (met["shot_nearest_def_facing_B"]["mean"], met["shot_nearest_def_closing_B"]["mean"]) == (pytest.approx(1.0), pytest.approx(1.0))
+        assert met["shot_nearest_def_facing_A"]["mean"] is None
+        below = census.defence_metrics([m] * 9)
+        assert below["shot_nearest_def_facing_B"] == {"mean": None, "se": None, "n": 9}
+        assert below["shot_nearest_def_closing_B"]["mean"] is None
+
+    def test_a_floor_of_one_returns_the_single_match_value(self):
+        """[RED] With `min_events` 1 the regain scene gives its hand values from one match: at the shot (2 + 0) / 2 = 1, retention 2/3."""
+        met = census.defence_metrics([census.match_metrics(regain_scene())], min_events=1)
+        assert met["regain_goalside_at_shot_A"]["mean"] == pytest.approx(1.0)
+        assert met["regain_goalside_retention_A"]["mean"] == pytest.approx(2 / 3)
+
+    def test_summary_carries_every_defence_key_for_each_group(self):
+        """[RED] `summarize` has the ten defence keys with the `_A`, `_B` and `_pooled` suffixes (the per-match count included), each a
+        `{mean, se, n}` entry, on a trace that has none of the events."""
+        tr = defence_trace(30)
+        met = census.summarize([census.match_metrics(tr)])["metrics"]
+        keys = [f"{k}_{g}" for k in (*DEFENCE_RATIO_KEYS, "tackle_out_of_range_per_match") for g in ("A", "B", "pooled")]
+        assert all(set(met[k]) == {"mean", "se", "n"} for k in keys)
+
+    def test_harness_traces_run_through_the_defence_counts(self, ckpt):
+        """[RED] Two real 120-step matches: every count is a finite non-negative number and the summary has no error."""
+        traces = harness.run_matches(quick_spec(ckpt, n=2, max_steps=120))
+        for t in traces:
+            counts = census.defence_counts(t)
+            assert counts and all(np.isfinite(v) and v >= 0 for v in counts.values())
+        census.summarize([census.match_metrics(t) for t in traces])
+
+
+class TestDefenceCli:
+    def test_the_json_of_the_command_line_carries_the_defence_keys_and_the_counts(self, ckpt, tmp_path):
+        """[RED] `census.py DIR --json OUT` on two saved harness traces writes the thirty defence keys to the summary (each `{mean, se, n}`) and
+        the 57 counts to every per-match record."""
+        traces = harness.run_matches(quick_spec(ckpt, n=2, max_steps=60))
+        out = harness.save_traces(traces, tmp_path / "traces", [Path(ckpt)])
+        assert census.main([str(out), "--json", str(tmp_path / "census.json")]) == 0
+        (payload,) = json.loads((tmp_path / "census.json").read_text(encoding="utf-8")).values()
+        metrics = payload["summary"]["metrics"]
+        keys = [f"{k}_{g}" for k in (*DEFENCE_RATIO_KEYS, "tackle_out_of_range_per_match") for g in ("A", "B", "pooled")]
+        assert len(keys) == 30 and all(set(metrics[k]) == {"mean", "se", "n"} for k in keys)
+        assert all(len([k for k in m if k in census.DEFENCE_COUNT_KEYS]) == 57 for m in payload["per_match"])
+
+
+class TestTrapFlag:
+    @staticmethod
+    def payload(facing, goals):
+        return {"summary": {"n_matches": 96, "metrics": {
+            "facing_ball_share_pooled": {"mean": facing, "se": 0.01, "n": 96}, "goals_total": {"mean": goals, "se": 0.1, "n": 96}}}}
+
+    @pytest.mark.parametrize("facing, goals, flag", [(0.35, 0.49, True), (0.351, 0.49, False), (0.35, 0.5, False), (0.0, 0.0, True), (0.33, 0.44, True), (0.47, 1.47, False)])
+    def test_rule_is_facing_at_most_035_and_goals_below_05(self, facing, goals, flag):
+        """[RED] facing_ball_share_pooled <= 0.35 and goals_total < 0.5: (0.35, 0.49) flags, (0.351, 0.49) and (0.35, 0.5) do not;
+        ft43 at generation 50 (0.33, 0.44) flags and ft42 (0.47, 1.47) does not."""
+        assert census.trap_flag_g50(self.payload(facing, goals)) is flag
+
+    def test_the_summary_and_the_metrics_dict_are_accepted_too(self):
+        """[RED] The census payload, its `summary`, the `summarize` result and the bare metrics mapping all give the same flag."""
+        payload = self.payload(0.3, 0.2)
+        assert census.trap_flag_g50(payload["summary"]) is True
+        assert census.trap_flag_g50(payload["summary"]["metrics"]) is True
+
+    @pytest.mark.parametrize("missing", ["facing_ball_share_pooled", "goals_total"])
+    def test_a_missing_or_none_input_raises(self, missing):
+        """[RED] A census without one of the two inputs (absent, or a mean of None) cannot be flagged: ValueError, not False."""
+        payload = self.payload(0.3, 0.2)
+        del payload["summary"]["metrics"][missing]
+        with pytest.raises(ValueError, match=missing):
+            census.trap_flag_g50(payload)
+        payload = self.payload(0.3, 0.2)
+        payload["summary"]["metrics"][missing]["mean"] = None
+        with pytest.raises(ValueError, match=missing):
+            census.trap_flag_g50(payload)
+
+
+# ----------------------------------------------------------------------------
+# Gates: parking guard P1 and the held-out bot target T1h
+# ----------------------------------------------------------------------------
+def _p1_arms(values: dict) -> dict:
+    """`{seed: {gen: deep_block_ge4_pooled}}` as gates input (`self_sampled` censuses with the defaults of `_fresh_arm_seed`)."""
+    return {s: _fresh_arm_seed({g: {"deep_block_ge4_pooled": (v, 0.01)} for g, v in gens.items()}) for s, gens in values.items()}
+
+
+def _evaluate_p1(arm_values: dict, comp_values: dict | None, **kw):
+    from tools.audit import gates
+
+    comp = None if comp_values is None else _p1_arms(comp_values)
+    return gates.evaluate_gates(_p1_arms(arm_values), comparator=comp, gens=["100", "200", "300"], calibration=_make_fake_calibration(), **kw)
+
+
+class TestParkingGuardP1:
+    # Comparator maximum per generation: 0.10 at 200 (mean 0.07), 0.30 at 300. The limit is the maximum plus 0.05.
+    COMP = {"s42": {"100": 0.40, "200": 0.10, "300": 0.30}, "s43": {"100": 0.40, "200": 0.04, "300": 0.20}}
+
+    def test_an_arm_seed_at_the_comparator_maximum_plus_005_passes_and_just_above_fails(self):
+        """[RED] Gen 200: comparator seeds 0.10 and 0.04, limit 0.10 + 0.05 = 0.15 (the mean 0.07 would give 0.12). An arm seed at 0.14
+        and one at 0.15 pass (a mean-based guard would fail both); 0.1501 fails, with the seed, generation, value and limit named.
+        Gen 100 is not evaluated: an arm seed at 0.90 there (comparator limit 0.45) still passes."""
+        passed = _evaluate_p1({"s42": {"100": 0.90, "200": 0.14, "300": 0.12}, "s43": {"100": 0.0, "200": 0.15, "300": 0.12}}, self.COMP)
+        assert passed["gates"]["P1"]["passed"] is True
+        assert passed["gates"]["P1"]["violations"] == []
+        assert sorted(passed["gates"]["P1"]["per_gen"]) == ["200", "300"]
+        failed = _evaluate_p1({"s42": {"100": 0.0, "200": 0.1501, "300": 0.12}, "s43": {"100": 0.0, "200": 0.0, "300": 0.0}}, self.COMP)
+        p1 = failed["gates"]["P1"]
+        assert p1["passed"] is False
+        assert len(p1["violations"]) == 1
+        v = p1["violations"][0]
+        assert (v["seed"], v["gen"], v["value"]) == ("s42", "200", pytest.approx(0.1501))
+        assert v["limit"] == pytest.approx(0.15)
+
+    def test_any_arm_seed_above_the_limit_at_any_generation_from_200_fails(self):
+        """[RED] Gen 300: comparator maximum 0.30 -> limit 0.35. Arm seed s43 at 0.36 fails there while s42 stays inside; only s43 is named."""
+        res = _evaluate_p1({"s42": {"100": 0.0, "200": 0.0, "300": 0.35}, "s43": {"100": 0.0, "200": 0.0, "300": 0.36}}, self.COMP)
+        p1 = res["gates"]["P1"]
+        assert p1["passed"] is False
+        assert [(v["seed"], v["gen"]) for v in p1["violations"]] == [("s43", "300")]
+
+    def test_a_failing_parking_guard_has_a_report_section_and_does_not_set_the_exit_status(self, tmp_path):
+        """[RED] Four-seed CLI run (gens 200 and 300, `--exit-on-c0`) in which every arm seed parks (0.60 against the comparator's 0.10):
+        P1 fails, C0 passes, the exit status stays 0 (only C0, C0L and G6 set it), and the Markdown has a P1 row in the gate table
+        and a `## Parking (P1)` section."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+        args = {}
+        for name, deep in (("arm", 0.60), ("comp", 0.10)):
+            args[name] = []
+            for s in ("42", "43", "44", "45"):
+                root = tmp_path / name / s
+                for g in (200, 300):
+                    _write_e6_eval_dir(root, g, extra_census={"deep_block_ge4_pooled": deep})
+                args[name].append(f"{s}={root}")
+        rc = gates.main(["--arm", *args["arm"], "--comparator", *args["comp"], "--gens", "200", "300", "--protocol", "fresh",
+                         "--calibration", str(cal_path), "--exit-on-c0", "--json", str(tmp_path / "out.json"), "--md", str(tmp_path / "out.md")])
+        res = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+        assert (res["gates"]["P1"]["passed"], res["gates"]["C0"]["passed"]) == (False, True)
+        assert rc == 0
+        md = (tmp_path / "out.md").read_text(encoding="utf-8")
+        assert "| P1 |" in md and "## Parking (P1)" in md
+
+    def test_without_a_comparator_or_without_the_key_the_guard_is_skipped_and_reported(self):
+        """[RED] No comparator: no P1 entry and a note. A comparator but arm censuses without `deep_block_ge4_pooled` (older census files)
+        and one that has it only at gen 100: the same."""
+        from tools.audit import gates
+
+        for comp in (None, self.COMP):
+            notes: list = []
+            arm = {s: _fresh_arm_seed({"100": {}, "200": {}, "300": {}}) for s in ("s42", "s43")}
+            res = gates.evaluate_gates(arm, comparator=None if comp is None else _p1_arms(comp), gens=["100", "200", "300"],
+                                       calibration=_make_fake_calibration(), notes=notes)
+            assert "P1" not in res["gates"]
+            assert [n for n in notes if n.startswith("P1: not evaluated")]
+        notes = []
+        only_100 = {"s42": {"100": 0.1, "200": 0.1, "300": 0.1}, "s43": {"100": 0.1, "200": 0.1, "300": 0.1}}
+        arm = {s: _fresh_arm_seed({"100": {"deep_block_ge4_pooled": (0.9, 0.01)}, "200": {}, "300": {}}) for s in only_100}
+        res = gates.evaluate_gates(arm, comparator=_p1_arms(only_100), gens=["100", "200", "300"], calibration=_make_fake_calibration(), notes=notes)
+        assert "P1" not in res["gates"] and [n for n in notes if n.startswith("P1: not evaluated")]
+
+    def test_a_missing_value_in_one_seed_or_in_the_comparator_raises(self):
+        """[RED] The key present for seed s42 but absent for s43 at gen 200 raises naming s43; the arm having it and the comparator lacking it
+        raises naming the comparator; a None mean (below the census floor) raises too. Nothing is skipped silently."""
+        arm = _p1_arms({"s42": {"100": 0.0, "200": 0.1, "300": 0.1}, "s43": {"100": 0.0, "200": 0.1, "300": 0.1}})
+        arm["s43"]["200"]["self_sampled"]["summary"]["metrics"].pop("deep_block_ge4_pooled")
+        from tools.audit import gates
+
+        comp = _p1_arms(self.COMP)
+        with pytest.raises(ValueError, match="s43"):
+            gates.evaluate_gates(arm, comparator=comp, gens=["100", "200", "300"], calibration=_make_fake_calibration())
+        arm = _p1_arms({"s42": {"100": 0.0, "200": 0.1, "300": 0.1}, "s43": {"100": 0.0, "200": 0.1, "300": 0.1}})
+        bare = {s: _fresh_arm_seed({"100": {}, "200": {}, "300": {}}) for s in ("s42", "s43")}
+        with pytest.raises(ValueError, match="comparator"):
+            gates.evaluate_gates(arm, comparator=bare, gens=["100", "200", "300"], calibration=_make_fake_calibration())
+        arm["s42"]["300"]["self_sampled"]["summary"]["metrics"]["deep_block_ge4_pooled"]["mean"] = None
+        with pytest.raises(ValueError, match="s42"):
+            gates.evaluate_gates(arm, comparator=comp, gens=["100", "200", "300"], calibration=_make_fake_calibration())
+
+
+def _t1h_arms(values: dict, goals_a: float = 20.0) -> dict:
+    """`{seed: ((goals_B, goal_diff) on vs_heldout_sampled, (goals_B, goal_diff) on vs_heldout_sampled_red)}` at gen 300 on top of the
+    defaults of `_fresh_arm_seed`; `goals_A` is `goals_a` on both tags."""
+    out = {}
+    for seed, tags in values.items():
+        out[seed] = _fresh_arm_seed({"300": {}})
+        for tag, (goals_b, diff) in zip(("vs_heldout_sampled", "vs_heldout_sampled_red"), tags):
+            out[seed]["300"][tag] = {"summary": {"n_matches": 48, "metrics": {
+                "goals_A": {"mean": goals_a, "se": 0.5, "n": 48}, "goals_B": {"mean": goals_b, "se": 0.3, "n": 48},
+                "goal_diff": {"mean": diff, "se": 0.4, "n": 48}}}}
+    return out
+
+
+def _t1h(arm: dict, comp: dict | None, **kw) -> dict:
+    from tools.audit import gates
+
+    res = gates.evaluate_gates(arm, comparator=comp, gens=["300"], calibration=_make_fake_calibration(), **kw)
+    found = [t for t in res["targets"] if t["id"] == "T1h"]
+    return found[0] if found else None
+
+
+class TestHeldOutTargetT1h:
+    COMP = {"s42": ((6.0, -4.0), (4.0, -2.0)), "s43": ((7.0, -5.0), (5.0, -3.0))}   # goals_B per seed 5.0 and 6.0, mean 5.5
+
+    def test_beats_neutral_and_loses_on_goals_conceded(self):
+        """[RED] Lower is better, delta 1.0 goal, the seed value being the mean of the two colours' `goals_B`. Comparator seeds 5.0 and 6.0
+        (mean 5.5). Arm 3.0 and 3.5 (mean 3.25): separated and 2.25 better -> BEATS. Arm 4.6 and 4.7 (mean 4.65): separated but only 0.85
+        better -> NEUTRAL. Arm 7.0 and 7.5: every arm seed above every comparator seed and 1.75 worse -> LOSES. Arm 5.0 and 5.0 against
+        comparator 6.0 and 6.0: exactly 1.0 better and separated -> BEATS. The record names the key, tags, direction and delta."""
+        comp = _t1h_arms(self.COMP)
+        beats = _t1h(_t1h_arms({"s42": ((2.0, 0.0), (4.0, 0.0)), "s43": ((4.0, 0.0), (3.0, 0.0))}), comp)
+        assert beats["verdict"] == "BEATS"
+        assert (beats["key"], beats["tag"], beats["direction"], beats["delta"], beats["gen"]) == (
+            "goals_B", "vs_heldout_sampled+vs_heldout_sampled_red", "lower", 1.0, "300")
+        assert beats["arm_per_seed"] == {"s42": 3.0, "s43": 3.5}
+        assert beats["comp_per_seed"] == {"s42": 5.0, "s43": 6.0}
+        assert beats["mean_diff"] == pytest.approx(3.25 - 5.5)
+        assert _t1h(_t1h_arms({"s42": ((4.6, 0.0), (4.6, 0.0)), "s43": ((4.7, 0.0), (4.7, 0.0))}), comp)["verdict"] == "NEUTRAL"
+        assert _t1h(_t1h_arms({"s42": ((7.0, 0.0), (7.0, 0.0)), "s43": ((7.5, 0.0), (7.5, 0.0))}), comp)["verdict"] == "LOSES"
+        same6 = _t1h_arms({"s42": ((6.0, 0.0), (6.0, 0.0)), "s43": ((6.0, 0.0), (6.0, 0.0))})
+        assert _t1h(_t1h_arms({"s42": ((5.0, 0.0), (5.0, 0.0)), "s43": ((5.0, 0.0), (5.0, 0.0))}), same6)["verdict"] == "BEATS"
+
+    def test_the_target_reads_goals_b_not_goals_a(self):
+        """[RED] The arm concedes fewer goals (BEATS on `goals_B`) while its `goals_A` (40) is far above the comparator's (10): a verdict taken
+        from `goals_A` with the same direction would be LOSES."""
+        arm = _t1h_arms({"s42": ((3.0, 0.0), (3.0, 0.0)), "s43": ((3.5, 0.0), (3.5, 0.0))}, goals_a=40.0)
+        comp = _t1h_arms(self.COMP, goals_a=10.0)
+        assert _t1h(arm, comp)["verdict"] == "BEATS"
+
+    def test_goal_difference_is_reported_beside_the_verdict(self):
+        """[RED] The record carries the goal difference of the same tags: per-seed means of the two colours (arm -1.0 and +1.0 -> seed 0.0;
+        -2.0 and -4.0 -> -3.0; comparator -4.0 and -2.0 -> -3.0; -5.0 and -3.0 -> -4.0) and the mean difference (-1.5 - (-3.5)) = +2.0."""
+        arm = _t1h_arms({"s42": ((3.0, -1.0), (3.0, 1.0)), "s43": ((3.0, -2.0), (3.0, -4.0))})
+        rec = _t1h(arm, _t1h_arms(self.COMP))
+        gd = rec["goal_diff"]
+        assert (gd["arm_per_seed"], gd["comp_per_seed"]) == ({"s42": 0.0, "s43": -3.0}, {"s42": -3.0, "s43": -4.0})
+        assert gd["mean_diff"] == pytest.approx(2.0)
+
+    def test_skipped_and_reported_when_the_tags_or_the_comparator_are_absent(self):
+        """[RED] Without a comparator, with arm censuses lacking the held-out tags, and with a comparator lacking them: no T1h target and a
+        note that starts `T1h: not evaluated`; the other targets are still there."""
+        arm = _t1h_arms({"s42": ((3.0, 0.0), (3.0, 0.0)), "s43": ((3.0, 0.0), (3.0, 0.0))})
+        bare = {s: _fresh_arm_seed({"300": {}}) for s in ("s42", "s43")}
+        from tools.audit import gates
+
+        for a, c in ((arm, None), (bare, _t1h_arms(self.COMP)), (arm, bare)):
+            notes: list = []
+            res = gates.evaluate_gates(a, comparator=c, gens=["300"], calibration=_make_fake_calibration(), notes=notes)
+            assert [t["id"] for t in res["targets"]] == ["T1", "T2", "T3"]
+            assert [n for n in notes if n.startswith("T1h: not evaluated")]
+
+    def test_tags_present_for_some_arm_seeds_only_raise(self):
+        """[RED] Held-out tags for s42 but not for s43 are an error naming s43, not a skip."""
+        from tools.audit import gates
+
+        arm = _t1h_arms({"s42": ((3.0, 0.0), (3.0, 0.0))})
+        arm["s43"] = _fresh_arm_seed({"300": {}})
+        with pytest.raises(ValueError, match="s43"):
+            gates.evaluate_gates(arm, comparator=_t1h_arms(self.COMP), gens=["300"], calibration=_make_fake_calibration())
+
+    def test_the_markdown_lists_the_target_and_its_goal_difference(self):
+        """[RED] The Targets table has a T1h row and a line with the goal difference."""
+        from tools.audit import gates
+
+        arm = _t1h_arms({"s42": ((3.0, -1.0), (3.0, 1.0)), "s43": ((3.0, -2.0), (3.0, -4.0))})
+        res = gates.evaluate_gates(arm, comparator=_t1h_arms(self.COMP), gens=["300"], calibration=_make_fake_calibration())
+        md = gates.format_markdown(res)
+        assert "T1h (goals_B@vs_heldout_sampled+vs_heldout_sampled_red)" in md
+        assert "T1h goal_diff" in md
+
+    def test_the_cli_keeps_stdout_and_prints_skip_notes_on_stderr(self, tmp_path, capsys):
+        """[RED] Four seeds without held-out tags and without the parking key: stdout is exactly the Markdown (no new line), stderr names
+        both skipped checks."""
+        from tools.audit import gates
+
+        cal_path = tmp_path / "cal.json"
+        cal_path.write_text(json.dumps(_make_fake_calibration(gen="300")), encoding="utf-8")
+        args = {name: [f"{s}={_write_e6_eval_dir(tmp_path / name / s, 300)}" for s in ("42", "43", "44", "45")] for name in ("arm", "comp")}
+        assert gates.main(["--arm", *args["arm"], "--comparator", *args["comp"], "--gens", "300", "--protocol", "fresh",
+                           "--calibration", str(cal_path), "--md", str(tmp_path / "out.md")]) == 0
+        out, err = capsys.readouterr()
+        assert out == (tmp_path / "out.md").read_text(encoding="utf-8") + "\n"
+        assert "T1h: not evaluated" in err and "P1: not evaluated" in err
+
+
+# ----------------------------------------------------------------------------
 # Kick-conditional aim head (`hybrid6`) in the harness and the aim-control internals
 # ----------------------------------------------------------------------------
 def write_hybrid6_checkpoint(directory: Path, seed: int = 0, spread: float = 0.3) -> Path:
