@@ -1414,7 +1414,7 @@ class TestAimRollouts:
         assert c["n"] == 1 and c["paired"]["aim_minus_policy"]["non_shaping_return_75"]["mean"] == pytest.approx(0.0)
         n_of = {k: v["n"] for k, v in s["buckets"].items()}
         assert n_of == {
-            "not_aimed": 2, "already_aimed": 1,
+            "not_aimed": 2, "already_aimed": 1, "all": 3,
             "not_aimed_third_defensive": 1, "not_aimed_third_middle": 1, "not_aimed_third_attacking": 0,
             "not_aimed_intent_kick": 2, "not_aimed_intent_mid": 0, "not_aimed_intent_hold": 0,
         }
@@ -1422,6 +1422,34 @@ class TestAimRollouts:
         text = rollouts.format_aim_report(s, title="hand")
         assert text.splitlines()[0].startswith("===== rollouts aim hand")
         assert "-- not already aimed (n=2) --" in text and "-- already aimed (n=1) --" in text
+
+    def test_all_points_bucket_has_no_already_aimed_filter(self):
+        """[RED] Records (already, POLICY first receiver, non-shaping return POLICY/AIM/AIMP):
+          A  yes  target    0.0/0.5/0.0     B  yes  target    0.0/0.5/0.0     C  yes  opponent  0.0/0.0/0.0
+          D  no   target    0.0/1.0/0.0     E  no   none      0.0/0.0/0.0
+        `all` holds every point: n 5, POLICY first receiver target 3/5, opponent 1/5, none 1/5, AIM - POLICY mean (0.5 + 0.5 + 0 + 1 + 0) / 5 = 0.4.
+        A bucket that kept the not-aimed filter would read target 1/2 (D, E), one that kept the already-aimed filter 2/3 (A, B, C)."""
+        from tools.audit import rollouts
+
+        recs = [
+            self._hand_record(True, "defensive", "kick", ("target", "target", "target"), (0.0, 0.5, 0.0)),
+            self._hand_record(True, "middle", "kick", ("target", "target", "target"), (0.0, 0.5, 0.0)),
+            self._hand_record(True, "middle", "hold", ("opponent", "target", "target"), (0.0, 0.0, 0.0)),
+            self._hand_record(False, "attacking", "kick", ("target", "target", "target"), (0.0, 1.0, 0.0)),
+            self._hand_record(False, "middle", "mid", ("none", "target", "target"), (0.0, 0.0, 0.0)),
+        ]
+        s = rollouts.summarize_aim(recs, 1, 1, 0, 0.0, seed=1)
+        everything = s["buckets"]["all"]
+        assert everything["n"] == s["n_points"] == 5
+        policy = everything["branches"]["policy"]
+        assert [policy[f"first_receiver_{o}"]["mean"] for o in ("target", "opponent", "none", "teammate")] == pytest.approx([0.6, 0.2, 0.2, 0.0])
+        assert everything["paired"]["aim_minus_policy"]["non_shaping_return_75"]["mean"] == pytest.approx(0.4)
+        assert s["buckets"]["not_aimed"]["branches"]["policy"]["first_receiver_target"]["mean"] == pytest.approx(0.5)
+        assert s["buckets"]["already_aimed"]["branches"]["policy"]["first_receiver_target"]["mean"] == pytest.approx(2 / 3)
+        assert set(everything) == set(s["buckets"]["not_aimed"])
+        text = rollouts.format_aim_report(s, title="hand")
+        assert "-- all points (n=5) --" in text
+        assert text.index("-- not already aimed (n=2) --") < text.index("-- already aimed (n=3) --") < text.index("-- all points (n=5) --")
 
     def test_aim_cli_end_to_end(self, tmp_path):
         """[RED] `rollouts aim` on the hybrid5 fixture (2 matches, 1 point): JSON and report written, the same JSON with 1 and

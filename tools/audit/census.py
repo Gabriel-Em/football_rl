@@ -60,6 +60,39 @@ Metrics
                     players within 85 u of the carrier. The team is the tacklers' team. Decisions with a loose ball or a
                     keeper holding it enter nothing.
                     The report line is `basin: reverse X | facing ball Y | tackle-ready Z` (pooled shares).
+  defence keys      per defending team: `<key>_A` and `<key>_B` are the values of the team that defends (A defends against B's
+                    attacks), `<key>_pooled` pools both. Canonical x is the distance from the defending team's own goal line
+                    (0..1400, `side` gives the team's goal); a goal-side outfielder has canonical x strictly below the ball's. Defenders
+                    are the five outfield seats. A shot is a rise of the team's `s_shots` counter on row k; its shooter is the holder on
+                    row k (a shot on a row without a holder of the shooting team raises ValueError). The per-match records carry the
+                    counts (`defence_counts`), `summarize` the shares (`defence_metrics`): ratios of per-match counts with the cluster-robust
+                    SE, except `tackle_out_of_range_per_match` (mean per match, pooled = A + B). A key is None (mean and SE) when its event
+                    count over the matches is below `DEFENCE_MIN_EVENTS` (10 shots, regains reaching a shot or chance spells) or, for the
+                    two decision-based keys, `DEFENCE_MIN_DECISIONS` (100); `n` still counts the matches that had events.
+                    `goal_side_at_goal`: over the shots after which the shooting team scores within 45 decisions (3 s; the goal shots),
+                    the mean number of the conceding team's outfielders goal-side of the ball on the shot row.
+                    `shot_nearest_def_facing` / `shot_nearest_def_closing`: over every shot, the conceding outfielder nearest the shooter on
+                    the shot row faces it (cos(body angle, bearing to the shooter) >= 0.25, the tackle gate) / has a mean velocity component
+                    toward the shooter above 20 u/s over the 8 decisions before the shot (rows k - 8 .. k - 1, those that exist; the
+                    shooter and defender positions of each row). Shares over shots; a shot with a non-finite input enters neither.
+                    `regain_goalside_at_shot` / `regain_goalside_retention`: a regain is the first row held by the opponent after the last
+                    held row was the defending team's (the ball may be loose in between); its spell runs until the defending team holds
+                    again or the match ends. Over the regains whose spell holds a shot of the opponent (the first rise of its `s_shots`
+                    after the regain row), the mean number of the defending team's outfielders goal-side on the shot row, and the mean over
+                    those regains that had a goal-side outfielder on the regain row of the share of them still goal-side on the shot row.
+                    `tackle_in_range_rate`, `tackle_win_rate`, `tackle_out_of_range_per_match`: on rows where an opposing outfielder holds the
+                    ball (a keeper carrier enters nothing), a chance row of defender i is one with the carrier within the tackle reach of
+                    its slot (distance - 28 u of body contact <= 85, 85, 75, 75, 65 u for slots 1..5) and i facing it (the tackle gate);
+                    a chance spell is a maximal run of consecutive chance rows of one defender against one carrier. In-range rate:
+                    spells in which i fired a tackle (`act[..., 3] > 0.5`) over spells. Win rate: spells in which a fired tackle was
+                    followed by i holding the ball on the same row or within the next 3 decisions, over spells with a fire. Out of range per
+                    match: tackle decisions by a defender against a carrier within 180 u (the whiff range) on rows outside that defender's
+                    own chance rows. Traces without `act` or `ang` enter none of them.
+                    `deep_block_ge4`: over the team-decisions with the ball at canonical x >= 700 (the opponent's half), the share in which
+                    at least 4 of the 5 outfielders stand at canonical x <= 280 (a fifth of the pitch). `outfield_depth_oop`: the mean over
+                    the decisions in which the opponent holds the ball of the mean canonical x of the five outfielders.
+  trap_flag_g50     `trap_flag_g50(census)` on a generation-50 `self_sampled` census: `facing_ball_share_pooled <= 0.35` and
+                    `goals_total < 0.5`.
   n_within(R)       mean number of a team's outfield players strictly closer than R u to the ball per
                     decision (per team). Uniform random placement gives 0.123 (R=100), 0.266 (R=150).
   cluster_ge4       fraction of decisions in which at least 4 of a team's 5 outfield players form one
@@ -101,7 +134,8 @@ from football_rl.config import DEFAULT_CONFIG  # noqa: E402
 
 __all__ = [
     "hold_share", "loose_share", "holder_spell_intervals", "holder_spells", "kick_events", "kick_outcomes",
-    "outfield_outcome_counts", "pass_options", "pass_option_counts", "aim_reach_counts", "basin_counts", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
+    "outfield_outcome_counts", "pass_options", "pass_option_counts", "aim_reach_counts", "basin_counts", "defence_counts", "defence_metrics",
+    "trap_flag_g50", "kick_propensity_counts", "kick_propensity", "n_within", "max_component_size",
     "cluster_ge4", "role_inversion", "gk_geometry", "gk_opportunities", "goal_events", "goal_type_counts",
     "time_binned_counts", "time_binned_metrics", "match_metrics", "mean_se", "ratio_se", "summarize", "report",
     "load_traces", "main",
@@ -155,6 +189,40 @@ BASIN_BLOCK_ROWS = 768
 LATE_WINDOW_STEPS = 225
 TEAM_SIZE = 6
 TEAMS = ("A", "B")
+DEFENCE_MIN_EVENTS = 10
+DEFENCE_MIN_DECISIONS = 100
+GOAL_AFTER_SHOT_STEPS = 45
+SHOT_APPROACH_STEPS = 8
+CLOSING_MIN_SPEED = 20.0
+DEEP_BLOCK_MIN_BALL_X = 0.5 * FIELD_WIDTH
+DEEP_BLOCK_MAX_X = FIELD_WIDTH / 5.0
+DEEP_BLOCK_MIN_PLAYERS = 4
+TACKLE_WIN_STEPS = 3
+TACKLE_CONTACT_OFFSET = 2.0 * float(DEFAULT_CONFIG.physics.player_radius) - 8.0
+TACKLE_WHIFF_RANGE = float(DEFAULT_CONFIG.mechanics.tackle_whiff_max_ball_dist)
+# tackle reach beyond body contact by slot 1..5 (D1, D2, M1, M2, ST)
+TACKLE_REACH = np.array([
+    DEFAULT_CONFIG.mechanics.tackle_radius_def, DEFAULT_CONFIG.mechanics.tackle_radius_def,
+    DEFAULT_CONFIG.mechanics.tackle_radius_mid, DEFAULT_CONFIG.mechanics.tackle_radius_mid,
+    DEFAULT_CONFIG.mechanics.tackle_radius_atk,
+], dtype=np.float64)
+TRAP_FACING_MAX = 0.35
+TRAP_GOALS_BELOW = 0.5
+# key -> (numerator count, denominator count, count that must reach the minimum, kind of minimum); each count has the suffixes _A, _B, _pooled
+DEFENCE_SHARES = {
+    "goal_side_at_goal": ("goal_side_at_goal_sum", "goal_side_at_goal_den", "goal_side_at_goal_den", "events"),
+    "shot_nearest_def_facing": ("shot_nearest_def_facing_n", "shot_nearest_def_facing_den", "shot_nearest_def_facing_den", "events"),
+    "shot_nearest_def_closing": ("shot_nearest_def_closing_n", "shot_nearest_def_closing_den", "shot_nearest_def_closing_den", "events"),
+    "regain_goalside_at_shot": ("regain_goalside_at_shot_sum", "regain_goalside_at_shot_den", "regain_goalside_at_shot_den", "events"),
+    "regain_goalside_retention": ("regain_goalside_retention_sum", "regain_goalside_retention_den", "regain_goalside_at_shot_den", "events"),
+    "tackle_in_range_rate": ("tackle_in_range_rate_n", "tackle_in_range_rate_den", "tackle_in_range_rate_den", "events"),
+    "tackle_win_rate": ("tackle_win_rate_n", "tackle_win_rate_den", "tackle_in_range_rate_den", "events"),
+    "deep_block_ge4": ("deep_block_ge4_n", "deep_block_ge4_den", "deep_block_ge4_den", "decisions"),
+    "outfield_depth_oop": ("outfield_depth_oop_sum", "outfield_depth_oop_den", "outfield_depth_oop_den", "decisions"),
+}
+DEFENCE_COUNT_KEYS = tuple(
+    f"{part}_{group}" for num, den, _, _ in DEFENCE_SHARES.values() for part in (num, den) for group in BASIN_GROUPS
+) + tuple(f"tackle_out_of_range_per_match_{group}" for group in BASIN_GROUPS)
 # row = the carrier's team; True at the outfield seats of the other team (the players that can tackle the carrier)
 _OPPOSING_OUTFIELD = np.zeros((2, 2 * TEAM_SIZE), dtype=bool)
 for _carrier_team in (0, 1):
@@ -441,6 +509,222 @@ def basin_counts(trace: Dict[str, np.ndarray]) -> Dict[str, int]:
             mine = seat // TEAM_SIZE == team
             add("tackle_ready", label, int(np.count_nonzero(ready & mine)), int(np.count_nonzero(valid & mine)))
     return c
+
+
+# ----------------------------------------------------------------------------
+# Defence keys
+# ----------------------------------------------------------------------------
+def _canonical_x(x: np.ndarray, side_col: np.ndarray) -> np.ndarray:
+    """`x` (K, ...) as the distance from the own goal line of the team whose `side` entry on each of the K rows is `side_col`."""
+    own_left = (side_col == 0).reshape((-1,) + (1,) * (x.ndim - 1))
+    return np.where(own_left, x, FIELD_WIDTH - x)
+
+
+def _rise_rows(counter: np.ndarray) -> np.ndarray:
+    """Rows on which the cumulative `counter` (T,) rises."""
+    return np.flatnonzero(np.diff(counter, prepend=0) > 0)
+
+
+def _outfield_seats(team: int) -> np.ndarray:
+    return TEAM_SIZE * team + np.arange(1, TEAM_SIZE)
+
+
+def _add_share(c: Dict[str, Any], key: str, team: int, num: float, den: int) -> None:
+    num_name, den_name = DEFENCE_SHARES[key][:2]
+    for group in (TEAMS[team], "pooled"):
+        c[f"{num_name}_{group}"] += num
+        c[f"{den_name}_{group}"] += den
+
+
+def _goal_side(pos: np.ndarray, ball: np.ndarray, side: np.ndarray, rows: np.ndarray, team: int) -> np.ndarray:
+    """(K, 5): which of `team`'s outfielders stand strictly closer to their own goal line than the ball on each of `rows`."""
+    side_rows = side[rows, team]
+    return _canonical_x(pos[rows][:, _outfield_seats(team), 0], side_rows) < _canonical_x(ball[rows, 0], side_rows)[:, None]
+
+
+def _shot_counts(c: Dict[str, Any], trace: Dict[str, np.ndarray], pos: np.ndarray, ball: np.ndarray, side: np.ndarray, holder: np.ndarray) -> None:
+    shots = np.asarray(trace["s_shots"]).astype(np.int64)
+    score = np.asarray(trace["s_score"]).astype(np.int64)
+    last = holder.size - 1
+    for shooting in (0, 1):
+        defending = 1 - shooting
+        ks = _rise_rows(shots[:, shooting])
+        if ks.size == 0:
+            continue
+        shooter = holder[ks]
+        wrong = (shooter < 0) | (shooter // TEAM_SIZE != shooting)
+        if wrong.any():
+            k = int(ks[wrong][0])
+            raise ValueError(f"shot of team {TEAMS[shooting]} on row {k}: the holder on that row is {int(holder[k])}, not a player of that team")
+        goal_side = _goal_side(pos, ball, side, ks, defending).sum(axis=1)
+        before = np.where(ks > 0, score[np.maximum(ks - 1, 0), shooting], 0)
+        scored = score[np.minimum(ks + GOAL_AFTER_SHOT_STEPS, last), shooting] > before
+        _add_share(c, "goal_side_at_goal", defending, float(goal_side[scored].sum()), int(scored.sum()))
+
+        seats = _outfield_seats(defending)
+        gap = pos[ks, shooter][:, None, :] - pos[ks][:, seats]                       # defender -> shooter
+        dist = np.hypot(gap[..., 0], gap[..., 1])
+        at = np.arange(ks.size)
+        nearest = np.argmin(dist, axis=1)
+        seat = seats[nearest]
+        if "ang" in trace:
+            angle = np.asarray(trace["ang"], dtype=np.float64)[ks, seat]
+            toward = np.cos(angle) * gap[at, nearest, 0] + np.sin(angle) * gap[at, nearest, 1]
+            seen = np.isfinite(toward)
+            facing = (dist[at, nearest] < TACKLE_ON_CARRIER) | (toward >= TACKLE_FACING_DOT * dist[at, nearest])
+            _add_share(c, "shot_nearest_def_facing", defending, int((facing & seen).sum()), int(seen.sum()))
+        if "vel" in trace:
+            vel = np.asarray(trace["vel"], dtype=np.float64)
+            window = ks[:, None] + np.arange(-SHOT_APPROACH_STEPS, 0)[None, :]       # the decisions before the shot
+            inside = window >= 0
+            rows = np.maximum(window, 0)
+            gap_w = pos[rows, shooter[:, None]] - pos[rows, seat[:, None]]
+            speed = (vel[rows, seat[:, None], 0] * gap_w[..., 0] + vel[rows, seat[:, None], 1] * gap_w[..., 1]) / np.maximum(
+                np.hypot(gap_w[..., 0], gap_w[..., 1]), 1e-6)
+            seen = inside.any(axis=1) & np.where(inside, np.isfinite(speed), True).all(axis=1)
+            mean = np.where(inside, speed, 0.0).sum(axis=1) / np.maximum(inside.sum(axis=1), 1)
+            _add_share(c, "shot_nearest_def_closing", defending, int(((mean > CLOSING_MIN_SPEED) & seen).sum()), int(seen.sum()))
+
+
+def _regain_counts(c: Dict[str, Any], trace: Dict[str, np.ndarray], pos: np.ndarray, ball: np.ndarray, side: np.ndarray, holder: np.ndarray) -> None:
+    shots = np.asarray(trace["s_shots"]).astype(np.int64)
+    team = np.where(holder >= 0, holder // TEAM_SIZE, -1)
+    held = np.flatnonzero(team >= 0)
+    for defending in (0, 1):
+        opponent = 1 - defending
+        regain = held[1:][(team[held[:-1]] == defending) & (team[held[1:]] == opponent)]
+        rises = _rise_rows(shots[:, opponent])
+        if regain.size == 0 or rises.size == 0:
+            continue
+        own = held[team[held] == defending]
+        after = np.searchsorted(own, regain, side="right")
+        end = np.where(after < own.size, own[np.minimum(after, own.size - 1)], holder.size - 1)
+        first = np.searchsorted(rises, regain + 1)
+        shot = rises[np.minimum(first, rises.size - 1)]
+        reaches = (first < rises.size) & (shot <= end)
+        regain, shot = regain[reaches], shot[reaches]
+        if regain.size == 0:
+            continue
+        goal_side_at_regain = _goal_side(pos, ball, side, regain, defending)
+        goal_side_at_shot = _goal_side(pos, ball, side, shot, defending)
+        had = goal_side_at_regain.sum(axis=1)
+        kept = (goal_side_at_regain & goal_side_at_shot).sum(axis=1)[had > 0] / had[had > 0]
+        _add_share(c, "regain_goalside_at_shot", defending, float(goal_side_at_shot.sum()), int(regain.size))
+        _add_share(c, "regain_goalside_retention", defending, float(kept.sum()), int(kept.size))
+
+
+def _tackle_counts(c: Dict[str, Any], trace: Dict[str, np.ndarray], pos: np.ndarray, holder: np.ndarray) -> None:
+    ang = np.asarray(trace["ang"], dtype=np.float64)
+    fires = np.asarray(trace["act"])[..., 3] > 0.5
+    last = holder.size - 1
+    for defending in (0, 1):
+        seats = _outfield_seats(defending)
+        rows = np.flatnonzero((holder >= 0) & (holder // TEAM_SIZE == 1 - defending) & (holder % TEAM_SIZE != 0))
+        if rows.size == 0:
+            continue
+        carrier = holder[rows]
+        gap = pos[rows, carrier][:, None, :] - pos[rows][:, seats]                    # defender -> carrier, (R, 5, 2)
+        dist = np.hypot(gap[..., 0], gap[..., 1])
+        toward = np.cos(ang[rows][:, seats]) * gap[..., 0] + np.sin(ang[rows][:, seats]) * gap[..., 1]
+        seen = np.isfinite(dist) & np.isfinite(toward)
+        facing = (dist < TACKLE_ON_CARRIER) | (toward >= TACKLE_FACING_DOT * dist)
+        chance = seen & facing & (np.maximum(0.0, dist - TACKLE_CONTACT_OFFSET) <= TACKLE_REACH[None, :])
+        fired = fires[rows][:, seats]
+        out_of_reach = int((fired & seen & ~chance & (dist <= TACKLE_WHIFF_RANGE)).sum())
+        for group in (TEAMS[defending], "pooled"):
+            c[f"tackle_out_of_range_per_match_{group}"] += out_of_reach
+        # a spell starts at a chance row that does not continue the previous chance row of the same defender against the same carrier
+        continues = (rows[1:] == rows[:-1] + 1) & (carrier[1:] == carrier[:-1])
+        start = chance.copy()
+        start[1:] &= ~(chance[:-1] & continues[:, None])
+        spell = np.cumsum(start, axis=0)
+        # the defender holds the ball on the fire row or within the next TACKLE_WIN_STEPS decisions
+        holds = np.cumsum(holder[:, None] == seats[None, :], axis=0)
+        upto = np.minimum(rows + TACKLE_WIN_STEPS, last)
+        from_row = np.where(rows[:, None] > 0, holds[np.maximum(rows - 1, 0)], 0)
+        won = (holds[upto] - from_row) > 0
+        n_fired = n_won = 0
+        for j in range(seats.size):
+            n_fired += np.unique(spell[chance[:, j] & fired[:, j], j]).size
+            n_won += np.unique(spell[chance[:, j] & fired[:, j] & won[:, j], j]).size
+        _add_share(c, "tackle_in_range_rate", defending, n_fired, int(start.sum()))
+        _add_share(c, "tackle_win_rate", defending, n_won, n_fired)
+
+
+def _deep_block_counts(c: Dict[str, Any], pos: np.ndarray, ball: np.ndarray, side: np.ndarray, holder: np.ndarray) -> None:
+    rows = np.arange(holder.size)
+    for defending in (0, 1):
+        x = _canonical_x(pos[:, _outfield_seats(defending), 0], side[:, defending])
+        in_opponent_half = _canonical_x(ball[:, 0], side[:, defending]) >= DEEP_BLOCK_MIN_BALL_X
+        deep = (x <= DEEP_BLOCK_MAX_X).sum(axis=1) >= DEEP_BLOCK_MIN_PLAYERS
+        _add_share(c, "deep_block_ge4", defending, int((in_opponent_half & deep).sum()), int(in_opponent_half.sum()))
+        out_of_possession = rows[(holder >= 0) & (holder // TEAM_SIZE == 1 - defending)]
+        _add_share(c, "outfield_depth_oop", defending, float(x[out_of_possession].mean(axis=1).sum()), int(out_of_possession.size))
+
+
+def defence_counts(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    """Per-match numerators and denominators of the defence keys, per defending team and pooled (see `defence keys`).
+
+    A trace without `s_shots` enters no shot or regain key, one without `act` or `ang` no tackle key, one without `ang` no facing key
+    and one without `vel` no closing key.
+    """
+    c: Dict[str, Any] = {key: 0 for key in DEFENCE_COUNT_KEYS}
+    holder = _holder(trace)
+    if holder.size == 0:
+        return c
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ball = np.asarray(trace["ball"], dtype=np.float64)
+    side = np.asarray(trace["side"]).astype(np.int64)
+    _deep_block_counts(c, pos, ball, side, holder)
+    if "s_shots" in trace:
+        _shot_counts(c, trace, pos, ball, side, holder)
+        _regain_counts(c, trace, pos, ball, side, holder)
+    if "act" in trace and "ang" in trace:
+        _tackle_counts(c, trace, pos, holder)
+    return c
+
+
+def defence_metrics(
+    per_match: Sequence[Dict[str, Any]], *, min_events: int = DEFENCE_MIN_EVENTS, min_decisions: int = DEFENCE_MIN_DECISIONS
+) -> Dict[str, Dict[str, Any]]:
+    """`{mean, se, n}` of every defence key from per-match records; a key whose event count over the matches is below the minimum is None."""
+    col = lambda key: [m[key] for m in per_match]  # noqa: E731
+    minimum = {"events": min_events, "decisions": min_decisions}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, (num, den, floor, kind) in DEFENCE_SHARES.items():
+        for group in BASIN_GROUPS:
+            stat = ratio_se(col(f"{num}_{group}"), col(f"{den}_{group}"))
+            if sum(col(f"{floor}_{group}")) < minimum[kind]:
+                stat = (None, None, stat[2])
+            out[f"{key}_{group}"] = _stat_dict(stat)
+    for group in BASIN_GROUPS:
+        key = f"tackle_out_of_range_per_match_{group}"
+        stat = mean_se(col(key))
+        if sum(col(f"tackle_in_range_rate_den_{group}")) < min_events:
+            stat = (None, None, stat[2])
+        out[key] = _stat_dict(stat)
+    return out
+
+
+def trap_flag_g50(census_json: Dict[str, Any]) -> bool:
+    """The early-trap flag of a generation-50 `self_sampled` census: pooled facing-the-ball share <= 0.35 and goals per match < 0.5.
+
+    Accepts the census payload (`summary`), the `summarize` result or its `metrics` mapping; raises ValueError when either input is
+    missing, None or not finite.
+    """
+    metrics = census_json
+    if "summary" in metrics:
+        metrics = metrics["summary"]
+    if "metrics" in metrics:
+        metrics = metrics["metrics"]
+    values = []
+    for key in ("facing_ball_share_pooled", "goals_total"):
+        entry = metrics.get(key)
+        mean = entry.get("mean") if isinstance(entry, dict) else None
+        if mean is None or not math.isfinite(mean):
+            raise ValueError(f"trap flag needs a finite mean of {key!r}, got {mean!r}")
+        values.append(float(mean))
+    return bool(values[0] <= TRAP_FACING_MAX and values[1] < TRAP_GOALS_BELOW)
 
 
 def kick_propensity_counts(
@@ -886,6 +1170,7 @@ def match_metrics(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     m.update(pass_option_counts(options))
     m.update(aim_reach_counts(options))
     m.update(basin_counts(trace))
+    m.update(defence_counts(trace))
 
     kp_counts = kick_propensity_counts(trace, holder=holder, kicks=kicks)
     for k, (kn, hn) in kp_counts.items():
@@ -991,6 +1276,8 @@ def summarize(per_match: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     for key, (num, den) in BASIN_SHARES.items():
         metrics[key] = _stat_dict(ratio_se(col(num), col(den)))
+
+    metrics.update(defence_metrics(per_match))
 
     for k in KICK_PROP_KEYS:
         metrics[f"kick_propensity_{k}"] = _stat_dict(ratio_se(col(f"kick_prop_kicks_{k}"), col(f"kick_prop_holds_{k}")))
