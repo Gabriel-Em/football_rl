@@ -5131,3 +5131,45 @@ def test_observations_stay_deterministic_and_bounded_across_both_halves() -> Non
     np.testing.assert_array_equal(first, second)
     assert np.isfinite(first).all()
     assert first.min() >= -1.0 and first.max() <= 1.0
+
+
+def test_kick_gate_physics_substep_timing() -> None:
+    """[GUARD] Kick grace against substep order: holding for k = 0 substeps blocks a kick on all 4 substeps with
+    obs[3, 8] == 0.0; holding for k = 1 substep releases the ball on substep 4 with obs[3, 8] == 1/300."""
+    for k in (0, 1):
+        env = _kickoff_env()
+        seat = 3
+        env.ball_holder = seat
+        env.ball_kicked_in_flight = False
+        env.ball_hold_timer = k / 60.0
+        env.kick_grace_timer = max(0.0, 0.08 - k / 60.0)
+        env.stun_timer[:] = 0.0
+        env.ghost_timer[:] = 0.0
+        env.is_ghost[:] = False
+        env.stats["kicks"] = 0
+
+        obs = env._get_observations_array()
+        assert obs[seat, 7] == 1.0
+        if k == 0:
+            assert obs[seat, 8] == 0.0
+        else:
+            assert float(obs[seat, 8]) == pytest.approx(1.0 / 300.0, abs=1e-7)
+
+        actions = np.zeros((12, 4), dtype=np.float32)
+        actions[:, 2] = -1.0
+        actions[:, 3] = -1.0
+        actions[seat, 2] = 1.0
+
+        held_after = []
+        for _ in range(4):
+            env._physics_substep(actions)
+            held_after.append(env.ball_holder == seat)
+
+        if k == 0:
+            assert held_after == [True, True, True, True]
+            assert env.stats["kicks"] == 0
+        else:
+            assert held_after == [True, True, True, False]
+            assert env.ball_holder is None
+            assert env.stats["kicks"] == 1
+

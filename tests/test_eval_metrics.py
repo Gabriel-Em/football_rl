@@ -4856,3 +4856,236 @@ class TestAimControl:
         got = internals.match_internals(tr)
         for key in internals.METRIC_KEYS:
             assert got[key] == ref[key], key
+
+
+# ----------------------------------------------------------------------------
+# Kick-target head (`hybrid7`) in the harness and internals
+# ----------------------------------------------------------------------------
+def write_hybrid7_checkpoint(directory: Path, seed: int = 0, spread: float = 0.3) -> Path:
+    """hybrid7 checkpoint (both teams) whose outputs depend on the observation."""
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head="hybrid7")
+            with torch.no_grad():
+                net.actor_mean[4].weight.normal_(0.0, spread)
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+def write_constant_hybrid7_checkpoint(directory: Path, z_kick: float, target_logits) -> Path:
+    """hybrid7 checkpoint with observation-independent outputs: thr 0.7, steer -0.2, power 0.4, aim 0.6,
+    kick z_kick, special -3, and 6 target logits."""
+    directory.mkdir(parents=True, exist_ok=True)
+    bias = [0.7, -0.2, 0.4, 0.6, z_kick, -3.0, *target_logits]
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            net = ActorCritic(policy_head="hybrid7")
+            with torch.no_grad():
+                net.actor_mean[4].weight.zero_()
+                net.actor_mean[4].bias.copy_(torch.tensor(bias, dtype=torch.float32))
+            torch.save(net.state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+class TestHybrid7Harness:
+    def test_a_hybrid7_team_plays_a_scripted_team_and_records_target_fields(self, tmp_path):
+        """[RED] CLI, one match of 30 decisions: head is [3, 0]; kick_target (30, 12) int8 is -1 wherever K*c != 1
+        and in 0..5 on K*c == 1; free_p (30, 12) float32 is NaN off c rows and in [0, 1] on them; scripted seats
+        are -1 and NaN; aim_mean is finite on team A and NaN on scripted team B."""
+        d = write_hybrid7_checkpoint(tmp_path / "c", seed=2)
+        out = tmp_path / "out"
+        argv = ["--checkpoint-dir", str(d), "--opp", "scripted", "--n", "1", "--seed", "3", "--workers", "1",
+                "--max-steps", "30", "--out-dir", str(out)]
+        assert harness.main(argv) == 0
+        with np.load(out / "m000.npz") as trace:
+            assert trace["head"].tolist() == [3, 0]
+            kt = trace["kick_target"]
+            fp = trace["free_p"]
+            aim = trace["aim_mean"]
+            assert kt.shape == (30, 12) and kt.dtype == np.int8
+            assert fp.shape == (30, 12) and fp.dtype == np.float32
+            assert aim.shape == (30, 12) and aim.dtype == np.float32
+            assert np.isfinite(aim[:, :6]).all() and np.isnan(aim[:, 6:]).all()
+            assert (kt[:, 6:] == -1).all() and np.isnan(fp[:, 6:]).all()
+            holder = trace["holder"]
+            hold_t = trace["hold_t"]
+            act_k = trace["act"][:, :6, 2]
+            for t in range(30):
+                for s in range(6):
+                    ready = (int(holder[t]) == s) and (float(hold_t[t]) / 5.0 > 1.0 / 600.0)
+                    fired = float(act_k[t, s]) > 0.35
+                    if ready:
+                        assert np.isfinite(fp[t, s]) and 0.0 <= float(fp[t, s]) <= 1.0
+                    else:
+                        assert np.isnan(fp[t, s])
+                    if ready and fired:
+                        assert 0 <= int(kt[t, s]) <= 5
+                    else:
+                        assert int(kt[t, s]) == -1
+        h6 = write_hybrid6_checkpoint(tmp_path / "h6", seed=1)
+        tr6 = harness.play_match(quick_spec(h6, max_steps=5), 0)
+        assert "aim_mean" in tr6 and "kick_target" not in tr6 and "free_p" not in tr6
+
+    def test_hybrid7_modes_and_sigma_scale_do_not_touch_target(self, tmp_path):
+        """[RED] Constant hybrid7: greedy picks masked argmax; mixed samples T and fires with mean Gaussians;
+        sigma_scale scales the four Gaussians and leaves T unchanged."""
+        obs, cen = _obs_cen()
+        obs[:, 7] = 0.0
+        obs[:, 8] = 0.0
+        # Seat 2 is ready with TM1 (idx 23) = 0.10, TM2 (28) = 0.19, TM3 (33) = 0.20 (out), TM4 (38) = -0.05, TM5 (43) = -0.50 (out)
+        obs[2, 7] = 1.0
+        obs[2, 8] = 1.0 / 300.0
+        obs[2, 23], obs[2, 28], obs[2, 33], obs[2, 38], obs[2, 43] = 0.10, 0.19, 0.20, -0.05, -0.50
+        # Seat 3 is ready with all teammates out of arc -> only FREE valid
+        obs[3, 7] = 1.0
+        obs[3, 8] = 1.0 / 300.0
+        obs[3, 23], obs[3, 28], obs[3, 33], obs[3, 38], obs[3, 43] = 0.5, 0.5, 0.5, -0.5, -0.5
+        # Seat 4 is holding at hold_t = 0 -> not ready
+        obs[4, 7] = 1.0
+        obs[4, 8] = 0.0
+
+        d = write_constant_hybrid7_checkpoint(tmp_path / "c", 3.0, [1.0, 0.0, 5.0, 0.0, 5.0, 0.0])
+        team = harness.TeamPolicy(str(d), "blue")
+        assert team.head == 3
+        aim = np.full(6, np.nan, dtype=np.float32)
+        kt = np.full(6, -1, dtype=np.int8)
+        fp = np.full(6, np.nan, dtype=np.float32)
+        a, _, m = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0),
+                           aim_out=aim, kick_target_out=kt, free_p_out=fp)
+        assert kt.tolist() == [-1, -1, 0, 5, -1, -1]
+        assert np.isnan(fp[[0, 1, 4, 5]]).all()
+        assert float(fp[2]) == pytest.approx(1.0 / (math.e + 3.0), abs=1e-6)
+        assert float(fp[3]) == pytest.approx(1.0, abs=1e-6)
+        np.testing.assert_allclose(a[2, 1], 0.10 * 180.0 / 35.0, atol=1e-6)
+        np.testing.assert_allclose(a[3, 1], TANH_AIM, atol=1e-6)
+        np.testing.assert_allclose(a[4, 1], CONST_STEER, atol=1e-6)
+        np.testing.assert_allclose(aim, TANH_AIM, atol=1e-6)
+        np.testing.assert_allclose(m[:, 1], CONST_STEER, atol=1e-6)
+
+        # sigma_scale does not touch T (same generator seed gives identical kick_target across scales 0, 1, 2).
+        kts = []
+        acts = []
+        for s in (0.0, 1.0, 2.0):
+            kt_s = np.full(6, -1, dtype=np.int8)
+            act_s, _, _ = team.act(obs, cen, "sampled", s, torch.Generator().manual_seed(7), kick_target_out=kt_s)
+            kts.append(kt_s.tolist())
+            acts.append(act_s)
+        assert kts[0] == kts[1] == kts[2]
+        assert (acts[2][3, 1] - acts[0][3, 1]) == pytest.approx(2.0 * (acts[1][3, 1] - acts[0][3, 1]), abs=1e-5)
+
+        # mixed samples T (draws vary across seeds on seat 2) while keeping throttle at its mean.
+        mixed_ts = set()
+        for seed in range(20):
+            kt_m = np.full(6, -1, dtype=np.int8)
+            act_m, _, _ = team.act(obs, cen, "mixed", 1.0, torch.Generator().manual_seed(seed), kick_target_out=kt_m)
+            np.testing.assert_allclose(act_m[:, 0], math.tanh(0.7), atol=1e-6)
+            if kt_m[2] >= 0:
+                mixed_ts.add(int(kt_m[2]))
+        assert len(mixed_ts) >= 2 and 2 not in mixed_ts and 4 not in mixed_ts
+
+
+def _hand_hybrid7_trace(n_tm_hit: int, n_tm_other_mate: int, n_tm_opp: int, n_free_with_tm: int, n_free_no_tm: int) -> dict:
+    """Hand-built hybrid7 trace (team A = head 3, team B = head 0) with known field kicks by seat 3 (A def/mid)
+    plus one keeper kick (seat 0, ignored) and one non-ready kick (kick_target = -1, ignored).
+    For seat 3, env._entity_player_slots[3][:5] == [0, 1, 2, 4, 5], so target T = 3 is seat 4."""
+    events = (
+        [("tm_hit", 3)] * n_tm_hit
+        + [("tm_other", 3)] * n_tm_other_mate
+        + [("tm_opp", 3)] * n_tm_opp
+        + [("free_with_tm", 5)] * n_free_with_tm
+        + [("free_no_tm", 5)] * n_free_no_tm
+        + [("keeper", 3), ("not_ready", -1)]
+    )
+    stride = 10
+    T = stride * len(events) + 60
+    tr = make_internals_trace(T)
+    tr["head"] = np.array([3, 0], dtype=np.int8)
+    tr["kick_target"] = np.full((T, 12), -1, dtype=np.int8)
+    tr["lastkick"] = np.full((T, 12), -999.0, dtype=np.float32)
+    tr["s_score"] = np.zeros((T, 2), dtype=np.int32)
+    # Default positions: everyone behind kicker (facing 0), so no teammate is in arc unless placed ahead.
+    tr["pos"][:] = np.array([200.0, 420.0], dtype=np.float32)
+    tr["ang"][:] = 0.0
+    tr["holder"][:] = -1
+
+    for idx, (kind, target) in enumerate(events):
+        k = 5 + idx * stride
+        kicker = 0 if kind == "keeper" else 3
+        tr["pos"][k, kicker] = [500.0, 420.0]
+        tr["ang"][k, kicker] = 0.0
+        tr["holder"][k] = kicker
+        tr["lastkick"][k:, kicker] = float(k) / 15.0
+        if kind != "not_ready":
+            tr["kick_target"][k, kicker] = target
+        if kind != "free_no_tm":
+            # Put seat 4 (slot 3 for kicker 3; slot 3 for keeper 0 is seat 4 too) directly ahead (0 deg, in arc).
+            tr["pos"][k, 4] = [700.0, 420.0]
+        if kind == "tm_hit":
+            tr["holder"][k + 2] = 4  # targeted teammate receives first
+        elif kind == "tm_other":
+            tr["holder"][k + 2] = 5  # different teammate receives first
+        elif kind == "tm_opp":
+            tr["holder"][k + 2] = 9  # opponent receives first
+    return tr
+
+
+class TestHybrid7Internals:
+    def test_kick_target_keys_hand_counted_and_threshold(self, tmp_path, capsys):
+        """[RED] Hand-counted kick_target_n, free_share and tm_reach:
+        12 tm_hit + 4 tm_other + 4 tm_opp (= 20 tm kicks, 12 reached -> 0.60) + 5 free_with_tm (= 25 choice kicks,
+        free share 5/25 = 0.20), plus 3 free_no_tm, 1 keeper kick and 1 non-ready kick (all excluded).
+        Below 20 kicks (19 total): free_share and tm_reach are None."""
+        from tools.audit import internals
+
+        tr_full = _hand_hybrid7_trace(n_tm_hit=12, n_tm_other_mate=4, n_tm_opp=4, n_free_with_tm=5, n_free_no_tm=3)
+        res = internals.kick_target_summary([internals.kick_target_counts(tr_full)])
+        assert res["kick_target_n"] == 25
+        assert res["kick_target_free_share"] == pytest.approx(5.0 / 25.0, abs=1e-12)
+        assert res["kick_target_tm_reach"] == pytest.approx(12.0 / 20.0, abs=1e-12)
+
+        tr_small = _hand_hybrid7_trace(n_tm_hit=10, n_tm_other_mate=2, n_tm_opp=2, n_free_with_tm=5, n_free_no_tm=2)
+        small = internals.kick_target_summary([internals.kick_target_counts(tr_small)])
+        assert small["kick_target_n"] == 19
+        assert small["kick_target_free_share"] is None
+        assert small["kick_target_tm_reach"] is None
+
+        # CLI writes kick_target in JSON and prints its line; old traces without kick_target work unchanged.
+        d = tmp_path / "t"
+        d.mkdir()
+        np.savez_compressed(d / "m000.npz", **tr_full)
+        out_json = tmp_path / "internals.json"
+        assert internals.main([str(d), "--json", str(out_json)]) == 0
+        assert "kick target" in capsys.readouterr().out
+        payload = json.loads(out_json.read_text(encoding="utf-8"))[str(d)]
+        assert payload["kick_target"]["kick_target_n"] == 25
+        assert payload["kick_target"]["kick_target_free_share"] == pytest.approx(0.20, abs=1e-12)
+        assert payload["kick_target"]["kick_target_tm_reach"] == pytest.approx(0.60, abs=1e-12)
+
+        old = make_internals_trace(20)
+        assert internals.kick_target_summary([internals.kick_target_counts(old)]) == {
+            "kick_target_n": 0, "kick_target_free_share": None, "kick_target_tm_reach": None,
+        }
+
+    def test_head_code_3_reads_fire_and_aim_columns_like_hybrid6(self):
+        """[RED] Head code 3 matches head code 2 on match_internals and aim_control_points."""
+        from tools.audit import internals
+
+        tr = TestInternalsHybridHead._trace([2, 0])
+        ref = internals.match_internals(tr)
+        tr["head"] = np.array([3, 0], dtype=np.int8)
+        got = internals.match_internals(tr)
+        for key in internals.METRIC_KEYS:
+            assert got[key] == ref[key], key
+
+        tr_aim = make_internals_trace(20)
+        tr_aim["mean"][:] = 0.0
+        tr_aim["act"][:] = 0.0
+        aim_scene(tr_aim, 5, {4: 17.5})
+        tr_aim["mean"][5, 3, 1], tr_aim["mean"][4, 3, 1], tr_aim["act"][5, 3, 1] = -0.6, 0.1, 0.7
+        tr_aim["aim_mean"] = np.full((20, 12), np.nan, dtype=np.float32)
+        tr_aim["aim_mean"][5, 3] = 0.4
+        tr_aim["head"] = np.array([3, 0], dtype=np.int8)
+        np.testing.assert_allclose(internals.aim_control_points(tr_aim), [[0.4, 0.1, 0.5, 0.3]], atol=1e-6)
+

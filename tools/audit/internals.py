@@ -5,7 +5,7 @@ Every metric is computed per match from one trace and aggregated across matches 
 and 7..11.
 
 Policy heads: the trace's optional `head` field gives each team's head (0 = gaussian4, the default when the field
-is absent; 1 = hybrid5; 2 = hybrid6). A hybrid5 or hybrid6 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
+is absent; 1 = hybrid5; 2 = hybrid6; 3 = hybrid7). A hybrid5, hybrid6 or hybrid7 seat records `mean = 2 p - 1` in its kick and special columns, so its intent is
 p = (mean + 1) / 2 > 0.5; a gaussian4 seat's intent is mean > 0.35 (kick) or mean > 0.5 (special). `sat99_*` and
 `grad_scale_*` of the kick and special columns are computed over gaussian4 field players only (a probability
 column has no tanh gradient scale) and are None when no such decision exists. The fire-behaviour metrics
@@ -48,6 +48,12 @@ k - 1; need is `rollouts.aim_steer(deflection)`, the steer pointing the kick at 
   aim_control_r2_gain     R^2 of x_k on (m_prev, need) minus aim_control_r2_prev.
   kick_steer_noise_sd     SD of the sampled kick steer `act[k, i, 1]` minus x_k.
 
+Kick target (`kick_target`, reported per trace directory beside `aim_control`, pooled over field seats of hybrid7 teams):
+  kick_target_n           executed field kicks with K*c = 1 and >= 1 valid teammate in the kickable arc.
+  kick_target_free_share  share of those kicks with kick_target = 5 (None below 20 kicks).
+  kick_target_tm_reach    among executed field kicks with a teammate target, the share whose first receiver
+                          (census `kick_outcomes`, `teammate`) is that slot's player (None below 20 kicks).
+
 Usage:
   python tools/audit/internals.py TRACE_DIR [TRACE_DIR ...] [--json OUT]
 """
@@ -67,6 +73,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from football_rl.config import DEFAULT_CONFIG  # noqa: E402
+from football_rl.policy import KICK_ARC_OBS, KICK_TARGET_FREE  # noqa: E402
 from tools.audit import census, rollouts  # noqa: E402
 
 __all__ = [
@@ -75,9 +82,13 @@ __all__ = [
     "HEAD_COLS",
     "METRIC_KEYS",
     "AIM_CONTROL_KEYS",
+    "KICK_TARGET_KEYS",
     "aim_control_points",
     "aim_control_stats",
     "aim_control",
+    "kick_target_counts",
+    "kick_target_summary",
+    "kick_target_line",
     "match_internals",
     "summarize",
     "internals_payload",
@@ -92,7 +103,7 @@ HEAD_COLS = (("throttle", 0), ("steer", 1), ("kick", 2), ("special", 3))
 TRACE_KEYS = ("mean", "act", "holder", "hold_t", "pos", "ang", "ball")
 # Further keys `aim_control_points` reads (through `rollouts.find_aim_points`).
 AIM_TRACE_KEYS = ("bvel", "side", "lastkick", "s_score")
-OPTIONAL_TRACE_KEYS = ("head", "s_failed_tackles", "s_successful_tackles", "aim_mean")
+OPTIONAL_TRACE_KEYS = ("head", "s_failed_tackles", "s_successful_tackles", "aim_mean", "kick_target")
 
 KICK_THR = float(DEFAULT_CONFIG.mechanics.kick_trigger_threshold)
 SPECIAL_THR = float(DEFAULT_CONFIG.mechanics.special_trigger_threshold)
@@ -135,7 +146,24 @@ METRIC_KEYS = (
 )
 AIM_CONTROL_KEYS = ("aim_control_r2_prev", "aim_control_r2_gain", "kick_steer_noise_sd")
 AIM_CONTROL_MIN_POINTS = 20
+KICK_TARGET_KEYS = ("kick_target_n", "kick_target_free_share", "kick_target_tm_reach")
+KICK_TARGET_MIN_KICKS = 20
 HYBRID6_HEAD = 2
+HYBRID7_HEAD = 3
+_TEAMMATE_SLOTS: Optional[np.ndarray] = None
+
+
+def _entity_teammate_slots() -> np.ndarray:
+    """`(12, 5)` teammate seat indices for observation entity slots 1..5, read from `FootballParallelEnv`."""
+    global _TEAMMATE_SLOTS
+    if _TEAMMATE_SLOTS is None:
+        from dataclasses import replace
+        from football_rl.env import FootballParallelEnv
+
+        cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+        env = FootballParallelEnv(config=cfg)
+        _TEAMMATE_SLOTS = np.array([env._entity_player_slots[i][:5] for i in range(12)], dtype=np.int64)
+    return _TEAMMATE_SLOTS
 
 
 def _aim_share(
@@ -168,7 +196,7 @@ def aim_control_points(trace: Dict[str, np.ndarray]) -> np.ndarray:
         k, i = point["step"], point["kicker"]
         if k < 1:
             continue
-        if team_head[i // census.TEAM_SIZE] == HYBRID6_HEAD:
+        if team_head[i // census.TEAM_SIZE] in (HYBRID6_HEAD, HYBRID7_HEAD):
             x_k = float(trace["aim_mean"][k, i])
         else:
             x_k = float(np.clip(mean[k, i, 1], -1.0, 1.0))
@@ -204,6 +232,77 @@ def aim_control(points: Sequence[np.ndarray]) -> Dict[str, Dict[str, Any]]:
     return {key: {"mean": values[key], "se": None, "n": n_points} for key in AIM_CONTROL_KEYS}
 
 
+def kick_target_counts(trace: Dict[str, np.ndarray]) -> Dict[str, int]:
+    """Per-match hybrid7 field kick-target counts `{n, free, tm, tm_reach}` over executed `K*c = 1` kicks."""
+    zeros = {"n": 0, "free": 0, "tm": 0, "tm_reach": 0}
+    if "kick_target" not in trace or "head" not in trace:
+        return zeros
+    team_head = np.asarray(trace["head"], dtype=np.int64)
+    if HYBRID7_HEAD not in team_head:
+        return zeros
+    steps, players = census.kick_events(trace)
+    if steps.size == 0:
+        return zeros
+    keep = (team_head[players // census.TEAM_SIZE] == HYBRID7_HEAD) & (players % census.TEAM_SIZE != 0)
+    steps, players = steps[keep], players[keep]
+    if steps.size == 0:
+        return zeros
+    kt = np.asarray(trace["kick_target"], dtype=np.int64)
+    targets = kt[steps, players]
+    ready_mask = targets >= 0
+    steps, players, targets = steps[ready_mask], players[ready_mask], targets[ready_mask]
+    if steps.size == 0:
+        return zeros
+
+    slot_map = _entity_teammate_slots()
+    pos = np.asarray(trace["pos"], dtype=np.float64)
+    ang = np.asarray(trace["ang"], dtype=np.float64)
+    slots = slot_map[players]  # (M, 5)
+    dx = pos[steps[:, None], slots, 0] - pos[steps, players, 0][:, None]
+    dy = pos[steps[:, None], slots, 1] - pos[steps, players, 1][:, None]
+    dist = np.hypot(dx, dy)
+    rel = np.where(
+        dist < 1e-6,
+        0.0,
+        (np.arctan2(dy, dx) - ang[steps, players][:, None] + math.pi) % (2.0 * math.pi) - math.pi,
+    )
+    has_valid_tm = (np.abs(rel) / math.pi <= KICK_ARC_OBS).any(axis=1)
+    n_choice = int(has_valid_tm.sum())
+    n_free = int((has_valid_tm & (targets == KICK_TARGET_FREE)).sum())
+
+    tm_mask = (targets >= 0) & (targets < KICK_TARGET_FREE)
+    n_tm = int(tm_mask.sum())
+    n_tm_reach = 0
+    if n_tm > 0:
+        tm_steps, tm_players, tm_targets = steps[tm_mask], players[tm_mask], targets[tm_mask]
+        outcomes = census.kick_outcomes(trace, kicks=(tm_steps, tm_players))
+        outcome_map = {(o["step"], o["player"]): o["outcome"] for o in outcomes}
+        holder = np.asarray(trace["holder"], dtype=np.int64)
+        n_steps = holder.size
+        for t0, p, tgt in zip(tm_steps.tolist(), tm_players.tolist(), tm_targets.tolist()):
+            if outcome_map.get((t0, p)) != "teammate":
+                continue
+            last = min(t0 + census.KICK_WINDOW_STEPS, n_steps - 1)
+            window = holder[t0 + 1 : last + 1]
+            arr = np.flatnonzero((window >= 0) & (window != p))
+            if arr.size and int(window[int(arr[0])]) == int(slot_map[p, tgt]):
+                n_tm_reach += 1
+    return {"n": n_choice, "free": n_free, "tm": n_tm, "tm_reach": n_tm_reach}
+
+
+def kick_target_summary(counts: Sequence[Dict[str, int]]) -> Dict[str, Any]:
+    """Pool per-match `kick_target_counts` into `{kick_target_n, kick_target_free_share, kick_target_tm_reach}`."""
+    n = sum(c["n"] for c in counts)
+    free = sum(c["free"] for c in counts)
+    tm = sum(c["tm"] for c in counts)
+    tm_reach = sum(c["tm_reach"] for c in counts)
+    return {
+        "kick_target_n": n,
+        "kick_target_free_share": float(free / n) if n >= KICK_TARGET_MIN_KICKS else None,
+        "kick_target_tm_reach": float(tm_reach / tm) if tm >= KICK_TARGET_MIN_KICKS else None,
+    }
+
+
 def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     """Compute per-match policy-internal metrics from one harness trace."""
     holder = np.asarray(trace["holder"], dtype=np.int64)
@@ -221,7 +320,7 @@ def match_internals(trace: Dict[str, np.ndarray]) -> Dict[str, Any]:
     ang = np.asarray(trace["ang"], dtype=np.float64)
 
     team_head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
-    seat_hybrid = np.repeat(np.isin(team_head, (1, HYBRID6_HEAD)), census.TEAM_SIZE)
+    seat_hybrid = np.repeat(np.isin(team_head, (1, HYBRID6_HEAD, HYBRID7_HEAD)), census.TEAM_SIZE)
     field_hybrid = seat_hybrid[list(FIELD_PLAYERS)]
 
     rec = {"n_steps": n_steps}
@@ -405,6 +504,13 @@ def aim_control_line(aim: Dict[str, Dict[str, Any]]) -> str:
     )
 
 
+def kick_target_line(kt: Dict[str, Any]) -> str:
+    """Printable line of the pooled hybrid7 kick-target keys."""
+    free_s = "-" if kt["kick_target_free_share"] is None else f"{kt['kick_target_free_share']:.3f}"
+    reach_s = "-" if kt["kick_target_tm_reach"] is None else f"{kt['kick_target_tm_reach']:.3f}"
+    return f"kick target (n / free / tm_reach)    : {kt['kick_target_n']} / {free_s} / {reach_s}"
+
+
 def _iter_internal_traces(directory: Path | str) -> Iterator[Dict[str, np.ndarray]]:
     for path in census._trace_paths(directory):
         with np.load(path) as z:
@@ -418,14 +524,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     dump: Dict[str, Any] = {}
     for directory in args.trace_dirs:
-        per_match, points = [], []
+        per_match, points, kt_counts = [], [], []
         for trace in _iter_internal_traces(directory):
             per_match.append(match_internals(trace))
             points.append(aim_control_points(trace))
+            kt_counts.append(kick_target_counts(trace))
         aim = aim_control(points)
+        kt = kick_target_summary(kt_counts)
         print(report(per_match, title=str(directory)))
         print(aim_control_line(aim))
-        dump[str(directory)] = {**internals_payload(per_match), "aim_control": aim}
+        print(kick_target_line(kt))
+        dump[str(directory)] = {**internals_payload(per_match), "aim_control": aim, "kick_target": kt}
     if args.json:
         out_path = Path(args.json)
         out_path.parent.mkdir(parents=True, exist_ok=True)

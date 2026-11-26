@@ -1049,6 +1049,42 @@ class TestHoldIntentSplit:
             tr["mean"][step, 3, 2] = mean_kick
             assert rollouts.decision_intent(tr, step, 3) == expected, (mean_kick, expected)
 
+    def test_intent_hybrid7_reads_p_from_the_kick_mean_like_hybrid5(self):
+        """[RED] hybrid7 (`head[team] == 3`) records the kick column as 2 p - 1 too: the same five cases as hybrid5."""
+        from tools.audit import rollouts
+
+        tr = self._intent_trace([3, 0])
+        cases = {0.2: "kick", 0.0: "mid", -0.88: "mid", -0.92: "hold", -1.0: "hold"}
+        for step, (mean_kick, expected) in enumerate(cases.items()):
+            tr["mean"][step, 3, 2] = mean_kick
+            assert rollouts.decision_intent(tr, step, 3) == expected, (mean_kick, expected)
+
+    def test_rollouts_decodes_hybrid7_with_snapshot_obs(self, tmp_path):
+        """[RED] A hybrid7 trace verifies against its checkpoint and steps through `_team_action_and_value` using obs."""
+        from football_rl.policy import ActorCritic
+        from tools.audit import harness, rollouts
+
+        ckpt = tmp_path / "ckpt_h7"
+        ckpt.mkdir()
+        torch.manual_seed(4)
+        for prefix in ("blue", "red"):
+            for kind in ("field", "keeper"):
+                net = ActorCritic(policy_head="hybrid7")
+                with torch.no_grad():
+                    net.actor_mean[4].weight.normal_(0.0, 0.3)
+                torch.save(net.state_dict(), ckpt / f"{prefix}_{kind}_policy.pt")
+        spec = harness.EvalSpec(checkpoint_dir=str(ckpt), opponent="self", mode="sampled", n=1, seed=11, workers=1, max_steps=15)
+        trace = harness.play_match(spec, 0)
+        assert trace["head"].tolist() == [3, 3]
+        ok, err, snaps = rollouts.resimulate_match(trace, match_seed=11000, target_steps=(0, 5))
+        assert ok and err < 1e-3
+        team_a, team_b = harness._load_policies(spec)
+        rollouts._verify_checkpoint_matches_trace(0, 0, snaps[0], trace, team_a, team_b)
+        obs = snaps[5]._get_observations_array()
+        cen = snaps[5].get_centralized_state()
+        act_a, val_a = rollouts._team_action_and_value(team_a, snaps[5], 0, obs, cen, "sampled", 1.0, torch.Generator().manual_seed(1))
+        assert act_a.shape == (6, 4) and np.isfinite(act_a).all() and np.isfinite(val_a).all()
+
     def test_intent_gaussian4_threshold_is_strict_at_0_35(self):
         """[RED] gaussian4 (`head[team] == 0`, or no `head` field): kick if mean_kick > 0.35, else hold (never mid)."""
         from tools.audit import rollouts

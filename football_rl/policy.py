@@ -23,11 +23,13 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 
 
 _HALF_LOG_TWO_PI = math.log(math.sqrt(2 * math.pi))
 
-POLICY_HEADS = ("gaussian4", "hybrid5", "hybrid6")
+POLICY_HEADS = ("gaussian4", "hybrid5", "hybrid6", "hybrid7")
 # Heads that fire kick and special as Bernoulli draws (they share the fire telemetry).
-FIRE_HEADS = ("hybrid5", "hybrid6")
+FIRE_HEADS = ("hybrid5", "hybrid6", "hybrid7")
 # Observation column that is 1.0 on the seat holding the ball and 0.0 on every other seat.
 HOLDING_OBS_INDEX = 7
+# Observation column holding ball_hold_timer / 5.0 for the carrier.
+HOLD_TIME_OBS_INDEX = 8
 # Fire telemetry is read from every this-many-th decision of a role's rollout batch. The subsample adds sampling noise
 # to the saturation shares: at most about 3 percentage points of standard error for a keeper batch (300 sampled rows
 # at 8 environments x 300 decisions) and about 1 for a field batch (1500 sampled rows).
@@ -36,17 +38,125 @@ FIRE_STATS_STRIDE = 8
 HYBRID_ACTION_DIM = 5
 # hybrid6 policy action: [throttle, steer, power sample u, aim a, kick fire K, special fire S].
 HYBRID6_ACTION_DIM = 6
+# hybrid7 policy action: [throttle, steer, power sample u, aim a, target T, kick fire K, special fire S].
+HYBRID7_ACTION_DIM = 7
+# hybrid7 output logits: [z_thr, z_steer, z_pow, z_aim, z_kick, z_spec, z_tm1..z_tm5, z_free].
+HYBRID7_LOGIT_DIM = 12
+NUM_KICK_TARGETS = 6
+KICK_TARGET_FREE = 5
+# Half of one physics substep in normalized hold-time units (1/60 s / 5.0 s = 1/300 -> midpoint 1/600).
+KICK_READY_OBS_MIN = 1.0 / 600.0
+# Kickable deflection arc in normalized bearing units (rel_ang / pi for +-35 deg).
+KICK_ARC_OBS = 35.0 / 180.0
+# Observation indices of teammate relative bearings (entity slots 1..5: 16 + 5*s + 2 = 18 + 5*s -> 23, 28, 33, 38, 43).
+TEAMMATE_REL_ANG_SLICE = slice(23, 44, 5)
 # Initial hybrid5 power-head bias: the mean power (1 + tanh(bias)) / 2 is 0.4666.
 HYBRID_POWER_BIAS = -0.067
 
 
 def policy_head_of_weights(weights: Dict[str, torch.Tensor]) -> Optional[str]:
-    """Head of an `ActorCritic` state dict from the width of its output layer (4 -> gaussian4, 5 -> hybrid5, 6 -> hybrid6),
-    else None."""
+    """Head of an `ActorCritic` state dict from the width of its output layer (4 -> gaussian4, 5 -> hybrid5,
+    6 -> hybrid6, 12 -> hybrid7), else None."""
     out = weights.get("actor_mean.4.weight")
     if out is None or out.dim() != 2:
         return None
-    return {ACTION_DIM: "gaussian4", HYBRID_ACTION_DIM: "hybrid5", HYBRID6_ACTION_DIM: "hybrid6"}.get(int(out.shape[0]))
+    return {
+        ACTION_DIM: "gaussian4",
+        HYBRID_ACTION_DIM: "hybrid5",
+        HYBRID6_ACTION_DIM: "hybrid6",
+        HYBRID7_LOGIT_DIM: "hybrid7",
+    }.get(int(out.shape[0]))
+
+
+def validate_hybrid7_env_config(cfg: Any) -> None:
+    """Verify the environment constants relied on by `kick_targets` for `hybrid7`, raising ValueError on mismatch."""
+    phys = cfg.physics
+    mech = cfg.mechanics
+    # KICK_READY_OBS_MIN is half of one 1/60 s substep in obs[8] units; another substep length moves the k = 1 hold.
+    if phys.dt != 1.0 / 60.0:
+        raise ValueError(f"hybrid7 requires dt == 1/60 s, got {phys.dt}")
+    min_substeps = math.ceil(mech.pickup_kick_grace / phys.dt - phys.frame_skip - 1e-12)
+    if min_substeps != 1:
+        raise ValueError(
+            f"hybrid7 requires ceil(pickup_kick_grace / dt - frame_skip) == 1 substep, "
+            f"got {min_substeps} from pickup_kick_grace={mech.pickup_kick_grace}, dt={phys.dt}, frame_skip={phys.frame_skip}"
+        )
+    if mech.field_max_hold_time != 5.0:
+        raise ValueError(f"hybrid7 requires field_max_hold_time == 5.0, got {mech.field_max_hold_time}")
+    if mech.keeper_max_hold_time != 5.0:
+        raise ValueError(f"hybrid7 requires keeper_max_hold_time == 5.0, got {mech.keeper_max_hold_time}")
+    if mech.kick_steer_max_deflection_deg != 35.0:
+        raise ValueError(
+            f"hybrid7 requires kick_steer_max_deflection_deg == 35.0, got {mech.kick_steer_max_deflection_deg}"
+        )
+
+
+def kick_targets(obs: Any) -> Tuple[Any, Any, Any]:
+    """Compute `(ready, valid, tm_steer)` from raw observations `obs` (`np.ndarray` or `torch.Tensor`).
+
+    Readiness derivation from the substep order (`physics.py` `_physics_substep`, 4 substeps per decision at dt = 1/60 s):
+    each substep decrements `kick_grace_timer` and increments `ball_hold_timer` before checking whether a kick fires
+    (`kick_grace_timer <= 0`). A free-ball pickup or successful tackle sets `ball_hold_timer = 0` and
+    `kick_grace_timer = 0.08` together after the action pass, so at a decision row after k substeps held,
+    `hold = k/60` and `grace = max(0, 0.08 - k/60)`. On substep j in 1..4 of the next decision `grace = 0.08 - (k + j)/60`,
+    which reaches <= 0 iff `k + j >= 5`. Thus a kick can fire on some substep of the next decision iff `k >= 1`:
+    k = 0 is blocked on all four substeps, k = 1 fires on substep 4, and k >= 4 fires on substep 1. Because `obs[..., 8]`
+    stores `ball_hold_timer / 5.0`, k = 0 gives 0.0 and k = 1 gives 1/300; `KICK_READY_OBS_MIN = 1/600` separates them.
+    Kickoffs (which clear both timers to 0) and keeper perimeter strips (which reset hold without resetting grace) are
+    exceptions the observation cannot see and are treated as not ready (`ready = False`).
+
+    Teammate slots 1..5 carry `rel_ang / pi` at columns 23, 28, 33, 38, 43 (`18 + 5*s`). A teammate slot is valid iff
+    `|rel_ang / pi| <= 35/180` (`KICK_ARC_OBS`), FREE (index 5) is always valid, and `tm_steer = rel_ang * (180 / 35)`.
+    """
+    if torch.is_tensor(obs):
+        if obs.shape[-1] <= 43:
+            raise ValueError(f"obs last dimension must exceed 43 for kick_targets, got {obs.shape[-1]}")
+        ready = (obs[..., HOLDING_OBS_INDEX] > 0.5) & (obs[..., HOLD_TIME_OBS_INDEX] > KICK_READY_OBS_MIN)
+        rel = obs[..., TEAMMATE_REL_ANG_SLICE]
+        valid = F.pad(rel.abs() <= KICK_ARC_OBS, (0, 1), value=True)
+        tm_steer = rel * (180.0 / 35.0)
+        return ready, valid, tm_steer
+    arr = np.asarray(obs)
+    if arr.shape[-1] <= 43:
+        raise ValueError(f"obs last dimension must exceed 43 for kick_targets, got {arr.shape[-1]}")
+    ready = (arr[..., HOLDING_OBS_INDEX] > 0.5) & (arr[..., HOLD_TIME_OBS_INDEX] > KICK_READY_OBS_MIN)
+    rel = arr[..., TEAMMATE_REL_ANG_SLICE]
+    valid = np.empty((*arr.shape[:-1], NUM_KICK_TARGETS), dtype=np.bool_)
+    valid[..., :5] = np.abs(rel) <= KICK_ARC_OBS
+    valid[..., KICK_TARGET_FREE] = True
+    tm_steer = rel * (180.0 / 35.0)
+    return ready, valid, tm_steer
+
+
+def masked_target_log_probs_and_entropy(
+    target_logits: torch.Tensor, valid: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """`(log_pi, H_pi)` of the masked categorical over `{TM_1..5, FREE}` without `-inf * 0` or NaN in values or gradients."""
+    masked = target_logits.masked_fill(~valid, float("-inf"))
+    log_pi = F.log_softmax(masked, dim=-1)
+    zero = torch.zeros_like(log_pi)
+    pi = torch.where(valid, log_pi.exp(), zero)
+    log_pi_safe = torch.where(valid, log_pi, zero)
+    h_pi = -torch.where(valid, pi * log_pi_safe, zero).sum(dim=-1)
+    return log_pi, h_pi
+
+
+def sample_kick_target(
+    target_logits: torch.Tensor,
+    valid: torch.Tensor,
+    deterministic: bool = False,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Sample a kick target index in `0..5` from the masked categorical, or take the masked argmax when `deterministic`."""
+    if target_logits.numel() == 0:
+        return torch.empty(target_logits.shape[:-1], dtype=torch.int64, device=target_logits.device)
+    masked = target_logits.masked_fill(~valid, float("-inf"))
+    if deterministic:
+        return masked.argmax(dim=-1)
+    probs = F.softmax(masked, dim=-1)
+    flat = probs.reshape(-1, NUM_KICK_TARGETS)
+    drawn = torch.multinomial(flat, 1, generator=generator).squeeze(-1)
+    return drawn.reshape(target_logits.shape[:-1])
 
 
 def fire_probability(z: torch.Tensor, floor: Any, bound: Any) -> torch.Tensor:
@@ -54,28 +164,35 @@ def fire_probability(z: torch.Tensor, floor: Any, bound: Any) -> torch.Tensor:
     return floor + (1.0 - 2.0 * floor) * torch.sigmoid(bound * torch.tanh(z / bound))
 
 
-def to_env_actions(policy_actions: np.ndarray, kick_threshold: float, holding: Optional[np.ndarray] = None) -> np.ndarray:
-    """Decode hybrid5 policy actions `[thr, steer, u, K, S]` or hybrid6 ones `[thr, steer, u, a, K, S]` into the env's
-    `[thr, steer, kick, special]`.
+def to_env_actions(
+    policy_actions: np.ndarray,
+    kick_threshold: float,
+    holding: Optional[np.ndarray] = None,
+    obs: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Decode hybrid5 `[thr, steer, u, K, S]`, hybrid6 `[thr, steer, u, a, K, S]` or hybrid7 `[thr, steer, u, a, T, K, S]`
+    policy actions into the env's `[thr, steer, kick, special]`.
 
     Kick is `-1` unless K = 1, then `thr + (1 - thr) * max(power, 0.001)` with `thr = kick_threshold` and
     `power = clip((u + 1) / 2, 0, 1)`, so a fired kick is always strictly above the env threshold. Special is
-    `+1` when S = 1 and `-1` otherwise. Throttle passes through unchanged. The env steer is `steer`, except for a
-    hybrid6 action whose seat holds the ball (`holding`, shape `policy_actions.shape[:-1]`, required for hybrid6) and
-    fires the kick: then it is the aim `a`, which the env turns into the kick's deflection. hybrid5 ignores `holding`.
+    `+1` when S = 1 and `-1` otherwise. Throttle passes through unchanged. The env steer is `steer`, except:
+    - hybrid6: on rows where the seat holds the ball (`holding`) and fires the kick, it is the aim `a`;
+    - hybrid7: requires `obs` (matching leading shape), computes `(ready, valid, tm_steer) = kick_targets(obs)`, and on
+      rows where `K > 0.5` and `ready`, sets the env steer to `tm_steer[T]` for `T < 5` or `a` for `T = 5`, raising
+      ValueError if `T` is not valid on a ready kick row.
     """
     pol = np.asarray(policy_actions)
     width = pol.shape[-1]
-    if width not in (HYBRID_ACTION_DIM, HYBRID6_ACTION_DIM):
+    if width not in (HYBRID_ACTION_DIM, HYBRID6_ACTION_DIM, HYBRID7_ACTION_DIM):
         raise ValueError(
-            f"expected {HYBRID_ACTION_DIM} or {HYBRID6_ACTION_DIM} policy action components, got {width}"
+            f"expected {HYBRID_ACTION_DIM}, {HYBRID6_ACTION_DIM} or {HYBRID7_ACTION_DIM} policy action components, got {width}"
         )
-    fire = 3 if width == HYBRID_ACTION_DIM else 4
+    fire = 3 if width == HYBRID_ACTION_DIM else 4 if width == HYBRID6_ACTION_DIM else 5
     out = np.empty(pol.shape[:-1] + (ACTION_DIM,), dtype=pol.dtype)
     out[..., 0] = pol[..., 0]
     if width == HYBRID_ACTION_DIM:
         out[..., 1] = pol[..., 1]
-    else:
+    elif width == HYBRID6_ACTION_DIM:
         if holding is None:
             raise ValueError("hybrid6 policy actions need the holding flag of every seat to decode the steer")
         holding = np.asarray(holding)
@@ -84,6 +201,30 @@ def to_env_actions(policy_actions: np.ndarray, kick_threshold: float, holding: O
         if holding.dtype != np.bool_:
             holding = holding > 0.5
         out[..., 1] = np.where((pol[..., fire] > 0.5) & holding, pol[..., 3], pol[..., 1])
+    else:
+        if obs is None:
+            raise ValueError("hybrid7 policy actions need obs to decode the kick target")
+        obs_arr = np.asarray(obs)
+        if obs_arr.shape[:-1] != pol.shape[:-1]:
+            raise ValueError(f"obs has leading shape {obs_arr.shape[:-1]}, expected {pol.shape[:-1]}")
+        ready, valid, tm_steer = kick_targets(obs_arr)
+        ready_kick = (pol[..., fire] > 0.5) & ready
+        out[..., 1] = pol[..., 1]
+        if np.any(ready_kick):
+            t_raw = pol[ready_kick, 4]
+            t_int = np.rint(t_raw).astype(np.int64)
+            v_act = valid[ready_kick]
+            in_range = (
+                np.isfinite(t_raw)
+                & (t_int >= 0)
+                & (t_int < NUM_KICK_TARGETS)
+                & (np.abs(t_raw - t_int) <= 1e-4)
+            )
+            if not np.all(in_range) or not np.all(v_act[np.arange(t_int.size), t_int]):
+                raise ValueError("hybrid7 ready kick selected an invalid target")
+            tm_act = tm_steer[ready_kick]
+            chosen_tm = tm_act[np.arange(t_int.size), np.minimum(t_int, KICK_TARGET_FREE - 1)]
+            out[ready_kick, 1] = np.where(t_int == KICK_TARGET_FREE, pol[ready_kick, 3], chosen_tm)
     power = np.maximum(np.clip((pol[..., 2] + 1.0) / 2.0, 0.0, 1.0), 0.001)
     out[..., 2] = np.where(pol[..., fire] > 0.5, kick_threshold + (1.0 - kick_threshold) * power, -1.0)
     out[..., 3] = np.where(pol[..., fire + 1] > 0.5, 1.0, -1.0)
@@ -99,14 +240,49 @@ def _holding_mask(holding: Optional[torch.Tensor], shape: torch.Size) -> torch.T
     return holding if holding.dtype == torch.bool else holding > 0.5
 
 
-def _hybrid_log_prob(
-    mean: torch.Tensor, logstd: torch.Tensor, p: torch.Tensor, action: torch.Tensor, holding: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """Log-probability of a hybrid5 or hybrid6 `action`; `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities.
+def _resolve_kick_targets_torch(
+    shape: torch.Size,
+    obs: Optional[torch.Tensor],
+    ready: Optional[torch.Tensor],
+    valid: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Resolve `(ready, valid)` for a hybrid7 batch from explicit tensors or `obs`, validating shapes."""
+    if ready is None or valid is None:
+        if obs is None:
+            raise ValueError("the hybrid7 head needs obs or (ready, valid) of every row")
+        if obs.shape[:-1] != shape:
+            raise ValueError(f"obs has leading shape {tuple(obs.shape[:-1])}, expected {tuple(shape)}")
+        ready, valid, _ = kick_targets(obs)
+    else:
+        if ready.shape != shape:
+            raise ValueError(f"ready has shape {tuple(ready.shape)}, expected {tuple(shape)}")
+        if valid.shape != (*shape, NUM_KICK_TARGETS):
+            raise ValueError(f"valid has shape {tuple(valid.shape)}, expected {(*shape, NUM_KICK_TARGETS)}")
+    return ready, valid
 
-    With four Gaussians (hybrid6) the steer Gaussian counts on rows where the kick did not fire or the seat does not hold
-    the ball (`holding`), and the aim Gaussian on the rows where a holder fired. hybrid5 ignores `holding`.
+
+def _hybrid_log_prob(
+    mean: torch.Tensor,
+    logstd: torch.Tensor,
+    p: torch.Tensor,
+    action: torch.Tensor,
+    holding: Optional[torch.Tensor] = None,
+    *,
+    target_logits: Optional[torch.Tensor] = None,
+    obs: Optional[torch.Tensor] = None,
+    ready: Optional[torch.Tensor] = None,
+    valid: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Log-probability of a hybrid5, hybrid6 or hybrid7 `action`; `p[..., 0]` and `p[..., 1]` are the kick and special
+    fire probabilities.
+
+    With `target_logits` (hybrid7), ready fired kicks (`K * c = 1`) use the masked target categorical plus the aim
+    Gaussian when `T = FREE`; all other rows use the steer Gaussian. With four Gaussians and no `target_logits`
+    (hybrid6), the aim Gaussian replaces steer on rows where a holder fired (`K * h = 1`). hybrid5 ignores `holding`.
     """
+    if target_logits is not None:
+        r, v = _resolve_kick_targets_torch(action.shape[:-1], obs, ready, valid)
+        return _hybrid7_log_prob(mean, logstd, p, target_logits, action, r, v)
     if mean.shape[-1] == 4:
         return _hybrid6_log_prob(mean, logstd, p, action, _holding_mask(holding, action.shape[:-1]))
     kick = action[..., 3]
@@ -126,13 +302,124 @@ def _hybrid6_log_prob(
     return log_n[..., 0] + direction + kick * log_n[..., 2] + log_fire
 
 
-def _hybrid_entropy(logstd: torch.Tensor, p: torch.Tensor, holding: Optional[torch.Tensor] = None) -> torch.Tensor:
+def _validate_hybrid7_targets(
+    action: torch.Tensor, ready: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Validate stored target column `action[..., 4]` on ready-kick rows; return safe int64 indices."""
+    kick_fired = action[..., 5] > 0.5
+    active = kick_fired & ready
+    target = action[..., 4]
+    t_int = torch.round(target).to(torch.int64)
+    in_range = (
+        torch.isfinite(target)
+        & (t_int >= 0)
+        & (t_int < NUM_KICK_TARGETS)
+        & ((target - t_int.to(target.dtype)).abs() <= 1e-4)
+    )
+    free_idx = torch.full_like(t_int, KICK_TARGET_FREE)
+    t_safe = torch.where(in_range, t_int, free_idx)
+    t_valid = in_range & valid.gather(-1, t_safe.unsqueeze(-1)).squeeze(-1)
+    if bool((active & ~t_valid).any()):
+        raise ValueError("hybrid7 ready kick has an invalid target")
+    return t_safe
+
+
+def _hybrid7_log_prob(
+    mean: torch.Tensor,
+    logstd: torch.Tensor,
+    p: torch.Tensor,
+    target_logits: torch.Tensor,
+    action: torch.Tensor,
+    ready: torch.Tensor,
+    valid: torch.Tensor,
+    validate_targets: bool = True,
+) -> torch.Tensor:
+    """`logN(thr) + (1 - K c) logN(steer) + K c (log pi(T|valid) + [T=5] logN(a)) + K logN(u) + log Bern(K) + log Bern(S)`."""
+    kick_fired = action[..., 5] > 0.5
+    active = kick_fired & ready
+    if validate_targets:
+        t_safe = _validate_hybrid7_targets(action, ready, valid)
+    else:
+        t_safe = torch.round(action[..., 4]).to(torch.int64).clamp(0, KICK_TARGET_FREE)
+
+    masked = target_logits.masked_fill(~valid, float("-inf"))
+    log_pi = F.log_softmax(masked, dim=-1)
+    free_idx = torch.full_like(t_safe, KICK_TARGET_FREE)
+    t_gather = torch.where(active, t_safe, free_idx)
+    log_pi_t = log_pi.gather(-1, t_gather.unsqueeze(-1)).squeeze(-1)
+
+    log_n = -0.5 * ((action[..., :4] - mean) * torch.exp(-logstd)) ** 2 - logstd - _HALF_LOG_TWO_PI
+    log_fire = torch.log(torch.where(action[..., 5:] > 0.5, p, 1.0 - p)).sum(-1)
+    zero = torch.zeros_like(log_n[..., 0])
+    is_free = t_safe == KICK_TARGET_FREE
+    kick_dir = torch.where(is_free, log_pi_t + log_n[..., 3], log_pi_t)
+    direction = torch.where(active, kick_dir, log_n[..., 1])
+    power_term = torch.where(kick_fired, log_n[..., 2], zero)
+    return log_n[..., 0] + direction + power_term + log_fire
+
+
+def _hybrid7_sample_and_log_prob(
+    mean: torch.Tensor,
+    logstd: torch.Tensor,
+    p: torch.Tensor,
+    target_logits: torch.Tensor,
+    ready: torch.Tensor,
+    valid: torch.Tensor,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample a 7-wide hybrid7 action and its log-probability in one masked-target softmax pass.
+
+    Draws in order: Gaussian `(thr, steer, u, a)`, Bernoulli `(K, S)`, then masked categorical `T` (or masked argmax
+    when `deterministic`). Log-probability matches `_hybrid7_log_prob` identically.
+    """
+    if deterministic:
+        gauss = mean
+        fires = (p > 0.5).to(mean.dtype)
+    else:
+        gauss = torch.normal(mean, torch.exp(logstd))
+        fires = torch.bernoulli(p)
+    masked = target_logits.masked_fill(~valid, float("-inf"))
+    log_pi = F.log_softmax(masked, dim=-1)
+    if deterministic:
+        t_int = masked.argmax(dim=-1)
+    else:
+        flat = log_pi.exp().reshape(-1, NUM_KICK_TARGETS)
+        t_int = torch.multinomial(flat, 1).squeeze(-1).reshape(target_logits.shape[:-1])
+    action = torch.cat([gauss, t_int.to(mean.dtype).unsqueeze(-1), fires], dim=-1)
+
+    kick = fires[..., 0]
+    log_n = -0.5 * ((gauss - mean) * torch.exp(-logstd)) ** 2 - logstd - _HALF_LOG_TWO_PI
+    log_fire = torch.log(torch.where(fires > 0.5, p, 1.0 - p)).sum(-1)
+    active = (kick > 0.5) & ready
+    if bool(active.any()):
+        log_pi_t = log_pi.gather(-1, t_int.unsqueeze(-1)).squeeze(-1)
+        kick_dir = torch.where(t_int == KICK_TARGET_FREE, log_pi_t + log_n[..., 3], log_pi_t)
+        direction = torch.where(active, kick_dir, log_n[..., 1])
+    else:
+        direction = log_n[..., 1]
+    return action, log_n[..., 0] + direction + kick * log_n[..., 2] + log_fire
+
+
+def _hybrid_entropy(
+    logstd: torch.Tensor,
+    p: torch.Tensor,
+    holding: Optional[torch.Tensor] = None,
+    *,
+    ready: Optional[torch.Tensor] = None,
+    is_free: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Entropy of the hybrid5 head distribution: two Gaussians, two Bernoullis and `p_kick` times the power Gaussian.
 
     hybrid6 (four Gaussians) adds `p_kick * h` times the aim Gaussian, with h the row's holding flag.
+    hybrid7 (`ready` and `is_free` given) replaces `h` with `c * [T = FREE]` and omits the target categorical entropy.
     """
     h_n = 0.5 + _HALF_LOG_TWO_PI + logstd
     h_b = -(p * torch.log(p) + (1.0 - p) * torch.log1p(-p)).sum(-1)
+    if ready is not None:
+        if is_free is None:
+            raise ValueError("hybrid7 entropy requires is_free alongside ready")
+        aim_w = torch.where(ready & is_free, p[..., 0], torch.zeros_like(p[..., 0]))
+        return h_n[..., 0] + h_n[..., 1] + h_b + p[..., 0] * h_n[..., 2] + aim_w * h_n[..., 3]
     if logstd.shape[-1] == 4:
         hold = _holding_mask(holding, p.shape[:-1]).to(p.dtype)
         return h_n[..., 0] + h_n[..., 1] + h_b + p[..., 0] * h_n[..., 2] + p[..., 0] * hold * h_n[..., 3]
@@ -146,16 +433,19 @@ def hybrid_log_prob_entropy(
     p_spec: torch.Tensor,
     action: torch.Tensor,
     holding: Optional[torch.Tensor] = None,
+    *,
+    target_logits: Optional[torch.Tensor] = None,
+    obs: Optional[torch.Tensor] = None,
+    ready: Optional[torch.Tensor] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Log-probability of a hybrid5 or hybrid6 `action` and the entropy of the head distribution.
-
-    `mean` and `logstd` hold the throttle, steer and power Gaussians (last dimension 3), and for hybrid6 the aim
-    Gaussian as a fourth; `p_kick` and `p_spec` are the fire probabilities. The power Gaussian counts only when a kick
-    fired: log-probability adds `K * logN(u)` and entropy adds `p_kick * H_N(power)`. hybrid6 needs `holding` (the
-    rows' holding flags h): the aim Gaussian replaces the steer one in the log-probability when `K * h = 1`, and the
-    entropy adds `p_kick * h * H_N(aim)`. hybrid5 ignores `holding`.
-    """
+    """Log-probability of a hybrid5, hybrid6 or hybrid7 `action` and the logged entropy of the head distribution."""
     p = torch.stack([p_kick, p_spec], dim=-1)
+    if target_logits is not None:
+        r, v = _resolve_kick_targets_torch(action.shape[:-1], obs, ready, valid)
+        lp = _hybrid7_log_prob(mean, logstd, p, target_logits, action, r, v)
+        is_free = torch.round(action[..., 4]).to(torch.int64) == KICK_TARGET_FREE
+        return lp, _hybrid_entropy(logstd, p, ready=r, is_free=is_free)
     return _hybrid_log_prob(mean, logstd, p, action, holding), _hybrid_entropy(logstd, p, holding)
 
 
@@ -166,14 +456,39 @@ def hybrid_entropy_bonus(
     fire_entropy: str,
     fire_ent_coef: float,
     holding: Optional[torch.Tensor] = None,
+    *,
+    target_logits: Optional[torch.Tensor] = None,
+    target_ent_coef: float = 0.0,
+    target: Optional[torch.Tensor] = None,
+    obs: Optional[torch.Tensor] = None,
+    ready: Optional[torch.Tensor] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-sample entropy bonus of the hybrid5 or hybrid6 loss; `p[..., 0]` is the kick and `p[..., 1]` the special fire probability.
+    """Per-sample entropy bonus of the hybrid5, hybrid6 or hybrid7 loss; `p[..., 0]` is kick and `p[..., 1]` special.
 
-    `joint`: `ent_coef` times the full head entropy. `separate`: `ent_coef` times the three Gaussian terms, with the
-    power term weighted by the detached kick probability, plus `fire_ent_coef` times the two Bernoulli entropies.
-    hybrid6 (four logstds) needs `holding`, the rows' holding flags h: its aim term is weighted by the detached kick
-    probability times h, and the steer term is not reweighted.
+    `joint` (hybrid5 / hybrid6): `ent_coef` times the full head entropy. `separate`: `ent_coef` times the Gaussian
+    terms (power weighted by detached p_kick; hybrid6 aim by detached p_kick * h; hybrid7 aim by detached p_kick * c *
+    [T = FREE] where T is the stored sample), plus `fire_ent_coef` times the two Bernoulli entropies, plus (for
+    hybrid7) `target_ent_coef * p_kick.detach() * c * [n_valid > 1] * H_pi`. Callers reduce this with `.mean()` over
+    every row of the minibatch.
     """
+    if target_logits is not None:
+        if fire_entropy != "separate":
+            raise ValueError(f"hybrid7 requires fire_entropy='separate', got {fire_entropy!r}")
+        if target is None:
+            raise ValueError("hybrid7 entropy bonus requires the stored target T")
+        r, v = _resolve_kick_targets_torch(p.shape[:-1], obs, ready, valid)
+        h_n = 0.5 + _HALF_LOG_TWO_PI + logstd
+        h_b = -(p * torch.log(p) + (1.0 - p) * torch.log1p(-p)).sum(-1)
+        p_hat = p[..., 0].detach()
+        zero = torch.zeros_like(p_hat)
+        is_free = (torch.round(target).to(torch.int64) == KICK_TARGET_FREE).detach()
+        aim_term = torch.where(r & is_free, p_hat * h_n[..., 3], zero)
+        gaussian = h_n[..., 0] + h_n[..., 1] + p_hat * h_n[..., 2] + aim_term
+        _, h_pi = masked_target_log_probs_and_entropy(target_logits, v)
+        multi = r & (v.sum(dim=-1) > 1)
+        target_term = torch.where(multi, p_hat * h_pi, zero)
+        return ent_coef * gaussian + target_ent_coef * target_term + fire_ent_coef * h_b
     if fire_entropy == "joint":
         return ent_coef * _hybrid_entropy(logstd, p, holding)
     if fire_entropy != "separate":
@@ -267,6 +582,9 @@ class ActorCritic(nn.Module):
     logits `[z_thr, z_steer, z_pow, z_aim, z_kick, z_spec]` and the policy action is `[thr, steer, u, a, K, S]`. The aim
     replaces the steer, in the env action and in the log-probability, on rows where the seat holds the ball
     (observation column `HOLDING_OBS_INDEX`) and the kick fires.
+    `policy_head="hybrid7"`: hybrid6 with six kick-target logits `[z_tm1..z_tm5, z_free]` after the fire logits (twelve
+    outputs) and the policy action `[thr, steer, u, a, T, K, S]`. On rows where the holder is ready (`kick_targets`) and
+    the kick fires, T picks an in-arc teammate slot, whose bearing becomes the env steer, or FREE, which uses the aim.
 
     With `value_norm` the critic head is trained in standardised return units and the network holds the running
     return statistics as the buffers `ret_mean`, `ret_std` and `ret_count`. Every value it returns is in raw return units
@@ -292,7 +610,8 @@ class ActorCritic(nn.Module):
         self.value_norm = False
         self.policy_head = policy_head
         self.hybrid = policy_head in FIRE_HEADS
-        self.aim = policy_head == "hybrid6"
+        self.aim = policy_head in ("hybrid6", "hybrid7")
+        self.kick_target = policy_head == "hybrid7"
         # Gaussian components ahead of the two fire logits: throttle, steer, power (and aim).
         self.n_gauss = 4 if self.aim else 3
         h1, h2 = hidden_dims
@@ -307,11 +626,20 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(h2, 1), std=1.0),
         )
-        hybrid_width = HYBRID6_ACTION_DIM if self.aim else HYBRID_ACTION_DIM
-        out_layer = layer_init(nn.Linear(h2, hybrid_width if self.hybrid else action_dim), std=0.01)
+        out_width = (
+            HYBRID7_LOGIT_DIM
+            if self.kick_target
+            else HYBRID6_ACTION_DIM
+            if self.aim
+            else HYBRID_ACTION_DIM
+            if self.hybrid
+            else action_dim
+        )
+        out_layer = layer_init(nn.Linear(h2, out_width), std=0.01)
         if self.hybrid:
             # Initial priors reproduce the gaussian4 start: throttle logit 0.35, steer 0, mean power 0.4666, and
-            # kick / special fire rates of 0.1289 / 0.0275 at a zero observation; the hybrid6 aim starts at 0 like the steer.
+            # kick / special fire rates of 0.1289 / 0.0275 at a zero observation; the hybrid6/hybrid7 aim starts at 0
+            # like the steer, and hybrid7 target logits start at 0 (uniform over valid options).
             kick_bias = _initial_fire_logit(
                 _gaussian4_fire_rate(0.35, -0.35), fire_prob_floor, fire_logit_bound, "kick"
             )
@@ -319,8 +647,9 @@ class ActorCritic(nn.Module):
                 _gaussian4_fire_rate(0.5, -0.8), fire_prob_floor, fire_logit_bound, "special"
             )
             gaussian_bias = [0.35, 0.0, HYBRID_POWER_BIAS] + ([0.0] if self.aim else [])
+            target_bias = [0.0] * NUM_KICK_TARGETS if self.kick_target else []
             with torch.no_grad():
-                out_layer.bias.copy_(torch.tensor(gaussian_bias + [kick_bias, spec_bias], dtype=torch.float32))
+                out_layer.bias.copy_(torch.tensor(gaussian_bias + [kick_bias, spec_bias] + target_bias, dtype=torch.float32))
             self.register_buffer("fire_prob_floor", torch.tensor(float(fire_prob_floor), dtype=torch.float32))
             self.register_buffer("fire_logit_bound", torch.tensor(float(fire_logit_bound), dtype=torch.float32))
         elif action_dim == 4:
@@ -342,7 +671,15 @@ class ActorCritic(nn.Module):
             actor_layers.append(nn.Tanh())  # Bound mean to [-1.0, 1.0]
         self.actor_mean = nn.Sequential(*actor_layers)
         self.actor_logstd = nn.Parameter(torch.full((1, self.n_gauss if self.hybrid else action_dim), -0.5))
-        self.action_dim = hybrid_width if self.hybrid else action_dim
+        self.action_dim = (
+            HYBRID7_ACTION_DIM
+            if self.kick_target
+            else HYBRID6_ACTION_DIM
+            if self.aim
+            else HYBRID_ACTION_DIM
+            if self.hybrid
+            else action_dim
+        )
         if value_norm:
             self.enable_value_norm()
 
@@ -423,21 +760,34 @@ class ActorCritic(nn.Module):
         return_mean: bool = False,
         return_heads: bool = False,
         normalized_value: bool = False,
+        ready: Optional[torch.Tensor] = None,
+        valid: Optional[torch.Tensor] = None,
+        validate_targets: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
         """Return `(action, log_prob, entropy, value)`; with `return_mean` the policy mean action is appended.
 
-        With `return_heads` (hybrid heads only) the `(logstd, p)` pair of the same forward pass is appended last, where
-        `p[..., 0]` and `p[..., 1]` are the kick and special fire probabilities. A hybrid6 network reads each row's
-        holding flag from column `HOLDING_OBS_INDEX` of `obs`. `value` is in raw return units;
-        `normalized_value` returns the critic head output instead (they coincide without return statistics).
+        With `return_heads` (hybrid heads only) the `(logstd, p)` pair (or `(logstd, p, target_logits)` for hybrid7) of
+        the same forward pass is appended last, where `p[..., 0]` and `p[..., 1]` are the kick and special fire
+        probabilities. A hybrid6 network reads each row's holding flag from column `HOLDING_OBS_INDEX` of `obs`;
+        hybrid7 reads `(ready, valid)` via `kick_targets(obs)` unless passed explicitly. `value` is in raw return
+        units; `normalized_value` returns the critic head output instead (they coincide without return statistics).
         """
         actor_obs = obs[..., :self.obs_dim] if obs.shape[-1] > self.obs_dim else obs
         if self.hybrid:
             return self._hybrid_action_and_value(
-                actor_obs, action, deterministic, central_state, return_mean, return_heads, normalized_value
+                actor_obs,
+                action,
+                deterministic,
+                central_state,
+                return_mean,
+                return_heads,
+                normalized_value,
+                ready=ready,
+                valid=valid,
+                validate_targets=validate_targets,
             )
         if return_heads:
-            raise ValueError("return_heads requires the hybrid5 or hybrid6 policy head")
+            raise ValueError("return_heads requires the hybrid5, hybrid6 or hybrid7 policy head")
         action_mean = self.actor_mean(actor_obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
@@ -457,9 +807,9 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, value
 
     def _hybrid_split(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """`(Gaussian means (n, 3) or (n, 4), fire probabilities (n, 2))` from the five or six output logits."""
+        """`(Gaussian means (n, 3) or (n, 4), fire probabilities (n, 2))` from the five, six or twelve output logits."""
         n = self.n_gauss
-        return torch.tanh(z[..., :n]), fire_probability(z[..., n:], self.fire_prob_floor, self.fire_logit_bound)
+        return torch.tanh(z[..., :n]), fire_probability(z[..., n : n + 2], self.fire_prob_floor, self.fire_logit_bound)
 
     def _hybrid_from_logits(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(Gaussian means (n, 3) or (n, 4), p_kick (n,), p_spec (n,))` from the output logits."""
@@ -504,19 +854,52 @@ class ActorCritic(nn.Module):
         return_mean: bool,
         return_heads: bool = False,
         normalized_value: bool = False,
+        ready: Optional[torch.Tensor] = None,
+        valid: Optional[torch.Tensor] = None,
+        validate_targets: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
-        mean3, p = self._hybrid_split(self.actor_mean(actor_obs))
+        z = self.actor_mean(actor_obs)
+        mean3, p = self._hybrid_split(z)
         logstd = self.actor_logstd
-        holding = actor_obs[..., HOLDING_OBS_INDEX] > 0.5 if self.aim else None
-        if action is None:
-            if deterministic:
-                action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
-            else:
-                action = torch.cat(
-                    [Normal(mean3, torch.exp(logstd).expand_as(mean3)).sample(), torch.bernoulli(p)], dim=-1
-                )
-        log_prob = _hybrid_log_prob(mean3, logstd, p, action, holding)
-        entropy = _hybrid_entropy(logstd, p, holding)
+        if self.kick_target:
+            target_logits = z[..., 6:]
+            if ready is None or valid is None:
+                ready, valid, _ = kick_targets(actor_obs)
+            if action is None:
+                if deterministic:
+                    t = sample_kick_target(target_logits, valid, deterministic=True).to(mean3.dtype).unsqueeze(-1)
+                    action = torch.cat(
+                        [
+                            mean3,
+                            t,
+                            (p[..., 0] > 0.5).to(mean3.dtype).unsqueeze(-1),
+                            (p[..., 1] > 0.5).to(mean3.dtype).unsqueeze(-1),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    gauss = Normal(mean3, torch.exp(logstd).expand_as(mean3)).sample()
+                    fires = torch.bernoulli(p)
+                    t = sample_kick_target(target_logits, valid, deterministic=False).to(mean3.dtype).unsqueeze(-1)
+                    action = torch.cat([gauss, t, fires], dim=-1)
+            log_prob = _hybrid7_log_prob(
+                mean3, logstd, p, target_logits, action, ready, valid, validate_targets=validate_targets
+            )
+            is_free = torch.round(action[..., 4]).to(torch.int64) == KICK_TARGET_FREE
+            entropy = _hybrid_entropy(logstd, p, ready=ready, is_free=is_free)
+            heads: Tuple[torch.Tensor, ...] = (logstd, p, target_logits)
+        else:
+            holding = actor_obs[..., HOLDING_OBS_INDEX] > 0.5 if self.aim else None
+            if action is None:
+                if deterministic:
+                    action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+                else:
+                    action = torch.cat(
+                        [Normal(mean3, torch.exp(logstd).expand_as(mean3)).sample(), torch.bernoulli(p)], dim=-1
+                    )
+            log_prob = _hybrid_log_prob(mean3, logstd, p, action, holding)
+            entropy = _hybrid_entropy(logstd, p, holding)
+            heads = (logstd, p)
         critic_in = self._prepare_critic_input(actor_obs, central_state)
         value = self.critic(critic_in).squeeze(-1)
         if self.value_norm and not normalized_value:
@@ -525,7 +908,7 @@ class ActorCritic(nn.Module):
         if return_mean:
             out += (self._hybrid_env_mean(mean3, p[..., 0], p[..., 1]),)
         if return_heads:
-            out += ((logstd, p),)
+            out += (heads,)
         return out
 
     @torch.no_grad()
@@ -577,14 +960,36 @@ class ActorCritic(nn.Module):
         h = torch.tanh(F.linear(obs, a0.weight, a0.bias))
         h = torch.tanh(F.linear(h, a1.weight, a1.bias))
         if self.hybrid:
-            mean3, p = self._hybrid_split(F.linear(h, a2.weight, a2.bias))
+            z = F.linear(h, a2.weight, a2.bias)
+            mean3, p = self._hybrid_split(z)
             logstd = self.actor_logstd
-            if deterministic:
-                action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+            if self.kick_target:
+                target_logits = z[..., 6:]
+                ready, valid, _ = kick_targets(obs)
+                if deterministic:
+                    t = sample_kick_target(target_logits, valid, deterministic=True).to(mean3.dtype).unsqueeze(-1)
+                    action = torch.cat(
+                        [
+                            mean3,
+                            t,
+                            (p[..., 0] > 0.5).to(mean3.dtype).unsqueeze(-1),
+                            (p[..., 1] > 0.5).to(mean3.dtype).unsqueeze(-1),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    gauss = torch.normal(mean3, torch.exp(logstd).expand_as(mean3))
+                    fires = torch.bernoulli(p)
+                    t = sample_kick_target(target_logits, valid, deterministic=False).to(mean3.dtype).unsqueeze(-1)
+                    action = torch.cat([gauss, t, fires], dim=-1)
+                log_prob = _hybrid7_log_prob(mean3, logstd, p, target_logits, action, ready, valid)
             else:
-                action = torch.cat([torch.normal(mean3, torch.exp(logstd).expand_as(mean3)), torch.bernoulli(p)], dim=-1)
-            holding = obs[..., HOLDING_OBS_INDEX] > 0.5 if self.aim else None
-            log_prob = _hybrid_log_prob(mean3, logstd, p, action, holding)
+                if deterministic:
+                    action = self._hybrid_mode_action(mean3, p[..., 0], p[..., 1])
+                else:
+                    action = torch.cat([torch.normal(mean3, torch.exp(logstd).expand_as(mean3)), torch.bernoulli(p)], dim=-1)
+                holding = obs[..., HOLDING_OBS_INDEX] > 0.5 if self.aim else None
+                log_prob = _hybrid_log_prob(mean3, logstd, p, action, holding)
             critic_in = self._prepare_critic_input(obs, central_state)
             v = torch.tanh(F.linear(critic_in, c0.weight, c0.bias))
             v = torch.tanh(F.linear(v, c1.weight, c1.bias))

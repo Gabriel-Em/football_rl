@@ -17,7 +17,7 @@ branches:
 
   hold  At eligible outfield holding decisions (outfield holder, hold_t >= 0.08 s, >= 3 s after
         the previous point in the match), clones the env twice with identical generator seeds and
-        loads policies via `tools/audit/harness.py` (supporting `gaussian4`, `hybrid5` and `hybrid6`).
+        loads policies via `tools/audit/harness.py` (supporting `gaussian4`, `hybrid5`, `hybrid6` and `hybrid7`).
         Branch KICK forces the holder's env-space kick column to +1 on decision 0; branch HOLD
         forces it to -1 for the first `--hold-steps` decisions (default 15). Rolls 75 decisions (5 s)
         and 225 decisions (15 s), reporting paired HOLD - KICK differences (overall, by pressure
@@ -25,7 +25,7 @@ branches:
         non-shaping return, full return with gamma^H team-mean critic bootstrap, P(team holds at
         1 s), P(goal for), P(goal against), and the non-shaping component split.
         Kick intent is read from the trace at the decision (`mean` kick column of the holder; the
-        team's head from `head`, absent = gaussian4): hybrid5 or hybrid6, p = (mean + 1) / 2, `kick` if
+        team's head from `head`, absent = gaussian4): hybrid5, hybrid6 or hybrid7, p = (mean + 1) / 2, `kick` if
         p > 0.5, `hold` if p < 0.05, else `mid`; gaussian4 (or a scripted team), `kick` if
         mean > 0.35, else `hold`. Buckets `intent_kick`, `intent_mid`, `intent_hold`, and in the
         defensive third `def_intent_kick`, `def_intent_hold`.
@@ -625,10 +625,10 @@ def find_hold_decisions(trace: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
 
 
 def decision_intent(trace: Dict[str, np.ndarray], step: int, holder: int) -> str:
-    """Kick intent of `holder` at `step` from its recorded kick mean: `kick`, `mid` (hybrid5 and hybrid6 only) or `hold`."""
+    """Kick intent of `holder` at `step` from its recorded kick mean: `kick`, `mid` (hybrid5/6/7 only) or `hold`."""
     mean_kick = float(np.asarray(trace["mean"])[step, holder, 2])
     head = np.asarray(trace["head"], dtype=np.int64) if "head" in trace else np.zeros(2, dtype=np.int64)
-    if int(head[holder // TEAM_SIZE]) in (1, 2):
+    if int(head[holder // TEAM_SIZE]) in (1, 2, 3):
         p = (mean_kick + 1.0) / 2.0
         if p > FIRE_PROB_KICK:
             return "kick"
