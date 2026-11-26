@@ -361,19 +361,23 @@ class PPOHyperparams:
     hidden_dims: Tuple[int, int] = (256, 256)
     # Policy head: "gaussian4" samples all four env action components from Gaussians; "hybrid5" samples throttle,
     # steer and kick power from Gaussians and fires kick and special through bounded Bernoulli heads; "hybrid6" adds an
-    # aim Gaussian with its own logstd that sets the env steer (the kick deflection) when a ball holder fires the kick.
+    # aim Gaussian with its own logstd that sets the env steer (the kick deflection) when a ball holder fires the kick;
+    # "hybrid7" adds a masked categorical kick target over the five teammate slots and FREE (the aim Gaussian) when a
+    # ready holder fires the kick.
     policy_head: str = "gaussian4"
     # Range the Gaussian log standard deviations are clamped to after every update.
     logstd_min: float = -1.25
     logstd_max: float = -0.35
-    # hybrid5 / hybrid6 fire probabilities lie in [floor + (1 - 2*floor)*sigmoid(-bound), 1 - that]; the logit is bounded by `fire_logit_bound`.
+    # hybrid5 / hybrid6 / hybrid7 fire probabilities lie in [floor + (1 - 2*floor)*sigmoid(-bound), 1 - that]; the logit is bounded by `fire_logit_bound`.
     fire_prob_floor: float = 0.005
     fire_logit_bound: float = 6.0
-    # hybrid5 / hybrid6 entropy bonus: "joint" applies `ent_coef` to the whole head entropy, including the two Bernoulli fire
+    # hybrid5 / hybrid6 / hybrid7 entropy bonus: "joint" applies `ent_coef` to the whole head entropy, including the two Bernoulli fire
     # entropies and the kick-weighted power entropy; "separate" applies `ent_coef` to the Gaussian terms and a detached
-    # kick-weighted power term, and `fire_ent_coef` to the two Bernoulli fire entropies.
+    # kick-weighted power term, `fire_ent_coef` to the two Bernoulli fire entropies, and (for hybrid7) `target_ent_coef`
+    # to the detached kick-weighted target categorical entropy on ready multi-option rows. hybrid7 requires "separate".
     fire_entropy: str = "joint"
     fire_ent_coef: float = 0.0
+    target_ent_coef: float = 0.0
     # Critic switches. `value_clip` keeps the PPO value-loss clip at +-`clip_coef` around the rollout's value
     # estimate; with `value_clip=False` the loss is the plain squared error. `value_norm` trains each critic on
     # lambda-return targets standardised by a running mean and standard deviation (their blend weight on the old
@@ -383,8 +387,10 @@ class PPOHyperparams:
     value_norm_momentum: float = 0.95
 
     def __post_init__(self) -> None:
-        if self.policy_head not in ("gaussian4", "hybrid5", "hybrid6"):
-            raise ValueError(f"policy_head must be 'gaussian4', 'hybrid5' or 'hybrid6', got {self.policy_head!r}")
+        if self.policy_head not in ("gaussian4", "hybrid5", "hybrid6", "hybrid7"):
+            raise ValueError(
+                f"policy_head must be 'gaussian4', 'hybrid5', 'hybrid6' or 'hybrid7', got {self.policy_head!r}"
+            )
         if not (math.isfinite(self.logstd_min) and math.isfinite(self.logstd_max) and self.logstd_min < self.logstd_max):
             raise ValueError(
                 f"logstd_min and logstd_max must be finite with logstd_min < logstd_max, "
@@ -398,17 +404,25 @@ class PPOHyperparams:
             raise ValueError(f"fire_entropy must be 'joint' or 'separate', got {self.fire_entropy!r}")
         if not (math.isfinite(self.fire_ent_coef) and self.fire_ent_coef >= 0.0):
             raise ValueError(f"fire_ent_coef must be finite and >= 0, got {self.fire_ent_coef}")
-        if self.fire_entropy == "separate" and self.policy_head not in ("hybrid5", "hybrid6"):
+        if not (math.isfinite(self.target_ent_coef) and self.target_ent_coef >= 0.0):
+            raise ValueError(f"target_ent_coef must be finite and >= 0, got {self.target_ent_coef}")
+        if self.target_ent_coef != 0.0 and self.policy_head != "hybrid7":
             raise ValueError(
-                f"fire_entropy 'separate' requires policy_head 'hybrid5' or 'hybrid6', got {self.policy_head!r}"
+                f"target_ent_coef must be 0 unless policy_head is 'hybrid7', got {self.target_ent_coef} with {self.policy_head!r}"
             )
+        if self.fire_entropy == "separate" and self.policy_head not in ("hybrid5", "hybrid6", "hybrid7"):
+            raise ValueError(
+                f"fire_entropy 'separate' requires policy_head 'hybrid5', 'hybrid6' or 'hybrid7', got {self.policy_head!r}"
+            )
+        if self.policy_head == "hybrid7" and self.fire_entropy != "separate":
+            raise ValueError("policy_head 'hybrid7' requires fire_entropy='separate'")
         if self.fire_entropy == "joint" and self.fire_ent_coef != 0.0:
             raise ValueError(f"fire_ent_coef must be 0 with fire_entropy 'joint', got {self.fire_ent_coef}")
         if not (math.isfinite(self.field_actor_gae_lambda) and 0.0 <= self.field_actor_gae_lambda <= 1.0):
             raise ValueError(f"field_actor_gae_lambda must be finite and in [0, 1], got {self.field_actor_gae_lambda}")
         if not (math.isfinite(self.value_norm_momentum) and 0.0 < self.value_norm_momentum < 1.0):
             raise ValueError(f"value_norm_momentum must be finite and in (0, 1), got {self.value_norm_momentum}")
-        if self.policy_head in ("hybrid5", "hybrid6"):
+        if self.policy_head in ("hybrid5", "hybrid6", "hybrid7"):
             # The head starts at the gaussian4 kick and special fire rates; refuse a floor / bound pair that cannot.
             _initial_fire_logit(
                 _gaussian4_fire_rate(0.35, -0.35), self.fire_prob_floor, self.fire_logit_bound, "kick"

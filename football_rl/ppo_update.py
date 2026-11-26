@@ -10,7 +10,17 @@ import torch.nn as nn
 import torch.optim as optim
 
 from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
-from football_rl.policy import ActorCritic, FIRE_HEADS, FIRE_STATS_STRIDE, HOLDING_OBS_INDEX, hybrid_entropy_bonus
+from football_rl.policy import (
+    ActorCritic,
+    FIRE_HEADS,
+    FIRE_STATS_STRIDE,
+    HOLDING_OBS_INDEX,
+    KICK_TARGET_FREE,
+    _validate_hybrid7_targets,
+    hybrid_entropy_bonus,
+    kick_targets,
+    masked_target_log_probs_and_entropy,
+)
 from football_rl.returns import compute_mc_returns, pearson_correlation
 
 
@@ -64,6 +74,8 @@ class PPOUpdateMixin:
             empty = {"pg_loss": nan, "v_loss": nan, "entropy": nan}
             if self.policy_head in FIRE_HEADS:
                 empty.update({"fire_sat_kick": nan, "fire_sat_spec": nan, "p_kick": nan, "p_spec": nan})
+            if self.policy_head == "hybrid7":
+                empty.update({"target_rows": 0, "free_share": nan, "target_entropy": nan})
             return empty
         num_minibatches = min(self.cfg.ppo.num_minibatches, batch_size)
         minibatch_size = max(1, batch_size // num_minibatches)
@@ -98,12 +110,32 @@ class PPOUpdateMixin:
             b_values = (b_values - policy.ret_mean) / policy.ret_std
             value_kwargs = {"normalized_value": True}
 
+        target_metrics: Dict[str, Any] = {}
+        b_ready: Optional[torch.Tensor] = None
+        b_valid: Optional[torch.Tensor] = None
+        b_multi: Optional[torch.Tensor] = None
+        if self.policy_head == "hybrid7":
+            b_ready, b_valid, _ = kick_targets(b_obs)
+            _validate_hybrid7_targets(b_actions, b_ready, b_valid)
+            b_multi = b_ready & (b_valid.sum(dim=-1) > 1)
+            t_mask = (b_actions[..., 5] > 0.5) & b_multi
+            t_rows = int(t_mask.sum().item())
+            t_free = (
+                float((torch.round(b_actions[t_mask, 4]).to(torch.int64) == KICK_TARGET_FREE).to(torch.float32).mean().item())
+                if t_rows > 0
+                else float("nan")
+            )
+            target_metrics = {"target_rows": t_rows, "free_share": t_free}
+
         pg_losses: List[float] = []
         v_losses: List[float] = []
         entropy_losses: List[float] = []
-
         device = b_obs.device
-        for _ in range(self.cfg.ppo.update_epochs):
+        target_ent_sum = torch.zeros((), dtype=torch.float64, device=device)
+        target_ent_count = torch.zeros((), dtype=torch.int64, device=device)
+
+        last_epoch = self.cfg.ppo.update_epochs - 1
+        for epoch in range(self.cfg.ppo.update_epochs):
             if num_minibatches > 1:
                 b_inds = torch.randperm(batch_size, device=device)
             else:
@@ -120,6 +152,9 @@ class PPOUpdateMixin:
                     mb_returns = b_returns[mb_inds]
                     mb_values = b_values[mb_inds]
                     cen_mb = b_central[mb_inds] if b_central is not None else None
+                    mb_ready = b_ready[mb_inds] if b_ready is not None else None
+                    mb_valid = b_valid[mb_inds] if b_valid is not None else None
+                    mb_multi = b_multi[mb_inds] if b_multi is not None else None
                 else:
                     mb_obs = b_obs
                     mb_actions = b_actions
@@ -128,6 +163,9 @@ class PPOUpdateMixin:
                     mb_returns = b_returns
                     mb_values = b_values
                     cen_mb = b_central
+                    mb_ready = b_ready
+                    mb_valid = b_valid
+                    mb_multi = b_multi
 
                 if critic_only:
                     newvalue = policy.get_value(mb_obs, central_state=cen_mb, **value_kwargs)
@@ -145,8 +183,13 @@ class PPOUpdateMixin:
                     continue
 
                 if separate_fire_entropy:
-                    _, newlogprob, entropy, newvalue, (head_logstd, head_p) = policy.get_action_and_value(
-                        mb_obs, mb_actions, central_state=cen_mb, return_heads=True, **value_kwargs
+                    extra = (
+                        {"ready": mb_ready, "valid": mb_valid, "validate_targets": False}
+                        if policy.kick_target
+                        else {}
+                    )
+                    _, newlogprob, entropy, newvalue, heads = policy.get_action_and_value(
+                        mb_obs, mb_actions, central_state=cen_mb, return_heads=True, **extra, **value_kwargs
                     )
                 else:
                     _, newlogprob, entropy, newvalue = policy.get_action_and_value(
@@ -167,11 +210,34 @@ class PPOUpdateMixin:
 
                 entropy_loss = entropy.mean()
                 if separate_fire_entropy:
-                    # hybrid6 weights its aim entropy by each row's holding flag, read from the raw minibatch observations.
-                    holding = mb_obs[..., HOLDING_OBS_INDEX] > 0.5 if policy.aim else None
-                    bonus = hybrid_entropy_bonus(
-                        head_logstd, head_p, self.cfg.ppo.ent_coef, "separate", self.cfg.ppo.fire_ent_coef, holding
-                    ).mean()
+                    if policy.kick_target:
+                        head_logstd, head_p, head_target_logits = heads
+                        bonus = hybrid_entropy_bonus(
+                            head_logstd,
+                            head_p,
+                            self.cfg.ppo.ent_coef,
+                            "separate",
+                            self.cfg.ppo.fire_ent_coef,
+                            target_logits=head_target_logits,
+                            target_ent_coef=self.cfg.ppo.target_ent_coef,
+                            target=mb_actions[..., 4],
+                            ready=mb_ready,
+                            valid=mb_valid,
+                        ).mean()
+                        if epoch == last_epoch:
+                            with torch.no_grad():
+                                _, h_pi = masked_target_log_probs_and_entropy(head_target_logits.detach(), mb_valid)
+                                target_ent_sum = target_ent_sum + torch.where(
+                                    mb_multi, h_pi.to(torch.float64), torch.zeros_like(h_pi, dtype=torch.float64)
+                                ).sum()
+                                target_ent_count = target_ent_count + mb_multi.sum()
+                    else:
+                        head_logstd, head_p = heads
+                        # hybrid6 weights its aim entropy by each row's holding flag, read from the raw minibatch observations.
+                        holding = mb_obs[..., HOLDING_OBS_INDEX] > 0.5 if policy.aim else None
+                        bonus = hybrid_entropy_bonus(
+                            head_logstd, head_p, self.cfg.ppo.ent_coef, "separate", self.cfg.ppo.fire_ent_coef, holding
+                        ).mean()
                     loss = pg_loss - bonus + v_loss * self.cfg.ppo.vf_coef
                 else:
                     loss = (
@@ -189,11 +255,18 @@ class PPOUpdateMixin:
                 v_losses.append(float(v_loss.item()))
                 entropy_losses.append(float(entropy_loss.item()))
 
+        if self.policy_head == "hybrid7":
+            cnt = int(target_ent_count.item())
+            target_metrics["target_entropy"] = (
+                float(target_ent_sum.item() / cnt) if cnt > 0 else float("nan")
+            )
+
         return {
             "pg_loss": float(np.mean(pg_losses)),
             "v_loss": float(np.mean(v_losses)),
             "entropy": float(np.mean(entropy_losses)),
             **fire_metrics,
+            **target_metrics,
         }
 
     def update_policies(
