@@ -9,9 +9,11 @@ import os
 import shutil
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from football_rl.coevolution import COEVO_WINDOW_MATCHES
+from football_rl.config import CENTRAL_STATE_DIM
 from football_rl.migrations import (
     TEAM_COLOR_SCHEMA,
     adapt_optimizer_state,
@@ -19,7 +21,7 @@ from football_rl.migrations import (
     migrate_team_color_keys,
 )
 from football_rl.opponent_pool import DEFAULT_POOL_SIZE
-from football_rl.policy import ActorCritic, holds_return_statistics, policy_head_of_weights
+from football_rl.policy import ActorCritic, central_state_dim_of_weights, holds_return_statistics, policy_head_of_weights
 
 
 SNAPSHOT_INTERVAL = 50
@@ -68,6 +70,7 @@ class CheckpointMixin:
                 "policy_head": self.policy_head,
                 "pool_envs": self.pool_envs,
                 "pool_size": self.pool_size,
+                "bot_envs": self.bot_envs,
                 "replay_every": self.replay_every,
                 "replay_kind": self.replay_kind,
                 "field_policy": self.blue_field_policy.state_dict(),
@@ -288,6 +291,15 @@ class CheckpointMixin:
 
         return summary_path
 
+    def _use_flagged_critics(self) -> None:
+        """Rebuild the networks, optimizers and central-state buffer with the opponent-is-bot flag column.
+
+        For a run without bot envs that resumes a checkpoint whose critics have that column: the flag stays 0.
+        """
+        self.central_dim = CENTRAL_STATE_DIM + 1
+        self._build_networks()
+        self.current_central_state = np.zeros((self.num_envs, self.num_agents, self.central_dim), dtype=np.float32)
+
     def _load_adapted_weights(self, policy: ActorCritic, weights: Dict[str, torch.Tensor]) -> None:
         """Load a state dict into `policy`, zero-padding narrower first-layer inputs (`adapt_policy_weights`).
 
@@ -348,6 +360,14 @@ class CheckpointMixin:
                         "Pass --accept-config-change to resume anyway."
                     )
                 print(f"[Resume] Pool settings changed: {described}; continuing with the requested settings.")
+            stored_bot_envs = int(state.get("bot_envs", 0))
+            if stored_bot_envs != self.bot_envs:
+                described = f"stored bot_envs={stored_bot_envs}, requested bot_envs={self.bot_envs}"
+                if not self.accept_config_change:
+                    raise ValueError(
+                        f"Bot envs differ from the checkpoint: {described}. Pass --accept-config-change to resume anyway."
+                    )
+                print(f"[Resume] Bot envs changed: {described}; continuing with the requested setting.")
             stored_shared_keepers = bool(state.get("shared_keepers", False))
             if stored_shared_keepers != self.shared_keepers:
                 described = f"stored shared_keepers={stored_shared_keepers}, requested shared_keepers={self.shared_keepers}"
@@ -388,6 +408,13 @@ class CheckpointMixin:
             blue_k_weights = state.get("blue_keeper_policy", state.get("keeper_policy"))
             red_f_weights = state.get("red_field_policy", blue_f_weights)
             red_k_weights = state.get("red_keeper_policy", blue_k_weights)
+
+            if (
+                blue_f_weights is not None
+                and self.central_dim == CENTRAL_STATE_DIM
+                and central_state_dim_of_weights(blue_f_weights) > CENTRAL_STATE_DIM
+            ):
+                self._use_flagged_critics()
 
             if blue_f_weights is not None:
                 self._load_adapted_weights(self.blue_field_policy, blue_f_weights)

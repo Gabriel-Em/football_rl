@@ -1,4 +1,5 @@
-"""Deterministic scripted opponents used as evaluation benchmarks (never as a training signal).
+"""Deterministic scripted opponents. `scripted_actions` is an evaluation benchmark and also the training opponent
+of the trainer's `--bot-envs`; `passing_actions` is an evaluation-only opponent.
 
 `scripted_actions(env, team)` reads the true engine state and returns one `(6, 4)` action block
 `[throttle, steer, kick, special]` per slot (GK, D1, D2, M1, M2, ST). It has no random component and
@@ -20,9 +21,9 @@ Steering is the heading error to the current target times 2, clipped to [-1, 1];
 target is farther than 25 u and within 1.2 rad of dead ahead, 0.2 when it is farther than 25 u but
 behind, and 0 inside 25 u.
 
-`passing_actions(env, team)` is a second opponent that is held out of every training run. It defends,
-chases, tackles and keeps goal exactly like `scripted_actions` (the same code) and differs only in how
-its team attacks:
+`passing_actions(env, team)` is a second opponent that is held out of every training run; it must never be
+trained against. It defends, chases, tackles and keeps goal exactly like `scripted_actions` (the same code)
+and differs only in how its team attacks:
   * While its team holds the ball, the non-chasing midfielders and the striker move their anchors
     0.12 x field width forward and 120 u away from the centre line y = 420 (a striker anchored on the
     centre line only moves forward).

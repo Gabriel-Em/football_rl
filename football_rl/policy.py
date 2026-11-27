@@ -68,6 +68,16 @@ def policy_head_of_weights(weights: Dict[str, torch.Tensor]) -> Optional[str]:
     }.get(int(out.shape[0]))
 
 
+def central_state_dim_of_weights(weights: Dict[str, torch.Tensor]) -> int:
+    """Central-state width a critic reads, from its first layer: 55 (the 54 environment columns plus the
+    opponent-is-bot flag) for 82 + 55 = 137 inputs, else the environment's 54. Other widths are the weight adapter's
+    to place or refuse; an observation-only critic and a state dict without a critic read 54."""
+    first = weights.get("critic.0.weight")
+    if first is not None and first.dim() == 2 and int(first.shape[1]) == OBS_DIM + CENTRAL_STATE_DIM + 1:
+        return CENTRAL_STATE_DIM + 1
+    return CENTRAL_STATE_DIM
+
+
 def validate_hybrid7_env_config(cfg: Any) -> None:
     """Verify the environment constants relied on by `kick_targets` for `hybrid7`, raising ValueError on mismatch."""
     phys = cfg.physics

@@ -879,3 +879,157 @@ def test_set_export_replays_false_skips_writes_and_holds_no_payloads(
     finally:
         vec.close()
 
+
+
+# ==============================================================================
+# Scripted-bot envs: one team of an env is played by `scripted_actions`
+# ==============================================================================
+BOT_ENV_TEAMS = [None, 1, 0]   # env 0 plays self-play; env 1 has the bot as team B, env 2 as team A
+BOT_STEPS = 20
+BOT_RESET_STEP = 10
+
+
+def _bot_cfg():
+    return replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+
+
+def _bot_policy_actions(steps: int = BOT_STEPS) -> np.ndarray:
+    """Random env-space actions for every seat of every env; the bot team's rows must be ignored."""
+    return np.random.default_rng(7).uniform(-1.0, 1.0, (steps, len(BOT_ENV_TEAMS), 12, 4)).astype(np.float32)
+
+
+def _bot_reference_run(actions: np.ndarray):
+    """Independent single-process run: plain envs, the bot team's rows replaced by `scripted_actions(env, team)` computed
+    on the env's own state before each step. Returns the per-step (obs, central, rew, done) of every env and the
+    reset observations of env 1 at `BOT_RESET_STEP`."""
+    from football_rl.baselines import scripted_actions
+
+    envs = [FootballParallelEnv(config=_bot_cfg()) for _ in BOT_ENV_TEAMS]
+    for i, env in enumerate(envs):
+        env.reset(seed=30 + i, options={"generation": 1, "match_id": i + 1})
+    out = []
+    for t in range(actions.shape[0]):
+        if t == BOT_RESET_STEP:
+            envs[1].reset(seed=99, options={"generation": 1, "match_id": 9})
+        rows = []
+        for i, env in enumerate(envs):
+            act = actions[t, i].copy()
+            if BOT_ENV_TEAMS[i] is not None:
+                team = BOT_ENV_TEAMS[i]
+                act[6 * team:6 * team + 6] = scripted_actions(env, team)
+            obs, central, rew, done, _ = env.step_array(act)
+            rows.append((obs.copy(), central.copy(), rew.copy(), done))
+        out.append(rows)
+    return out
+
+
+def _vec_bot_run(vec, actions: np.ndarray):
+    vec.reset_array(
+        seeds=[30 + i for i in range(len(BOT_ENV_TEAMS))],
+        options_list=[{"generation": 1, "match_id": i + 1} for i in range(len(BOT_ENV_TEAMS))],
+    )
+    vec.set_scripted_teams(BOT_ENV_TEAMS)
+    out = []
+    for t in range(actions.shape[0]):
+        if t == BOT_RESET_STEP:
+            vec.reset_array(seeds=[99], options_list=[{"generation": 1, "match_id": 9}], env_indices=[1])
+        obs, central, rew, done, _ = vec.step_array(actions[t])
+        out.append([(obs[i].copy(), central[i].copy(), rew[i].copy(), bool(done[i])) for i in range(len(BOT_ENV_TEAMS))])
+    return out
+
+
+@pytest.mark.parametrize("kind", ["dummy", "subproc"])
+def test_bot_team_plays_scripted_actions_on_the_state_the_policy_acted_on(kind: str) -> None:
+    """[RED] In both vec envs, an env whose team B (env 1) or team A (env 2) is scripted steps exactly like a plain env
+    whose bot rows are `scripted_actions` of that env before the step, whatever the policy actions for those seats
+    are, across an episode reset (the scripting persists); the self-play env is unaffected. The reference is a
+    separate single-process run built from the bot itself."""
+    from football_rl.vec_env import _EnvWorkerThunk
+
+    actions = _bot_policy_actions()
+    reference = _bot_reference_run(actions)
+    thunks = [_EnvWorkerThunk(_bot_cfg()) for _ in BOT_ENV_TEAMS]
+    vec = DummyVecFootballEnv(thunks) if kind == "dummy" else SubprocVecFootballEnv(thunks, context="spawn")
+    try:
+        got = _vec_bot_run(vec, actions)
+        control = DummyVecFootballEnv([_EnvWorkerThunk(_bot_cfg()) for _ in BOT_ENV_TEAMS])
+        try:
+            plain = _vec_plain_run(control, actions)
+        finally:
+            control.close()
+    finally:
+        vec.close()
+    for t in range(actions.shape[0]):
+        for i in range(len(BOT_ENV_TEAMS)):
+            for part, (a, b) in enumerate(zip(got[t][i], reference[t][i])):
+                assert np.array_equal(a, b), (t, i, part)
+    # The bot changes the bot envs' play and leaves the self-play env as a plain run would play it.
+    assert np.array_equal(got[-1][0][0], plain[-1][0][0])
+    assert not np.array_equal(got[-1][1][0], plain[-1][1][0])
+    assert not np.array_equal(got[-1][2][0], plain[-1][2][0])
+
+
+def _vec_plain_run(vec, actions: np.ndarray):
+    vec.reset_array(
+        seeds=[30 + i for i in range(len(BOT_ENV_TEAMS))],
+        options_list=[{"generation": 1, "match_id": i + 1} for i in range(len(BOT_ENV_TEAMS))],
+    )
+    out = []
+    for t in range(actions.shape[0]):
+        if t == BOT_RESET_STEP:
+            vec.reset_array(seeds=[99], options_list=[{"generation": 1, "match_id": 9}], env_indices=[1])
+        obs, central, rew, done, _ = vec.step_array(actions[t])
+        out.append([(obs[i].copy(), central[i].copy(), rew[i].copy(), bool(done[i])) for i in range(len(BOT_ENV_TEAMS))])
+    return out
+
+
+def test_dummy_applies_the_bot_rows_computed_on_a_deep_copy_of_the_pre_step_env() -> None:
+    """[RED] On the Dummy vec env the action array reaching the physics holds `scripted_actions(copy of the env before the
+    step, team)` in the bot team's six rows and the policy's clipped rows in the other six, for both sides."""
+    import copy
+    from football_rl.baselines import scripted_actions
+    from football_rl.vec_env import _EnvWorkerThunk
+
+    vec = DummyVecFootballEnv([_EnvWorkerThunk(_bot_cfg()) for _ in range(2)])
+    try:
+        vec.reset_array(seeds=[3, 4], options_list=[{"generation": 1, "match_id": 1}, {"generation": 1, "match_id": 2}])
+        vec.set_scripted_teams([1, 0])
+        seen = []
+        for idx, env in enumerate(vec.envs):
+            original = env._step_core
+
+            def spy(act_array, v_preds=None, action_means=None, _o=original, _e=env, _i=idx):
+                seen.append((_i, np.array(act_array, copy=True), copy.deepcopy(_e)))
+                return _o(act_array, v_preds=v_preds, action_means=action_means)
+
+            env._step_core = spy
+        rng = np.random.default_rng(1)
+        for _ in range(12):
+            vec.step_array(rng.uniform(-1.0, 1.0, (2, 12, 4)).astype(np.float32))
+        assert len(seen) == 24
+        moved = 0
+        for idx, act, pre in seen:
+            team = (1, 0)[idx]
+            bot = scripted_actions(pre, team).astype(np.float64)
+            assert np.array_equal(act[6 * team:6 * team + 6], bot)
+            moved += int(np.any(bot[:, 0] != 0.0))
+        assert moved > 0
+    finally:
+        vec.close()
+
+
+@pytest.mark.parametrize("kind", ["dummy", "subproc"])
+def test_set_scripted_teams_rejects_a_wrong_length_or_team(kind: str) -> None:
+    """[RED] `set_scripted_teams` takes one entry per env, each None, 0 or 1."""
+    from football_rl.vec_env import _EnvWorkerThunk
+
+    thunks = [_EnvWorkerThunk(_bot_cfg()) for _ in range(2)]
+    vec = DummyVecFootballEnv(thunks) if kind == "dummy" else SubprocVecFootballEnv(thunks, context="spawn")
+    try:
+        for bad in ([None], [None, None, None], [2, None], [None, -1], [None, "B"]):
+            with pytest.raises(ValueError):
+                vec.set_scripted_teams(bad)
+        vec.set_scripted_teams([None, 1])
+        vec.set_scripted_teams([None, None])
+    finally:
+        vec.close()

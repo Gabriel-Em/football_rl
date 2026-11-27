@@ -6,7 +6,9 @@ keeper saves, loose-ball % and stationary-ball frames per bucket of generations.
 Every statistic, and the takeoff generation, reads self-play matches only. Pool matches (a team played by
 a frozen snapshot from the opponent pool; match record `pool` set) face weaker opponents and would inflate
 them; they are counted per bucket (`n_pooled`, printed as `pooled=K` when present) and excluded. A bucket
-whose matches are all pool matches has n 0 and no statistics.
+whose matches are all pool matches has n 0 and no statistics. Matches against the scripted bot (a team
+played by the bot; match record `bot` set) are left out the same way and counted in `n_bot` (printed as
+`bot=K`): the bot scores far more goals than self-play does.
 
 With `--takeoff`, also prints the takeoff generation: the smallest generation g such that the mean,
 over generations g-window+1 ... g, of the per-generation mean self-play training-match `goals` reaches the
@@ -73,14 +75,22 @@ def _is_pool(m: Dict[str, Any]) -> bool:
     return m.get("pool") is not None
 
 
+def _is_bot(m: Dict[str, Any]) -> bool:
+    """True for a match one team of which the scripted bot played (record `bot` set)."""
+    return m.get("bot") is not None
+
+
 _STAT_KEYS = ("interest_mean", "interest_median", "interest_max", "goals", "passes", "shots", "tackles", "saves",
               "loose_pct", "stationary_frames")
 
 
-def _row(gen_start: int, gen_end: int, ms: List[Dict[str, Any]], n_pooled: int = 0) -> Dict[str, Any]:
-    """Bucket statistics over the self-play matches `ms`; `n_pooled` pool matches of the bucket were left out."""
+def _row(gen_start: int, gen_end: int, ms: List[Dict[str, Any]], n_pooled: int = 0, n_bot: int = 0) -> Dict[str, Any]:
+    """Bucket statistics over the self-play matches `ms`; `n_pooled` pool and `n_bot` bot matches of the bucket were left out."""
     if not ms:
-        return {"gen_start": gen_start, "gen_end": gen_end, "n": 0, **{k: None for k in _STAT_KEYS}, "n_pooled": n_pooled}
+        return {
+            "gen_start": gen_start, "gen_end": gen_end, "n": 0, **{k: None for k in _STAT_KEYS},
+            "n_pooled": n_pooled, "n_bot": n_bot,
+        }
     interest = np.array([float(m.get("interest_score", 0.0)) for m in ms])
     loose = [v for v in (_loose(m) for m in ms) if v is not None]
     return {
@@ -98,6 +108,7 @@ def _row(gen_start: int, gen_end: int, ms: List[Dict[str, Any]], n_pooled: int =
         "loose_pct": float(np.mean(loose)) if loose else None,
         "stationary_frames": float(np.mean([float(m.get("stationary_ball_frames", 0)) for m in ms])),
         "n_pooled": n_pooled,
+        "n_bot": n_bot,
     }
 
 
@@ -122,7 +133,7 @@ def bucket_progress(
     """Group matches into consecutive generation buckets starting at the first generation present.
 
     Bucket bounds come from all matches; the statistics from the self-play ones (`n`), with the pool matches
-    counted in `n_pooled`.
+    counted in `n_pooled` and the bot matches in `n_bot`.
     """
     if bucket <= 0:
         raise ValueError("bucket must be a positive integer")
@@ -137,8 +148,11 @@ def bucket_progress(
     rows = []
     for key in sorted(groups):
         g = groups[key]
-        own = [m for m in g if not _is_pool(m)]
-        rows.append(_row(first + key * bucket, max(int(m.get("generation", 0)) for m in g), own, len(g) - len(own)))
+        own = [m for m in g if not _is_pool(m) and not _is_bot(m)]
+        n_bot = sum(1 for m in g if _is_bot(m))
+        rows.append(
+            _row(first + key * bucket, max(int(m.get("generation", 0)) for m in g), own, len(g) - len(own) - n_bot, n_bot)
+        )
     return rows
 
 
@@ -160,9 +174,9 @@ def takeoff_summary(
 
     Returns `{"gen", "goals", "window", "first_gen", "last_gen"}` where `gen` is the smallest generation
     whose trailing `window`-generation mean of the per-generation mean self-play training-match `goals`
-    is at least `goals` (None if no generation qualifies). Pool matches are left out. Raises ValueError for
+    is at least `goals` (None if no generation qualifies). Pool and bot matches are left out. Raises ValueError for
     a history without matches, a match without a `generation`, a self-play match without a finite `goals`,
-    a generation between the first and the last that has no match, or one that has only pool matches.
+    a generation between the first and the last that has no match, or one that has only pool or bot matches.
     """
     if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
         raise ValueError(f"takeoff window must be a positive integer, got {window!r}")
@@ -172,25 +186,26 @@ def takeoff_summary(
     if not matches:
         raise ValueError("history has no matches")
     per_gen: Dict[int, List[float]] = {}
-    pool_gens = set()
+    left_out: Dict[int, set] = {}   # generation -> kinds of the pool / bot matches left out
     for m in matches:
         if m.get("generation") is None:
             raise ValueError("history match without a generation")
         g = int(m["generation"])
-        if _is_pool(m):
-            pool_gens.add(g)
+        if _is_pool(m) or _is_bot(m):
+            left_out.setdefault(g, set()).add("pool" if _is_pool(m) else "bot")
             continue
         value = m.get("goals")
         if value is None or not math.isfinite(float(value)):
             raise ValueError(f"history match in generation {g} has no finite goals ({value!r})")
         per_gen.setdefault(g, []).append(float(value))
     if not per_gen:
-        raise ValueError("history has no self-play match (every match is a pool match)")
-    all_gens = set(per_gen) | pool_gens
+        raise ValueError("history has no self-play match (every match is a pool or bot match)")
+    all_gens = set(per_gen) | set(left_out)
     first, last = min(all_gens), max(all_gens)
     for g in range(first, last + 1):
-        if g not in per_gen and g in pool_gens:
-            raise ValueError(f"generation {g} has only pool matches (takeoff needs a self-play match in every generation)")
+        if g not in per_gen and g in left_out:
+            kinds = " and ".join(sorted(left_out[g]))
+            raise ValueError(f"generation {g} has only {kinds} matches (takeoff needs a self-play match in every generation)")
         if g not in per_gen:
             raise ValueError(
                 f"generation {g} has no matches (every generation from {first} to {last} needs at least one)"
@@ -289,7 +304,7 @@ def _fire_lines(row: Dict[str, Any], fire: Optional[Dict[str, Any]]) -> List[str
 
 
 def _line(r: Dict[str, Any]) -> str:
-    pooled = f" pooled={r['n_pooled']}" if r["n_pooled"] else ""
+    pooled = (f" pooled={r['n_pooled']}" if r["n_pooled"] else "") + (f" bot={r['n_bot']}" if r.get("n_bot") else "")
     if r["n"] == 0:
         return f"  gens {r['gen_start']:5d}-{r['gen_end']:5d} n={r['n']:4d} (no self-play match){pooled}"
     return (
@@ -319,7 +334,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows = bucket_progress(hist, args.bucket, args.gen_min, args.gen_max)
     last = per_generation(hist, args.last_gens)
     n_pooled = sum(r["n_pooled"] for r in rows)
-    excluded = f" ({n_pooled} pool matches excluded)" if n_pooled else ""
+    n_bot = sum(r["n_bot"] for r in rows)
+    excluded = (f" ({n_pooled} pool matches excluded)" if n_pooled else "") + (
+        f" ({n_bot} bot matches excluded)" if n_bot else ""
+    )
     print(f"training_progress: {sum(r['n'] for r in rows)} matches in {len(rows)} bucket(s) of {args.bucket} gens{excluded}")
     for r in rows[-args.max_rows:]:
         print(_line(r))
@@ -337,6 +355,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pool_total = sum(1 for m in hist.get("matches") or [] if _is_pool(m))
         if pool_total:
             print(f"takeoff: self-play matches only ({pool_total} pool matches excluded)")
+        bot_total = sum(1 for m in hist.get("matches") or [] if _is_bot(m))
+        if bot_total:
+            print(f"takeoff: self-play matches only ({bot_total} bot matches excluded)")
         payload["takeoff"] = summary
     if args.fire:
         fires = fire_progress(hist, args.bucket, args.gen_min, args.gen_max, rows=rows)
