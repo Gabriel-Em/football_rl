@@ -12,9 +12,11 @@ not depend on `n`, on the worker count or on the other matches.
 Policies: team A plays the `blue_*` state dicts of the checkpoint (team B the `red_*` ones, or with
 `--swap` the other way round). Opponents:
   self          team B plays the checkpoint's own other state dicts
-  scripted      team B is the scripted baseline (`football_rl.baselines`)
+  scripted      team B is the scripted baseline (`football_rl.baselines.scripted_actions`)
+  heldout       team B is the held-out passing bot (`football_rl.baselines.passing_actions`)
   frozen:DIR    team B plays the `red_*` state dicts of DIR
   scripted2     both teams are the scripted baseline (no checkpoint needed)
+  scripted2:heldout  team A is the held-out passing bot and team B the scripted baseline (no checkpoint needed)
 Modes: `sampled` draws all four action components from the policy distribution, `mixed` uses the mean
 for throttle and steer and samples kick and special, `greedy` uses the mean. `--sigma-scale` multiplies
 the standard deviation of the sampled components.
@@ -36,14 +38,14 @@ and `greedy` takes its masked argmax; `--sigma-scale` scales the four Gaussians 
 
 Trace layout (row t = decision t, T = steps played): `pos vel ang ball bvel holder inflight lastteam box
 half side hold_t act mean val` hold the state before the step-t action (act = clipped actions applied,
-mean = deterministic action means, val = critic values; scripted teams record mean = act and val = 0);
+mean = deterministic action means, val = critic values; scripted and held-out teams record mean = act and val = 0);
 `rew`, `lastkick` and every `s_*` counter hold the value after step t. `holder` is -1 while the ball is
 loose, `side` is 0 for the team defending the left goal, `box` is the active keeper box radius per side.
 `aim_mean` (T, 12), present only when a team plays `hybrid6` or `hybrid7`, holds `tanh(z_aim)` on those seats and NaN on
 every other seat. `kick_target` (T, 12) int8 and `free_p` (T, 12) float32, present only when a team plays `hybrid7`, hold
 the target index `0..5` on ready fired kicks (`K * c = 1`, else `-1`) and `pi(FREE)` on ready rows (`c = 1`, else NaN).
 `final_score`, `n_steps` are scalars; `head` is `(2,)` int8 with the policy head of team A and team B per match
-(0 = `gaussian4` or scripted, 1 = `hybrid5`, 2 = `hybrid6`, 3 = `hybrid7`). `--store-obs` adds `obs_s` and `cen_s` (observations of every 5th
+(0 = `gaussian4`, scripted or held-out, 1 = `hybrid5`, 2 = `hybrid6`, 3 = `hybrid7`). `--store-obs` adds `obs_s` and `cen_s` (observations of every 5th
 decision); `--breakdown` enables replay recording in the environment and adds `bd` (ball advance,
 individual potential, role potential, crowd potential, sparse), `role` (label index) and `phi`.
 
@@ -76,7 +78,8 @@ from tools.audit._common import REPO_ROOT  # noqa: E402
 __all__ = ["EvalSpec", "Session", "run_matches", "iter_matches", "play_match", "save_traces", "check_output_dir", "main"]
 
 MODES = ("sampled", "mixed", "greedy")
-FIXED_OPPONENTS = ("self", "scripted", "scripted2")
+FIXED_OPPONENTS = ("self", "scripted", "heldout", "scripted2", "scripted2:heldout")
+BOT_ONLY_OPPONENTS = ("scripted2", "scripted2:heldout")      # no network plays: no checkpoint is needed
 POLICY_FILES = ("{prefix}_field_policy.pt", "{prefix}_keeper_policy.pt")
 OBS_STRIDE = 5
 ROLE_LABELS = ("GK", "BALL", "CHSE", "1stP", "2ndP", "COVR", "STUN", "LNGE")
@@ -129,9 +132,9 @@ class EvalSpec:
     def policy_dirs(self) -> List[str]:
         """Directories the evaluation reads policies from (empty when both teams are scripted)."""
         dirs: List[str] = []
-        if self.opponent != "scripted2":
+        if self.opponent not in BOT_ONLY_OPPONENTS:
             if not self.checkpoint_dir:
-                raise ValueError("checkpoint_dir is required unless the opponent is scripted2")
+                raise ValueError(f"checkpoint_dir is required unless the opponent is one of {BOT_ONLY_OPPONENTS}")
             dirs.append(self.checkpoint_dir)
         if self.opponent_dir:
             dirs.append(self.opponent_dir)
@@ -142,7 +145,7 @@ class EvalSpec:
         return ("red", "blue") if self.swap else ("blue", "red")
 
     def required_files(self) -> List[Path]:
-        prefixes = {"scripted2": (), "scripted": self.team_prefixes()[:1], "self": self.team_prefixes()}.get(
+        prefixes = {"scripted2": (), "scripted2:heldout": (), "scripted": self.team_prefixes()[:1], "self": self.team_prefixes()}.get(
             self.opponent, self.team_prefixes()[:1]
         )
         files = [Path(d) / pat.format(prefix=pre) for d in self.policy_dirs()[:1] for pre in prefixes for pat in POLICY_FILES]
@@ -339,7 +342,7 @@ def _build_env(spec: EvalSpec, replay_dir: str):
 
 
 def _load_policies(spec: EvalSpec):
-    if spec.opponent == "scripted2":
+    if spec.opponent in BOT_ONLY_OPPONENTS:
         return None, None
     first, second = spec.team_prefixes()
     team_a = TeamPolicy(spec.checkpoint_dir, first)
@@ -419,9 +422,18 @@ def play_match(spec: EvalSpec, idx: int) -> Dict[str, np.ndarray]:
         return session.play(idx)
 
 
-def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
-    from football_rl.baselines import scripted_actions
+def _scripted_bots(opponent: str):
+    """`(team A bot, team B bot)` that act for a team without a network; `scripted_actions` unless the opponent names the held-out bot."""
+    from football_rl.baselines import passing_actions, scripted_actions
 
+    return {
+        "heldout": (scripted_actions, passing_actions),
+        "scripted2:heldout": (passing_actions, scripted_actions),
+    }.get(opponent, (scripted_actions, scripted_actions))
+
+
+def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
+    bot_a, bot_b = _scripted_bots(spec.opponent)
     team_a, team_b = policies
     match_seed = spec.seed * 1000 + idx
     gen = torch.Generator().manual_seed(match_seed)
@@ -438,7 +450,7 @@ def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
         kt = tr["kick_target"][t]
         fp = tr["free_p"][t]
         if team_a is None:
-            act_a, val_a = scripted_actions(env, 0), np.zeros(6, np.float32)
+            act_a, val_a = bot_a(env, 0), np.zeros(6, np.float32)
             mean_a = act_a
         else:
             act_a, val_a, mean_a = team_a.act(
@@ -446,7 +458,7 @@ def _play(spec: EvalSpec, idx: int, env, policies) -> Dict[str, np.ndarray]:
                 aim_out=aim[:6], kick_target_out=kt[:6], free_p_out=fp[:6],
             )
         if team_b is None:
-            act_b, val_b = scripted_actions(env, 1), np.zeros(6, np.float32)
+            act_b, val_b = bot_b(env, 1), np.zeros(6, np.float32)
             mean_b = act_b
         else:
             act_b, val_b, mean_b = team_b.act(
@@ -562,7 +574,7 @@ def save_traces(traces: Sequence[Dict[str, np.ndarray]], out_dir: Path | str, pr
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint-dir", default=str(REPO_ROOT / "checkpoints"), help="directory with blue_*/red_* policies (read only)")
-    ap.add_argument("--opp", default="self", help="self | scripted | scripted2 | frozen:DIR")
+    ap.add_argument("--opp", default="self", help="self | scripted | heldout | scripted2 | scripted2:heldout | frozen:DIR")
     ap.add_argument("--mode", default="sampled", choices=MODES)
     ap.add_argument("--n", type=int, default=8, help="number of matches")
     ap.add_argument("--seed", type=int, default=1)
