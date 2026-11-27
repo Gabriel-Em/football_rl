@@ -1,7 +1,8 @@
 """Evaluate snapshot checkpoints across the harness evaluation tags and write census outputs.
 
 Runs `self_sampled` (n=96, seed 11), `self_mixed` (n=48, seed 12), `vs_scripted_sampled` and
-`vs_scripted_sampled_red` (n=48, seed 13), and `vs_frozen` and `vs_frozen_red` (n=48, seed 15,
+`vs_scripted_sampled_red` (n=48, seed 13), `vs_heldout_sampled` and `vs_heldout_sampled_red` (n=48,
+seed 14; team B is the held-out passing bot), and `vs_frozen` and `vs_frozen_red` (n=48, seed 15,
 requires `--frozen-dir`) via `tools/audit/harness.py`, `tools/audit/census.py`, and
 `tools/audit/internals.py`, writing traces (`m*.npz`), `census.json`, `report.txt`, and
 `internals.json` (for `self_sampled`) under `OUT/<gen>/<tag>/`.
@@ -34,6 +35,8 @@ TAG_SPECS: Dict[str, Dict[str, Any]] = {
     "self_mixed": {"opp": "self", "mode": "mixed", "n": 48, "seed": 12, "swap": False},
     "vs_scripted_sampled": {"opp": "scripted", "mode": "sampled", "n": 48, "seed": 13, "swap": False},
     "vs_scripted_sampled_red": {"opp": "scripted", "mode": "sampled", "n": 48, "seed": 13, "swap": True},
+    "vs_heldout_sampled": {"opp": "heldout", "mode": "sampled", "n": 48, "seed": 14, "swap": False},
+    "vs_heldout_sampled_red": {"opp": "heldout", "mode": "sampled", "n": 48, "seed": 14, "swap": True},
     "vs_frozen": {"opp": "frozen", "mode": "sampled", "n": 48, "seed": 15, "swap": False},
     "vs_frozen_red": {"opp": "frozen", "mode": "sampled", "n": 48, "seed": 15, "swap": True},
 }

@@ -5872,3 +5872,118 @@ class TestHybrid7Internals:
         tr_aim["head"] = np.array([3, 0], dtype=np.int8)
         np.testing.assert_allclose(internals.aim_control_points(tr_aim), [[0.4, 0.1, 0.5, 0.3]], atol=1e-6)
 
+
+
+# ----------------------------------------------------------------------------
+# Held-out passing bot: harness opponents and evaluation tags
+# ----------------------------------------------------------------------------
+def _set_env_to_trace_row(env, trace, t):
+    """Write the state recorded before decision `t` into the arrays the scripted bots read."""
+    env.player_pos[:] = trace["pos"][t]
+    env.player_angle[:] = trace["ang"][t]
+    env.ball_pos[:] = trace["ball"][t]
+    holder = int(trace["holder"][t])
+    env.ball_holder = None if holder < 0 else holder
+    env.team_side[:] = trace["side"][t]
+
+
+class TestHeldOutHarness:
+    def test_heldout_opponent_plays_the_passing_bot_as_team_b(self, ckpt, tmp_path):
+        """[RED] CLI, seed 2, 30 decisions (team B holds the ball in rows 21-29): every row of team B's actions equals
+        `passing_actions` on the stored state to within float32 storage (2e-3), differs from the training bot's on at least
+        one row, and the team is recorded like a scripted one (head 0, mean = act, val = 0).
+        Hand-solved rows: at the kickoff (row 0, team A holds) B's keeper stands 15.87 u from its bisector point (45, 404.13 in
+        its frame) facing along the pitch, so it stops and steers -1 (error -pi/2); B's M1 at (960, 220) is a chaser-free
+        attacker whose anchor (875.2, 200) lies 0.77 rad to its right, so throttle 1 and steer -1. At row 21, when B's M2 holds
+        the ball and M1 is not a chaser, M1's anchor moves to x 1033.11, y 80 in its frame: error 0.0828, steer 0.1656
+        (the training bot would steer 0.0354)."""
+        from football_rl.baselines import passing_actions, scripted_actions
+        from football_rl.config import DEFAULT_CONFIG
+        from football_rl.env import FootballParallelEnv
+
+        out = tmp_path / "out"
+        argv = ["--checkpoint-dir", str(ckpt), "--opp", "heldout", "--n", "1", "--seed", "2", "--workers", "1",
+                "--max-steps", "30", "--out-dir", str(out)]
+        assert harness.main(argv) == 0
+        with np.load(out / "m000.npz") as loaded:
+            trace = {k: loaded[k] for k in loaded.files}
+        assert trace["head"].tolist() == [0, 0]
+        assert np.array_equal(trace["mean"][:, 6:], trace["act"][:, 6:])
+        assert np.all(trace["val"][:, 6:] == 0.0)
+
+        env = FootballParallelEnv(config=DEFAULT_CONFIG)
+        env.reset(seed=0)
+        differs = 0
+        for t in range(30):
+            _set_env_to_trace_row(env, trace, t)
+            np.testing.assert_allclose(trace["act"][t, 6:], passing_actions(env, 1), atol=2e-3, err_msg=f"row {t}")
+            differs += int(not np.allclose(passing_actions(env, 1), scripted_actions(env, 1), atol=0.05))
+        assert differs >= 1
+
+        assert trace["holder"][0] == 5 and trace["holder"][21] == 10
+        np.testing.assert_allclose(trace["act"][0, 6], [0.0, -1.0, -1.0, -1.0], atol=1e-6)
+        np.testing.assert_allclose(trace["act"][0, 9], [1.0, -1.0, -1.0, -1.0], atol=1e-6)
+        np.testing.assert_allclose(trace["act"][21, 9], [1.0, 0.1656, -1.0, -1.0], atol=2e-3)
+
+    def test_scripted2_heldout_pits_the_passing_bot_against_the_training_bot(self):
+        """[RED] Team A plays `passing_actions` and team B `scripted_actions`; no checkpoint is needed; both are recorded like
+        scripted teams. On the stored states team A's rows equal the passing bot's (and differ from the training bot's on
+        at least one row of the 30), team B's the training bot's."""
+        from football_rl.baselines import passing_actions, scripted_actions
+        from football_rl.config import DEFAULT_CONFIG
+        from football_rl.env import FootballParallelEnv
+
+        spec = harness.EvalSpec(opponent="scripted2:heldout", mode="sampled", n=1, seed=2, max_steps=30)
+        assert spec.policy_dirs() == [] and spec.required_files() == []
+        trace = harness.play_match(spec, 0)
+        assert trace["head"].tolist() == [0, 0]
+        assert np.array_equal(trace["mean"], trace["act"]) and np.all(trace["val"] == 0.0)
+        env = FootballParallelEnv(config=DEFAULT_CONFIG)
+        env.reset(seed=0)
+        differs = 0
+        for t in range(30):
+            _set_env_to_trace_row(env, trace, t)
+            np.testing.assert_allclose(trace["act"][t, :6], passing_actions(env, 0), atol=2e-3, err_msg=f"A row {t}")
+            np.testing.assert_allclose(trace["act"][t, 6:], scripted_actions(env, 1), atol=2e-3, err_msg=f"B row {t}")
+            differs += int(not np.allclose(passing_actions(env, 0), scripted_actions(env, 0), atol=0.05))
+        assert differs >= 1
+
+    @pytest.mark.parametrize("swap, expected", [(False, [0, 0]), (True, [1, 0])])
+    def test_head_records_the_seats_against_the_heldout_bot(self, tmp_path, swap, expected):
+        d = write_head_checkpoint(tmp_path / "c", {"blue": "gaussian4", "red": "hybrid5"})
+        trace = harness.play_match(quick_spec(d, opponent="heldout", swap=swap, n=1, max_steps=4), 0)
+        assert trace["head"].tolist() == expected
+
+    def test_heldout_needs_a_checkpoint_and_scripted2_variants_do_not(self):
+        with pytest.raises(ValueError):
+            harness.EvalSpec(opponent="heldout", n=1, max_steps=5).validate()
+        harness.EvalSpec(opponent="scripted2:heldout", n=1, max_steps=5).validate()
+        with pytest.raises(ValueError):
+            harness.EvalSpec(opponent="scripted2:mystery", n=1, max_steps=5).validate()
+
+    @pytest.mark.parametrize("red, swap", [("vs_heldout_sampled", False), ("vs_heldout_sampled_red", True)])
+    def test_heldout_tags_are_registered_with_seed_14_and_48_matches(self, red, swap):
+        from tools.audit import evaluate_arm
+
+        assert evaluate_arm.TAG_SPECS[red] == {"opp": "heldout", "mode": "sampled", "n": 48, "seed": 14, "swap": swap}
+
+    def test_evaluate_arm_writes_the_heldout_tags_from_direct_harness_runs(self, tmp_path):
+        """[RED] Both tags are in the default tag set; `vs_heldout_sampled_red` equals a direct `heldout` harness run with
+        swapped seats, array for array."""
+        from tools.audit import census, evaluate_arm
+
+        snap = write_checkpoint(tmp_path / "snaps" / "gen0300", seed=12)
+        out_dir = tmp_path / "eval_out"
+        results = evaluate_arm.evaluate_arm([snap], out_dir, workers=1, n_override=1, max_steps=5)
+        assert {"vs_heldout_sampled", "vs_heldout_sampled_red"} <= set(results["gen0300"])
+        evaluate_arm.evaluate_arm([snap], out_dir, workers=1, tags=["vs_heldout_sampled_red"], n_override=2, max_steps=30)
+        direct = harness.run_matches(
+            harness.EvalSpec(checkpoint_dir=str(snap), opponent="heldout", mode="sampled", n=2, seed=14, swap=True,
+                             workers=1, max_steps=30)
+        )
+        got = census.load_traces(out_dir / "gen0300" / "vs_heldout_sampled_red")
+        assert len(got) == 2
+        for g, e in zip(got, direct):
+            assert set(g) == set(e)
+            for k in e:
+                assert np.array_equal(g[k], e[k]), k
