@@ -773,6 +773,23 @@ class TestHoldRollouts:
                 break
         assert nonzero_sparse_steps >= 5
 
+    @pytest.mark.parametrize("opponent", ["heldout", "scripted2:heldout"])
+    def test_hold_refuses_an_opponent_that_names_the_heldout_bot(self, tmp_path, opponent):
+        """[RED] Hold branches replay a team without a network as `scripted_actions`, so on a held-out trace they
+        would re-simulate the held-out team as the training bot. The kickoff row is the same for both bots, so the
+        step-0 checkpoint check passes and only an explicit refusal stops the run."""
+        from tools.audit import rollouts
+
+        ckpt = write_head_checkpoint(tmp_path / "ckpt", {"blue": "gaussian4", "red": "gaussian4"}, seed=3)
+        trace_dir = tmp_path / "traces_heldout"
+        spec = quick_spec(ckpt, opponent="heldout", mode="sampled", n=1, seed=11, max_steps=120)
+        harness.save_traces(harness.run_matches(spec), trace_dir, protected=[ckpt])
+
+        with pytest.raises(ValueError, match=re.escape(f"'{opponent}'")):
+            rollouts.run_hold(
+                trace_dir=trace_dir, checkpoint_dir=ckpt, opponent=opponent, trace_seed=11, seed=1, max_matches=1, workers=1,
+            )
+
 
 # ----------------------------------------------------------------------------
 # 4. E5: X4 leftovers (F5b limit boundary, F6 checkpoint-trace match & metadata)

@@ -1201,6 +1201,10 @@ def run_hold(
         raise ValueError(f"workers must be positive, got {workers}")
     if int(hold_steps) < 1:
         raise ValueError(f"hold_steps must be >= 1, got {hold_steps}")
+    if "heldout" in opponent:
+        # Branches play every team without a network as `scripted_actions`, so a held-out trace would be
+        # re-simulated with the training bot in the held-out bot's seats.
+        raise ValueError(f"hold rollouts do not replay the held-out bot; opponent {opponent!r} is not supported")
     spec = harness.EvalSpec(
         checkpoint_dir=str(checkpoint_dir) if checkpoint_dir is not None else None,
         opponent=opponent,
