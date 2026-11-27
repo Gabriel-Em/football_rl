@@ -45,6 +45,7 @@ from football_rl.policy import (
     HYBRID_ACTION_DIM,
     _hybrid7_sample_and_log_prob,
     _hybrid_log_prob,
+    central_state_dim_of_weights,
     holds_return_statistics,
     kick_targets,
     policy_head_of_weights,
@@ -84,6 +85,45 @@ def validate_pool_head(pool_envs: int, policy_head: str) -> None:
         raise ValueError(
             f"pool_envs > 0 is not available with policy_head {policy_head!r}: frozen pool seats have no aim/target head"
         )
+
+
+def validate_bot_settings(
+    bot_envs: Any, num_envs: int, separate_teams: bool = True, pool_envs: int = 0, shared_keepers: bool = False
+) -> None:
+    """Raise ValueError unless `bot_envs` is 0 or an even number with 2 <= N <= num_envs - 2.
+
+    Bot envs (one team played by the scripted bot) need separate teams, no opponent pool and no shared keepers.
+    """
+    if isinstance(bot_envs, bool) or not isinstance(bot_envs, int):
+        raise ValueError(f"bot_envs must be an integer, got {bot_envs!r}")
+    if bot_envs == 0:
+        return
+    if bot_envs < 0 or bot_envs % 2 != 0 or bot_envs > num_envs - 2:
+        raise ValueError(
+            f"bot_envs must be 0 or an even number from 2 to num_envs - 2 ({num_envs - 2}), got {bot_envs}"
+        )
+    if not separate_teams:
+        raise ValueError("bot_envs > 0 needs separate teams; a shared-team run has no learning side opposite the bot")
+    if pool_envs > 0:
+        raise ValueError("bot_envs > 0 is not supported with pool_envs > 0; the bot is not an opponent-pool member")
+    if shared_keepers:
+        raise ValueError("bot_envs > 0 is not supported with shared_keepers; the two keepers see different opponents")
+
+
+def bot_env_teams(num_envs: int, bot_envs: int) -> Dict[int, int]:
+    """Bot team (0 = A, 1 = B) of each bot env: the last `bot_envs` envs, team B first, then A, alternating upward."""
+    return {num_envs - bot_envs + k: 1 - k % 2 for k in range(bot_envs)}
+
+
+def tag_bot_replay(path: str) -> str:
+    """Rename the uniform replay `path` of a bot env from `..._uniform_<time>.json` to `..._uniform_bot_<time>.json`; return the new path."""
+    directory, name = os.path.split(path)
+    tagged = name.replace("_uniform_", "_uniform_bot_", 1)
+    if tagged == name:
+        raise ValueError(f"not a uniform replay file name: {name!r}")
+    new_path = os.path.join(directory, tagged)
+    os.replace(path, new_path)
+    return new_path
 
 
 def _run_git(args: Sequence[str]) -> Optional[str]:
@@ -142,11 +182,13 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         replay_every: int = 1,
         replay_kind: str = "both",
         shared_keepers: bool = False,
+        bot_envs: int = 0,
     ) -> None:
         validate_pool_settings(
             int(pool_envs), int(pool_size), int(num_envs), separate_teams, int(seed), bool(shared_keepers)
         )
         validate_pool_head(int(pool_envs), config.ppo.policy_head)
+        validate_bot_settings(bot_envs, int(num_envs), separate_teams, int(pool_envs), bool(shared_keepers))
         if config.ppo.policy_head == "hybrid7":
             validate_hybrid7_env_config(config)
         self.replay_every, self.replay_kind = validate_replay_settings(replay_every, replay_kind)
@@ -168,6 +210,11 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         self.accept_config_change = bool(accept_config_change)
         self.pool_envs = int(pool_envs)
         self.pool_size = int(pool_size)
+        # Envs whose one team the scripted bot plays (env index -> bot team) and the critic's central-state width: the
+        # environment's columns plus, with bot envs, one flag column that is 1 on the learning team's rows of those envs.
+        self.bot_envs = int(bot_envs)
+        self._bot_teams: Dict[int, int] = bot_env_teams(int(num_envs), self.bot_envs)
+        self.central_dim: int = CENTRAL_STATE_DIM + (1 if self.bot_envs > 0 else 0)
         # Frozen pool members of the generation being played, keyed by (member generation, team) -> (keeper, field).
         self._pool_members: Dict[Tuple[int, str], Tuple[ActorCritic, ActorCritic]] = {}
         self._pool_skipped: set = set()
@@ -212,6 +259,28 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         self.keeper_indices = [0, 6]
         self.field_indices = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
+        self._build_networks()
+
+        # Seats of the bot team of each bot env (never trained on) and of the other, learning team (the bot-match
+        # source of the update and the rows whose critic flag is 1).
+        self._bot_seats = np.zeros((num_envs, len(ALL_AGENTS)), dtype=bool)
+        self._bot_learning = np.zeros((num_envs, len(ALL_AGENTS)), dtype=bool)
+        for env_i, team in self._bot_teams.items():
+            self._bot_seats[env_i, 6 * team:6 * team + 6] = True
+            self._bot_learning[env_i, 6 * (1 - team):6 * (1 - team) + 6] = True
+        if self._bot_teams:
+            self.vec_env.set_scripted_teams([self._bot_teams.get(env_i) for env_i in range(num_envs)])
+
+        # Initialize environments and store current observations and centralized states
+        self.num_agents: int = len(ALL_AGENTS)
+        self.current_obs = np.zeros((num_envs, self.num_agents, OBS_DIM), dtype=np.float32)
+        self.current_central_state = np.zeros(
+            (num_envs, self.num_agents, self.central_dim), dtype=np.float32
+        )
+        self._reset_all_envs(initial=True)
+
+    def _build_networks(self) -> None:
+        """Create the role policies, their optimizers and the CPU rollout copies, at the current critic width."""
         # Red Team (TEAM_A) Policies (on self.device, e.g. CUDA)
         self.blue_field_policy = self._new_policy(self.device)
         self.blue_keeper_policy = self._new_policy(self.device)
@@ -260,14 +329,6 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             self.cpu_red_field_policy = self.red_field_policy
             self.cpu_red_keeper_policy = self.red_keeper_policy
 
-        # Initialize environments and store current observations and centralized states
-        self.num_agents: int = len(ALL_AGENTS)
-        self.current_obs = np.zeros((num_envs, self.num_agents, OBS_DIM), dtype=np.float32)
-        self.current_central_state = np.zeros(
-            (num_envs, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32
-        )
-        self._reset_all_envs(initial=True)
-
     def _new_policy(self, device: torch.device) -> ActorCritic:
         """A freshly initialised role network with the configured policy head."""
         ppo = self.cfg.ppo
@@ -275,6 +336,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             obs_dim=OBS_DIM,
             action_dim=ACTION_DIM,
             hidden_dims=ppo.hidden_dims,
+            central_state_dim=self.central_dim,
             policy_head=ppo.policy_head,
             fire_prob_floor=ppo.fire_prob_floor,
             fire_logit_bound=ppo.fire_logit_bound,
@@ -331,7 +393,9 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             seeds=seeds, options_list=options_list
         )
         self.current_obs[:] = obs_batch
-        self.current_central_state[:] = central_batch
+        self.current_central_state[..., :CENTRAL_STATE_DIM] = central_batch
+        if self.central_dim > CENTRAL_STATE_DIM:
+            self.current_central_state[..., CENTRAL_STATE_DIM] = self._bot_learning
         # Pool assignment of the match each environment is playing (None: no frozen seat so far in that match).
         self._pool_match_tags: List[Optional[Dict[str, Any]]] = [None] * self.num_envs
 
@@ -377,7 +441,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             rows = slice(indices[0], indices[-1] + 1) if indices[-1] - indices[0] + 1 == len(indices) else indices
             # Contiguous rows: the CPU matmul's summation order depends on the input row stride.
             g_obs = obs_t[:, rows, :].reshape(-1, OBS_DIM).contiguous()
-            g_cen = cen_t[:, rows, :].reshape(-1, CENTRAL_STATE_DIM) if cen_t is not None else None
+            g_cen = cen_t[:, rows, :].reshape(-1, self.central_dim) if cen_t is not None else None
             if hybrid:
                 z, value = policy.hybrid_logits_and_value(g_obs, central_state=g_cen)
                 aux = (
@@ -482,7 +546,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         if not self.separate_teams:
             k_obs = obs_t[:, self.keeper_indices, :].reshape(-1, OBS_DIM)
             k_cen = (
-                cen_t[:, self.keeper_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                cen_t[:, self.keeper_indices, :].reshape(-1, self.central_dim)
                 if cen_t is not None
                 else None
             )
@@ -494,7 +558,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             )
             f_obs = obs_t[:, self.field_indices, :].reshape(-1, OBS_DIM)
             f_cen = (
-                cen_t[:, self.field_indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                cen_t[:, self.field_indices, :].reshape(-1, self.central_dim)
                 if cen_t is not None
                 else None
             )
@@ -515,7 +579,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                 cnt = len(indices)
                 g_obs = obs_t[:, indices, :].reshape(-1, OBS_DIM)
                 g_cen = (
-                    cen_t[:, indices, :].reshape(-1, CENTRAL_STATE_DIM)
+                    cen_t[:, indices, :].reshape(-1, self.central_dim)
                     if cen_t is not None
                     else None
                 )
@@ -646,7 +710,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
         N = self.num_envs
 
         buf_obs = np.zeros((T, N, self.num_agents, OBS_DIM), dtype=np.float32)
-        buf_central = np.zeros((T, N, self.num_agents, CENTRAL_STATE_DIM), dtype=np.float32)
+        buf_central = np.zeros((T, N, self.num_agents, self.central_dim), dtype=np.float32)
         buf_act = np.zeros((T, N, self.num_agents, self.policy_action_dim), dtype=np.float32)
         buf_logp = np.zeros((T, N, self.num_agents), dtype=np.float32)
         buf_rew = np.zeros((T, N, self.num_agents), dtype=np.float32)
@@ -689,6 +753,8 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                 pool_batch.apply(
                     self.current_obs, self.current_central_state, pool_generator_, actions, logprobs, values, action_means
                 )
+            if self.bot_envs > 0:
+                logprobs[self._bot_seats] = 0.0   # the bot plays these seats; their transitions are never trained on
             buf_act[t] = actions
             buf_logp[t] = logprobs
             buf_val[t] = values
@@ -764,6 +830,7 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                         "kick_to_opponent": int(fstats.get("kick_to_opponent", 0)),
                         "kick_other": int(fstats.get("kick_other", 0)),
                         "pool": dict(self._pool_match_tags[env_i]) if self._pool_match_tags[env_i] else None,
+                        "bot": {"bot_team": "AB"[self._bot_teams[env_i]]} if env_i in self._bot_teams else None,
                         "replay_path": (rpath or "") if write_regular else None,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
@@ -786,14 +853,14 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                     central_batch[env_i] = reset_central[0]
 
             self.current_obs[:] = obs_batch
-            self.current_central_state[:] = central_batch
+            self.current_central_state[..., :CENTRAL_STATE_DIM] = central_batch
 
         # If save_best_only is enabled, export only the single best match replay from the winning worker
         if write_regular and self.save_best_only and gen_completed_matches and self.cfg.replay.enable_recording:
             eligible = [
                 (env_idx, m)
                 for env_idx, m in gen_completed_matches
-                if float(m.get("interest_score", 0.0)) >= self.cfg.replay.interest_threshold
+                if float(m.get("interest_score", 0.0)) >= self.cfg.replay.interest_threshold and m["bot"] is None
             ]
             if eligible:
                 best_env_idx, best_match = max(
@@ -839,8 +906,28 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
             "completed_episodes": completed_episodes,
             "max_interest": max_interest,
             "exported_replays": exported_replays,
-            "frozen_seats": frozen_seats,
+            "frozen_seats": self._bot_seats.copy() if self.bot_envs > 0 else frozen_seats,
+            "bot_rows": self._bot_learning.copy() if self.bot_envs > 0 else None,
             "pool_schedule": pool_played,
+        }
+
+    @staticmethod
+    def _bot_goals(matches: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+        """Goals scored `for` and conceded `against` by each learning policy in its bot-env `matches`.
+
+        Team A's networks (`blue_*`) learn in envs where the bot is team B, and the other way round.
+        """
+        totals = {"A": [0, 0], "B": [0, 0]}   # learning team -> [for, against]
+        for m in matches:
+            if m["bot"] is None:
+                continue
+            learner = "A" if m["bot"]["bot_team"] == "B" else "B"
+            own, other = (0, 1) if learner == "A" else (1, 0)
+            totals[learner][0] += int(m["score"][own])
+            totals[learner][1] += int(m["score"][other])
+        return {
+            role: {"for": totals[team][0], "against": totals[team][1]}
+            for role, team in (("blue_field", "A"), ("blue_keeper", "A"), ("red_field", "B"), ("red_keeper", "B"))
         }
 
     def close(self) -> None:
@@ -875,6 +962,8 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                 uniform_replay = None
                 if recording and write_uniform:
                     uniform_replay = self.vec_env.export_uniform_replay(uniform_env)
+                    if uniform_replay and uniform_env in self._bot_teams:
+                        uniform_replay = tag_bot_replay(uniform_replay)
                     self.vec_env.set_uniform_capture(None)
                     self._uniform_capture_active = False
                 critic_only = gen <= self.critic_only_until_gen
@@ -979,6 +1068,13 @@ class ParameterSharingPPOTrainer(PPOUpdateMixin, CheckpointMixin, CoevolutionMix
                     gen_record["target_rows"] = {role: metrics[role]["target_rows"] for role in roles}
                     gen_record["free_share"] = {role: metrics[role]["free_share"] for role in roles}
                     gen_record["target_entropy"] = {role: metrics[role]["target_entropy"] for role in roles}
+                if self.bot_envs > 0:
+                    roles = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+                    fit_keys = ("v_corr_bot", "v_corr_self", "value_loss_share_bot", "value_loss_share_self")
+                    gen_record["bot_envs"] = self.bot_envs
+                    gen_record["bot_goals"] = self._bot_goals(self.match_history[matches_before:])
+                    gen_record["bot_adv_ss_share"] = {role: metrics[role]["bot_adv_ss_share"] for role in roles}
+                    gen_record["bot_critic_fit"] = {role: {k: metrics[role][k] for k in fit_keys} for role in roles}
                 self.generation_history.append(gen_record)
                 self.current_generation = gen
 
@@ -1137,9 +1233,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of newest generation snapshots forming the opponent pool (default: 10).",
     )
     parser.add_argument(
+        "--bot-envs",
+        type=int,
+        default=0,
+        help="Number of environments (the last ones) in which one team is the scripted bot, on alternating sides "
+        "(default: 0). An even number from 2 to num_envs - 2; needs separate teams, no opponent pool and no shared "
+        "keepers. Stored with the checkpoint and must match on resume.",
+    )
+    parser.add_argument(
         "--accept-config-change",
         action="store_true",
-        help="Resume even when --config-override or pool values differ from those stored in the checkpoint.",
+        help="Resume even when --config-override, pool or bot-env values differ from those stored in the checkpoint.",
     )
 
     # Lifecycle & Batch Management Flags
@@ -1239,6 +1343,7 @@ def main() -> None:
         args.pool_envs, args.pool_size, args.num_envs, not args.shared_teams, args.seed, args.shared_keepers
     )
     validate_pool_head(args.pool_envs, cfg.ppo.policy_head)
+    validate_bot_settings(args.bot_envs, args.num_envs, not args.shared_teams, args.pool_envs, args.shared_keepers)
     if cfg.ppo.policy_head == "hybrid7":
         validate_hybrid7_env_config(cfg)
     validate_replay_settings(args.replay_every, args.replay_kind)
@@ -1266,6 +1371,7 @@ def main() -> None:
         replay_every=args.replay_every,
         replay_kind=args.replay_kind,
         shared_keepers=args.shared_keepers,
+        bot_envs=args.bot_envs,
     )
 
     state_file = os.path.join(ckpt_dir, "training_state.pt")

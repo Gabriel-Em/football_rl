@@ -6567,3 +6567,618 @@ class TestHybrid7:
         )
         assert float(bonus6) == pytest.approx(0.0354735, abs=1e-7)
 
+
+# ==============================================================================
+# Scripted-bot envs (`bot_envs`): layout, critic flag, untrained seats, per-source advantages
+# ==============================================================================
+import football_rl.train_ppo as bot_tp  # noqa: E402
+
+BOT_ROLES = ("blue_field", "blue_keeper", "red_field", "red_keeper")
+
+
+def _bot_trainer(tmp_path: Path, name: str = "ckpt", num_envs: int = 4, bot_envs: int = 2, rollout_steps: int = 8,
+                 max_rl_steps: int = 4, head: str = "gaussian4", recording: bool = False, seed: int = 3,
+                 ppo: dict | None = None, **kwargs) -> ParameterSharingPPOTrainer:
+    """Trainer whose last `bot_envs` envs have a scripted team; matches end after `max_rl_steps` decisions."""
+    cfg = _quiet_cfg(save_dir=str(tmp_path / f"rep_{name}"), recording=recording)
+    cfg = replace(
+        cfg,
+        ppo=replace(cfg.ppo, policy_head=head, **(ppo or {})),
+        physics=replace(cfg.physics, max_rl_steps=max_rl_steps),
+    )
+    return ParameterSharingPPOTrainer(
+        config=cfg, num_envs=num_envs, rollout_steps=rollout_steps, device="cpu",
+        checkpoint_dir=str(tmp_path / name), seed=seed, bot_envs=bot_envs, **kwargs,
+    )
+
+
+def _bot_masks_of_four_envs() -> tuple[np.ndarray, np.ndarray]:
+    """Hand-built masks of a 4-env, 2-bot-env layout: env 2 has the bot as team B, env 3 as team A.
+    Returns `(bot seats, learning seats of the bot envs)`, both `(4, 12)`."""
+    bot_seats = np.zeros((4, 12), dtype=bool)
+    bot_seats[2, 6:] = True
+    bot_seats[3, :6] = True
+    learning = np.zeros((4, 12), dtype=bool)
+    learning[2, :6] = True
+    learning[3, 6:] = True
+    return bot_seats, learning
+
+
+def _bot_defaults(**changes) -> dict:
+    return {**dict(bot_envs=2, num_envs=8, separate_teams=True, pool_envs=0, shared_keepers=False), **changes}
+
+
+@pytest.mark.parametrize("changes", [
+    dict(bot_envs=3),                      # odd
+    dict(bot_envs=1),                      # odd
+    dict(bot_envs=8),                      # more than num_envs - 2
+    dict(bot_envs=2, num_envs=2),          # more than num_envs - 2
+    dict(bot_envs=-2),                     # negative
+    dict(pool_envs=1),                     # a pool is a different opponent mechanism
+    dict(shared_keepers=True),
+    dict(separate_teams=False),
+], ids=["odd-3", "odd-1", "too-many", "two-of-two", "negative", "pool", "shared-keepers", "shared-teams"])
+def test_bot_settings_refusals(tmp_path: Path, changes: dict) -> None:
+    """[RED] Odd N, N above num_envs - 2, negative N, and N > 0 with a pool, shared keepers or shared teams are refused
+    by `validate_bot_settings` and by the trainer, which writes nothing."""
+    with pytest.raises(ValueError, match="bot_envs"):
+        bot_tp.validate_bot_settings(**_bot_defaults(**changes))
+    kwargs = {k: v for k, v in changes.items() if k in ("bot_envs", "num_envs", "pool_envs", "shared_keepers")}
+    cfg = _quiet_cfg(save_dir=str(tmp_path / "rep"))
+    with pytest.raises(ValueError, match="bot_envs"):
+        ParameterSharingPPOTrainer(
+            config=cfg, num_envs=kwargs.pop("num_envs", 4), rollout_steps=4, device="cpu",
+            checkpoint_dir=str(tmp_path / "ckpt"), separate_teams=changes.get("separate_teams", True),
+            **{"bot_envs": 2, **kwargs},
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("num_envs, bot_envs", [(8, 0), (1, 0), (4, 2), (8, 2), (8, 4), (8, 6)])
+def test_bot_settings_accept_zero_or_an_even_number_up_to_num_envs_minus_two(num_envs: int, bot_envs: int) -> None:
+    """[RED] 0 and the even numbers 2 <= N <= num_envs - 2 are valid."""
+    assert bot_tp.validate_bot_settings(**_bot_defaults(num_envs=num_envs, bot_envs=bot_envs)) is None
+
+
+def test_bot_envs_option_defaults_to_zero_and_is_parsed() -> None:
+    """[RED] `--bot-envs` is an integer option with default 0."""
+    parser = bot_tp.build_arg_parser()
+    assert parser.parse_args([]).bot_envs == 0
+    assert parser.parse_args(["--bot-envs", "2"]).bot_envs == 2
+
+
+def test_main_refuses_a_bad_bot_envs_before_touching_disk(tmp_path: Path, monkeypatch) -> None:
+    """[RED] An odd `--bot-envs` aborts `main()` before `--from-scratch` wipes the active checkpoints."""
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "checkpoints" / "marker.txt"
+    marker.parent.mkdir()
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["train_ppo", "--from-scratch", "--total-updates", "1", "--bot-envs", "3"])
+    with pytest.raises(ValueError, match="bot_envs"):
+        bot_tp.main()
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert sorted(p.name for p in (tmp_path / "checkpoints").iterdir()) == ["marker.txt"]
+    assert not (tmp_path / "replays").exists()
+
+
+def test_bot_layout_alternates_the_bot_between_team_b_and_team_a_over_the_last_envs() -> None:
+    """[RED] The bot envs are the last N indices; counting up from the first of them the bot is team B (index 1) on even
+    positions and team A (index 0) on odd ones, whatever N is."""
+    assert bot_tp.bot_env_teams(8, 0) == {}
+    assert bot_tp.bot_env_teams(8, 2) == {6: 1, 7: 0}
+    assert bot_tp.bot_env_teams(8, 4) == {4: 1, 5: 0, 6: 1, 7: 0}
+    assert bot_tp.bot_env_teams(4, 2) == {2: 1, 3: 0}
+
+
+def test_critic_flag_is_one_exactly_on_the_learning_teams_rows_of_the_bot_envs(tmp_path: Path) -> None:
+    """[RED] 4 envs, 2 bot envs (env 2: bot is team B; env 3: bot is team A), matches ending every 4 decisions inside an
+    8-step rollout. Every network's critic reads 82 + 54 + 1 = 137 inputs, the stored central rows have the flag in
+    column 54 on seats 0-5 of env 2 and seats 6-11 of env 3 at every step (across the auto-resets), 0 elsewhere, the
+    actors still read 82 inputs, and the stored values are the critics' output on exactly those stored inputs."""
+    trainer = _bot_trainer(tmp_path)
+    try:
+        for _, policy, _ in _policy_groups(trainer):
+            assert policy.critic[0].in_features == 137 and policy.actor_mean[0].in_features == OBS_DIM
+            with torch.no_grad():
+                policy.critic[0].weight[:, 136] = 5.0   # makes every value depend strongly on the flag
+        rollout = trainer.collect_rollouts(active_generation=1)
+        _, learning = _bot_masks_of_four_envs()
+        central = rollout["central_state"]
+        assert central.shape == (8, 4, 12, CENTRAL_STATE_DIM + 1) and rollout["obs"].shape == (8, 4, 12, OBS_DIM)
+        assert np.array_equal(central[..., CENTRAL_STATE_DIM], np.broadcast_to(learning.astype(np.float32), (8, 4, 12)))
+        for indices, policy in trainer._rollout_groups():
+            obs = torch.as_tensor(rollout["obs"][:, :, indices]).reshape(-1, OBS_DIM)
+            cen = torch.as_tensor(central[:, :, indices]).reshape(-1, CENTRAL_STATE_DIM + 1)
+            with torch.no_grad():
+                values = policy.get_value(obs, central_state=cen).numpy().reshape(8, 4, len(indices))
+            np.testing.assert_allclose(values, rollout["values"][:, :, indices], atol=1e-4)
+    finally:
+        trainer.close()
+
+
+def test_bot_seats_are_frozen_and_the_learning_rows_form_the_bot_source(tmp_path: Path) -> None:
+    """[RED] The rollout's frozen-seat mask is the bot team of each bot env (env 2: seats 6-11, env 3: seats 0-5), the
+    bot-source mask is the other team of those envs, and the stored log-probabilities of the bot seats are 0."""
+    trainer = _bot_trainer(tmp_path)
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        bot_seats, learning = _bot_masks_of_four_envs()
+        assert np.array_equal(rollout["frozen_seats"], bot_seats)
+        assert np.array_equal(rollout["bot_rows"], learning)
+        assert np.all(rollout["logprobs"][:, bot_seats] == 0.0)
+        assert np.all(rollout["logprobs"][:, learning] != 0.0)
+    finally:
+        trainer.close()
+
+
+def test_match_records_name_the_bot_team_of_bot_envs_only(tmp_path: Path) -> None:
+    """[RED] The first four match records (envs 0-3 finishing together after 4 decisions) carry `bot: None` for the
+    self-play envs and `{"bot_team": "B"}` for env 2, `{"bot_team": "A"}` for env 3."""
+    trainer = _bot_trainer(tmp_path)
+    try:
+        trainer.collect_rollouts(active_generation=1)
+        assert [m["bot"] for m in trainer.match_history[:4]] == [None, None, {"bot_team": "B"}, {"bot_team": "A"}]
+        assert all(m["pool"] is None for m in trainer.match_history)
+    finally:
+        trainer.close()
+
+
+def _trainer_snapshot(trainer: ParameterSharingPPOTrainer) -> dict:
+    return {
+        role: (copy.deepcopy(pol.state_dict()), copy.deepcopy(opt.state_dict()))
+        for role, pol, opt in _policy_groups(trainer)
+    }
+
+
+def _restore_trainer(trainer: ParameterSharingPPOTrainer, snapshot: dict) -> None:
+    for role, pol, opt in _policy_groups(trainer):
+        pol.load_state_dict(copy.deepcopy(snapshot[role][0]))
+        opt.load_state_dict(copy.deepcopy(snapshot[role][1]))
+
+
+@pytest.mark.parametrize("value_norm", [False, True])
+def test_bot_seats_never_reach_the_update(tmp_path: Path, value_norm: bool) -> None:
+    """[RED] After one generation's update, poisoning every stored array of the bot seats with NaN leaves all four
+    networks' weights (return statistics included), their full Adam states and every returned metric byte-identical
+    and finite: bot rows reach neither the loss, the value targets, the return statistics nor the optimiser."""
+    trainer = _bot_trainer(tmp_path, ppo={"value_norm": value_norm})
+    try:
+        trainer.update_policies(_seeded_collect(trainer, 1))   # populate every Adam state
+        rollout = _seeded_collect(trainer, 2)
+        poisoned = {k: (v.copy() if k in ROLLOUT_ARRAYS else v) for k, v in rollout.items()}
+        for key in ROLLOUT_ARRAYS:
+            poisoned[key][:, rollout["frozen_seats"]] = np.nan
+        start = _trainer_snapshot(trainer)
+
+        torch.manual_seed(0)
+        clean_metrics = trainer.update_policies(rollout)
+        clean = _trainer_snapshot(trainer)
+        _restore_trainer(trainer, start)
+        torch.manual_seed(0)
+        poisoned_metrics = trainer.update_policies(poisoned)
+        dirty = _trainer_snapshot(trainer)
+        for role in BOT_ROLES:
+            for key, value in clean[role][0].items():
+                assert torch.isfinite(dirty[role][0][key].float()).all(), (role, key)
+                assert torch.equal(value, dirty[role][0][key]), (role, key)
+            assert dirty[role][1]["state"].keys() == clean[role][1]["state"].keys()
+            for pid, state in clean[role][1]["state"].items():
+                for k, v in state.items():
+                    assert torch.equal(torch.as_tensor(v), torch.as_tensor(dirty[role][1]["state"][pid][k])), (role, pid, k)
+            assert clean_metrics[role] == poisoned_metrics[role], role
+            assert all(math.isfinite(v) for v in poisoned_metrics[role].values()), role
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ advantages normalised per source
+SOURCE_BATCH = [1.0, 2.0, 10.0, 3.0, 30.0]            # self-play 1, 2, 3 and bot 10, 30 in batch order
+SOURCE_IS_BOT = [False, False, True, False, True]
+SOURCE_HAND = [-1.0, 0.0, -0.7071068, 1.0, 0.7071068]           # each source standardised on its own (torch std)
+SOURCE_POOLED = [-0.6747200, -0.5924371, 0.0658264, -0.5101542, 1.7114849]   # rejected: one pooled mean and SD
+
+
+def _normalised(adv, bot=None):
+    obs = torch.zeros(len(adv), OBS_DIM)
+    bot_rows = None if bot is None else torch.tensor(bot, dtype=torch.bool)
+    return ParameterSharingPPOTrainer._normalize_advantages_per_role(obs, torch.tensor(adv, dtype=torch.float32), bot_rows)
+
+
+def test_advantages_are_standardised_per_source_when_bot_rows_are_present() -> None:
+    """[RED] Self-play rows [1, 2, 3] -> [-1, 0, 1] and bot rows [10, 30] -> [-0.7071068, 0.7071068], each with its own mean and
+    unbiased SD, in batch order [1, 2, 10, 3, 30]; the single pooled result [.., -0.6747, ..] is not what comes out."""
+    out = _normalised(SOURCE_BATCH, SOURCE_IS_BOT).numpy()
+    np.testing.assert_allclose(out, SOURCE_HAND, atol=1e-6)
+    assert not np.allclose(out, SOURCE_POOLED, atol=1e-3)
+    np.testing.assert_allclose(_normalised([1.0, 2.0, 3.0, 10.0, 30.0]).numpy(), [-0.6747200, -0.5924371, -0.5101542, 0.0658264, 1.7114849], atol=1e-6)
+
+
+def test_without_bot_rows_the_normalisation_is_the_pooled_one_bit_for_bit() -> None:
+    """[RED] No mask, an all-False mask and an all-True mask give the same bits as the single pooled standardisation."""
+    rng = np.random.default_rng(4)
+    adv = rng.standard_normal(97).astype(np.float32).tolist()
+    pooled = _normalised(adv)
+    assert torch.equal(_normalised(adv, [False] * 97), pooled)
+    assert torch.equal(_normalised(adv, [True] * 97), pooled)
+    np.testing.assert_allclose(_normalised([1.0, 2.0, 3.0]).numpy(), [-1.0, 0.0, 1.0], atol=1e-6)
+
+
+def test_a_source_with_at_most_one_row_is_left_as_it_is() -> None:
+    """[RED] One bot row among three self-play rows stays raw while the others are standardised; so does one self-play row among bot rows."""
+    np.testing.assert_allclose(_normalised([1.0, 2.0, 3.0, 10.0], [False, False, False, True]).numpy(), [-1.0, 0.0, 1.0, 10.0], atol=1e-6)
+    np.testing.assert_allclose(_normalised([4.0, 10.0, 30.0], [False, True, True]).numpy(), [4.0, -0.7071068, 0.7071068], atol=1e-6)
+    assert _normalised([7.0], [True]).tolist() == [7.0]
+
+
+def test_advantages_are_normalised_once_over_the_whole_batch_before_minibatching(tmp_path: Path, monkeypatch) -> None:
+    """[RED] A 5-row role batch [1, 2, 10, 3, 30] (bot rows 10, 30) updated in several minibatches and epochs calls the
+    normaliser once, with the whole batch, and gets the batch-level values: a minibatch {1, 2, 10} sees
+    [-1, 0, -0.7071068], a minibatch {3, 30} sees [1, 0.7071068], and one without bot rows {1, 2, 3} sees [-1, 0, 1]
+    (minibatch-level statistics would give {1, 2} -> [-0.7071, 0.7071] and leave the lone bot row 10 raw)."""
+    trainer = _bot_trainer(tmp_path, ppo={"num_minibatches": 2, "update_epochs": 2})
+    try:
+        calls = []
+        original = trainer._normalize_advantages_per_role
+
+        def spy(obs, advantages, bot_rows=None):
+            out = original(obs, advantages, bot_rows)
+            calls.append((advantages.clone(), None if bot_rows is None else bot_rows.clone(), out.clone()))
+            return out
+
+        monkeypatch.setattr(trainer, "_normalize_advantages_per_role", spy)
+        policy, optimizer = trainer.blue_field_policy, trainer.blue_field_optimizer
+        obs, actions = torch.zeros(5, OBS_DIM), torch.zeros(5, ACTION_DIM)
+        with torch.no_grad():
+            _, logp, _, _ = policy.get_action_and_value(obs, actions)
+        trainer._ppo_update_role(
+            policy, optimizer, obs, actions, logp, torch.tensor(SOURCE_BATCH), torch.zeros(5), torch.zeros(5),
+            b_bot=torch.tensor(SOURCE_IS_BOT),
+        )
+        assert len(calls) == 1
+        seen, mask, out = calls[0]
+        assert seen.tolist() == SOURCE_BATCH and mask.tolist() == SOURCE_IS_BOT
+        np.testing.assert_allclose(out.numpy(), SOURCE_HAND, atol=1e-6)
+        np.testing.assert_allclose(out[[0, 1, 2]].numpy(), [-1.0, 0.0, -0.7071068], atol=1e-6)
+        np.testing.assert_allclose(out[[3, 4]].numpy(), [1.0, 0.7071068], atol=1e-6)
+        np.testing.assert_allclose(_normalised([1.0, 2.0, 3.0, 10.0, 30.0], [False, False, False, True, True]).numpy()[:3], [-1.0, 0.0, 1.0], atol=1e-6)
+    finally:
+        trainer.close()
+
+
+def test_policy_loss_is_the_plain_mean_over_the_minibatch_rows(tmp_path: Path, monkeypatch) -> None:
+    """[RED] A 7-row minibatch with normalised advantages [1, 1, 1, 1, 1, 1] (self-play) and [-2] (bot) at ratio 1 has
+    `pg_loss` = -(6 - 2) / 7 = -0.5714286: every row counts equally. A mean over sources with each source's own mean
+    first would give -(1 + (-2)) / 2 = +0.5. (The normaliser is bypassed so the post-normalisation values are the input.)"""
+    trainer = _bot_trainer(tmp_path, ppo={"num_minibatches": 1, "update_epochs": 1})
+    try:
+        monkeypatch.setattr(trainer, "_normalize_advantages_per_role", lambda obs, advantages, bot_rows=None: advantages)
+        policy, optimizer = trainer.blue_field_policy, trainer.blue_field_optimizer
+        obs, actions = torch.zeros(7, OBS_DIM), torch.zeros(7, ACTION_DIM)
+        with torch.no_grad():
+            _, logp, _, _ = policy.get_action_and_value(obs, actions)
+        advantages = torch.tensor([1.0] * 6 + [-2.0])
+        bot = torch.tensor([False] * 6 + [True])
+        metrics = trainer._ppo_update_role(
+            policy, optimizer, obs, actions, logp, advantages, torch.zeros(7), torch.zeros(7), b_bot=bot
+        )
+        assert metrics["pg_loss"] == pytest.approx(-0.5714286, abs=1e-6)
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ per-generation telemetry
+def _telemetry_rollout(trainer: ParameterSharingPPOTrainer) -> dict:
+    """A 2-step rollout of the 4-env layout with hand-set advantages, values and returns of every learning seat.
+
+    Advantages. Field seats: the seat number within the team (1-5) on self-play rows; on bot rows (env 2 for team A,
+    env 3 for team B) 3 x seat + 5 for team A and 4 x seat + 1 for team B. Keeper seats: self-play rows 1, 3 (env 0,
+    steps 0, 1) and 2, 4 (env 1); bot rows 10, 14 (team A, env 2) and 20, 6 (team B, env 3).
+    Field seats: value = seat number within the team (1-5); return = 2 x value on bot rows, 6 - value on self-play rows.
+    Keeper seats: return = value + 1 everywhere."""
+    rollout = trainer.collect_rollouts(active_generation=1)
+    adv, values, returns = rollout["advantages"], rollout["values"], rollout["returns"]
+    seat_number = np.arange(1, 6, dtype=np.float32)
+    adv[:, :, 1:6] = seat_number
+    adv[:, :, 7:12] = seat_number
+    adv[:, 2, 1:6] = 3.0 * seat_number + 5.0
+    adv[:, 3, 7:12] = 4.0 * seat_number + 1.0
+    adv[:, 0, 0], adv[:, 1, 0], adv[:, 2, 0] = [1.0, 3.0], [2.0, 4.0], [10.0, 14.0]
+    adv[:, 0, 6], adv[:, 1, 6], adv[:, 3, 6] = [1.0, 3.0], [2.0, 4.0], [20.0, 6.0]
+    for keeper in (0, 6):
+        returns[:, :, keeper] = values[:, :, keeper] + 1.0
+    for first, bot_env in ((1, 2), (7, 3)):
+        seats = np.arange(first, first + 5)
+        values[:, :, first:first + 5] = (seats - first + 1)[None, None, :]
+        returns[:, :, first:first + 5] = 6.0 - values[:, :, first:first + 5]
+        returns[:, bot_env, first:first + 5] = 2.0 * values[:, bot_env, first:first + 5]
+    return rollout
+
+
+def test_update_reports_the_bot_share_and_the_per_source_critic_fit(tmp_path: Path, monkeypatch) -> None:
+    """[RED] On the hand-set rollout the networks report `bot_adv_ss_share`, the bot rows' share of the sum of squared
+    deviations of the role's advantages from the batch mean before normalisation (their share under one pooled
+    normalisation). Team A field: self-play 1..5 four times, bot 8, 11, 14, 17, 20 twice, mean 20/3, shares
+    6460/9240 = 323/462 = 0.6991342; team B field (bot 5, 9, 13, 17, 21): 172/231 = 0.7445887; keepers: team A
+    (self 1, 3, 2, 4; bot 10, 14; mean 17/3) 397/600 = 0.6616667, team B (bot 20, 6; mean 6) 98/125 = 0.784. The
+    critic correlation is +1 on bot rows and -1 on self-play rows; the bot rows' share of the value loss 0.5 (v - r)^2
+    is 55/135 = 0.4074074 and the self-play share 80/135 = 0.5925926. The normaliser receives each role's bot-row
+    mask: 10 of 30 field rows, 2 of 6 keeper rows."""
+    trainer = _bot_trainer(tmp_path, rollout_steps=2)
+    try:
+        calls = []
+        original = trainer._normalize_advantages_per_role
+
+        def spy(obs, advantages, bot_rows=None):
+            calls.append((int(advantages.numel()), None if bot_rows is None else int(bot_rows.sum())))
+            return original(obs, advantages, bot_rows)
+
+        monkeypatch.setattr(trainer, "_normalize_advantages_per_role", spy)
+        metrics = trainer.update_policies(_telemetry_rollout(trainer))
+        assert calls == [(30, 10), (6, 2), (30, 10), (6, 2)]
+        for role, share in (("blue_field", 0.6991342), ("blue_keeper", 0.6616667), ("red_field", 0.7445887), ("red_keeper", 0.784)):
+            assert metrics[role]["bot_adv_ss_share"] == pytest.approx(share, abs=1e-6), role
+        for role in ("blue_field", "red_field"):
+            assert metrics[role]["v_corr_bot"] == pytest.approx(1.0, abs=1e-9), role
+            assert metrics[role]["v_corr_self"] == pytest.approx(-1.0, abs=1e-9), role
+            assert metrics[role]["value_loss_share_bot"] == pytest.approx(0.4074074, abs=1e-6), role
+            assert metrics[role]["value_loss_share_self"] == pytest.approx(0.5925926, abs=1e-6), role
+        for role in ("blue_keeper", "red_keeper"):   # 2 bot rows against 4 self-play rows, each 0.5
+            assert metrics[role]["value_loss_share_bot"] == pytest.approx(1.0 / 3.0, abs=1e-6), role
+            assert metrics[role]["value_loss_share_self"] == pytest.approx(2.0 / 3.0, abs=1e-6), role
+    finally:
+        trainer.close()
+
+
+def test_generation_record_holds_the_bot_goals_the_share_and_the_critic_fit_of_all_four_networks(tmp_path: Path) -> None:
+    """[RED] After one generation with every match of env i ending [i, 10 + i] (two matches per env), the record has
+    `bot_envs` 2, the bot-env goals for / against of each policy (team A learns in env 2: for 2 x 2 = 4, against 12 x 2 = 24;
+    team B in env 3: for 13 x 2 = 26, against 3 x 2 = 6), `bot_adv_ss_share` in (0, 1) and the critic fit per source for
+    `blue_field`, `blue_keeper`, `red_field` and `red_keeper`; the same record round-trips through the history file."""
+    trainer = _bot_trainer(tmp_path, rollout_steps=8)
+    try:
+        original = trainer.vec_env.step_array
+
+        def spy(actions, values, action_means=None):
+            obs, central, rew, done, summaries = original(actions, values, action_means=action_means)
+            for i in np.flatnonzero(done):
+                summaries[i]["final_stats"]["score"] = [int(i), 10 + int(i)]
+            return obs, central, rew, done, summaries
+
+        trainer.vec_env.step_array = spy
+        trainer.train(total_updates=1)
+        record = trainer.generation_history[0]
+        assert record["bot_envs"] == 2
+        for role in BOT_ROLES:
+            expected = {"for": 4, "against": 24} if role.startswith("blue") else {"for": 26, "against": 6}
+            assert record["bot_goals"][role] == expected, role
+            assert 0.0 < record["bot_adv_ss_share"][role] < 1.0, role
+            assert set(record["bot_critic_fit"][role]) == {
+                "v_corr_bot", "v_corr_self", "value_loss_share_bot", "value_loss_share_self"
+            }, role
+            assert record["bot_critic_fit"][role]["value_loss_share_bot"] + record["bot_critic_fit"][role]["value_loss_share_self"] == pytest.approx(1.0)
+        on_disk = json.loads((tmp_path / "ckpt" / "training_history.json").read_text(encoding="utf-8"))
+        assert on_disk["generations"][0]["bot_goals"] == record["bot_goals"]
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ exclusions
+def test_bot_matches_stay_out_of_the_coevolution_window(tmp_path: Path) -> None:
+    """[RED] 24 bot matches scored 10-0 neither fill the window nor sync; 12 of them mixed with 12 self-play 10-0 matches
+    leave a window of 12; 24 self-play 10-0 matches sync team B towards team A."""
+    trainer = _coevo_trainer(tmp_path)
+    try:
+        bot = [{**m, "bot": {"bot_team": "B"}} for m in _matches_with_totals(240, 0, n=24)]
+        plain = [{**m, "bot": None} for m in _matches_with_totals(240, 0, n=24)]
+        assert trainer._coevolution_step(bot) is False
+        assert len(trainer.recent_match_scores) == 0 and _team_b_weight(trainer) == 0.0
+        assert trainer._coevolution_step(bot[:12] + plain[:12]) is False
+        assert len(trainer.recent_match_scores) == 12
+        trainer.recent_match_scores.clear()
+        assert trainer._coevolution_step(plain) is True
+        assert _team_b_weight(trainer) == pytest.approx(0.35)
+    finally:
+        trainer.close()
+
+
+def test_best_replay_is_chosen_among_self_play_matches_only(tmp_path: Path) -> None:
+    """[RED] With interest scores 5, 6 (self-play envs 0, 1) and 99, 98 (bot envs 2, 3), the single best replay exported
+    is env 1's."""
+    trainer = _replay_cap_trainer(tmp_path, num_envs=4, max_rl_steps=4, rollout_steps=4, bot_envs=2, replay_every=1, replay_kind="best")
+    try:
+        exported = []
+        trainer.vec_env.export_replay = lambda idx: exported.append(idx) or f"fake_{idx}.json"
+        original = trainer.vec_env.step_array
+
+        def spy(actions, values, action_means=None):
+            obs, central, rew, done, summaries = original(actions, values, action_means=action_means)
+            for i in np.flatnonzero(done):
+                summaries[i]["interest_score"] = (5.0, 6.0, 99.0, 98.0)[int(i)]
+            return obs, central, rew, done, summaries
+
+        trainer.vec_env.step_array = spy
+        trainer.collect_rollouts(active_generation=1)
+        assert exported == [1]
+    finally:
+        trainer.close()
+
+
+def test_a_uniform_replay_of_a_bot_env_gets_a_bot_tag_in_its_file_name(tmp_path: Path, monkeypatch) -> None:
+    """[RED] Generation 1's uniform replay comes from bot env 2 and generation 2's from self-play env 0: only the first
+    file is renamed `..._uniform_bot_<timestamp>.json`, and the generation record names the new path."""
+    trainer = _replay_cap_trainer(tmp_path, num_envs=4, max_rl_steps=4, rollout_steps=4, bot_envs=2, replay_every=1, replay_kind="uniform")
+    try:
+        monkeypatch.setattr(bot_tp, "uniform_env_index", lambda seed, generation, num_envs: {1: 2, 2: 0}[generation])
+        rep_dir = tmp_path / "rep_cap"
+        rep_dir.mkdir(exist_ok=True)
+
+        def fake_export(idx: int) -> str:
+            path = rep_dir / f"match_000{idx}_gen000{idx}_score1_0_uniform_20261127_000000.json"
+            path.write_text("{}", encoding="utf-8")
+            return str(path)
+
+        trainer.vec_env.export_uniform_replay = fake_export
+        trainer.train(total_updates=2)
+        first, second = (r["uniform_replay"] for r in trainer.generation_history)
+        assert os.path.basename(first) == "match_0002_gen0002_score1_0_uniform_bot_20261127_000000.json"
+        assert os.path.exists(first) and not (rep_dir / "match_0002_gen0002_score1_0_uniform_20261127_000000.json").exists()
+        assert os.path.basename(second) == "match_0000_gen0000_score1_0_uniform_20261127_000000.json"
+        assert os.path.exists(second)
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ checkpoints, resume and the 137-wide critic
+def test_a_bot_run_checkpoints_a_137_wide_critic_and_resume_checks_the_setting(tmp_path: Path, capsys) -> None:
+    """[RED] A run with 2 bot envs stores `bot_envs` 2 and 137-input critics; resuming with 2 restores the weights and the
+    flag layout; resuming with 0 raises naming both settings and the override option; with `--accept-config-change` it
+    prints one line and continues with the stored critic width and a flag that stays 0."""
+    first = _bot_trainer(tmp_path, rollout_steps=4)
+    try:
+        first.train(total_updates=1)
+        saved = {role: copy.deepcopy(pol.state_dict()) for role, pol, _ in _policy_groups(first)}
+    finally:
+        first.close()
+    state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+    assert state["bot_envs"] == 2
+    for role in BOT_ROLES:
+        assert _saved_weights(tmp_path / "ckpt" / f"{role}_policy.pt")["critic.0.weight"].shape == (256, 137)
+
+    same = _bot_trainer(tmp_path, rollout_steps=4)
+    try:
+        assert same.load_checkpoints() is True and same.current_generation == 1
+        for role, pol, _ in _policy_groups(same):
+            assert list(pol.state_dict()) == list(saved[role]), role
+            for key, value in saved[role].items():
+                assert torch.equal(pol.state_dict()[key], value), (role, key)
+        rollout = same.collect_rollouts(active_generation=2)
+        assert np.array_equal(rollout["bot_rows"], _bot_masks_of_four_envs()[1])
+    finally:
+        same.close()
+
+    refused = _bot_trainer(tmp_path, bot_envs=0, rollout_steps=4)
+    try:
+        with pytest.raises(ValueError) as exc:
+            refused.load_checkpoints()
+        message = str(exc.value)
+        assert "bot_envs" in message and "stored" in message and "requested" in message and "--accept-config-change" in message
+        assert refused.current_generation == 0
+    finally:
+        refused.close()
+
+    accepted = _bot_trainer(tmp_path, bot_envs=0, rollout_steps=4, accept_config_change=True)
+    try:
+        capsys.readouterr()
+        assert accepted.load_checkpoints() is True and accepted.current_generation == 1
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(lines) == 1 and "bot_envs" in lines[0]
+        for role, pol, _ in _policy_groups(accepted):
+            assert pol.critic[0].in_features == 137
+            for key, value in saved[role].items():
+                assert torch.equal(pol.state_dict()[key], value), (role, key)
+        rollout = accepted.collect_rollouts(active_generation=2)
+        assert rollout["central_state"].shape[-1] == CENTRAL_STATE_DIM + 1
+        assert not rollout["central_state"][..., CENTRAL_STATE_DIM].any()
+        assert rollout["frozen_seats"] is None and rollout.get("bot_rows") is None
+        accepted.update_policies(rollout)
+    finally:
+        accepted.close()
+
+
+def test_a_136_wide_checkpoint_cannot_resume_with_bot_envs(tmp_path: Path) -> None:
+    """[RED] A checkpoint written without bot envs has 136-input critics: resuming with bot envs raises on the setting, and
+    with `--accept-config-change` it still raises, naming the critic width."""
+    plain = _bot_trainer(tmp_path, bot_envs=0, rollout_steps=4)
+    try:
+        plain.train(total_updates=1)
+    finally:
+        plain.close()
+    assert _saved_weights(tmp_path / "ckpt" / "blue_field_policy.pt")["critic.0.weight"].shape == (256, 136)
+    for accept, pattern in ((False, "bot_envs"), (True, "critic")):
+        resumed = _bot_trainer(tmp_path, rollout_steps=4, accept_config_change=accept)
+        try:
+            with pytest.raises(ValueError, match=pattern):
+                resumed.load_checkpoints()
+        finally:
+            resumed.close()
+
+
+def test_a_run_without_bot_envs_keeps_the_136_wide_layout(tmp_path: Path) -> None:
+    """[GUARD] With 0 bot envs the critics read 136 inputs, the rollout's central rows are 54 wide, no seat is frozen, no
+    match is tagged, the generation record has no bot entries and the saved state records `bot_envs` 0. The golden
+    digests cover the numbers."""
+    trainer = _bot_trainer(tmp_path, num_envs=2, bot_envs=0)
+    try:
+        rollout = trainer.collect_rollouts(active_generation=1)
+        assert rollout["central_state"].shape[-1] == CENTRAL_STATE_DIM
+        assert rollout["frozen_seats"] is None and rollout.get("bot_rows") is None
+        assert all(pol.critic[0].in_features == CRITIC_STATE_DIM for _, pol, _ in _policy_groups(trainer))
+        assert [m["bot"] for m in trainer.match_history] == [None] * len(trainer.match_history) and trainer.match_history
+        trainer.update_policies(rollout)
+        trainer.train(total_updates=1)
+        state = torch.load(tmp_path / "ckpt" / "training_state.pt", map_location="cpu", weights_only=False)
+        assert state["bot_envs"] == 0
+        assert not {"bot_envs", "bot_goals", "bot_adv_ss_share", "bot_critic_fit"} & set(trainer.generation_history[0])
+    finally:
+        trainer.close()
+
+
+# ------------------------------------------------------------------ the 137-wide critic in the loaders
+def _critic_state_dict(width: int, seed: int = 0) -> dict:
+    """An `ActorCritic` state dict whose first critic layer reads `width` inputs (82 observation columns + the rest central)."""
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        net = ActorCritic(central_state_dim=width - OBS_DIM)
+    return net.state_dict()
+
+
+def test_a_137_wide_critic_is_left_alone_and_other_widths_are_refused_by_the_weight_adapter() -> None:
+    """[GUARD] `adapt_policy_weights` returns the very tensors of a 137-input critic when the network reads 55 central
+    columns, refuses it for a 54-column network (no scatter into 136 columns), and refuses a 138-input critic in both."""
+    weights = _critic_state_dict(137)
+    adapted = adapt_policy_weights(weights, OBS_DIM, CENTRAL_STATE_DIM + 1)
+    assert adapted["critic.0.weight"] is weights["critic.0.weight"]
+    assert adapted["actor_mean.0.weight"] is weights["actor_mean.0.weight"]
+    with pytest.raises(ValueError, match="137"):
+        adapt_policy_weights(weights, OBS_DIM, CENTRAL_STATE_DIM)
+    critic_only = {"critic.0.weight": weights["critic.0.weight"]}
+    with pytest.raises(ValueError):
+        adapt_policy_weights(critic_only, OBS_DIM, CENTRAL_STATE_DIM)
+    for central in (CENTRAL_STATE_DIM, CENTRAL_STATE_DIM + 1):
+        with pytest.raises(ValueError, match="138"):
+            adapt_policy_weights(_critic_state_dict(138), OBS_DIM, central)
+
+
+def test_central_width_is_read_from_the_first_critic_layer() -> None:
+    """[RED] 136 critic inputs mean 54 central columns, 137 mean 55 (the bot flag); a critic without a central block
+    (observation inputs only, as in checkpoints written before the central state) and a state dict without a critic read 54."""
+    from football_rl.policy import central_state_dim_of_weights
+
+    assert central_state_dim_of_weights(_critic_state_dict(136)) == 54
+    assert central_state_dim_of_weights(_critic_state_dict(137)) == 55
+    assert central_state_dim_of_weights(_critic_state_dict(138)) == 54   # left for the weight adapter to refuse
+    legacy = {"critic.0.weight": torch.zeros(256, OBS_DIM)}
+    assert central_state_dim_of_weights(legacy) == 54
+    assert central_state_dim_of_weights({"actor_mean.0.weight": torch.zeros(256, OBS_DIM)}) == 54
+
+
+def test_the_trainer_loads_each_critic_width_only_into_a_matching_network(tmp_path: Path) -> None:
+    """[RED] A trainer with bot envs loads a 137-input critic and refuses a 136- or a 138-input one; a trainer without
+    them loads a 136-input critic as before and refuses a 137-input one."""
+    with_bots = _bot_trainer(tmp_path, name="a")
+    without = _bot_trainer(tmp_path, name="b", num_envs=1, bot_envs=0)
+    try:
+        w137, w136 = _critic_state_dict(137, 1), _critic_state_dict(136, 2)
+        with_bots._load_adapted_weights(with_bots.blue_field_policy, w137)
+        assert torch.equal(with_bots.blue_field_policy.critic[0].weight, w137["critic.0.weight"])
+        for bad in (w136, _critic_state_dict(138)):
+            with pytest.raises(ValueError, match="critic"):
+                with_bots._load_adapted_weights(with_bots.blue_field_policy, bad)
+        without._load_adapted_weights(without.blue_field_policy, w136)
+        assert torch.equal(without.blue_field_policy.critic[0].weight, w136["critic.0.weight"])
+        with pytest.raises(ValueError, match="critic"):
+            without._load_adapted_weights(without.blue_field_policy, w137)
+    finally:
+        with_bots.close()
+        without.close()
+

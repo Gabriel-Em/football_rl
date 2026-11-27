@@ -11,6 +11,7 @@ import numpy as np
 from pettingzoo import ParallelEnv
 
 from football_rl.ball_play import BallPlayMixin
+from football_rl.baselines import scripted_actions
 from football_rl.config import (
     ALL_AGENTS,
     DEFAULT_CONFIG,
@@ -368,6 +369,8 @@ class FootballParallelEnv(
         self._deferred_replay: Optional[Dict[str, Any]] = None
         # When cleared, non-uniform replay export and deferral are skipped without disabling recording.
         self.export_replays: bool = True
+        # Team index (0 = A, 1 = B) whose six action rows `step_array` replaces with `scripted_actions`; None: none.
+        self.scripted_team: Optional[int] = None
         # When set, every completed match is kept (whatever its interest score) until exported.
         self.uniform_capture: bool = False
         self._uniform_replay: Optional[Dict[str, Any]] = None
@@ -748,7 +751,15 @@ class FootballParallelEnv(
         v_preds: Optional[np.ndarray] = None,
         action_means: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Optional[Dict[str, Any]]]:
-        """Execute one RL step using a (12, 4) action array and return contiguous NumPy arrays."""
+        """Execute one RL step using a (12, 4) action array and return contiguous NumPy arrays.
+
+        The rows of `scripted_team`, when set, are replaced by `scripted_actions` of the state the step starts from;
+        the caller's array is left as it is.
+        """
+        if self.scripted_team is not None:
+            actions_array = np.array(actions_array, dtype=np.float64)
+            first = 6 * self.scripted_team
+            actions_array[first:first + 6] = scripted_actions(self, self.scripted_team)
         act_array = np.clip(np.asarray(actions_array, dtype=np.float64), -1.0, 1.0)
         step_rewards, is_terminated, is_truncated = self._step_core(
             act_array, v_preds=v_preds, action_means=action_means

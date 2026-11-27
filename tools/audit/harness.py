@@ -17,6 +17,10 @@ Policies: team A plays the `blue_*` state dicts of the checkpoint (team B the `r
   frozen:DIR    team B plays the `red_*` state dicts of DIR
   scripted2     both teams are the scripted baseline (no checkpoint needed)
   scripted2:heldout  team A is the held-out passing bot and team B the scripted baseline (no checkpoint needed)
+A checkpoint trained with bot envs has critics that read one input more than the environment's central state
+(137 = 82 + 54 + 1 instead of 136): the opponent-is-bot flag, fed as 1 to team A's network when the opponent is
+`scripted` or `heldout` and as 0 otherwise (`self`, `frozen`, `scripted2`). Only the recorded critic values depend
+on it.
 Modes: `sampled` draws all four action components from the policy distribution, `mixed` uses the mean
 for throttle and steer and samples kick and special, `greedy` uses the mean. `--sigma-scale` multiplies
 the standard deviation of the sampled components.
@@ -188,20 +192,23 @@ class TeamPolicy:
     `head` is 0 for `gaussian4`, 1 for `hybrid5`, 2 for `hybrid6` and 3 for `hybrid7`; a team's two networks share one head.
     """
 
-    def __init__(self, directory: str, prefix: str) -> None:
+    def __init__(self, directory: str, prefix: str, opponent_is_bot: bool = False) -> None:
         from football_rl.migrations import adapt_policy_weights
-        from football_rl.policy import ActorCritic, policy_head_of_weights
+        from football_rl.policy import ActorCritic, central_state_dim_of_weights, policy_head_of_weights
 
         base = Path(directory)
+        self.opponent_is_bot = bool(opponent_is_bot)
         self.heads = []
         self.fire_bounds = []
         self.value_affines = []
         kinds = set()
+        central_dims = set()
         for pattern, slot in ((POLICY_FILES[1], slice(0, 1)), (POLICY_FILES[0], slice(1, 6))):
             weights = torch.load(base / pattern.format(prefix=prefix), map_location="cpu", weights_only=True)
             kind = policy_head_of_weights(weights) or "gaussian4"
             kinds.add(kind)
-            net = ActorCritic(policy_head=kind)
+            central_dims.add(central_state_dim_of_weights(weights))
+            net = ActorCritic(policy_head=kind, central_state_dim=central_state_dim_of_weights(weights))
             net.load_state_dict(adapt_policy_weights(weights, net.obs_dim, net.central_state_dim))
             net.eval()
             for p in net.parameters():
@@ -211,7 +218,10 @@ class TeamPolicy:
             self.value_affines.append(net.value_affine())  # (ret_mean, ret_std) of a value-normalised critic, else None
         if len(kinds) != 1:
             raise ValueError(f"the field and keeper networks of {base} / {prefix} use different policy heads: {sorted(kinds)}")
+        if len(central_dims) != 1:
+            raise ValueError(f"the field and keeper critics of {base} / {prefix} read different central widths: {sorted(central_dims)}")
         self.head = {"hybrid5": 1, "hybrid6": 2, "hybrid7": 3}.get(kinds.pop(), 0)
+        self.central_dim = central_dims.pop()
 
     @staticmethod
     def _raw_value(head, affine):
@@ -302,6 +312,10 @@ class TeamPolicy:
         actions = np.empty((6, 4), dtype=np.float32)
         values = np.empty(6, dtype=np.float32)
         means = np.empty((6, 4), dtype=np.float32)
+        if self.central_dim > cen.shape[-1]:
+            # The critic's last input is 1 against a scripted bot and 0 otherwise.
+            flag = np.full((*cen.shape[:-1], self.central_dim - cen.shape[-1]), float(self.opponent_is_bot), dtype=cen.dtype)
+            cen = np.concatenate([cen, flag], axis=-1)
         with torch.inference_mode():
             for (slot, actor, critic, std), bounds, affine in zip(self.heads, self.fire_bounds, self.value_affines):
                 if bounds is not None:
@@ -345,7 +359,7 @@ def _load_policies(spec: EvalSpec):
     if spec.opponent in BOT_ONLY_OPPONENTS:
         return None, None
     first, second = spec.team_prefixes()
-    team_a = TeamPolicy(spec.checkpoint_dir, first)
+    team_a = TeamPolicy(spec.checkpoint_dir, first, opponent_is_bot=spec.opponent in ("scripted", "heldout"))
     if spec.opponent == "self":
         team_b = TeamPolicy(spec.checkpoint_dir, second)
     elif spec.opponent.startswith("frozen:"):

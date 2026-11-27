@@ -56,6 +56,17 @@ def _shm_layout(num_envs: int) -> Tuple[Dict[str, Tuple[str, Tuple[int, ...], in
     return layout, offset
 
 
+def _scripted_teams(teams: Any, num_envs: int) -> List[Optional[int]]:
+    """`teams` as a list with one entry per env, each None, 0 or 1; ValueError otherwise."""
+    teams = list(teams)
+    if len(teams) != num_envs:
+        raise ValueError(f"scripted teams need one entry per env ({num_envs}), got {len(teams)}")
+    for team in teams:
+        if team is not None and (isinstance(team, bool) or not isinstance(team, int) or team not in (0, 1)):
+            raise ValueError(f"a scripted team is None, 0 or 1, got {team!r}")
+    return teams
+
+
 def _shm_views(
     buf: Any, layout: Dict[str, Tuple[str, Tuple[int, ...], int]]
 ) -> Dict[str, np.ndarray]:
@@ -142,6 +153,9 @@ def _worker(
                 remote.send(True)
             elif cmd == "set_export_replays":
                 env.export_replays = bool(data)
+                remote.send(True)
+            elif cmd == "set_scripted_team":
+                env.scripted_team = data
                 remote.send(True)
             elif cmd == "set_generation":
                 env._deferred_replay = None
@@ -456,6 +470,18 @@ class SubprocVecFootballEnv:
         for idx in range(self.num_envs):
             self._recv(idx)
 
+    def set_scripted_teams(self, teams: List[Optional[int]]) -> None:
+        """Play team `teams[i]` (0 = A, 1 = B) of env `i` with the scripted bot from the next step on; None for no bot.
+
+        The setting stays through episode resets.
+        """
+        checked = _scripted_teams(teams, self.num_envs)
+        for idx, team in enumerate(checked):
+            self._send(idx, ("set_scripted_team", team))
+        self._recv_failed_sends()
+        for idx in range(self.num_envs):
+            self._recv(idx)
+
     def export_uniform_replay(self, env_idx: int) -> Optional[str]:
         """Instruct worker `env_idx` to write its captured uniform replay to disk."""
         self._send(env_idx, ("export_uniform_replay", None))
@@ -591,6 +617,10 @@ class DummyVecFootballEnv:
         flag = bool(enabled)
         for env in self.envs:
             env.export_replays = flag
+
+    def set_scripted_teams(self, teams: List[Optional[int]]) -> None:
+        for env, team in zip(self.envs, _scripted_teams(teams, self.num_envs)):
+            env.scripted_team = team
 
     def export_uniform_replay(self, env_idx: int) -> Optional[str]:
         return self.envs[env_idx].export_uniform_replay()

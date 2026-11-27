@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
+from football_rl.config import OBS_DIM
 from football_rl.policy import (
     ActorCritic,
     FIRE_HEADS,
@@ -28,15 +28,30 @@ class PPOUpdateMixin:
     """PPO update of `ParameterSharingPPOTrainer`."""
 
     @staticmethod
-    def _normalize_advantages_per_role(
-        obs: torch.Tensor, advantages: torch.Tensor
-    ) -> torch.Tensor:
-        """Normalize advantages across the pooled team unit without intra-role zero-sum washing."""
+    def _standardise(advantages: torch.Tensor) -> torch.Tensor:
+        """Zero mean and unit (unbiased) SD; a single row or none is returned as it is."""
         if advantages.numel() <= 1:
             return advantages
         mean = advantages.mean()
         std = advantages.std()
         return (advantages - mean) / (std + 1e-8)
+
+    @staticmethod
+    def _normalize_advantages_per_role(
+        obs: torch.Tensor, advantages: torch.Tensor, bot_rows: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Normalize advantages across the pooled team unit without intra-role zero-sum washing.
+
+        With `bot_rows` (bool, one per row) holding at least one True, the rows of matches against the scripted bot and
+        the self-play rows are each standardised on their own mean and SD, so a source's weight in the update is its
+        row share whatever its goal count. Without bot rows this is the single pooled standardisation.
+        """
+        if bot_rows is None or not bool(bot_rows.any()):
+            return PPOUpdateMixin._standardise(advantages)
+        out = advantages.clone()
+        for rows in (bot_rows, ~bot_rows):
+            out[rows] = PPOUpdateMixin._standardise(advantages[rows])
+        return out
 
     def _value_loss(self, newvalue: torch.Tensor, mb_values: torch.Tensor, mb_returns: torch.Tensor) -> torch.Tensor:
         """Critic loss of a minibatch: PPO's value clip around `mb_values` when `ppo.value_clip`, else the plain squared error."""
@@ -62,11 +77,15 @@ class PPOUpdateMixin:
         b_values: torch.Tensor,
         b_central: Optional[torch.Tensor] = None,
         critic_only: bool = False,
+        b_bot: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """Run multi-epoch minibatch PPO update on pooled role transitions.
 
         A role without any learning transition (every seat frozen) is left untouched: no optimizer step is taken and
-        its statistics are NaN.
+        its statistics are NaN. `b_bot` marks the rows played against the scripted bot; their advantages are
+        normalised apart from the self-play rows' (once, over the whole batch), and `bot_adv_ss_share` reports their
+        share of the sum of squared deviations of the batch's advantages from the batch mean before normalisation:
+        the weight they would carry under one pooled normalisation.
         """
         batch_size = b_obs.shape[0]
         if batch_size == 0:
@@ -93,9 +112,16 @@ class PPOUpdateMixin:
                 "p_spec": p_spec_mean,
             }
 
+        source_metrics: Dict[str, float] = {}
+        if b_bot is not None:
+            advantages64 = b_advantages.double()
+            squares = (advantages64 - advantages64.mean()) ** 2
+            total = float(squares.sum())
+            source_metrics["bot_adv_ss_share"] = float(squares[b_bot].sum()) / total if total > 0.0 else float("nan")
+
         # Normalize once across the full rollout batch for the team unit
         if not critic_only:
-            b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages)
+            b_advantages = self._normalize_advantages_per_role(b_obs, b_advantages, b_bot)
 
         # Critic targets and the rollout's value estimates move to the policy's standardised return units, with the
         # statistics already updated by this batch; the critic head is read in those units too.
@@ -267,6 +293,7 @@ class PPOUpdateMixin:
             "entropy": float(np.mean(entropy_losses)),
             **fire_metrics,
             **target_metrics,
+            **source_metrics,
         }
 
     def update_policies(
@@ -287,6 +314,11 @@ class PPOUpdateMixin:
             else None
         )
         frozen_seats = rollout.get("frozen_seats")
+        bot_rows = rollout.get("bot_rows")
+        # (T, num_envs, 12) mask of the rows played against the scripted bot, laid out like the rollout arrays.
+        bot_source = (
+            np.broadcast_to(np.asarray(bot_rows, dtype=bool)[None], values.shape) if bot_rows is not None else None
+        )
 
         def _role_rows(arr: np.ndarray, role_indices: List[int]) -> np.ndarray:
             """Rollout array `(T, num_envs, 12, ...)` restricted to the role's seats, without the frozen ones."""
@@ -304,10 +336,27 @@ class PPOUpdateMixin:
                 if mc_returns is not None
                 else 0.0
             )
+            _attach_source_fit(role_metrics, role_indices)
+
+        def _attach_source_fit(role_metrics: Dict[str, float], role_indices: List[int]) -> None:
+            """Critic fit of the rows against the bot and the self-play rows: value / return correlation and each
+            source's share of the value loss `0.5 (v - return)^2`, from the rollout's values and returns."""
+            if bot_source is None:
+                return
+            role_val = _role_rows(values, role_indices).reshape(-1)
+            role_ret = _role_rows(returns, role_indices).reshape(-1)
+            is_bot = _role_rows(bot_source, role_indices).reshape(-1)
+            half_squares = 0.5 * (role_val.astype(np.float64) - role_ret.astype(np.float64)) ** 2
+            total = float(half_squares.sum())
+            for source, rows in (("bot", is_bot), ("self", ~is_bot)):
+                role_metrics[f"v_corr_{source}"] = pearson_correlation(role_val[rows], role_ret[rows])
+                role_metrics[f"value_loss_share_{source}"] = (
+                    float(half_squares[rows].sum()) / total if total > 0.0 else float("nan")
+                )
 
         def _extract_role_tensors(
             role_indices: List[int],
-        ) -> Tuple[torch.Tensor, ...]:
+        ) -> Tuple[Optional[torch.Tensor], ...]:
             r_obs = torch.as_tensor(
                 _role_rows(obs, role_indices).reshape(-1, OBS_DIM),
                 dtype=torch.float32,
@@ -315,7 +364,7 @@ class PPOUpdateMixin:
             )
             r_cen = (
                 torch.as_tensor(
-                    _role_rows(central_state, role_indices).reshape(-1, CENTRAL_STATE_DIM),
+                    _role_rows(central_state, role_indices).reshape(-1, self.central_dim),
                     dtype=torch.float32,
                     device=self.device,
                 )
@@ -347,7 +396,12 @@ class PPOUpdateMixin:
                 dtype=torch.float32,
                 device=self.device,
             )
-            return r_obs, r_act, r_logp, r_adv, r_ret, r_val, r_cen
+            r_bot = (
+                torch.as_tensor(_role_rows(bot_source, role_indices).reshape(-1), device=self.device)
+                if bot_source is not None
+                else None
+            )
+            return r_obs, r_act, r_logp, r_adv, r_ret, r_val, r_cen, r_bot
 
         if not self.separate_teams:
             f_tensors = _extract_role_tensors(self.field_indices)
@@ -357,6 +411,7 @@ class PPOUpdateMixin:
                 f_tensors[0], f_tensors[1], f_tensors[2], f_tensors[3], f_tensors[4], f_tensors[5],
                 b_central=f_tensors[6],
                 critic_only=critic_only,
+                b_bot=f_tensors[7],
             )
             _attach_v_corr(field_metrics, self.field_indices)
             k_tensors = _extract_role_tensors(self.keeper_indices)
@@ -366,6 +421,7 @@ class PPOUpdateMixin:
                 k_tensors[0], k_tensors[1], k_tensors[2], k_tensors[3], k_tensors[4], k_tensors[5],
                 b_central=k_tensors[6],
                 critic_only=critic_only,
+                b_bot=k_tensors[7],
             )
             _attach_v_corr(keeper_metrics, self.keeper_indices)
             metrics = {
@@ -386,6 +442,7 @@ class PPOUpdateMixin:
             bf_tensors[0], bf_tensors[1], bf_tensors[2], bf_tensors[3], bf_tensors[4], bf_tensors[5],
             b_central=bf_tensors[6],
             critic_only=critic_only,
+            b_bot=bf_tensors[7],
         )
         _attach_v_corr(blue_field_m, self.blue_field_indices)
         # Shared keepers take one update per generation on the rows of both keeper seats.
@@ -397,6 +454,7 @@ class PPOUpdateMixin:
             bk_tensors[0], bk_tensors[1], bk_tensors[2], bk_tensors[3], bk_tensors[4], bk_tensors[5],
             b_central=bk_tensors[6],
             critic_only=critic_only,
+            b_bot=bk_tensors[7],
         )
         _attach_v_corr(blue_keeper_m, keeper_seats)
         rf_tensors = _extract_role_tensors(self.red_field_indices)
@@ -406,6 +464,7 @@ class PPOUpdateMixin:
             rf_tensors[0], rf_tensors[1], rf_tensors[2], rf_tensors[3], rf_tensors[4], rf_tensors[5],
             b_central=rf_tensors[6],
             critic_only=critic_only,
+            b_bot=rf_tensors[7],
         )
         _attach_v_corr(red_field_m, self.red_field_indices)
         if self.shared_keepers:
@@ -418,6 +477,7 @@ class PPOUpdateMixin:
                 rk_tensors[0], rk_tensors[1], rk_tensors[2], rk_tensors[3], rk_tensors[4], rk_tensors[5],
                 b_central=rk_tensors[6],
                 critic_only=critic_only,
+                b_bot=rk_tensors[7],
             )
             _attach_v_corr(red_keeper_m, self.red_keeper_indices)
         metrics = {

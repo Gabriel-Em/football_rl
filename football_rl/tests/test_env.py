@@ -5173,3 +5173,37 @@ def test_kick_gate_physics_substep_timing() -> None:
             assert env.ball_holder is None
             assert env.stats["kicks"] == 1
 
+
+
+def test_scripted_team_overwrites_only_its_rows_and_never_touches_the_callers_array() -> None:
+    """[GUARD] `scripted_team` is None on a new env. With team B scripted, `step_array` applies team A's rows exactly
+    as given (clipped to [-1, 1]) and `scripted_actions` for team B computed on the state it was called in; the
+    caller's array is left unmodified, and with None every row is applied as given."""
+    from football_rl.baselines import scripted_actions
+
+    cfg = replace(DEFAULT_CONFIG, replay=replace(DEFAULT_CONFIG.replay, enable_recording=False))
+    env = FootballParallelEnv(config=cfg)
+    assert env.scripted_team is None
+    env.reset(seed=5)
+    rng = np.random.default_rng(0)
+    given = rng.uniform(-1.5, 1.5, (12, 4)).astype(np.float32)
+    given_before = given.copy()
+
+    applied = []
+    original = env._step_core
+
+    def spy(act_array, v_preds=None, action_means=None):
+        applied.append((np.array(act_array, copy=True), copy.deepcopy(env)))
+        return original(act_array, v_preds=v_preds, action_means=action_means)
+
+    env._step_core = spy
+    env.step_array(given)
+    assert np.array_equal(applied[0][0], np.clip(given.astype(np.float64), -1.0, 1.0))
+
+    env.scripted_team = 1
+    env.step_array(given)
+    act, pre_step_env = applied[1]
+    assert np.array_equal(act[:6], np.clip(given[:6].astype(np.float64), -1.0, 1.0))
+    assert np.array_equal(act[6:], scripted_actions(pre_step_env, 1).astype(np.float64))
+    assert not np.array_equal(act[6:], np.clip(given[6:].astype(np.float64), -1.0, 1.0))
+    assert np.array_equal(given, given_before)

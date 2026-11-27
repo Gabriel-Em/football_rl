@@ -1288,3 +1288,193 @@ class TestRetreatProbeCli:
     def test_cli_requires_checkpoint_dir(self) -> None:
         with pytest.raises(SystemExit):
             _rp().main([])
+
+
+# ----------------------------------------------------------------------------
+# training_progress: matches against the scripted bot
+# ----------------------------------------------------------------------------
+def _bot_hist_match(gen: int, goals: int, bot: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    m = _hist_match(gen, 10.0, goals, 0, [0, 0], 0, 0, 0.0, 0)
+    m["bot"] = bot
+    m["pool"] = None
+    return m
+
+
+BOT_TAG = {"bot_team": "B"}
+
+
+class TestTrainingProgressBotMatches:
+    def test_bot_matches_are_counted_and_left_out_of_the_statistics(self) -> None:
+        """[RED] Self-play goals 2, 4 and 0 give a bucket mean of 2.0 whatever the bot match's 30 goals; the bucket counts n 3 and n_bot 1."""
+        hist = {"matches": [_bot_hist_match(1, 2), _bot_hist_match(1, 4), _bot_hist_match(1, 30, BOT_TAG), _bot_hist_match(2, 0)]}
+        row = training_progress.bucket_progress(hist, bucket=2)[0]
+        assert (row["n"], row["n_bot"], row["n_pooled"]) == (3, 1, 0)
+        assert row["goals"] == pytest.approx(2.0)
+
+    def test_a_bucket_of_bot_matches_only_has_no_statistics_and_the_old_rows_count_none(self) -> None:
+        """[RED] A bucket whose matches are all bot matches has n 0 and no statistics; matches without a `bot` field count 0."""
+        hist = {"matches": [_bot_hist_match(1, 30, BOT_TAG), _bot_hist_match(1, 25, BOT_TAG), _bot_hist_match(2, 1)]}
+        rows = training_progress.bucket_progress(hist, bucket=1)
+        assert (rows[0]["n"], rows[0]["n_bot"], rows[0]["goals"]) == (0, 2, None)
+        legacy = {"matches": [_hist_match(1, 10.0, 1, 0, [0, 0], 0, 0, 0.0, 0)]}
+        assert training_progress.bucket_progress(legacy, bucket=1)[0]["n_bot"] == 0
+
+    def test_takeoff_ignores_bot_matches(self) -> None:
+        """[RED] Self-play goals of 1 per generation never reach 5 over a 2-generation window; two bot matches of 30 goals per
+        generation would, so the takeoff generation stays None. A generation with only bot matches raises."""
+        hist = {"matches": [m for g in (1, 2, 3, 4) for m in (_bot_hist_match(g, 1), _bot_hist_match(g, 30, BOT_TAG), _bot_hist_match(g, 30, BOT_TAG))]}
+        summary = training_progress.takeoff_summary(hist, goals=5.0, window=2)
+        assert summary["gen"] is None and (summary["first_gen"], summary["last_gen"]) == (1, 4)
+        only_bot = {"matches": [_bot_hist_match(1, 1), _bot_hist_match(2, 30, BOT_TAG), _bot_hist_match(3, 1)]}
+        with pytest.raises(ValueError, match="generation 2"):
+            training_progress.takeoff_summary(only_bot, goals=5.0, window=2)
+
+    def test_the_report_names_the_bot_matches_it_left_out(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """[RED] The bucket line shows `bot=2`, the header and the takeoff note say how many bot matches were excluded."""
+        hist = {"matches": [m for g in (1, 2) for m in (_bot_hist_match(g, 3), _bot_hist_match(g, 30, BOT_TAG))]}
+        path = tmp_path / "history.json"
+        path.write_text(json.dumps(hist))
+        assert training_progress.main(["--history", str(path), "--bucket", "2", "--takeoff", "--takeoff-goals", "2", "--takeoff-window", "1"]) == 0
+        out = capsys.readouterr().out
+        assert out.splitlines()[0] == "training_progress: 2 matches in 1 bucket(s) of 2 gens (2 bot matches excluded)"
+        assert "bot=2" in out and "takeoff: self-play matches only (2 bot matches excluded)" in out
+        assert "takeoff_gen=1" in out
+
+
+# ----------------------------------------------------------------------------
+# Network loaders: the critic's central width and the "opponent is the bot" flag
+# ----------------------------------------------------------------------------
+def _flag_checkpoint(directory: Path, central_dim: int, seed: int = 0) -> Path:
+    import torch
+    from football_rl.policy import ActorCritic
+
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    for prefix in ("blue", "red"):
+        for kind in ("field", "keeper"):
+            torch.save(ActorCritic(central_state_dim=central_dim).state_dict(), directory / f"{prefix}_{kind}_policy.pt")
+    return directory
+
+
+def _team_values(team: Any, seed: int = 0):
+    import numpy as np
+    import torch
+
+    rng = np.random.default_rng(seed)
+    obs = rng.normal(size=(6, 82)).astype(np.float32)
+    cen = rng.normal(size=(6, 54)).astype(np.float32)
+    _, values, _ = team.act(obs, cen, "greedy", 1.0, torch.Generator().manual_seed(0))
+    return obs, cen, values
+
+
+def _critic_values(directory: Path, prefix: str, obs: Any, cen: Any, flag: Optional[float]):
+    """Values of the four-network team read straight from the state dicts: keeper slot 0, field slots 1-5."""
+    import numpy as np
+    import torch
+    from football_rl.policy import ActorCritic
+
+    out = np.zeros(6, dtype=np.float32)
+    for kind, sl in (("keeper", slice(0, 1)), ("field", slice(1, 6))):
+        weights = torch.load(directory / f"{prefix}_{kind}_policy.pt", weights_only=True)
+        net = ActorCritic(central_state_dim=int(weights["critic.0.weight"].shape[1]) - 82)
+        net.load_state_dict(weights)
+        c = torch.as_tensor(cen[sl])
+        if flag is not None:
+            c = torch.cat([c, torch.full((c.shape[0], 1), flag)], dim=-1)
+        with torch.no_grad():
+            out[sl] = net.get_value(torch.as_tensor(obs[sl]), central_state=c).numpy()
+    return out
+
+
+class TestHarnessLoadersAndTheBotFlag:
+    def test_a_137_input_critic_reads_the_flag_as_one_against_a_bot_and_zero_otherwise(self, tmp_path: Path) -> None:
+        """[RED] The team's critic values equal the networks' on observation + central state + a flag column that is 1 when the
+        opponent is a bot and 0 when it is not, and the two settings give different values."""
+        import numpy as np
+        from tools.audit import harness
+
+        d = _flag_checkpoint(tmp_path / "c", 55, seed=2)
+        obs, cen, against_bot = _team_values(harness.TeamPolicy(str(d), "blue", opponent_is_bot=True))
+        _, _, against_team = _team_values(harness.TeamPolicy(str(d), "blue", opponent_is_bot=False))
+        np.testing.assert_allclose(against_bot, _critic_values(d, "blue", obs, cen, 1.0), atol=1e-6)
+        np.testing.assert_allclose(against_team, _critic_values(d, "blue", obs, cen, 0.0), atol=1e-6)
+        assert np.abs(against_bot - against_team).min() > 1e-5
+
+    def test_a_136_input_critic_still_loads_and_ignores_the_opponent_setting(self, tmp_path: Path) -> None:
+        """[GUARD] A checkpoint with 136-input critics loads and plays bit-identically whether or not the opponent is a bot."""
+        import numpy as np
+        from tools.audit import harness
+
+        d = _flag_checkpoint(tmp_path / "c", 54, seed=2)
+        obs, cen, a = _team_values(harness.TeamPolicy(str(d), "blue", opponent_is_bot=True))
+        _, _, b = _team_values(harness.TeamPolicy(str(d), "blue", opponent_is_bot=False))
+        assert np.array_equal(a, b)
+        np.testing.assert_allclose(a, _critic_values(d, "blue", obs, cen, None), atol=1e-6)
+
+    def test_any_other_critic_width_is_refused(self, tmp_path: Path) -> None:
+        """[GUARD] A critic with 138 inputs does not load."""
+        from tools.audit import harness
+
+        d = _flag_checkpoint(tmp_path / "c", 56)
+        with pytest.raises(ValueError, match="138"):
+            harness.TeamPolicy(str(d), "blue")
+
+    def test_a_team_whose_two_critics_read_different_central_widths_is_refused(self, tmp_path: Path) -> None:
+        """[RED] A keeper critic with 137 inputs next to a field critic with 136 does not load as one team."""
+        import shutil
+        from tools.audit import harness
+
+        flagged = _flag_checkpoint(tmp_path / "flagged", 55)
+        plain = _flag_checkpoint(tmp_path / "plain", 54)
+        mixed = tmp_path / "mixed"
+        mixed.mkdir()
+        shutil.copy(flagged / "blue_keeper_policy.pt", mixed / "blue_keeper_policy.pt")
+        shutil.copy(plain / "blue_field_policy.pt", mixed / "blue_field_policy.pt")
+        with pytest.raises(ValueError, match="central width"):
+            harness.TeamPolicy(str(mixed), "blue")
+
+    def test_evaluation_feeds_flag_one_for_scripted_and_heldout_and_zero_for_the_rest(self, tmp_path: Path) -> None:
+        """[RED] `_load_policies` marks team A's network as playing a bot for the `scripted` and `heldout` opponents, and not for
+        `self`, `frozen:DIR` (whose team B is not marked either)."""
+        from tools.audit import harness
+
+        d = _flag_checkpoint(tmp_path / "c", 55)
+        other = _flag_checkpoint(tmp_path / "other", 55, seed=1)
+        expected = {"scripted": (True, None), "heldout": (True, None), "self": (False, False), f"frozen:{other}": (False, False)}
+        for opponent, (a_flag, b_flag) in expected.items():
+            team_a, team_b = harness._load_policies(harness.EvalSpec(checkpoint_dir=str(d), opponent=opponent, n=1))
+            assert team_a.opponent_is_bot is a_flag, opponent
+            assert (team_b is None) == (b_flag is None) and (team_b is None or team_b.opponent_is_bot is b_flag), opponent
+
+    def test_a_scripted_match_trace_records_the_critic_values_with_the_flag_set(self, tmp_path: Path) -> None:
+        """[RED] Decision 0 of a 2-step match: team A's recorded values are the critics' on the reset state with flag 1 against
+        `scripted` and flag 0 against `self`."""
+        import numpy as np
+        from tools.audit import harness
+
+        d = _flag_checkpoint(tmp_path / "c", 55, seed=3)
+        for opponent, flag in (("scripted", 1.0), ("self", 0.0)):
+            spec = harness.EvalSpec(checkpoint_dir=str(d), opponent=opponent, mode="greedy", n=1, seed=5, max_steps=2)
+            env = harness._build_env(spec, str(tmp_path))
+            env.reset(seed=5 * 1000)
+            obs, cen = env._get_observations_array(), env.get_centralized_state()
+            trace = harness.play_match(spec, 0)
+            np.testing.assert_allclose(trace["val"][0, :6], _critic_values(d, "blue", obs[:6], cen[:6], flag), atol=1e-5)
+
+    def test_the_hold_rollout_workers_load_the_same_flagged_policies(self, tmp_path: Path) -> None:
+        """[RED] The counterfactual-rollout worker initialiser reads a 137-input checkpoint through the harness loader and marks
+        team A as playing a bot for `--opp scripted`; a 136-input checkpoint loads as before."""
+        import torch
+        from tools.audit import harness, rollouts
+
+        threads = torch.get_num_threads()
+        try:
+            for central, opponent, expected in ((55, "scripted", True), (55, "self", False), (54, "scripted", True)):
+                d = _flag_checkpoint(tmp_path / f"c{central}{opponent}", central)
+                rollouts._init_hold_worker(harness.EvalSpec(checkpoint_dir=str(d), opponent=opponent, n=1), None)
+                team_a = rollouts._HOLD_POLICIES[0]
+                assert team_a.opponent_is_bot is expected
+                assert team_a.heads[0][2][0][0].shape[1] == 82 + central   # first critic layer: observation + central inputs
+        finally:
+            rollouts._HOLD_POLICIES = None
+            torch.set_num_threads(threads)

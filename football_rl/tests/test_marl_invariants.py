@@ -628,3 +628,49 @@ def test_assign_cover_invalid_inputs_raise() -> None:
         potentials.assign_cover(np.zeros((1, 2)), np.full((1, 2), np.nan), np.ones(1))
     with pytest.raises(ValueError):  # Inf weight
         potentials.assign_cover(np.zeros((1, 2)), np.ones((1, 2)), np.array([np.inf]))
+
+
+# ------------------------------------------------------------------ the critic-only "opponent is the bot" flag
+def _nets_with_and_without_the_flag_column():
+    """A 136-input-critic network and a 137-input one with the same weights and zero weights on the flag column."""
+    from football_rl.config import CENTRAL_STATE_DIM, OBS_DIM
+    from football_rl.policy import ActorCritic
+
+    torch.manual_seed(11)
+    plain = ActorCritic()
+    flagged = ActorCritic(central_state_dim=CENTRAL_STATE_DIM + 1)
+    state = {k: v.clone() for k, v in plain.state_dict().items()}
+    state["critic.0.weight"] = torch.cat([state["critic.0.weight"], torch.zeros(state["critic.0.weight"].shape[0], 1)], dim=1)
+    flagged.load_state_dict(state)
+    rng = np.random.default_rng(3)
+    obs = torch.as_tensor(rng.normal(size=(9, OBS_DIM)), dtype=torch.float32)
+    cen = torch.as_tensor(rng.normal(size=(9, CENTRAL_STATE_DIM)), dtype=torch.float32)
+    return plain, flagged, obs, cen
+
+
+def test_a_137_input_critic_with_zero_flag_weights_reads_like_a_136_input_critic() -> None:
+    """[GUARD] Hand construction: copy a 136-input critic and add a column of zero weights for the flag. For flag 0 and 1
+    it gives the 136-input critic's values; give the column weight 0.5 and flag 1 moves every value while flag 0
+    still gives them."""
+    plain, flagged, obs, cen = _nets_with_and_without_the_flag_column()
+    zeros, ones = torch.zeros(9, 1), torch.ones(9, 1)
+    with torch.no_grad():
+        want = plain.get_value(obs, central_state=cen)
+        for flag in (zeros, ones):
+            torch.testing.assert_close(flagged.get_value(obs, central_state=torch.cat([cen, flag], dim=-1)), want, atol=1e-5, rtol=0.0)
+        flagged.critic[0].weight[:, -1] = 0.5
+        torch.testing.assert_close(flagged.get_value(obs, central_state=torch.cat([cen, zeros], dim=-1)), want, atol=1e-5, rtol=0.0)
+        assert (flagged.get_value(obs, central_state=torch.cat([cen, ones], dim=-1)) - want).abs().min() > 1e-3
+
+
+def test_the_actor_does_not_see_the_critic_flag() -> None:
+    """[GUARD] Flipping the flag column of the central state changes the critic value and leaves the action
+    log-probability and entropy (functions of the actor only) bit-identical."""
+    _, flagged, obs, cen = _nets_with_and_without_the_flag_column()
+    action = torch.zeros(9, 4)
+    with torch.no_grad():
+        flagged.critic[0].weight[:, -1] = 0.5
+        _, logp0, ent0, value0 = flagged.get_action_and_value(obs, action, central_state=torch.cat([cen, torch.zeros(9, 1)], dim=-1))
+        _, logp1, ent1, value1 = flagged.get_action_and_value(obs, action, central_state=torch.cat([cen, torch.ones(9, 1)], dim=-1))
+    assert torch.equal(logp0, logp1) and torch.equal(ent0, ent1)
+    assert not torch.equal(value0, value1)

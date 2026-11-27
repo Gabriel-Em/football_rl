@@ -46,7 +46,7 @@ class CoevolutionMixin:
         """Record newly completed matches and soft-sync the trailing team when one side dominates.
 
         Scores enter the rolling window in completion order; matches played with frozen pool seats (record `pool` set)
-        are skipped. The condition is evaluated only once
+        and matches against the scripted bot (record `bot` set) are skipped. The condition is evaluated only once
         the window holds `COEVO_WINDOW_MATCHES` matches: at least 8 total goals with one side
         scoring >= 3x the other (opponent floored at 1 goal). The trailing team's policies are then
         blended 35% towards the dominant team's and the window is cleared; with shared keepers only the field
@@ -55,8 +55,8 @@ class CoevolutionMixin:
         if not self.separate_teams:
             return False
         for m in completed_matches:
-            if m.get("pool") is not None:
-                continue  # a match with frozen opponent seats says nothing about the balance of the two live teams
+            if m.get("pool") is not None or m.get("bot") is not None:
+                continue  # a match with a frozen or scripted team says nothing about the balance of the two live teams
             self.recent_match_scores.append((int(m["score"][0]), int(m["score"][1])))
         if len(self.recent_match_scores) < COEVO_WINDOW_MATCHES:
             return False
